@@ -77,7 +77,7 @@ class LaneDetector:
         bev, white_mask, yellow_mask = self.camera_processor.processor(frame)
 
         if bev is None:
-            return False, 0,0, 0,0, None
+            return False, 0.0, 0.0, None
         
         lane_valid, lane_offset, lookahead = self.slide_window_processor.detect(
             bev, white_mask, yellow_mask
