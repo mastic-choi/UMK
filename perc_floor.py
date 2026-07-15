@@ -28,7 +28,7 @@ def compressed_image_callback(data):
 
 # 정지선 확인 후 True/False 반환
 
-def check_stopline():
+def check_stopline(image):
     global stopline_num
 
     #image 잘라내기(ROI Area)
