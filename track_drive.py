@@ -54,10 +54,7 @@ class MissionState(Enum):
 
 class BehaviorState(Enum):
     B0_NORMAL   = 0  # Mission(차선주행) 출력 그대로
-    B1_LAVACON  = 1  # 라바콘 구간 주행 (Phase.LAVACON일 때, 트리거 조건 없이 항상 활성)
-                     # ★TODO: B2/B3처럼 라이다 감지 트리거 필요 — 현재는 S1 재진입 즉시 무조건 켜짐.
-                     #   process_lavacon()에 "콘 보임" 신호(예: lavacon_visible = len(px)>=MIN_POINTS)를
-                     #   3번째 리턴값으로 추가해서 그걸로 B1 진입을 게이팅해야 함. 다음에 구현.
+    B1_LAVACON  = 1  # 라바콘 구간 주행 (Phase.LAVACON일 때, 좌우 라이다 클러스터 동시검출 트리거로 활성)
     B2_OBSTACLE = 2  # 고정장애물 회피 (Phase.FIXED_OBSTACLE일 때, 감지 시 활성) — ★재설계 예정
     B3_VEHICLE  = 3  # 방해차량 추월   (Phase.VEHICLE일 때, 감지 시 활성)      — ★재설계 예정
 
@@ -94,6 +91,7 @@ LANE_LOOKAHEAD_REF = 220.0  # 예측감속 최대가 되는 lookahead 편차(px)
 
 LAVACON_KP   = 210.0
 LAVACON_DONE_FRAMES = 80   # 우측콘 미검출이 연속 N프레임(20Hz→약 4초) 쌓이면 Phase 전환(순간누락 디바운스)
+LAVACON_TRIGGER_FRAMES = 5   # 좌우 클러스터 동시검출이 연속 N프레임 쌓이면 B1_LAVACON 진입 확정(디바운스)
 SAFETY_DIST      = 5.0    # B2(고정장애물) 발동 거리(m) — ★재설계 시 재검토
 OVERTAKE_TRIGGER = 6.5    # B3(방해차량) 발동 거리(m)   — ★재설계 시 재검토
 
@@ -187,6 +185,10 @@ class TrackDriverNode(Node):
         self.lavacon_offset = 0.0
         self.lavacon_done   = False
         self._lavacon_empty_cnt = 0   # 우측콘 연속 미검출 프레임 수(Phase 전환 디바운스)
+        self.lavacon_left_detected  = False  # 좌측 라이다 클러스터 검출 여부(B1 진입 트리거용)
+        self.lavacon_right_detected = False  # 우측 라이다 클러스터 검출 여부(B1 진입 트리거용)
+        self.lavacon_trigger        = False  # 좌우 동시검출이 디바운스 프레임수만큼 유지되면 True
+        self._lavacon_trigger_cnt   = 0      # 좌우 동시검출 연속 프레임 수(디바운스 카운터)
 
         # ── 외부 차선 인식 모듈 (lane_util.py / perc_floor.py) 초기화 ──
         self.camera_processor = CameraProcessor()       # BEV 변환 및 색상 마스크(흰/노랑) 처리기
@@ -199,6 +201,8 @@ class TrackDriverNode(Node):
         self.behavior_state = BehaviorState.B0_NORMAL
         self.phase          = Phase.LAVACON     # S1 내부 진행 순서(라바콘부터 시작)
         self._behavior_enabled = False          # S2 교차로 "직진"으로 S1 재진입 시에만 True
+        self._lavacon_engaged  = False          # B1_LAVACON 진입 확정 latch (트리거 이후 잠깐 한쪽 클러스터가
+                                                 #   끊겨도 중간에 일반주행으로 안 튀도록 유지, lavacon_done으로 해제)
         self.ctrl_angle = 0.0
         self.ctrl_speed = SPEED_STOP
         self._pid_prev_error = 0.0
@@ -265,6 +269,7 @@ class TrackDriverNode(Node):
         self.perc_signal()      # 비전
         self.perc_obstacle()    # 라이다
         self.perc_lavacon()     # 라이다
+        self.perc_lavacon_trigger()  # 라이다 (좌우 클러스터 동시검출 → B1_LAVACON 진입 트리거)
         self.perc_stopline()    # 비전
 
     # [2-1] 차선
@@ -415,6 +420,63 @@ class TrackDriverNode(Node):
     def perc_lavacon(self):
         self.lavacon_offset, self.lavacon_done = process_lavacon(self.lidar_ranges)
 
+    # [2-4b] 라바콘 좌우 클러스터 검출 → B1_LAVACON 진입 트리거
+    #   입력 self.lidar_ranges
+    #   출력 lavacon_left_detected/right_detected, lavacon_trigger
+    #   설계 의도: 라이다 포인트가 "존재"하는 것만으로는 벽·바닥 잡음과 구분이 안 되므로,
+    #     인접 인덱스(=인접 각도)로 붙어있는 포인트 묶음(클러스터)이 좌/우 각각 최소 1개씩
+    #     동시에 있어야 "라바콘 구간 진입"으로 인정한다. perc_obstacle()과 동일한 차체 마스킹/
+    #     극좌표 변환 방식을 사용하되, ROI와 목적은 별개(장애물 회피용이 아니라 콘 게이트 진입 판단용)이므로
+    #     여기서 독립적으로 계산한다.
+    def perc_lavacon_trigger(self):
+        # ── 튜닝 파라미터 (실측 라바콘 간격 기준 추정치, 실차 튜닝 필요) ──
+        LON_MIN, LON_MAX = 0.3, 3.0   # 트리거 ROI 전방 종방향(m) — 너무 가깝거나(차체 반사) 먼 점 배제
+        LAT_MAX           = 2.0        # 트리거 ROI 횡방향 한계(m)
+        CLUSTER_MIN_PTS   = 2          # 클러스터로 인정할 최소 연속 포인트 수(단일 반사점 노이즈 배제)
+        CLUSTER_MAX_GAP   = 0.35       # 같은 클러스터로 볼 최대 거리편차(m) — 콘 지름 근사
+        BODY_LO, BODY_HI  = 99, 263    # 차체 자기가림 구간 (perc_obstacle과 동일)
+
+        if self.lidar_ranges is None:
+            self.lavacon_left_detected  = False
+            self.lavacon_right_detected = False
+            self._lavacon_trigger_cnt   = 0
+            self.lavacon_trigger        = False
+            return
+
+        ranges = np.array(self.lidar_ranges, dtype=np.float32)
+        ranges[~np.isfinite(ranges)] = 0.0
+        ranges[ranges <= 0.0] = 0.0
+        n = len(ranges)
+        if n > BODY_LO:
+            ranges[BODY_LO:min(BODY_HI, n)] = 0.0   # 차체 자기가림 마스킹
+
+        m = min(n, 360)
+        deg = np.linspace(0.0, 2.0 * math.pi, m, endpoint=False)
+        r = ranges[:m]
+        x = r * np.cos(deg)          # 전방(+앞)
+        y = r * np.sin(deg)          # 횡방향(+좌/-우)
+        roi = (r > 0.0) & (x > LON_MIN) & (x < LON_MAX) & (np.abs(y) < LAT_MAX)
+
+        def _has_cluster(side_mask):
+            idx = np.where(roi & side_mask)[0]
+            if len(idx) < CLUSTER_MIN_PTS:
+                return False
+            # 인덱스(=각도) 순 배열이므로, 인덱스가 서로 붙어있으면 공간적으로도 인접한 점으로 보고 묶는다.
+            splits = np.where(np.diff(idx) > 1)[0] + 1
+            for g in np.split(idx, splits):
+                if len(g) >= CLUSTER_MIN_PTS and (np.max(r[g]) - np.min(r[g])) <= CLUSTER_MAX_GAP:
+                    return True   # 콘 하나 크기로 뭉친 클러스터 발견
+            return False
+
+        self.lavacon_left_detected  = _has_cluster(y > 0.0)   # 좌측(y>0)
+        self.lavacon_right_detected = _has_cluster(y < 0.0)   # 우측(y<0)
+
+        if self.lavacon_left_detected and self.lavacon_right_detected:
+            self._lavacon_trigger_cnt += 1
+        else:
+            self._lavacon_trigger_cnt = 0
+        self.lavacon_trigger = self._lavacon_trigger_cnt >= LAVACON_TRIGGER_FRAMES
+
     # [2-5] 정지선(굵은 가로 흰선)
     #   입력 self.img_front → 출력 self.stopline
     #   용도 : S1→S2 진입 / 지름길 끝(탈출 좌회전 지점) 단서
@@ -487,9 +549,9 @@ class TrackDriverNode(Node):
           - ②에서는 Behavior가 조향/속도를 전담하므로 여기선 PID를 돌리지 않는다(적분 오염 방지).
         """
         # Behavior가 조향을 전담하는 구간에서는 Mission의 차선 PID를 건너뛴다.
-        # ★TODO: 지금은 phase==LAVACON이면 트리거 없이 바로 B1행 — 나중에 "콘 감지" 트리거가 생기면
-        #   감지 전까지는 여기서 안 걸리고 일반 차선주행(_lane_drive)이 돌아야 함.
-        if self._behavior_enabled and self.phase == Phase.LAVACON:
+        # phase==LAVACON이어도 좌우 클러스터 동시검출 트리거(_lavacon_engaged)가 확정되기 전까지는
+        # 여기서 안 걸리고 아래 else 분기의 일반 차선주행(_lane_drive)이 계속 돈다.
+        if self._behavior_enabled and self.phase == Phase.LAVACON and self._lavacon_engaged:
             return
         if self._obstacle_phase != 'idle' or self._overtake_phase_int != 0:
             return
@@ -627,10 +689,14 @@ class TrackDriverNode(Node):
         딱 하나의 Behavior만 활성화한다. Phase 전환은 각 핸들러가 완료 시점에 직접 수행.
         """
         if self.phase == Phase.LAVACON:
-            # ★TODO: 감지 트리거 필요 — 지금은 무조건 B1_LAVACON. B2/B3처럼
-            #   "라바콘 감지됨" 조건(예: process_lavacon의 lavacon_visible)이 True일 때만
-            #   B1_LAVACON, 아니면 B0_NORMAL(일반 차선주행)로 바꿔야 함. 다음에 구현.
-            self.behavior_state = BehaviorState.B1_LAVACON
+            # 좌우 라이다 클러스터가 동시에(디바운스 프레임수만큼) 검출되면 B1_LAVACON 진입을 확정(latch)한다.
+            # 한번 확정된 뒤에는 중간에 한쪽 클러스터가 잠깐 끊겨도(occlusion 등) B0로 되돌아가지 않고
+            # lavacon_done 디바운스(_lavacon_empty_cnt)로 정상 종료될 때까지 유지한다.
+            if self.lavacon_trigger:
+                self._lavacon_engaged = True
+            self.behavior_state = (BehaviorState.B1_LAVACON
+                                    if self._lavacon_engaged
+                                    else BehaviorState.B0_NORMAL)
         elif self.phase == Phase.FIXED_OBSTACLE:
             # TEST_DISABLE_B2_B3=True면 SAFETY_DIST 트리거 검사(아래 triggered 계산)를 아예 안 하고
             # 바로 리턴 — 장애물이 실제로 잡혀도 B2_OBSTACLE로 안 넘어가고 B0로 고정되어
@@ -713,6 +779,7 @@ class TrackDriverNode(Node):
                 self._lavacon_empty_cnt = 0
                 self._pid_prev_error = 0.0
                 self._pid_integral   = 0.0
+                self._lavacon_engaged = False   # B1 진입 latch 해제 (구간 재진입 대비)
                 self.phase = Phase.FIXED_OBSTACLE
                 self.get_logger().info('[LAVACON] 구간 통과 완료 → 고정장애물 구간')
         else:
