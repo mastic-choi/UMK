@@ -1,69 +1,50 @@
+import cv2
+import numpy as np
 
-import rospy, time, math, os
+# ── 정지선 감지 튜닝 파라미터 (전전년도 팀 실측값 그대로, 카메라 해상도 640x480 고정 가정) ──
+#   프로젝트 전체가 640x480 한 대의 카메라를 전제로 캘리브레이션돼 있어(BEV_SRC/DST, SIG_ROI 등)
+#   해상도가 달라지면 이 값들 전부 재보정 대상이므로, 비율 변환 없이 절대픽셀 그대로 사용.
+#   튜닝도 디버그 창에서 눈으로 사각형 맞추는 방식이라 절대픽셀이 더 직관적.
+STOPLINE_ROI_Y0, STOPLINE_ROI_Y1 = 270, 320   # 세로 밴드
+STOPLINE_ROI_X0, STOPLINE_ROI_X1 = 150, 480   # 가로 중앙 크롭
+STOPLINE_WHITE_LOW = 180                      # 그레이스케일 흰색 임계
+STOPLINE_TH = 0.06                            # ROI 내 흰 픽셀 비율 임계 (실측: 1000/16500 ≈ 6%)
+DEBUG_VIZ_STOPLINE = False
 
-from lane_util import CameraProcessor, SlideWindow
-
-
-
-# 변수
-bridge = CvBridge()
-image = np.empty(shape=[0])
-WIDTH, HEIGHT = 640, 480 
-Blue = (255,0,0)
-Green = (0,255,0)
-Red = (0,0,255)
-Yellow = (0,255,255)
-View_Center = WIDTH//2 # 화면의 중앙값 = 카메라 위치
-
-# 콜백 함수 - USB카메라 토픽을 받아 처리
-def usbcam_callback(data):
-    global image
-    image = bridge.image_to_cv2(data, "bgr8")
-
-def compressed_image_callback(data):
-    global compressed_image
-    np_arr = np.frombuffer(data.data, np.unit8)
-    compressed_image = cv2.imdecode(np_arr, cv2.IMAGED_COLOR)
-
-
-# 정지선 확인 후 True/False 반환
 
 def check_stopline(image):
-
-    #image 잘라내기(ROI Area)
-    roi_img = image[270:320, 0:640]
-    cv2.imshow("ROI Image", roi_img)
-
-    #HSV 변환, V채널에 대해 범위를 정해 흑백 이진화 이미지로 변환
-    hsv_image = cv2.cvtColor(roi_img, cv2.COLOR_BGR2HSV)
-    upper_white = np.array([255, 255, 255])
-    lower_white = np.array([0,0,100])
-    binary_img = cv2.inRange(hsv_image, lower_white, upper_white)
-
-    #흑백이진화 이미지에서 정지선 체크용 이미지 만들기
-    stopline_check_img = binary_img[0:50, 150:480]
-
-    #컬러 이미지로 바꾼 후 정지선 체크용 이미지 영역을 녹색 사각형으로 표시
-    img = cv2.cvtColor(binary_img, cv2.COLOR_GRAY2BGR)
-    cv2.rectangle(img, (200,100),(440,120),Green,3)
-    cv2.imshow('Stopline Check', img)
-    cv2.waitKey(1)
-
-    #정지선 체크용 이미지에서 흰색 점의 개수 카운트
-    stopline_count = cv2.countNonZero(stopline_check_img)
-
-    #사각형 안의 흰색 점이 기준치 이상이면 True
-    if stopline_count > 1000:
-        print("Stopline Found...! -", stopline_num)
-        stopline_num = stopline_num + 1
-        return True
-    
-    else:
+    """
+    굵은 가로 흰선(정지선) 감지 → True/False 반환.
+      - 입력 : 전방 카메라 BGR 이미지 (640x480 가정)
+      - 출력 : 정지선 감지 여부 (bool)
+    """
+    if image is None:
         return False
-    
 
-            
+    roi = image[STOPLINE_ROI_Y0:STOPLINE_ROI_Y1, STOPLINE_ROI_X0:STOPLINE_ROI_X1]
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    _, binary = cv2.threshold(gray, STOPLINE_WHITE_LOW, 255, cv2.THRESH_BINARY)
+
+    white_ratio = float(np.count_nonzero(binary)) / binary.size
+    detected = white_ratio > STOPLINE_TH
+
+    if DEBUG_VIZ_STOPLINE:
+        vis = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+        cv2.putText(vis, f'ratio={white_ratio:.3f} th={STOPLINE_TH:.2f}',
+                    (4, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(vis, 'DETECTED' if detected else 'none',
+                    (4, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                    (0, 0, 255) if detected else (200, 200, 200), 1, cv2.LINE_AA)
+        cv2.imshow('stopline', vis)
+        cv2.waitKey(1)
+
+    return detected
+
+
 class LaneDetector:
+    """CameraProcessor(BEV/마스크) + SlideWindow(차선 탐색/피팅)을 묶은 최종 통합 인식기."""
+
     def __init__(self, camera_processor=None, slide_window_processor=None):
         self.camera_processor = camera_processor
         self.slide_window_processor = slide_window_processor
@@ -73,54 +54,17 @@ class LaneDetector:
         self.slide_window_processor = slide_window
 
     def detect(self, frame):
-        #CameraProcessor 에서 BEV, mask 생성
+        """
+        입력 : 전방 카메라 BGR 프레임
+        출력 : (lane_valid, lane_offset, lane_lookahead, bev)
+        """
         bev, white_mask, yellow_mask = self.camera_processor.processor(frame)
 
         if bev is None:
             return False, 0.0, 0.0, None
-        
+
         lane_valid, lane_offset, lookahead = self.slide_window_processor.detect(
             bev, white_mask, yellow_mask
         )
 
         return lane_valid, lane_offset, lookahead, bev
-    
-            
-# 메인 함수
-def start():
-
-    camera_processor = CameraProcessor()
-    slide_window_processor = slideWindow()
-
-    lane_detector = LaneDetector(
-        camera_processor, slide_window_processor
-    )
-
-    #모드 변경 상수 아래에 적기
-    HSV = 11
-    #어떤 미션부터 수헹할 것인지 결정
-    drive_mode = HSV
-    cam_exposure(100)
-
-    #노드 생성, 구독/발행할 토픽 선언
-    rospy.init_node('Track_Driver')
-    #...
-    
-    #발행자 노드들로부터 첫번째 토픽이 도착할때까지 대기
-    rospy.wait_for_message("/usb_cam/image_raw/", Image)
-    print("Camera Ready------------")
-    rospy.wait_for_message("xycar_ultrasonic", Int32MultiArray)
-    print("UltraSonic Ready------------")
-    rospy.wait_for_message("/scan", LaserScan)
-    print("Lidar Readt------------")
-
-    print("===================================")
-    print(" S T A R T    D R I V I N G . . .")
-
-    #main loop
-    camera_processor = CameraProcessor()
-    slide_window_processor = SlideWindow()
-    lane_detector.set_processor(camera_processor, slide_window_processor)
-    perv_data = {}
-
-

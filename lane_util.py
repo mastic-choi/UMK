@@ -1,27 +1,36 @@
 import numpy as np
 import cv2
 
-#SlidingWindow 
-SW_NWIN = 9
-SW_MARGIN = 40
-SW_MINPIX = 30
-#BEV 
+#SlidingWindow
+# 출처: 전전년도 타 팀 코드(KUAC_2024-main) lane_detection/src/slidewindow_both_lane.py
+#   nwindows=14, margin=20, minpix=10 을 그대로 초기값으로 이식 (실차 미검증, 튜닝 전제)
+SW_NWIN = 14
+SW_MARGIN = 20
+SW_MINPIX = 10
+#BEV
+# 출처: KUAC_2024-main lane_detection/src/utils.py warper() — 원본 픽셀좌표 그대로(640x150 ROI 기준, 반올림 없음)
+#   src 원본: 좌하[0,126] 좌상[175,46] 우상[456,38] 우하[640,103]
+#   dst 원본: x=169~489, y=0~150(ROI 높이 그대로)
+#   같은 640x480 카메라·같은 ROI 높이(150px) 사용 가정 → 원본 수치/640,150 그대로 기입
+#   (우리 점 순서인 좌상,우상,우하,좌하로 재배열만 함). 카메라 마운트 다르면 실차에서 재확인 필요.
 BEV_SRC = np.float32([
-        [0.22,0.15],
-        [0.78,0.15],
-        [1.00,1.00],
-        [0.00,1.00]
+        [175/640, 46/150],
+        [456/640, 38/150],
+        [640/640, 103/150],
+        [0/640,   126/150],
     ])
 BEV_DST = np.float32([
-        [0.25,0.00],
-        [0.75,0.00],
-        [0.75,1.00],
-        [0.25,1.00]
+        [169/640, 0/150],
+        [489/640, 0/150],
+        [489/640, 150/150],
+        [169/640, 150/150],
     ])
 #Lane ROI
-LANE_ROI_TOP = 0.55
-LANE_ROI_BOT = 1.00
-LANE_LOOKAHEAD = 0.35
+# 출처: KUAC_2024-main lane_detection/src/utils.py roi_for_lane() → image[246:396, :] (640x480 기준)
+#   246/480=0.5125, 396/480=0.825 로 환산
+LANE_ROI_TOP = 0.5125
+LANE_ROI_BOT = 0.825
+LANE_LOOKAHEAD = 0.35  # KUAC_2024엔 예측조향 개념 자체가 없어 대응값 없음 — 기존값 유지
 # Yellow Lane
 LANE_YELLOW_WEIGHT = 0.25
 LANE_YELLOW_MAX_DEV = 40

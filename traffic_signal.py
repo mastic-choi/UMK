@@ -10,7 +10,7 @@ SIG_HORIZ_DIFF_MAX = SIG_MAX_RADIUS * 8
 SIG_MIN_DIST       = SIG_MIN_RADIUS * 3
 SIG_BRIGHT_MARGIN  = 15
 
-#Signal4 (4구, S3 교차로) - 배치 좌→우 [빨강,노랑,좌회전,직진]
+#Signal4 (4구, S2 교차로) - 배치 좌→우 [빨강,노랑,좌회전,직진]
 SIG4_ROI_T, SIG4_ROI_B = 0.08, 0.28
 SIG4_ROI_L, SIG4_ROI_R = 0.04, 0.78
 SIG4_MIN_RADIUS, SIG4_MAX_RADIUS = 15, 25
@@ -20,7 +20,7 @@ SIG4_MIN_DIST       = SIG4_MIN_RADIUS * 3
 SIG4_BRIGHT_MARGIN  = 15
 
 #Debug
-DEBUG_VIZ_SIGNAL = True
+DEBUG_VIZ_SIGNAL = False
 
 
 class SignalDetector:
@@ -43,6 +43,9 @@ class SignalDetector:
         return float(np.mean(patch))
 
     def shape_ok(self, circles, vert_max, horiz_max, min_dist):
+        # ★TODO(실차 테스트시 체크): 원 개수가 정확히 3개/4개가 아니면(빛반사·블러로 하나 덜/더 잡히면)
+        #   그 프레임은 무조건 인식 실패로 처리됨 — 디바운스나 "N프레임 중 M번" 같은 폴백이 없음.
+        #   실차 카메라로 돌려보고 신호 놓치는 빈도가 높으면 여기에 보강 필요.
         xs = sorted(int(c[0]) for c in circles)
         ys = sorted(int(c[1]) for c in circles)
 
@@ -69,6 +72,9 @@ class SignalDetector:
         return gray, circles
 
     def detect_s0(self, frame):
+        if frame is None:
+            return self.color
+
         h, w = frame.shape[:2]
 
         self.roi = frame[
@@ -101,7 +107,10 @@ class SignalDetector:
 
         return self.color
 
-    def detect_s3(self, frame):
+    def detect_s2(self, frame):
+        if frame is None:
+            return self.red_on, self.straight_on, self.left_on
+
         h, w = frame.shape[:2]
 
         self.roi = frame[
