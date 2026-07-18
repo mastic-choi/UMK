@@ -128,12 +128,16 @@ APPROACH_TIME  = 1.0    # [진입] 감속 유지 시간(s)
 APPROACH_EXIT_SPEED = 2.0  # [진출] S3 탈출 정지선 감지 후 감속 속도
 APPROACH_EXIT_TIME  = 1.0  # [진출] 감속 유지 시간(s)
 
+# 장애물회피 판단
+AVOID_OFFSET = 100      # 차선 중앙에서 좌우로 이동할 거리(px)
+RETURN_THRESHOLD = 10 
 # ── 신호등 ROI/임계값은 traffic_signal.py(SignalDetector)로 이관 — 여기서 중복 정의하지 않음 ──
 
 # ── Behavior 게이팅 ──
 # 라바콘·고정장애물·방해차량 미션은 전부 S1(차선주행)에서만 나온다.
 # 단, S1에는 두 번 진입한다: ①S0 직후(교차로 가기 전, 순수 주행만) ②S2 교차로 "직진" 선택 후 복귀(여기서만 Behavior 작동).
 # → _behavior_enabled 로 ①/② 를 구분한다.
+
 
 # ── 개발/테스트 플래그 ──
 START_STATE     = MissionState.S0_WAIT_GREEN
@@ -259,6 +263,10 @@ class TrackDriverNode(Node):
         self._corner_hold    = 0.0    # 코너 활성도(감쇠 peak-hold)
         self._last_debug_t   = 0.0
 
+        self.target_lane = None       # LEFT / RIGHT
+        self.target_offset = 0.0      # 목표 편차 (px)
+        self._return_cnt = 0
+
         # ── ROS 통신 ──
         self.motor_msg = XycarMotor()
         self.motor_pub = self.create_publisher(XycarMotor, 'xycar_motor', 10)
@@ -330,8 +338,9 @@ class TrackDriverNode(Node):
             return
 
         # lane_util.py의 LaneDetector를 사용하여 차선 인식 수행
-        valid, offset, lookahead, bev = self.lane_detector.detect(self.img_front)
+        valid, offset, lookahead, lane_center, bev = self.lane_detector.detect(self.img_front)
 
+        self.lane_center = lane_center
         self.lane_valid = valid
         if valid:
             # 기존 제어 코드와 호환되도록 필터링 적용
@@ -577,6 +586,42 @@ class TrackDriverNode(Node):
             self.get_logger().warn('[VEHICLE] YOLO 차량 미확인 — 라이다 단독 폴백으로 진입 (yolo_vehicle 노드 점검 요망)')
         self.vehicle_trigger = (self._vehicle_trigger_cnt >= VEHICLE_TRIGGER_FRAMES
                                 or self._vehicle_lidar_cnt >= YOLO_FALLBACK_FRAMES)
+        
+    # [2-8] 장애물 위치 판단
+
+    def perc_obstacle_lane(self):
+        self.obstacle_lane = None
+        if self._yolo_vehicle_msg is None:
+            return
+        # 오래된 메세지 무시
+        if time.time() - self._yolo_vehicle_t > YOLO_FRESH_SEC:
+            return
+        # 가장 큰 차량 하나 선택
+        best = None
+        best_area = 0
+
+        for det in self._yolo_vehicle_msg.detections:
+            if det.class_name not in YOLO_VEHICLE_CLASSES:
+                continue
+            area = det.bbox.size_x * det.bbox.size_y
+
+            if area > best_area:
+                best = det
+                best_area = area
+
+        if best is None:
+            return
+        
+        # Bounding Box 중심
+        cx = best.bbox.center.position.x
+
+        #화면 기준 좌/우 판단
+        if cx < self.lane_center:
+            self.obstacle_lane = "LEFT"
+        else:
+            self.obstacle_lane = "RIGHT"
+
+        
 
     # [2-5] 정지선(굵은 가로 흰선)
     #   입력 self.img_front → 출력 self.stopline
@@ -752,6 +797,26 @@ class TrackDriverNode(Node):
     def _s4_finish(self):
         self.ctrl_angle, self.ctrl_speed = 0.0, SPEED_STOP
 
+    # 목표 차선 결정
+    # obstacle_lane을 이용하여 회피할 목표 차선을 결정
+    def decide_target_lane(self):
+
+        if self.obstacle_lane == "LEFT":
+
+            self.target_lane = "RIGHT"
+
+            #현재 차선 기준으로 오른쪽으로 100px 이동
+            self.target_offset = self.lane_center + AVOID_OFFSET
+        
+        elif self.obstacle_lane == "RIGHT":
+            self.target_lane = "LEFT"
+            #현재 차선 기준으로 왼쪽으로 100px 이동
+            self.target_offset = self.lane_center - AVOID_OFFSET
+        
+        else:
+            self.target_lane = None
+            self.target_offset = self.lane_offset 
+
     # ── 좌회전 공통 (실차 전환: 후진 없이 무난한 좌회전) ──
     def _begin_left_turn(self):
         self._turn_yaw_start = self.imu_yaw   # 플래그로만 사용 (None 여부 체크)
@@ -909,34 +974,77 @@ class TrackDriverNode(Node):
             self._lavacon_empty_cnt = 0
 
     # ── B2-고정장애물 회피 ──★재설계 예정(임시 placeholder) ──
+    # target_lane을 반영해 수정
     def _handle_fixed_obstacle(self):
         """
         ★ TODO: 실차 회피 기동 재설계 필요. 시뮬 전용이던 역C자 고정 프레임 시퀀스는 폐기.
         지금은 감지되면 감속만 하고 버티다가, 장애물이 사라지면 방해차량 구간으로 넘어가는
         임시(placeholder) 동작이다. 실제 회피 궤적/조향은 팀에서 별도로 설계해서 교체할 것.
         """
-        is_obstacle = self.obstacle_front and self.obstacle_type == 'fixed'
+        is_obstacle = (
+            self.obstacle_front and 
+            self.obstacle_type == "fixed"
+        )
 
-        if self._obstacle_phase == 'idle':
+        #idle
+        if self._obstacle_phase == "idle":
             if is_obstacle:
-                self._obstacle_phase = 'avoid'
-                self._obstacle_frame_cnt = 0
-                self.get_logger().info(f'[OBSTACLE] 감지 dist={self.obstacle_dist:.1f}m side={self.obstacle_side}')
+                #회피 방향을 딱 한번 결정
+                self.decide_target_lane()
+                self._obstacle_phase = "avoid"
+                self.get_logger().info(
+                    f"[OBSTACLE] START lane={self.target_lane}"
+                )
             return
+        
+        #avoid
+        elif self._obstacle_phase == "avoid":
+            steer_offset = (
+                (1.0-LANE_PREVIEW)*self.target_offset + 
+                LANE_PREVIEW*self.lane_lookahead
+            )
 
-        # 'avoid' — TODO: 실제 회피 기동으로 교체
-        self.ctrl_angle = 0.0
-        self.ctrl_speed = SPEED_LAVACON
-        self._obstacle_frame_cnt += 1
-        if not is_obstacle and self._obstacle_frame_cnt > 10:
-            self._obstacle_phase     = 'idle'
-            self._obstacle_frame_cnt = 0
-            self._pid_prev_error = 0.0
-            self._pid_integral   = 0.0
-            self.phase = Phase.VEHICLE
-            self.get_logger().info('[OBSTACLE] 회피 완료(placeholder) → 방해차량 구간')
+            self.ctrl_angle = self._lane_pid(steer_offset)
+            self.ctrl_speed = SPEED_LAVACON
+
+            #장애물이 일전 프레임 동안 사라졌으면 복귀 시작
+            if not is_obstacle:
+                self._return_cnt += 1
+            else:
+                self._return_cnt = 0
+            if self._return_cnt >= 5:
+                self._return_cnt = 0
+                self._obstacle_phase = "return"
+
+                self.target_offset = 0.0
+
+                self.get_logger().info("[OBSTACLE] RETURN")
+
+        #return
+        elif self._obstacle_phase == "return":
+            steer_offset = (
+                (1.0-LANE_PREVIEW)*self.lane_offset +
+                LANE_PREVIEW*self.lane_lookahead
+            )
+
+            self.ctrl_angle = self._lane_pid(steer_offset)
+            self.ctrl_speed = SPEED_NORMAL
+
+            # 차선 중앙으로 거의 복귀
+            if abs(self.lane_offset) < RETURN_THRESHOLD:
+                self._obstacle_phase = "idle"
+                self.phase = Phase.VEHICLE
+
+                self._return_cnt = 0
+                
+                self._pid_prev_error = 0
+                self._pid_integral = 0
+
+                self.get_logger().info("[OBSTACLE] DONE")
 
     # ── B3-방해차량 추월 ──★재설계 예정(임시 placeholder) ──
+    # target_lane 반영 수정
+    # 회피 후 복귀하는 로직 추가 : idle -> avoid -> idle+Phase.VEHICLE => idel -> avoid -> return -> idle
     def _handle_overtake(self):
         """
         ★ TODO: 실차 추월 기동 재설계 필요. 시뮬 전용이던 6단계 고정 프레임 시퀀스는 폐기.
@@ -953,9 +1061,16 @@ class TrackDriverNode(Node):
             return
 
         # 활성 상태 — TODO: 실제 추월 기동으로 교체
-        self.ctrl_angle = 0.0
+        self.decide_target_lane()
+
+        steer_offset = (
+            (1.0 - LANE_PREVIEW) * self.target_offset
+            + LANE_PREVIEW * self.lane_lookahead
+        )
+        self.ctrl_angle = self._lane_pid(steer_offset) 
         self.ctrl_speed = SPEED_LAVACON
         self._overtake_frame_cnt += 1
+
         if not is_vehicle and self._overtake_frame_cnt > 10:
             self._overtake_phase_int = 0
             self._overtake_frame_cnt = 0
