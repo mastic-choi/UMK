@@ -1,0 +1,87 @@
+{\rtf1\ansi\ansicpg949\cocoartf2870
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\froman\fcharset0 Times-Bold;\f1\froman\fcharset0 Times-Roman;\f2\fmodern\fcharset0 Courier;
+}
+{\colortbl;\red255\green255\blue255;\red0\green0\blue0;}
+{\*\expandedcolortbl;;\cssrgb\c0\c0\c0;}
+\paperw11900\paperh16840\margl1440\margr1440\vieww11520\viewh8400\viewkind0
+\deftab720
+\pard\pardeftab720\sa240\partightenfactor0
+
+\f0\b\fs24 \cf0 \expnd0\expndtw0\kerning0
+\outl0\strokewidth0 \strokec2 0. \uc0\u49324 \u51204  \u51456 \u48708  (\u52264 \u50640 \u49436  1\u54924 )
+\f1\b0 \
+\pard\pardeftab720\partightenfactor0
+
+\f2\fs26 \cf0 # \uc0\u44032 \u51473 \u52824  \u54028 \u51068 \u51060  \u51060  \u44221 \u47196 \u50640  \u51080 \u50612 \u50556  \u54632  (launch \u44592 \u48376  \u44221 \u47196 )\
+ls ~/xycar_ws/src/yolo_ros/cone_best.pt ~/xycar_ws/src/yolo_ros/yolov8m.pt\
+\
+# ultralytics \uc0\u48120 \u49444 \u52824 \u46972 \u47732 \
+pip install ultralytics "numpy<2" lap\
+\pard\pardeftab720\sa240\partightenfactor0
+
+\f0\b\fs24 \cf0 1. \uc0\u48716 \u46300  & \u49548 \u49828 
+\f1\b0 \
+\pard\pardeftab720\partightenfactor0
+
+\f2\fs26 \cf0 cd ~/xycar_ws\
+colcon build --symlink-install --packages-select yolo_msgs yolo_ros yolo_bringup track_drive\
+source install/setup.bash\
+\
+\
+\pard\pardeftab720\sa240\partightenfactor0
+
+\f0\b\fs24 \cf0 2. \uc0\u49468 \u49436  \u46300 \u46972 \u51060 \u48260  \u54869 \u51064 
+\f1\b0  (xycar \uc0\u49884 \u49828 \u53596 \u51060  \u51088 \u46041  \u49892 \u54665 \u54616 \u45716  \u44221 \u50864 \u44032  \u47566 \u51004 \u45768  \u47676 \u51200  \u54869 \u51064 )\
+\pard\pardeftab720\partightenfactor0
+
+\f2\fs26 \cf0 ros2 topic list | grep -E "image_raw|scan|imu"\
+\pard\pardeftab720\sa240\partightenfactor0
+\cf0 /usb_cam/image_raw/front
+\f1\fs24 , 
+\f2\fs26 /scan
+\f1\fs24 , 
+\f2\fs26 /imu
+\f1\fs24 \uc0\u44032  \u50504  \u48372 \u51060 \u47732  \u52852 \u47700 \u46972 /\u46972 \u51060 \u45796 /IMU \u47088 \u52824 \u47484  \u48324 \u46020  \u53552 \u48120 \u45328 \u50640 \u49436  \u47676 \u51200  \u49892 \u54665 \u54616 \u49464 \u50836  (\u50696 : 
+\f2\fs26 ros2 launch xycar_cam xycar_cam.launch.py
+\f1\fs24 ).\
+\pard\pardeftab720\sa240\partightenfactor0
+
+\f0\b \cf0 3. \uc0\u47700 \u51064  \u49892 \u54665 
+\f1\b0 \
+\pard\pardeftab720\partightenfactor0
+
+\f2\fs26 \cf0 ros2 launch track_drive track_drive.launch.py\
+\pard\pardeftab720\sa240\partightenfactor0
+
+\f1\fs24 \cf0 YOLO \uc0\u47784 \u45944 \u51012  \u48148 \u45012  \u45180 \u50864 \u44256  \u49910 \u51012  \u46416  \u51064 \u51088 \u47196 :\
+\pard\pardeftab720\partightenfactor0
+
+\f2\fs26 \cf0 ros2 launch track_drive track_drive.launch.py \\\
+  cone_model:=$HOME/xycar_ws/src/yolo_ros/cone_best.pt \\\
+  vehicle_model:=$HOME/xycar_ws/src/yolo_ros/yolov8n.pt \\\
+  use_debug:=true\
+\
+\
+\pard\pardeftab720\sa240\partightenfactor0
+
+\f0\b\fs24 \cf0 4. \uc0\u46356 \u48260 \u44613 /\u47784 \u45768 \u53552 \u47553 
+\f1\b0  (\uc0\u48324 \u46020  \u53552 \u48120 \u45328 , \u44033 \u44033  \u54596 \u50836 \u54624  \u46412 )\
+\pard\pardeftab720\partightenfactor0
+
+\f2\fs26 \cf0 # YOLO \uc0\u44160 \u52636  \u49884 \u44033 \u54868  (bbox \u44536 \u47140 \u51652  \u54868 \u47732 )\
+ros2 run rqt_image_view rqt_image_view   # \uc0\u53664 \u54589 \u50640 \u49436  /yolo_cone/dbg_image \u49440 \u53469 \
+\
+# YOLO \uc0\u44160 \u52636  \u51452 \u44592  \u49892 \u52769  \u8592  \u49888 \u49440 \u46020 (YOLO_FRESH_SEC=0.5) \u53916 \u45789 \u51032  \u44540 \u44144 , \u44845  \u54620 \u48264  \u54869 \u51064 \
+ros2 topic hz /yolo_cone/detections\
+\
+# \uc0\u44160 \u52636  \u45236 \u50857  \u51649 \u51217  \u54869 \u51064  (\u53364 \u47000 \u49828 \u47749 /score/bbox)\
+ros2 topic echo /yolo_cone/detections --once\
+\
+# \uc0\u46972 \u51060 \u45796 /\u47784 \u53552  \u54869 \u51064 \
+ros2 topic hz /scan\
+ros2 topic echo /xycar_motor\
+\
+# YOLO \uc0\u45432 \u46300  \u49688 \u46041  on/off (\u51204 \u54872  \u47196 \u51649  \u53580 \u49828 \u53944 \u50857 )\
+ros2 service call /yolo_vehicle/enable std_srvs/srv/SetBool "\{data: true\}"\
+\
+}

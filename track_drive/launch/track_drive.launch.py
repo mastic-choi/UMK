@@ -5,6 +5,7 @@ import sys
 from ament_index_python.packages import get_package_share_directory
 from launch_ros.actions import Node
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 
@@ -50,6 +51,12 @@ def generate_launch_description():
         default_value='0.3',
         description='차량 검출 최소 신뢰도 (실측 truck 0.40~0.71 + 실차 웹캠 화질 감안해 낮게)')
 
+    use_debug = LaunchConfiguration('use_debug')
+    use_debug_cmd = DeclareLaunchArgument(
+        'use_debug',
+        default_value='true',
+        description='YOLO 검출 시각화(debug_node) 실행 여부 — dbg_image 토픽을 rqt_image_view로 확인')
+
     yolo_cone_node = Node(
         package='yolo_ros',
         executable='yolo_node',
@@ -80,6 +87,29 @@ def generate_launch_description():
         remappings=[('image_raw', '/usb_cam/image_raw/front')],
     )
 
+    # ── YOLO 디버그 시각화 (검출 bbox를 원본 이미지에 그려 dbg_image로 발행) ──
+    #   확인: ros2 run rqt_image_view rqt_image_view → /yolo_cone/dbg_image, /yolo_vehicle/dbg_image 선택
+    #   비활성화된 yolo_node는 detections를 발행하지 않으므로 해당 dbg_image도 멈추는 것이 정상.
+    yolo_cone_debug_node = Node(
+        package='yolo_ros',
+        executable='debug_node',
+        name='debug_node',
+        namespace='yolo_cone',
+        parameters=[{'image_reliability': 1}],
+        remappings=[('image_raw', '/usb_cam/image_raw/front')],
+        condition=IfCondition(use_debug),
+    )
+
+    yolo_vehicle_debug_node = Node(
+        package='yolo_ros',
+        executable='debug_node',
+        name='debug_node',
+        namespace='yolo_vehicle',
+        parameters=[{'image_reliability': 1}],
+        remappings=[('image_raw', '/usb_cam/image_raw/front')],
+        condition=IfCondition(use_debug),
+    )
+
     track_drive_node = Node(
         package='track_drive',
         executable='track_drive',
@@ -93,7 +123,10 @@ def generate_launch_description():
         device_cmd,
         cone_threshold_cmd,
         vehicle_threshold_cmd,
+        use_debug_cmd,
         yolo_cone_node,
         yolo_vehicle_node,
+        yolo_cone_debug_node,
+        yolo_vehicle_debug_node,
         track_drive_node,
     ])

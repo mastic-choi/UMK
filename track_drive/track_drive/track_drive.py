@@ -1112,6 +1112,15 @@ class TrackDriverNode(Node):
     # [6] 유틸/디버그
     # #########################################################
     def _print_debug(self):
+        """0.5초마다 한 줄 요약 로그. 각 필드 읽는 법:
+          lane   = 차선편차px(검출여부)
+          obs    = 라이다 전방장애물(거리m, 좌우, 타입)
+          lava   = 라바콘 보로노이 편차(구간종료 판정)
+          yolo   = YOLO 검출 플래그 cone/veh (0인데 dbg_image엔 잡히면 신선도(YOLO_FRESH_SEC) 탈락 의심)
+          trigL  = 라바콘 진입: 본선카운트/기준 (좌클러스터,우클러스터,폴백카운트/기준)
+          trigV  = 차량 진입:   본선카운트/기준 (폴백카운트/기준)
+          obsLane= YOLO bbox 기준 장애물 좌/우 판단 (B2/B3 회피방향 재료)
+        """
         now = time.time()
         if now - self._last_debug_t < DEBUG_PERIOD: return
         self._last_debug_t = now
@@ -1121,7 +1130,13 @@ class TrackDriverNode(Node):
             f'lane={self.lane_offset:+.1f}({int(self.lane_valid)}) '
             f'obs={self.obstacle_front}({self.obstacle_dist:.1f}m,{self.obstacle_side},{self.obstacle_type}) '
             f'lava={self.lavacon_offset:+.2f}(done={int(self.lavacon_done)}) '
-            f'yolo=cone:{int(self.yolo_cone_detected)}/veh:{int(self.yolo_vehicle_detected)}')
+            f'yolo=cone:{int(self.yolo_cone_detected)}/veh:{int(self.yolo_vehicle_detected)} '
+            f'trigL={self._lavacon_trigger_cnt}/{LAVACON_TRIGGER_FRAMES}'
+            f'(L{int(self.lavacon_left_detected)}R{int(self.lavacon_right_detected)},'
+            f'fb{self._lavacon_lidar_cnt}/{YOLO_FALLBACK_FRAMES}) '
+            f'trigV={self._vehicle_trigger_cnt}/{VEHICLE_TRIGGER_FRAMES}'
+            f'(fb{self._vehicle_lidar_cnt}/{YOLO_FALLBACK_FRAMES}) '
+            f'obsLane={self.obstacle_lane}')
 
 
 # #############################################################
