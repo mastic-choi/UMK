@@ -238,9 +238,14 @@ class SlideWindow:
             lookahead = offset
             lane_valid = True
         
+        # 차선 중앙 x좌표(px) — offset 정의(center - roi_w/2)를 역산해 세 분기 모두에서 일관되게 산출.
+        # 미검출 시 offset=0 → 화면 중앙(roi_w/2)이 기본값이 된다.
+        # track_drive.perc_obstacle_lane()에서 YOLO bbox 중심과 비교해 장애물 좌/우 판단에 사용.
+        lane_center = self.roi_w / 2 + offset
+
         self.visualize(offset)
 
-        return lane_valid, offset, lookahead    
+        return lane_valid, offset, lookahead, lane_center
 
     def sliding_window(self, mask, base, minpix, color):
         nz = mask.nonzero()

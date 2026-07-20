@@ -230,6 +230,9 @@ class TrackDriverNode(Node):
         self.vehicle_trigger       = False   # (라이다 AND YOLO 차량) 디바운스 통과 → B3 진입 트리거
         self._vehicle_trigger_cnt  = 0       # 동시검출 연속 프레임 수(디바운스 카운터)
         self._vehicle_lidar_cnt    = 0       # 라이다 단독검출 연속 프레임 수(YOLO 미확인 폴백 카운터)
+        # [2-8 장애물 위치 판단]
+        self.obstacle_lane = None            # YOLO bbox 중심 vs 차선 중앙 비교 결과 ('LEFT'/'RIGHT'/None)
+        self.lane_center   = 320.0           # 차선 중앙 x좌표(px) — 첫 카메라 프레임 전까지 화면 중앙 기본값
 
         # ── 외부 차선 인식 모듈 (lane_util.py / perc_floor.py) 초기화 ──
         self.camera_processor = CameraProcessor()       # BEV 변환 및 색상 마스크(흰/노랑) 처리기
@@ -328,6 +331,7 @@ class TrackDriverNode(Node):
         self.perc_lavacon()     # 라이다
         self.perc_lavacon_trigger()  # 라이다+YOLO (좌우 클러스터 AND 콘 검출 → B1_LAVACON 진입 트리거)
         self.perc_vehicle_trigger()  # 라이다+YOLO (전방 장애물 AND 차량 검출 → B3_VEHICLE 진입 트리거)
+        self.perc_obstacle_lane()    # 비전 (YOLO bbox 중심 vs 차선 중앙 → 장애물 좌/우 판단, B2/B3 회피방향 재료)
         self.perc_stopline()    # 비전
 
     # [2-1] 차선
@@ -603,7 +607,7 @@ class TrackDriverNode(Node):
         for det in self._yolo_vehicle_msg.detections:
             if det.class_name not in YOLO_VEHICLE_CLASSES:
                 continue
-            area = det.bbox.size_x * det.bbox.size_y
+            area = det.bbox.size.x * det.bbox.size.y   # yolo_msgs/BoundingBox2D: size는 Vector2(x,y) 필드
 
             if area > best_area:
                 best = det
