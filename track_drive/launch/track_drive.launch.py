@@ -57,6 +57,27 @@ def generate_launch_description():
         default_value='true',
         description='YOLO 검출 시각화(debug_node) 실행 여부 — dbg_image 토픽을 rqt_image_view로 확인')
 
+    # ── 센서 드라이버 (카메라/라이다/IMU) ──
+    #   이 launch는 원래 YOLO+track_drive만 띄우고 있었고 센서 드라이버가 빠져 있었다
+    #   (실차에서 img_front/lidar_ranges가 전혀 안 들어와 S0에서 계속 멈춰있던 원인).
+    #   img_left/right/behind는 track_drive.py에서 구독만 하고 실제로 안 쓰이므로
+    #   전방 카메라 하나만 있으면 되는 xycar_cam.launch.py로 충분하다.
+    #   ★주의: xycar_cam이 실제로 발행하는 토픽명이 /usb_cam/image_raw/front가 맞는지
+    #   `ros2 topic list | grep image_raw`로 확인할 것 — usb_cam의 params.yaml 설정에 따라
+    #   다를 수 있고, 다르면 yolo_cone/yolo_vehicle/track_drive의 image_raw 리매핑도 같이 맞춰야 한다.
+    cam_include = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(get_package_share_directory('xycar_cam'), 'launch', 'xycar_cam.launch.py'))
+    )
+    lidar_include = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(get_package_share_directory('xycar_lidar'), 'launch', 'xycar_lidar.launch.py'))
+    )
+    imu_include = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(get_package_share_directory('xycar_imu'), 'launch', 'xycar_imu.launch.py'))
+    )
+
     yolo_cone_node = Node(
         package='yolo_ros',
         executable='yolo_node',
@@ -124,6 +145,9 @@ def generate_launch_description():
         cone_threshold_cmd,
         vehicle_threshold_cmd,
         use_debug_cmd,
+        cam_include,
+        lidar_include,
+        imu_include,
         yolo_cone_node,
         yolo_vehicle_node,
         yolo_cone_debug_node,
