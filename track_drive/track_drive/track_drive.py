@@ -188,6 +188,8 @@ class TrackDriverNode(Node):
         self.img_front = self.img_left = self.img_right = self.img_behind = None
         self.lidar_ranges = None
         self.imu_yaw = 0.0
+        self._img_front_t = 0.0   # 전방 카메라 최근 수신 시각(디버그: 카메라 살아있는지 나이로 판단)
+        self._scan_t       = 0.0  # 라이다 최근 수신 시각(디버그용)
 
         # ── 인터페이스 변수 (인지 → 판단/제어) ──
         # [2-1 차선]
@@ -298,13 +300,14 @@ class TrackDriverNode(Node):
     def cb_img_front(self, msg):
         try:
             self.img_front = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
+            self._img_front_t = time.time()
             self.get_logger().info(f'[front] 첫 수신 OK enc={msg.encoding} shape={self.img_front.shape}', once=True)
         except Exception as e:
             self.get_logger().error(f'[front] 이미지 변환 실패 enc={msg.encoding}: {e}', throttle_duration_sec=2.0)
     def cb_img_left(self, msg):   self.img_left   = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
     def cb_img_right(self, msg):  self.img_right  = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
     def cb_img_behind(self, msg): self.img_behind = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
-    def cb_scan(self, msg):       self.lidar_ranges = msg.ranges
+    def cb_scan(self, msg):       self.lidar_ranges = msg.ranges; self._scan_t = time.time()
     def cb_imu(self, msg):
         q = msg.orientation
         self.imu_yaw = math.atan2(2.0*(q.w*q.z + q.x*q.y), 1.0 - 2.0*(q.y*q.y + q.z*q.z))
@@ -1112,9 +1115,12 @@ class TrackDriverNode(Node):
     # [6] 유틸/디버그
     # #########################################################
     def _print_debug(self):
-        """0.5초마다 한 줄 요약 로그. 각 필드 읽는 법:
-          lane   = 차선편차px(검출여부)
-          obs    = 라이다 전방장애물(거리m, 좌우, 타입)
+        """0.5초마다 여러 줄로 상태 덤프. 별도 터미널(rqt/topic echo) 없이 이 로그만으로
+        센서 원시상태(카메라 살아있는지·신호색·라이다 포인트수)부터 트리거 카운터까지 확인 가능하게 함.
+        80컬럼 좁은 터미널에서도 안 잘리게 줄당 길이를 짧게 나눴다.
+          [SENS] cam = 카메라 나이(s, 값이 계속 커지면 미수신) / sig = 신호등 색(S0: unknown이면 원 검출 실패)
+                 lidar = 유효포인트수(min거리m, 나이s)
+          [LANE] 차선편차px(검출여부) / obs = 라이다 전방장애물(거리m,좌우,타입)
           lava   = 라바콘 보로노이 편차(구간종료 판정)
           yolo   = YOLO 검출 플래그 cone/veh (0인데 dbg_image엔 잡히면 신선도(YOLO_FRESH_SEC) 탈락 의심)
           trigL  = 라바콘 진입: 본선카운트/기준 (좌클러스터,우클러스터,폴백카운트/기준)
@@ -1124,19 +1130,29 @@ class TrackDriverNode(Node):
         now = time.time()
         if now - self._last_debug_t < DEBUG_PERIOD: return
         self._last_debug_t = now
+
+        cam_age = now - self._img_front_t if self._img_front_t else -1.0
+        scan_age = now - self._scan_t if self._scan_t else -1.0
+        if self.lidar_ranges is not None:
+            r = np.asarray(self.lidar_ranges, dtype=np.float32)
+            valid = r[np.isfinite(r) & (r > 0.0)]
+            lidar_desc = f'{valid.size}pt(min={float(valid.min()):.2f}m,age={scan_age:.1f}s)' if valid.size else f'0pt(age={scan_age:.1f}s)'
+        else:
+            lidar_desc = 'NONE'
+
         self.get_logger().info(
             f'[{self.mission_state.name}|{self.behavior_state.name}|{self.phase.name}] '
-            f'ang={self.ctrl_angle:+.1f} spd={self.ctrl_speed:.1f} '
-            f'lane={self.lane_offset:+.1f}({int(self.lane_valid)}) '
+            f'ang={self.ctrl_angle:+.1f} spd={self.ctrl_speed:.1f}\n'
+            f'  [SENS] cam={cam_age:.1f}s sig={self.signal_color} lidar={lidar_desc}\n'
+            f'  [LANE] lane={self.lane_offset:+.1f}({int(self.lane_valid)}) '
             f'obs={self.obstacle_front}({self.obstacle_dist:.1f}m,{self.obstacle_side},{self.obstacle_type}) '
-            f'lava={self.lavacon_offset:+.2f}(done={int(self.lavacon_done)}) '
-            f'yolo=cone:{int(self.yolo_cone_detected)}/veh:{int(self.yolo_vehicle_detected)} '
+            f'lava={self.lavacon_offset:+.2f}(done={int(self.lavacon_done)})\n'
+            f'  [YOLO] cone:{int(self.yolo_cone_detected)}/veh:{int(self.yolo_vehicle_detected)} '
             f'trigL={self._lavacon_trigger_cnt}/{LAVACON_TRIGGER_FRAMES}'
             f'(L{int(self.lavacon_left_detected)}R{int(self.lavacon_right_detected)},'
             f'fb{self._lavacon_lidar_cnt}/{YOLO_FALLBACK_FRAMES}) '
             f'trigV={self._vehicle_trigger_cnt}/{VEHICLE_TRIGGER_FRAMES}'
-            f'(fb{self._vehicle_lidar_cnt}/{YOLO_FALLBACK_FRAMES}) '
-            f'obsLane={self.obstacle_lane}')
+            f'(fb{self._vehicle_lidar_cnt}/{YOLO_FALLBACK_FRAMES}) obsLane={self.obstacle_lane}')
 
 
 # #############################################################
