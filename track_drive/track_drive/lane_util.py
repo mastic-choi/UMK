@@ -83,7 +83,7 @@ class CameraProcessor:
 
         #White Lane
         self.white = cv2.inRange(
-            hsv, np.array([0,0,180]),np.array([180,45,255])
+            hsv, np.array([0,0,180]),np.array([180,45,240])
         )
         #Yellow Lane
         self.yellow = cv2.inRange(
@@ -96,6 +96,29 @@ class CameraProcessor:
             self.white, cv2.MORPH_OPEN, kernel
         )
 
+        # 세로 성분만 강조
+        kernel_vertical = cv2.getStructuringElement(
+            cv2.MORPH_RECT, (3,10)
+        )
+
+        self.white = cv2.morphologyEx(
+            self.white, cv2.MORPH_OPEN, kernel_vertical
+        )
+
+        # Connected Components
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(self.white)
+
+        mask = np.zeros_like(self.white)
+
+        for i in range(1, num) :
+            area = stats[i, cv2.CC_STAT_AREA]
+
+            if 20 < area < 1500:
+                mask[labels == i] = 255
+            
+        self.white = mask
+
+        #yellow morphology
         self.yellow = cv2.morphologyEx(
             self.yellow, cv2.MORPH_CLOSE, kernel
         )
