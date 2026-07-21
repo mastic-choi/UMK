@@ -57,6 +57,46 @@ def generate_launch_description():
         default_value='true',
         description='YOLO 검출 시각화(debug_node) 실행 여부 — dbg_image 토픽을 rqt_image_view로 확인')
 
+    video_device = LaunchConfiguration('video_device')
+    video_device_cmd = DeclareLaunchArgument(
+        'video_device',
+        default_value='/dev/videoCAM',
+        description='전방 카메라 장치 경로. xycar_cam.launch.py가 쓰는 usb_cam 기본 params.yaml은'
+                     ' video_device가 /dev/video0로 고정돼 있어 실제 xycar 카메라(/dev/videoCAM 심볼릭링크)와'
+                     ' 안 맞으면 usb_cam_node_exe가 장치를 못 열고 SIGABRT로 죽는다(실측 확인됨).'
+                     ' /dev/ttyLIDAR, /dev/ttyIMU와 같은 패턴의 udev 별칭이므로 여기서 직접 지정한다.')
+
+    # ── 센서 드라이버 (카메라/라이다/IMU) ──
+    #   이 launch는 원래 YOLO+track_drive만 띄우고 있었고 센서 드라이버가 빠져 있었다
+    #   (실차에서 img_front/lidar_ranges가 전혀 안 들어와 S0에서 계속 멈춰있던 원인).
+    #   xycar_cam.launch.py를 include하지 않고 usb_cam_node_exe를 직접 띄우는 이유:
+    #   include 방식은 파라미터 오버라이드가 안 되어 video_device를 못 바꾼다.
+    #   기본 params.yaml(usb_cam 패키지 표준값) 위에 video_device만 덮어써서 실제 장치를 잡는다.
+    #   img_left/right/behind는 track_drive.py에서 구독만 하고 실제로 안 쓰이므로 전방 카메라만 띄운다.
+    usb_cam_params = os.path.join(
+        get_package_share_directory('usb_cam'), 'config', 'params.yaml')
+
+    cam_node = Node(
+        package='usb_cam',
+        executable='usb_cam_node_exe',
+        name='xycar_cam',
+        arguments=['--ros-args', '--log-level', 'error'],
+        # pixel_format 오버라이드: 기본값(mjpeg2rgb, avcodec 디코드)이 이 카메라의 640x480/30fps
+        # 모드와 협상 실패해 usb_cam_node_exe가 시작 직후 char* 예외로 죽는 문제(SIGABRT) 발견됨.
+        # v4l2-ctl --list-formats-ext 확인 결과 이 카메라는 640x480을 YUYV로 30fps 네이티브 지원하므로
+        # avcodec 디코드 경로를 타지 않는 yuyv로 강제 지정한다.
+        parameters=[usb_cam_params, {'video_device': video_device, 'pixel_format': 'yuyv'}],
+        remappings=[('image_raw', '/usb_cam/image_raw/front')],
+    )
+    lidar_include = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(get_package_share_directory('xycar_lidar'), 'launch', 'xycar_lidar.launch.py'))
+    )
+    imu_include = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(get_package_share_directory('xycar_imu'), 'launch', 'xycar_imu.launch.py'))
+    )
+
     yolo_cone_node = Node(
         package='yolo_ros',
         executable='yolo_node',
@@ -124,6 +164,12 @@ def generate_launch_description():
         cone_threshold_cmd,
         vehicle_threshold_cmd,
         use_debug_cmd,
+        video_device_cmd,
+        cam_node,
+        lidar_include,
+        # imu_include,  # S0->S1 테스트 단계에서 비활성화. imu_yaw는 S2/S3 좌회전 로직에서만 쓰이므로
+        #               (track_drive.py의 _yaw_delta/_begin_left_turn/_s3_shortcut) 지금은 불필요.
+        #               좌회전(S2/S3) 테스트 시작하면 이 줄 다시 살릴 것.
         yolo_cone_node,
         yolo_vehicle_node,
         yolo_cone_debug_node,

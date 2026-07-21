@@ -20,7 +20,7 @@ SIG4_MIN_DIST       = SIG4_MIN_RADIUS * 3
 SIG4_BRIGHT_MARGIN  = 15
 
 #Debug
-DEBUG_VIZ_SIGNAL = False
+DEBUG_VIZ_SIGNAL = True
 
 
 class SignalDetector:
@@ -32,6 +32,14 @@ class SignalDetector:
 
         self.roi = None
         self.vis = None
+
+        # ── S0 진단 정보 (CLI 디버그용, track_drive.py의 _print_debug()가 읽어감) ──
+        # 원 검출이 실패하는 단계를 구분하기 위한 값들. detect_s0() 호출마다 갱신됨.
+        self.s0_roi_px      = (0, 0, 0, 0)   # (t, b, l, r) — ROI 픽셀 좌표(원본 프레임 기준)
+        self.s0_circle_count = 0             # HoughCircles가 찾은 원 개수(0=아예 못 찾음)
+        self.s0_reject_reason = 'no_frame'   # 실패 사유 문자열, 성공 시 None
+        self.s0_brightness   = []            # 3개 원의 밝기값(성공적으로 3개+배치통과 시에만 채워짐)
+        self.s0_bright_margin = 0.0          # 최댓값-평균 (SIG_BRIGHT_MARGIN과 비교되는 실측값)
 
     def circle_brightness(self, gray, x, y, r):
         y0, y1 = max(0, y - r // 2), y + r // 2
@@ -46,18 +54,23 @@ class SignalDetector:
         # ★TODO(실차 테스트시 체크): 원 개수가 정확히 3개/4개가 아니면(빛반사·블러로 하나 덜/더 잡히면)
         #   그 프레임은 무조건 인식 실패로 처리됨 — 디바운스나 "N프레임 중 M번" 같은 폴백이 없음.
         #   실차 카메라로 돌려보고 신호 놓치는 빈도가 높으면 여기에 보강 필요.
+        # 반환값: (통과여부, 실패시 사유 문자열 — CLI 디버그 로그용, 통과 시 None)
         xs = sorted(int(c[0]) for c in circles)
         ys = sorted(int(c[1]) for c in circles)
 
-        if (ys[-1] - ys[0]) > vert_max:
-            return False
-        if (xs[-1] - xs[0]) > horiz_max:
-            return False
+        vert_spread = ys[-1] - ys[0]
+        if vert_spread > vert_max:
+            return False, f'vert_spread={vert_spread}>{vert_max}'
+
+        horiz_spread = xs[-1] - xs[0]
+        if horiz_spread > horiz_max:
+            return False, f'horiz_spread={horiz_spread}>{horiz_max}'
 
         for i in range(len(xs) - 1):
-            if (xs[i + 1] - xs[i]) < min_dist:
-                return False
-        return True
+            gap = xs[i + 1] - xs[i]
+            if gap < min_dist:
+                return False, f'gap[{i}]={gap}<{min_dist}'
+        return True, None
 
     def find_circles(self, roi, min_r, max_r):
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
@@ -73,28 +86,46 @@ class SignalDetector:
 
     def detect_s0(self, frame):
         if frame is None:
+            self.s0_reject_reason = 'no_frame'
             return self.color
 
         h, w = frame.shape[:2]
+        t, b = int(h*SIG_ROI_T), int(h*SIG_ROI_B)
+        l, r = int(w*SIG_ROI_L), int(w*SIG_ROI_R)
+        self.s0_roi_px = (t, b, l, r)
 
-        self.roi = frame[
-            int(h*SIG_ROI_T): int(h*SIG_ROI_B),
-            int(w*SIG_ROI_L): int(w*SIG_ROI_R)
-            ]
+        self.roi = frame[t:b, l:r]
 
         gray, circles = self.find_circles(self.roi, SIG_MIN_RADIUS, SIG_MAX_RADIUS)
         self.color = 'unknown'
+        self.s0_circle_count = 0
+        self.s0_reject_reason = 'no_circles_found'
+        self.s0_brightness = []
+        self.s0_bright_margin = 0.0
 
         if circles is not None:
             circles = np.round(circles[0, :]).astype(int)
+            self.s0_circle_count = len(circles)
 
-            if len(circles) == 3 and self.shape_ok(circles, SIG_VERT_DIFF_MAX, SIG_HORIZ_DIFF_MAX, SIG_MIN_DIST):
-                circles = sorted(circles, key=lambda c: c[0])   #좌→우: 빨강,노랑,초록
-                bright = [self.circle_brightness(gray, x, y, r) for x, y, r in circles]
+            if len(circles) != 3:
+                self.s0_reject_reason = f'circle_count={len(circles)}(need 3)'
+            else:
+                shape_pass, reason = self.shape_ok(circles, SIG_VERT_DIFF_MAX, SIG_HORIZ_DIFF_MAX, SIG_MIN_DIST)
+                if not shape_pass:
+                    self.s0_reject_reason = reason
+                else:
+                    circles = sorted(circles, key=lambda c: c[0])   #좌→우: 빨강,노랑,초록
+                    bright = [self.circle_brightness(gray, x, y, r) for x, y, r in circles]
+                    self.s0_brightness = [round(b_, 1) for b_ in bright]
 
-                idx = int(np.argmax(bright))
-                if bright[idx] - float(np.mean(bright)) > SIG_BRIGHT_MARGIN:
-                    self.color = ('red', 'yellow', 'blue')[idx]   #idx=2(우측)=초록=출발
+                    idx = int(np.argmax(bright))
+                    margin = bright[idx] - float(np.mean(bright))
+                    self.s0_bright_margin = round(margin, 1)
+                    if margin > SIG_BRIGHT_MARGIN:
+                        self.color = ('red', 'yellow', 'blue')[idx]   #idx=2(우측)=초록=출발
+                        self.s0_reject_reason = None
+                    else:
+                        self.s0_reject_reason = f'bright_margin={margin:.1f}<={SIG_BRIGHT_MARGIN}'
 
         if DEBUG_VIZ_SIGNAL:
             self.vis = self.roi.copy()
@@ -124,7 +155,8 @@ class SignalDetector:
         if circles is not None:
             circles = np.round(circles[0, :]).astype(int)
 
-            if len(circles) == 4 and self.shape_ok(circles, SIG4_VERT_DIFF_MAX, SIG4_HORIZ_DIFF_MAX, SIG4_MIN_DIST):
+            shape_pass, _reason = self.shape_ok(circles, SIG4_VERT_DIFF_MAX, SIG4_HORIZ_DIFF_MAX, SIG4_MIN_DIST)
+            if len(circles) == 4 and shape_pass:
                 circles = sorted(circles, key=lambda c: c[0])   #좌→우: 빨강,노랑,좌회전,직진
                 bright = [self.circle_brightness(gray, x, y, r) for x, y, r in circles]
                 avg = float(np.mean(bright))
