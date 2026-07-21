@@ -78,22 +78,48 @@ class CameraProcessor:
             (self.roi_w, self.roi_h)
         )
 
-        #HSV
+        # white Lane : Local Contrast
+        # 1) Gray 변환
+        gray = cv2.cvtColor(self.bev, cv2.COLOR_BGR2GRAY)
+        # 2) CLAHE (극소 명암 향상)
+        clahe = cv2.createCLAHE(
+            clipLimit=2.0,
+            tileGridSize=(8,8)
+        )
+        gray = clahe.apply(gray)
+
+        # 3) Top-Hat(극소 대비)
+        kernel_tophat = cv2.getStructuringElement(
+            cv2.MORPH_RECT, (31,31)
+        )
+
+        contrast = cv2.morphologyEx(
+            gray, cv2.MORPH_TOPHAT, kernel_tophat
+        )
+
+        #Threshold
+        _, self.white = cv2.threshold(
+            contrast, 20, 255, cv2.THRESH_BINARY
+        )
+
+        # yellow Lane's HSV
         hsv = cv2.cvtColor(self.bev, cv2.COLOR_BGR2HSV)
 
-        #White Lane
-        self.white = cv2.inRange(
-            hsv, np.array([0,0,180]),np.array([180,45,240])
-        )
         #Yellow Lane
         self.yellow = cv2.inRange(
             hsv, np.array([18,120,120]), np.array([35,255,255])
         )
         #Morphology
-        kernel = np.ones((3,3), np.uint8)
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_RECT, (3,3)
+        )
 
         self.white = cv2.morphologyEx(
             self.white, cv2.MORPH_OPEN, kernel
+        )
+
+        self.white = cv2.morphologyEx(
+            self.white, cv2.MORPH_CLOSE, kernel
         )
 
         # 세로 성분만 강조
