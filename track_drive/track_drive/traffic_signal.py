@@ -4,7 +4,7 @@ import cv2
 #Signal (3구, S0 출발) - Hough Circle 원검출 + 밝기비교
 SIG_ROI_T, SIG_ROI_B = 0.17, 0.32
 SIG_ROI_L, SIG_ROI_R = 0.32, 0.63
-SIG_MIN_RADIUS, SIG_MAX_RADIUS = 15, 25
+SIG_MIN_RADIUS, SIG_MAX_RADIUS = 12, 28   # 실차 튜닝: 15~25 → 12~28로 완화
 SIG_VERT_DIFF_MAX  = SIG_MAX_RADIUS * 2
 SIG_HORIZ_DIFF_MAX = SIG_MAX_RADIUS * 8
 SIG_MIN_DIST       = SIG_MIN_RADIUS * 3
@@ -13,11 +13,17 @@ SIG_BRIGHT_MARGIN  = 15
 #Signal4 (4구, S2 교차로) - 배치 좌→우 [빨강,노랑,좌회전,직진]
 SIG4_ROI_T, SIG4_ROI_B = 0.08, 0.28
 SIG4_ROI_L, SIG4_ROI_R = 0.04, 0.78
-SIG4_MIN_RADIUS, SIG4_MAX_RADIUS = 15, 25
+SIG4_MIN_RADIUS, SIG4_MAX_RADIUS = 12, 28   # 실차 튜닝: 15~25 → 12~28로 완화
 SIG4_VERT_DIFF_MAX  = SIG4_MAX_RADIUS * 2
 SIG4_HORIZ_DIFF_MAX = SIG4_MAX_RADIUS * 11
 SIG4_MIN_DIST       = SIG4_MIN_RADIUS * 3
 SIG4_BRIGHT_MARGIN  = 15
+
+# HoughCircles 엄격도 (실차 튜닝: param1=40→30, param2=20→15로 완화)
+#   param1 : Canny 상위임계값(하위임계값은 내부적으로 param1/2) — 낮을수록 흐린 테두리도 엣지로 인정
+#   param2 : 원 중심 확정에 필요한 누적표 수 — 낮을수록 불완전한 원도 통과
+HOUGH_PARAM1 = 30
+HOUGH_PARAM2 = 15
 
 #Debug
 DEBUG_VIZ_SIGNAL = True
@@ -72,15 +78,23 @@ class SignalDetector:
                 return False, f'gap[{i}]={gap}<{min_dist}'
         return True, None
 
-    def find_circles(self, roi, min_r, max_r):
+    def find_circles(self, roi, min_r, max_r, tag='sig'):
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
 
         circles = cv2.HoughCircles(
             blur, cv2.HOUGH_GRADIENT, 1, 20,
-            param1=40, param2=20,
+            param1=HOUGH_PARAM1, param2=HOUGH_PARAM2,
             minRadius=min_r, maxRadius=max_r
         )
+
+        if DEBUG_VIZ_SIGNAL:
+            # HoughCircles가 내부적으로 보는 엣지맵과 동일한 임계값(param1, param1/2)으로 재현.
+            # 원이 안 잡힐 때 "엣지 자체가 안 그려지는지" vs "엣지는 있는데 원으로 안 뭉치는지"
+            # 구분하기 위한 디버그 창. tag로 s0/s2 창을 구분한다.
+            edges = cv2.Canny(blur, HOUGH_PARAM1 // 2, HOUGH_PARAM1)
+            cv2.imshow(f'canny_{tag}', edges)
+            cv2.waitKey(1)
 
         return gray, circles
 
@@ -96,7 +110,7 @@ class SignalDetector:
 
         self.roi = frame[t:b, l:r]
 
-        gray, circles = self.find_circles(self.roi, SIG_MIN_RADIUS, SIG_MAX_RADIUS)
+        gray, circles = self.find_circles(self.roi, SIG_MIN_RADIUS, SIG_MAX_RADIUS, tag='s0')
         self.color = 'unknown'
         self.s0_circle_count = 0
         self.s0_reject_reason = 'no_circles_found'
@@ -149,7 +163,7 @@ class SignalDetector:
             int(w*SIG4_ROI_L): int(w*SIG4_ROI_R)
             ]
 
-        gray, circles = self.find_circles(self.roi, SIG4_MIN_RADIUS, SIG4_MAX_RADIUS)
+        gray, circles = self.find_circles(self.roi, SIG4_MIN_RADIUS, SIG4_MAX_RADIUS, tag='s2')
         self.red_on = self.straight_on = self.left_on = False
 
         if circles is not None:
