@@ -57,17 +57,32 @@ def generate_launch_description():
         default_value='true',
         description='YOLO 검출 시각화(debug_node) 실행 여부 — dbg_image 토픽을 rqt_image_view로 확인')
 
+    video_device = LaunchConfiguration('video_device')
+    video_device_cmd = DeclareLaunchArgument(
+        'video_device',
+        default_value='/dev/videoCAM',
+        description='전방 카메라 장치 경로. xycar_cam.launch.py가 쓰는 usb_cam 기본 params.yaml은'
+                     ' video_device가 /dev/video0로 고정돼 있어 실제 xycar 카메라(/dev/videoCAM 심볼릭링크)와'
+                     ' 안 맞으면 usb_cam_node_exe가 장치를 못 열고 SIGABRT로 죽는다(실측 확인됨).'
+                     ' /dev/ttyLIDAR, /dev/ttyIMU와 같은 패턴의 udev 별칭이므로 여기서 직접 지정한다.')
+
     # ── 센서 드라이버 (카메라/라이다/IMU) ──
     #   이 launch는 원래 YOLO+track_drive만 띄우고 있었고 센서 드라이버가 빠져 있었다
     #   (실차에서 img_front/lidar_ranges가 전혀 안 들어와 S0에서 계속 멈춰있던 원인).
-    #   img_left/right/behind는 track_drive.py에서 구독만 하고 실제로 안 쓰이므로
-    #   전방 카메라 하나만 있으면 되는 xycar_cam.launch.py로 충분하다.
-    #   ★주의: xycar_cam이 실제로 발행하는 토픽명이 /usb_cam/image_raw/front가 맞는지
-    #   `ros2 topic list | grep image_raw`로 확인할 것 — usb_cam의 params.yaml 설정에 따라
-    #   다를 수 있고, 다르면 yolo_cone/yolo_vehicle/track_drive의 image_raw 리매핑도 같이 맞춰야 한다.
-    cam_include = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            os.path.join(get_package_share_directory('xycar_cam'), 'launch', 'xycar_cam.launch.py'))
+    #   xycar_cam.launch.py를 include하지 않고 usb_cam_node_exe를 직접 띄우는 이유:
+    #   include 방식은 파라미터 오버라이드가 안 되어 video_device를 못 바꾼다.
+    #   기본 params.yaml(usb_cam 패키지 표준값) 위에 video_device만 덮어써서 실제 장치를 잡는다.
+    #   img_left/right/behind는 track_drive.py에서 구독만 하고 실제로 안 쓰이므로 전방 카메라만 띄운다.
+    usb_cam_params = os.path.join(
+        get_package_share_directory('usb_cam'), 'config', 'params.yaml')
+
+    cam_node = Node(
+        package='usb_cam',
+        executable='usb_cam_node_exe',
+        name='xycar_cam',
+        arguments=['--ros-args', '--log-level', 'error'],
+        parameters=[usb_cam_params, {'video_device': video_device}],
+        remappings=[('image_raw', '/usb_cam/image_raw/front')],
     )
     lidar_include = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -145,7 +160,8 @@ def generate_launch_description():
         cone_threshold_cmd,
         vehicle_threshold_cmd,
         use_debug_cmd,
-        cam_include,
+        video_device_cmd,
+        cam_node,
         lidar_include,
         imu_include,
         yolo_cone_node,
