@@ -87,7 +87,7 @@ class CameraProcessor:
         )
         #Yellow Lane
         self.yellow = cv2.inRange(
-            hsv, np.array([15,80,80]), np.array([40,255,255])
+            hsv, np.array([18,120,120]), np.array([35,255,255])
         )
         #Morphology
         kernel = np.ones((3,3), np.uint8)
@@ -122,6 +122,21 @@ class CameraProcessor:
         self.yellow = cv2.morphologyEx(
             self.yellow, cv2.MORPH_CLOSE, kernel
         )
+
+        # Connected Components
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(self.yellow)
+
+        mask = np.zeros_like(self.yellow)
+
+        for i in range(1, num):
+            area = stats[i, cv2.CC_STAT_AREA]
+
+            width = stats[i, cv2.CC_STAT_WIDTH]
+
+            if 20<area<1000 and width < 40:
+                mask[labels == i] = 255
+
+        self.yellow = mask
 
         #DEBUG
         if DEBUG_VIZ_LANE:
