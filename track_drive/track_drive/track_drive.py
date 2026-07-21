@@ -68,7 +68,7 @@ class Phase(Enum):
     DONE           = 3  # 모든 Behavior 미션 완료 — 이후 계속 B0로 일반 차선주행
 
 # ── 속도·각도 상수 ──
-SPEED_NORMAL  = 10.0   # 차선주행(S1) 기본속도
+SPEED_NORMAL  = 5.0   # 차선주행(S1) 기본속도
                        # 출처: KUAC_2024-main lane_detection/src/lane_detection.py self.motor=30(고정)
                        #   기존 20.0 → 30.0. 모터/조향 스케일이 같은 xycar 플랫폼인지 미확인, 실차 저속 테스트 우선 권장
 SPEED_LAVACON = 2.5    # KUAC_2024 라바콘 속도(12~30, fast/safe 라벨 앞뒤가 안 맞아 신뢰도 낮음) 참고만 하고 미반영
@@ -140,7 +140,7 @@ RETURN_THRESHOLD = 10
 
 
 # ── 개발/테스트 플래그 ──
-START_STATE     = MissionState.S2_INTERSECTION
+START_STATE     = MissionState.S1_LANE_FOLLOW
 ENABLE_BEHAVIOR = True
 DEBUG_LOG       = True
 DEBUG_PERIOD    = 0.5
@@ -163,7 +163,7 @@ TEST_DISABLE_B2_B3 = True
 #         검사 자체를 건너뛰고 behavior_state를 무조건 B0_NORMAL로 고정 → 결과적으로 B1(라바콘) 끝난
 #         뒤에도 계속 일반 차선주행만 함(장애물이 실제로 잡혀도 회피/추월 기동이 안 걸림).
 #   False: 원래대로 SAFETY_DIST/OVERTAKE_TRIGGER 트리거 검사해서 B2/B3 정상 발동.
-TEST_FORCE_BEHAVIOR = False
+TEST_FORCE_BEHAVIOR = True
 #   True: _behavior_enabled를 시작부터 강제로 True로 켠다.
 #         원래 _behavior_enabled는 S2 교차로에서 "직진" 신호를 받아야만 켜지는데(딱 한 곳),
 #         TEST_DISABLE_INTERSECTION=True로 S2 진입 자체가 막혀 있으면 그 경로가 사라져서

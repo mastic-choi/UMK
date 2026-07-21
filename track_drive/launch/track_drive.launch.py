@@ -80,7 +80,11 @@ def generate_launch_description():
         package='usb_cam',
         executable='usb_cam_node_exe',
         name='xycar_cam',
-        arguments=['--ros-args', '--log-level', 'error'],
+        # compressed_depth_image_transport: usb_cam이 image_transport_plugins에 의존하다보니
+        # 뎁스가 아닌 일반 컬러 프레임에도 뎁스 압축을 시도하다 실패 로그를 매 프레임 찍는다
+        # (기능상 무해 — 아무도 .../compressedDepth 토픽을 구독하지 않음). 해당 로거만 조용히 시킴.
+        arguments=['--ros-args', '--log-level', 'error',
+                   '--log-level', 'compressed_depth_image_transport:=fatal'],
         # pixel_format 오버라이드: 기본값(mjpeg2rgb, avcodec 디코드)이 이 카메라의 640x480/30fps
         # 모드와 협상 실패해 usb_cam_node_exe가 시작 직후 char* 예외로 죽는 문제(SIGABRT) 발견됨.
         # v4l2-ctl --list-formats-ext 확인 결과 이 카메라는 640x480을 YUYV로 30fps 네이티브 지원하므로

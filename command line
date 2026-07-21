@@ -1,0 +1,366 @@
+cd ~/xycar_ws
+colcon build --packages-select track_drive --symlink-install
+source install/setup.bash
+
+ps -eo pid,stat,cmd | awk '$2 ~ /^T/ && /usb_cam|ros2 launch|yolo_node|debug_node|xycar_lidar|imu_node|track_drive/ {print $1}' | xargs -r kill -9
+ros2 launch track_drive track_drive.launch.py
+
+
+
+
+rack_drive-7] [INFO]: [S1_LANE_FOLLOW|B0_NORMAL|LAVACON] ang=-100.0 spd=0.8
+[track_drive-7]   [SENS] cam=0.1s sig=unknown lidar=223pt(min=0.11m,age=0.1s)
+
+[track_drive-7]   [YOLO] cone:1/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb672/60) obsLane=None
+[track_drive-7] [INFO]: [S1_LANE_FOLLOW|B0_NORMAL|LAVACON] ang=-100.0 spd=0.8
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=220pt(min=0.12m,age=0.1s)
+[track_drive-7]   [LANE] lane=-142.0(1) obs=True(0.1m,left,vehicle) lava=-0.37(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb683/60) obsLane=None
+[track_drive-7] [INFO]: [S1_LANE_FOLLOW|B0_NORMAL|LAVACON] ang=-100.0 spd=0.8
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=220pt(min=0.11m,age=0.1s)
+[track_drive-7]   [LANE] lane=-101.2(1) obs=True(0.1m,left,vehicle) lava=-0.40(done=0)
+[track_drive-7]   [YOLO] cone:1/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb693/60) obsLane=None
+[track_drive-7] [INFO]: [S1_LANE_FOLLOW|B0_NORMAL|LAVACON] ang=-100.0 spd=0.8
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=220pt(min=0.12m,age=0.0s)
+[track_drive-7]   [LANE] lane=-85.3(1) obs=True(0.1m,left,vehicle) lava=-0.31(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb704/60) obsLane=None
+[track_drive-7] [INFO]: [S1_LANE_FOLLOW|B0_NORMAL|LAVACON] ang=-38.2 spd=1.9
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=206pt(min=0.12m,age=0.1s)
+[track_drive-7]   [LANE] lane=+4.6(1) obs=True(0.1m,left,vehicle) lava=-0.36(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb714/60) obsLane=None
+[track_drive-7] [INFO]: [S1_LANE_FOLLOW|B0_NORMAL|LAVACON] ang=-11.1 spd=5.0
+[track_drive-7]   [SENS] cam=0.1s sig=unknown lidar=217pt(min=0.11m,age=0.1s)
+[track_drive-7]   [LANE] lane=+39.2(1) obs=True(0.1m,left,vehicle) lava=-0.26(done=0)
+[track_drive-7]   [YOLO] cone:1/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb724/60) obsLane=None
+[track_drive-7] [INFO]: [S1_LANE_FOLLOW|B0_NORMAL|LAVACON] ang=-37.9 spd=4.8
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=202pt(min=0.11m,age=0.1s)
+[track_drive-7]   [LANE] lane=+19.1(0) obs=True(0.1m,left,vehicle) lava=-0.35(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb735/60) obsLane=None
+[track_drive-7] [INFO]: [S1_LANE_FOLLOW|B0_NORMAL|LAVACON] ang=-37.9 spd=4.8
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=207pt(min=0.12m,age=0.1s)
+[track_drive-7]   [LANE] lane=+6.4(1) obs=True(0.1m,left,vehicle) lava=-0.34(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb745/60) obsLane=None
+[track_drive-7] [INFO]: [S1_LANE_FOLLOW|B0_NORMAL|LAVACON] ang=-37.9 spd=4.8
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=203pt(min=0.11m,age=0.0s)
+[track_drive-7]   [LANE] lane=-10.4(1) obs=True(0.1m,left,vehicle) lava=-0.27(done=0)
+[track_drive-7]   [YOLO] cone:1/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb756/60) obsLane=None
+[track_drive-7] [INFO]: [S1_LANE_FOLLOW|B0_NORMAL|LAVACON] ang=-72.5 spd=3.3
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=209pt(min=0.11m,age=0.0s)
+[track_drive-7]   [LANE] lane=-44.1(0) obs=True(0.1m,left,vehicle) lava=-0.24(done=0)
+[track_drive-7]   [YOLO] cone:1/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb767/60) obsLane=None
+[track_drive-7] [INFO]: [S1_LANE_FOLLOW|B0_NORMAL|LAVACON] ang=-38.2 spd=4.7
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=219pt(min=0.11m,age=0.0s)
+[track_drive-7]   [LANE] lane=-26.7(0) obs=True(0.1m,left,vehicle) lava=-0.25(done=0)
+[track_drive-7]   [YOLO] cone:1/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb777/60) obsLane=None
+[track_drive-7] [INFO]: [S1_LANE_FOLLOW|B0_NORMAL|LAVACON] ang=-38.2 spd=4.7
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=209pt(min=0.12m,age=0.1s)
+[track_drive-7]   [LANE] lane=-26.7(0) obs=True(0.1m,left,vehicle) lava=+0.03(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb788/60) obsLane=None
+[track_drive-7] [INFO]: [S1_LANE_FOLLOW|B0_NORMAL|LAVACON] ang=-38.2 spd=4.7
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=213pt(min=0.12m,age=0.1s)
+[track_drive-7]   [LANE] lane=-5.8(0) obs=True(0.1m,left,vehicle) lava=-0.08(done=0)
+[track_drive-7]   [YOLO] cone:1/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb798/60) obsLane=None
+[track_drive-7] [INFO]: [S1_LANE_FOLLOW|B0_NORMAL|LAVACON] ang=-38.2 spd=4.7
+[track_drive-7]   [SENS] cam=0.1s sig=unknown lidar=213pt(min=0.11m,age=0.1s)
+[track_drive-7]   [LANE] lane=-5.8(0) obs=True(0.1m,left,vehicle) lava=-0.09(done=0)
+[track_drive-7]   [YOLO] cone:1/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb808/60) obsLane=None
+[track_drive-7] [INFO]: [S1_LANE_FOLLOW|B0_NORMAL|LAVACON] ang=-38.2 spd=4.7
+[track_drive-7]   [SENS] cam=0.1s sig=unknown lidar=218pt(min=0.12m,age=0.2s)
+[track_drive-7]   [LANE] lane=-5.8(0) obs=True(0.1m,left,vehicle) lava=-0.07(done=0)
+[track_drive-7]   [YOLO] cone:1/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb818/60) obsLane=None
+[track_drive-7] [INFO]: [S1_LANE_FOLLOW|B0_NORMAL|LAVACON] ang=-38.2 spd=4.7
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=213pt(min=0.11m,age=0.0s)
+[track_drive-7]   [LANE] lane=-5.8(0) obs=True(0.1m,left,vehicle) lava=-0.01(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb829/60) obsLane=None
+[track_drive-7] [INFO]: [S1_LANE_FOLLOW|B0_NORMAL|LAVACON] ang=-38.2 spd=4.7
+[track_drive-7]   [SENS] cam=0.1s sig=unknown lidar=222pt(min=0.11m,age=0.0s)
+[track_drive-7]   [LANE] lane=-5.8(0) obs=True(0.1m,left,vehicle) lava=-0.07(done=0)
+[track_drive-7]   [YOLO] cone:1/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb839/60) obsLane=None
+[track_drive-7] [INFO]: [S1_LANE_FOLLOW|B0_NORMAL|LAVACON] ang=-38.2 spd=4.7
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=222pt(min=0.11m,age=0.1s)
+[track_drive-7]   [LANE] lane=-5.8(0) obs=True(0.1m,left,vehicle) lava=-0.04(done=0)
+[track_drive-7]   [YOLO] cone:1/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb849/60) obsLane=None
+[track_drive-7] [INFO]: [S1_LANE_FOLLOW|B0_NORMAL|LAVACON] ang=-38.2 spd=4.7
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=218pt(min=0.11m,age=0.0s)
+[track_drive-7]   [LANE] lane=-5.8(0) obs=True(0.1m,left,vehicle) lava=-0.07(done=0)
+[track_drive-7]   [YOLO] cone:1/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb860/60) obsLane=None
+[track_drive-7] [INFO]: [S1_LANE_FOLLOW|B0_NORMAL|LAVACON] ang=+100.0 spd=0.8
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=188pt(min=0.11m,age=0.0s)
+[track_drive-7]   [LANE] lane=+62.2(1) obs=True(0.1m,left,vehicle) lava=+0.13(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb870/60) obsLane=None
+[track_drive-7] [INFO]: [S1_LANE_FOLLOW|B0_NORMAL|LAVACON] ang=+68.7 spd=1.6
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=209pt(min=0.11m,age=0.1s)
+[track_drive-7]   [LANE] lane=+81.3(1) obs=True(0.1m,left,vehicle) lava=+0.06(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb880/60) obsLane=None
+[track_drive-7] [INFO]: [S1_LANE_FOLLOW|B0_NORMAL|LAVACON] ang=+54.7 spd=4.3
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=221pt(min=0.11m,age=0.1s)
+[track_drive-7]   [LANE] lane=+74.8(1) obs=True(0.1m,left,vehicle) lava=+0.11(done=0)
+[track_drive-7]   [YOLO] cone:1/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb891/60) obsLane=None
+[track_drive-7] [INFO]: [S1_LANE_FOLLOW|B0_NORMAL|LAVACON] ang=-6.7 spd=5.0
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=206pt(min=0.11m,age=0.1s)
+[track_drive-7]   [LANE] lane=+41.7(1) obs=True(0.1m,left,vehicle) lava=+0.03(done=0)
+[track_drive-7]   [YOLO] cone:1/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb902/60) obsLane=None
+[track_drive-7] [INFO]: [S1_LANE_FOLLOW|B0_NORMAL|LAVACON] ang=-42.4 spd=4.7
+[track_drive-7]   [SENS] cam=0.1s sig=unknown lidar=213pt(min=0.11m,age=0.0s)
+[track_drive-7]   [LANE] lane=+35.6(1) obs=True(0.1m,left,vehicle) lava=+0.07(done=0)
+[track_drive-7]   [YOLO] cone:1/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb912/60) obsLane=None
+[track_drive-7] [INFO]: [S1_LANE_FOLLOW|B0_NORMAL|LAVACON] ang=+2.0 spd=5.0
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=210pt(min=0.11m,age=0.1s)
+[track_drive-7]   [LANE] lane=+44.7(1) obs=True(0.1m,left,vehicle) lava=+0.05(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb923/60) obsLane=None
+[track_drive-7] [INFO]: [S1_LANE_FOLLOW|B0_NORMAL|LAVACON] ang=-35.3 spd=4.8
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=211pt(min=0.11m,age=0.0s)
+[track_drive-7]   [LANE] lane=+17.8(1) obs=True(0.1m,left,vehicle) lava=+0.04(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb934/60) obsLane=None
+[track_drive-7] [INFO]: [S1_LANE_FOLLOW|B0_NORMAL|LAVACON] ang=-2.9 spd=5.0
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=223pt(min=0.11m,age=0.0s)
+[track_drive-7]   [LANE] lane=+43.3(1) obs=True(0.1m,left,vehicle) lava=+0.05(done=0)
+[track_drive-7]   [YOLO] cone:1/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb945/60) obsLane=None
+[track_drive-7] [INFO]: [S1_LANE_FOLLOW|B0_NORMAL|LAVACON] ang=-4.9 spd=5.0
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=220pt(min=0.11m,age=0.1s)
+[track_drive-7]   [LANE] lane=+39.8(1) obs=True(0.1m,left,vehicle) lava=+0.03(done=0)
+[track_drive-7]   [YOLO] cone:1/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb956/60) obsLane=None
+[track_drive-7] [INFO]: [S1_LANE_FOLLOW|B0_NORMAL|LAVACON] ang=-34.7 spd=4.8
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=183pt(min=0.11m,age=0.0s)
+[track_drive-7]   [LANE] lane=+16.7(0) obs=True(0.1m,left,vehicle) lava=+0.15(done=0)
+[track_drive-7]   [YOLO] cone:1/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb967/60) obsLane=None
+[track_drive-7] [INFO]: [S1_LANE_FOLLOW|B0_NORMAL|LAVACON] ang=+82.6 spd=2.5
+[track_drive-7]   [SENS] cam=0.1s sig=unknown lidar=205pt(min=0.11m,age=0.1s)
+[track_drive-7]   [LANE] lane=+82.0(1) obs=True(0.1m,left,vehicle) lava=+0.22(done=0)
+[track_drive-7]   [YOLO] cone:1/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb977/60) obsLane=None
+[track_drive-7] [INFO]: [S1_LANE_FOLLOW|B0_NORMAL|LAVACON] ang=-33.9 spd=4.8
+[track_drive-7]   [SENS] cam=0.1s sig=unknown lidar=216pt(min=0.11m,age=0.0s)
+[track_drive-7]   [LANE] lane=+41.1(1) obs=True(0.1m,left,vehicle) lava=+0.04(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb988/60) obsLane=None
+[track_drive-7] [INFO]: [S1_LANE_FOLLOW|B0_NORMAL|LAVACON] ang=-33.7 spd=4.8
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=210pt(min=0.11m,age=0.1s)
+[track_drive-7]   [LANE] lane=+27.2(1) obs=True(0.1m,left,vehicle) lava=+0.16(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb998/60) obsLane=None
+[track_drive-7] [INFO]: [S1_LANE_FOLLOW|B0_NORMAL|LAVACON] ang=-33.7 spd=4.8
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=215pt(min=0.11m,age=0.0s)
+[track_drive-7]   [LANE] lane=+18.2(1) obs=True(0.1m,left,vehicle) lava=+0.21(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb1009/60) obsLane=None
+[track_drive-7] [INFO]: [S1_LANE_FOLLOW|B0_NORMAL|LAVACON] ang=-33.5 spd=4.8
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=205pt(min=0.11m,age=0.1s)
+[track_drive-7]   [LANE] lane=-14.7(1) obs=True(0.1m,center,vehicle) lava=+0.24(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb1020/60) obsLane=None
+[track_drive-7] [INFO]: [S1_LANE_FOLLOW|B0_NORMAL|LAVACON] ang=-33.5 spd=4.8
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=198pt(min=0.11m,age=0.1s)
+[track_drive-7]   [LANE] lane=+25.5(1) obs=True(0.1m,center,vehicle) lava=+0.29(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L0R0,fb0/60) trigV=0/5(fb1031/60) obsLane=None
+[track_drive-7] [INFO]: [S1_LANE_FOLLOW|B0_NORMAL|LAVACON] ang=+55.6 spd=4.2
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=204pt(min=0.11m,age=0.1s)
+[track_drive-7]   [LANE] lane=+15.8(1) obs=True(0.1m,center,vehicle) lava=-0.08(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L0R0,fb0/60) trigV=0/5(fb1041/60) obsLane=None
+[track_drive-7] [INFO]: [S1_LANE_FOLLOW|B0_NORMAL|LAVACON] ang=+10.4 spd=5.0
+[track_drive-7]   [SENS] cam=0.1s sig=unknown lidar=208pt(min=0.11m,age=0.2s)
+[track_drive-7]   [LANE] lane=+40.5(1) obs=True(0.1m,center,fixed) lava=-0.13(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb1051/60) obsLane=None
+[track_drive-7] [INFO]: [S1_LANE_FOLLOW|B0_NORMAL|LAVACON] ang=-32.7 spd=4.8
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=213pt(min=0.11m,age=0.1s)
+[track_drive-7]   [LANE] lane=+33.2(1) obs=True(0.1m,center,vehicle) lava=+0.33(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L0R0,fb0/60) trigV=0/5(fb1062/60) obsLane=None
+[track_drive-7] [INFO]: [S1_LANE_FOLLOW|B0_NORMAL|LAVACON] ang=-32.7 spd=4.8
+[track_drive-7]   [SENS] cam=0.1s sig=unknown lidar=193pt(min=0.11m,age=0.1s)
+[track_drive-7]   [LANE] lane=+6.4(1) obs=True(0.1m,center,vehicle) lava=-0.11(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb1069/60) obsLane=None
+[track_drive-7] [INFO]: [S1_LANE_FOLLOW|B0_NORMAL|LAVACON] ang=-32.7 spd=4.8
+[track_drive-7]   [SENS] cam=0.3s sig=unknown lidar=201pt(min=0.11m,age=0.1s)
+
+
+
+
+
+
+
+ck_drive-7] [INFO]: [S0_WAIT_GREEN|B0_NORMAL|LAVACON] ang=+0.0 spd=0.0
+[track_drive-7]   [SENS] cam=-1.0s sig=unknown lidar=NONE
+[track_drive-7]   [LANE] lane=+0.0(0) obs=False(999.0m,none,none) lava=+0.00(done=1)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L0R0,fb0/60) trigV=0/5(fb0/60) obsLane=None
+[track_drive-7]   [SIG-S0] roi=(0, 0, 0, 0) circles=0 reason=no_frame bright=[] margin=+0.0
+[track_drive-7] [INFO]: [front] 첫 수신 OK enc=yuv422_yuy2 shape=(480, 640, 3)
+[track_drive-7] [INFO]: [S0_WAIT_GREEN|B0_NORMAL|LAVACON] ang=+0.0 spd=0.0
+[track_drive-7]   [SENS] cam=0.5s sig=unknown lidar=NONE
+[track_drive-7]   [LANE] lane=-12.1(1) obs=False(999.0m,none,none) lava=+0.00(done=1)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L0R0,fb0/60) trigV=0/5(fb0/60) obsLane=None
+[track_drive-7]   [SIG-S0] roi=(81, 153, 204, 403) circles=6 reason=circle_count=6(need 3) bright=[] margin=+0.0
+[xycar_lidar_node-2] [2026-07-21 16:16:46][info] [YDLIDAR] Create thread 0x88BD9640
+[track_drive-7] [INFO]: [S0_WAIT_GREEN|B0_NORMAL|LAVACON] ang=+0.0 spd=0.0
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=NONE
+[track_drive-7]   [LANE] lane=-14.0(1) obs=False(999.0m,none,none) lava=+0.00(done=1)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L0R0,fb0/60) trigV=0/5(fb0/60) obsLane=None
+[track_drive-7]   [SIG-S0] roi=(81, 153, 204, 403) circles=5 reason=circle_count=5(need 3) bright=[] margin=+0.0
+[xycar_lidar_node-2] [2026-07-21 16:16:46][info] Successed to start scan mode, Elapsed time 2065 ms
+[xycar_lidar_node-2] [2026-07-21 16:16:46][info] Module device info
+[xycar_lidar_node-2] Firmware version: 3.5
+[xycar_lidar_node-2] Hardware version: 3
+[xycar_lidar_node-2] Model: unkown(YD-0)
+[xycar_lidar_node-2] Serial: 2021092700030848
+[xycar_lidar_node-2] [2026-07-21 16:16:46][info] Scan Frequency: 10.00Hz
+[xycar_lidar_node-2] [2026-07-21 16:16:46][info] Fixed Size: 500
+[xycar_lidar_node-2] [2026-07-21 16:16:46][info] Sample Rate: 5.00K
+[xycar_lidar_node-2] [2026-07-21 16:16:46][info] Successed to check the lidar, Elapsed time 0 ms
+[xycar_lidar_node-2] [2026-07-21 16:16:46][info] Now lidar is scanning...
+[track_drive-7] [INFO]: [S0_WAIT_GREEN|B0_NORMAL|LAVACON] ang=+0.0 spd=0.0
+[track_drive-7]   [SENS] cam=0.1s sig=unknown lidar=246pt(min=0.11m,age=0.0s)
+[track_drive-7]   [LANE] lane=+22.4(1) obs=True(0.1m,left,vehicle) lava=-0.17(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb8/60) obsLane=None
+[track_drive-7]   [SIG-S0] roi=(81, 153, 204, 403) circles=5 reason=circle_count=5(need 3) bright=[] margin=+0.0
+[track_drive-7] [INFO]: [S0_WAIT_GREEN|B0_NORMAL|LAVACON] ang=+0.0 spd=0.0
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=245pt(min=0.11m,age=0.0s)
+[track_drive-7]   [LANE] lane=-10.0(1) obs=True(0.1m,left,vehicle) lava=-0.15(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb19/60) obsLane=None
+[track_drive-7]   [SIG-S0] roi=(81, 153, 204, 403) circles=5 reason=circle_count=5(need 3) bright=[] margin=+0.0
+[track_drive-7] [INFO]: [S0_WAIT_GREEN|B0_NORMAL|LAVACON] ang=+0.0 spd=0.0
+[track_drive-7]   [SENS] cam=0.1s sig=unknown lidar=232pt(min=0.11m,age=0.0s)
+[track_drive-7]   [LANE] lane=+54.9(1) obs=True(0.1m,left,vehicle) lava=-0.17(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb29/60) obsLane=None
+[track_drive-7]   [SIG-S0] roi=(81, 153, 204, 403) circles=5 reason=circle_count=5(need 3) bright=[] margin=+0.0
+[track_drive-7] [INFO]: [S0_WAIT_GREEN|B0_NORMAL|LAVACON] ang=+0.0 spd=0.0
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=239pt(min=0.11m,age=0.1s)
+[track_drive-7]   [LANE] lane=+18.3(1) obs=True(0.1m,left,vehicle) lava=-0.16(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb40/60) obsLane=None
+[track_drive-7]   [SIG-S0] roi=(81, 153, 204, 403) circles=5 reason=circle_count=5(need 3) bright=[] margin=+0.0
+[track_drive-7] [INFO]: [S0_WAIT_GREEN|B0_NORMAL|LAVACON] ang=+0.0 spd=0.0
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=241pt(min=0.11m,age=0.1s)
+[track_drive-7]   [LANE] lane=+48.2(1) obs=True(0.1m,left,vehicle) lava=-0.14(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb50/60) obsLane=None
+[track_drive-7]   [SIG-S0] roi=(81, 153, 204, 403) circles=7 reason=circle_count=7(need 3) bright=[] margin=+0.0
+[track_drive-7] [WARN]: [VEHICLE] YOLO 차량 미확인 — 라이다 단독 폴백으로 진입 (yolo_vehicle 노드 점검 요망)
+[track_drive-7] [INFO]: [S0_WAIT_GREEN|B0_NORMAL|LAVACON] ang=+0.0 spd=0.0
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=239pt(min=0.11m,age=0.1s)
+[track_drive-7]   [LANE] lane=+22.8(1) obs=True(0.1m,left,vehicle) lava=-0.15(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb60/60) obsLane=None
+[track_drive-7]   [SIG-S0] roi=(81, 153, 204, 403) circles=6 reason=circle_count=6(need 3) bright=[] margin=+0.0
+[track_drive-7] [INFO]: [S0_WAIT_GREEN|B0_NORMAL|LAVACON] ang=+0.0 spd=0.0
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=237pt(min=0.11m,age=0.1s)
+[track_drive-7]   [LANE] lane=+25.1(1) obs=True(0.1m,left,vehicle) lava=-0.14(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb71/60) obsLane=None
+[track_drive-7]   [SIG-S0] roi=(81, 153, 204, 403) circles=6 reason=circle_count=6(need 3) bright=[] margin=+0.0
+[track_drive-7] [INFO]: [S0_WAIT_GREEN|B0_NORMAL|LAVACON] ang=+0.0 spd=0.0
+[track_drive-7]   [SENS] cam=0.1s sig=unknown lidar=244pt(min=0.11m,age=0.1s)
+[track_drive-7]   [LANE] lane=+34.3(1) obs=True(0.1m,left,vehicle) lava=-0.14(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb82/60) obsLane=None
+[track_drive-7]   [SIG-S0] roi=(81, 153, 204, 403) circles=7 reason=circle_count=7(need 3) bright=[] margin=+0.0
+[track_drive-7] [INFO]: [S0_WAIT_GREEN|B0_NORMAL|LAVACON] ang=+0.0 spd=0.0
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=238pt(min=0.11m,age=0.0s)
+[track_drive-7]   [LANE] lane=+37.4(1) obs=True(0.1m,left,vehicle) lava=-0.14(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb93/60) obsLane=None
+[track_drive-7]   [SIG-S0] roi=(81, 153, 204, 403) circles=4 reason=circle_count=4(need 3) bright=[] margin=+0.0
+[debug_node-6] [INFO]: [debug_node] Configuring...
+[yolo_node-3] [INFO]: [yolo_node] Configuring...
+[debug_node-5] [INFO]: [debug_node] Configuring...
+[yolo_node-4] [INFO]: [yolo_node] Configuring...
+[debug_node-5] [INFO]: [debug_node] Configured
+[debug_node-5] [INFO]: [debug_node] Activating...
+[debug_node-6] [INFO]: [debug_node] Configured
+[yolo_node-3] [INFO]: [yolo_node] Configured
+[debug_node-6] [INFO]: [debug_node] Activating...
+[yolo_node-3] [INFO]: [yolo_node] Activating...
+[debug_node-5] [INFO]: [debug_node] Activated
+[debug_node-6] [INFO]: [debug_node] Activated
+[yolo_node-4] [INFO]: [yolo_node] Configured
+[yolo_node-4] [INFO]: [yolo_node] Activating...
+[track_drive-7] [INFO]: [S0_WAIT_GREEN|B0_NORMAL|LAVACON] ang=+0.0 spd=0.0
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=232pt(min=0.11m,age=0.0s)
+[track_drive-7]   [LANE] lane=+28.6(1) obs=True(0.1m,left,vehicle) lava=-0.18(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb103/60) obsLane=None
+[track_drive-7]   [SIG-S0] roi=(81, 153, 204, 403) circles=5 reason=circle_count=5(need 3) bright=[] margin=+0.0
+[yolo_node-3] [INFO]: Trying to fuse model...
+[yolo_node-4] [INFO]: Trying to fuse model...
+[track_drive-7] [INFO]: [S0_WAIT_GREEN|B0_NORMAL|LAVACON] ang=+0.0 spd=0.0
+[track_drive-7]   [SENS] cam=0.1s sig=unknown lidar=245pt(min=0.11m,age=0.1s)
+[track_drive-7]   [LANE] lane=+13.1(1) obs=True(0.1m,left,vehicle) lava=-0.12(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb113/60) obsLane=None
+[track_drive-7]   [SIG-S0] roi=(81, 153, 204, 403) circles=5 reason=circle_count=5(need 3) bright=[] margin=+0.0
+[track_drive-7] [INFO]: [S0_WAIT_GREEN|B0_NORMAL|LAVACON] ang=+0.0 spd=0.0
+[track_drive-7]   [SENS] cam=0.2s sig=unknown lidar=235pt(min=0.11m,age=0.1s)
+[track_drive-7]   [LANE] lane=+27.7(1) obs=True(0.1m,left,vehicle) lava=-0.16(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb120/60) obsLane=None
+[track_drive-7]   [SIG-S0] roi=(81, 153, 204, 403) circles=6 reason=circle_count=6(need 3) bright=[] margin=+0.0
+[track_drive-7] [INFO]: [S0_WAIT_GREEN|B0_NORMAL|LAVACON] ang=+0.0 spd=0.0
+[track_drive-7]   [SENS] cam=0.2s sig=unknown lidar=252pt(min=0.11m,age=0.1s)
+[track_drive-7]   [LANE] lane=+54.1(1) obs=True(0.1m,left,vehicle) lava=-0.14(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb127/60) obsLane=None
+[track_drive-7]   [SIG-S0] roi=(81, 153, 204, 403) circles=4 reason=circle_count=4(need 3) bright=[] margin=+0.0
+[yolo_node-3] [INFO]: [yolo_node] Activated
+[track_drive-7] [INFO]: [S0_WAIT_GREEN|B0_NORMAL|LAVACON] ang=+0.0 spd=0.0
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=245pt(min=0.11m,age=0.1s)
+[track_drive-7]   [LANE] lane=+32.4(1) obs=True(0.1m,left,vehicle) lava=-0.12(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb136/60) obsLane=None
+[track_drive-7]   [SIG-S0] roi=(81, 153, 204, 403) circles=6 reason=circle_count=6(need 3) bright=[] margin=+0.0
+[yolo_node-4] [INFO]: [yolo_node] Activated
+[track_drive-7] [INFO]: [S0_WAIT_GREEN|B0_NORMAL|LAVACON] ang=+0.0 spd=0.0
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=243pt(min=0.11m,age=0.1s)
+[track_drive-7]   [LANE] lane=+25.9(1) obs=True(0.1m,left,vehicle) lava=-0.13(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb147/60) obsLane=None
+[track_drive-7]   [SIG-S0] roi=(81, 153, 204, 403) circles=4 reason=circle_count=4(need 3) bright=[] margin=+0.0
+[track_drive-7] [INFO]: [S0_WAIT_GREEN|B0_NORMAL|LAVACON] ang=+0.0 spd=0.0
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=241pt(min=0.11m,age=0.1s)
+[track_drive-7]   [LANE] lane=+33.3(1) obs=True(0.1m,left,vehicle) lava=-0.16(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb157/60) obsLane=None
+[track_drive-7]   [SIG-S0] roi=(81, 153, 204, 403) circles=5 reason=circle_count=5(need 3) bright=[] margin=+0.0
+[track_drive-7] [INFO]: [S0_WAIT_GREEN|B0_NORMAL|LAVACON] ang=+0.0 spd=0.0
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=239pt(min=0.11m,age=0.0s)
+[track_drive-7]   [LANE] lane=+38.2(1) obs=True(0.1m,left,vehicle) lava=-0.15(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb168/60) obsLane=None
+[track_drive-7]   [SIG-S0] roi=(81, 153, 204, 403) circles=6 reason=circle_count=6(need 3) bright=[] margin=+0.0
+[track_drive-7] [INFO]: [S0_WAIT_GREEN|B0_NORMAL|LAVACON] ang=+0.0 spd=0.0
+[track_drive-7]   [SENS] cam=0.1s sig=unknown lidar=248pt(min=0.11m,age=0.1s)
+[track_drive-7]   [LANE] lane=+20.1(1) obs=True(0.1m,left,vehicle) lava=-0.12(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb178/60) obsLane=None
+[track_drive-7]   [SIG-S0] roi=(81, 153, 204, 403) circles=5 reason=circle_count=5(need 3) bright=[] margin=+0.0
+[track_drive-7] [INFO]: [S0_WAIT_GREEN|B0_NORMAL|LAVACON] ang=+0.0 spd=0.0
+[track_drive-7]   [SENS] cam=0.1s sig=unknown lidar=242pt(min=0.11m,age=0.0s)
+[track_drive-7]   [LANE] lane=+18.7(1) obs=True(0.1m,left,vehicle) lava=-0.13(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb188/60) obsLane=None
+[track_drive-7]   [SIG-S0] roi=(81, 153, 204, 403) circles=7 reason=circle_count=7(need 3) bright=[] margin=+0.0
+[track_drive-7] [INFO]: [S0_WAIT_GREEN|B0_NORMAL|LAVACON] ang=+0.0 spd=0.0
+[track_drive-7]   [SENS] cam=0.1s sig=unknown lidar=234pt(min=0.11m,age=0.0s)
+[track_drive-7]   [LANE] lane=+21.1(1) obs=True(0.1m,left,vehicle) lava=-0.14(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb198/60) obsLane=None
+[track_drive-7]   [SIG-S0] roi=(81, 153, 204, 403) circles=7 reason=circle_count=7(need 3) bright=[] margin=+0.0
+[track_drive-7] [INFO]: [S0_WAIT_GREEN|B0_NORMAL|LAVACON] ang=+0.0 spd=0.0
+[track_drive-7]   [SENS] cam=0.1s sig=unknown lidar=241pt(min=0.11m,age=0.1s)
+[track_drive-7]   [LANE] lane=+21.6(1) obs=True(0.1m,left,vehicle) lava=-0.12(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb207/60) obsLane=None
+[track_drive-7]   [SIG-S0] roi=(81, 153, 204, 403) circles=5 reason=circle_count=5(need 3) bright=[] margin=+0.0
+[track_drive-7] [INFO]: [S0_WAIT_GREEN|B0_NORMAL|LAVACON] ang=+0.0 spd=0.0
+[track_drive-7]   [SENS] cam=0.2s sig=unknown lidar=237pt(min=0.11m,age=0.1s)
+[track_drive-7]   [LANE] lane=+17.0(1) obs=True(0.1m,left,vehicle) lava=-0.13(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb217/60) obsLane=None
+[track_drive-7]   [SIG-S0] roi=(81, 153, 204, 403) circles=5 reason=circle_count=5(need 3) bright=[] margin=+0.0
+[track_drive-7] [INFO]: [S0_WAIT_GREEN|B0_NORMAL|LAVACON] ang=+0.0 spd=0.0
+[track_drive-7]   [SENS] cam=0.1s sig=unknown lidar=236pt(min=0.11m,age=0.1s)
+[track_drive-7]   [LANE] lane=+8.2(1) obs=True(0.1m,left,vehicle) lava=-0.13(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb226/60) obsLane=None
+[track_drive-7]   [SIG-S0] roi=(81, 153, 204, 403) circles=6 reason=circle_count=6(need 3) bright=[] margin=+0.0
+[track_drive-7] [INFO]: [S0_WAIT_GREEN|B0_NORMAL|LAVACON] ang=+0.0 spd=0.0
+[track_drive-7]   [SENS] cam=0.6s sig=unknown lidar=245pt(min=0.11m,age=0.1s)
+[track_drive-7]   [LANE] lane=-5.2(1) obs=True(0.1m,left,vehicle) lava=-0.12(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb234/60) obsLane=None
+[track_drive-7]   [SIG-S0] roi=(81, 153, 204, 403) circles=6 reason=circle_count=6(need 3) bright=[] margin=+0.0
+[track_drive-7] [INFO]: [S0_WAIT_GREEN|B0_NORMAL|LAVACON] ang=+0.0 spd=0.0
+[track_drive-7]   [SENS] cam=0.1s sig=unknown lidar=236pt(min=0.11m,age=0.1s)
+[track_drive-7]   [LANE] lane=+47.2(1) obs=True(0.1m,left,vehicle) lava=-0.14(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb243/60) obsLane=None
+[track_drive-7]   [SIG-S0] roi=(81, 153, 204, 403) circles=6 reason=circle_count=6(need 3) bright=[] margin=+0.0
+[track_drive-7] [INFO]: [S0_WAIT_GREEN|B0_NORMAL|LAVACON] ang=+0.0 spd=0.0
+[track_drive-7]   [SENS] cam=0.2s sig=unknown lidar=244pt(min=0.11m,age=0.1s)
+[track_drive-7]   [LANE] lane=+19.1(1) obs=True(0.1m,left,vehicle) lava=-0.13(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb252/60) obsLane=None
+[track_drive-7]   [SIG-S0] roi=(81, 153, 204, 403) circles=4 reason=circle_count=4(need 3) bright=[] margin=+0.0
+[track_drive-7] [INFO]: [S0_WAIT_GREEN|B0_NORMAL|LAVACON] ang=+0.0 spd=0.0
+[track_drive-7]   [SENS] cam=0.1s sig=unknown lidar=240pt(min=0.11m,age=0.0s)
+[track_drive-7]   [LANE] lane=+22.1(1) obs=True(0.1m,left,vehicle) lava=-0.13(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb262/60) obsLane=None
+[track_drive-7]   [SIG-S0] roi=(81, 153, 204, 403) circles=4 reason=circle_count=4(need 3) bright=[] margin=+0.0
+[track_drive-7] [INFO]: [S0_WAIT_GREEN|B0_NORMAL|LAVACON] ang=+0.0 spd=0.0
+[track_drive-7]   [SENS] cam=0.0s sig=unknown lidar=240pt(min=0.11m,age=0.0s)
+[track_drive-7]   [LANE] lane=+40.1(1) obs=True(0.1m,left,vehicle) lava=-0.12(done=0)
+[track_drive-7]   [YOLO] cone:0/veh:0 trigL=0/5(L1R0,fb0/60) trigV=0/5(fb272/60) obsLane=None
+[track_drive-7]   [SIG-S0] roi=(81, 153, 204, 403) circles=5 reason=circle_count=5(need 3) bright=[] margin=+0.0
+[track_drive-7] [INFO]: [S0_WAIT_GREEN|B0_NORMAL|LAVACON] ang=+0.0 spd=0.0
+[track_drive-7]   [SENS] cam=0.2s sig=unknown lidar=240pt(min=0.11m,age=0.1s)
+
+
