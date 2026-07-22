@@ -39,6 +39,30 @@ LANE_YELLOW_MAX_DEV = 40
 #Debug
 DEBUG_VIZ_LANE = True
 
+# Canny + Hough 반사광(Glare) 필터
+#   문제 : 트랙 바닥 정반사가 CLAHE+Top-Hat+HSV 조건(밝고 흐릿한 흰색)을 흰 차선과
+#         똑같이 만족해버려서 슬라이딩 윈도우가 반사광 얼룩을 차선으로 오검출함.
+#   해결 : BEV 위에서 Canny 엣지 → HoughLinesP로 "직선 형태"만 추출 → 수직에 가까운
+#         (차선다운) 선분만 남긴 뒤, 기존 색상/명암 마스크와 AND로 결합한다.
+#         즉 "밝고(색상 조건) + 선분 모양(형태 조건)"을 모두 만족하는 픽셀만
+#         최종 흰 차선으로 인정 — 반사광 얼룩은 대개 뭉툭한 덩어리라 직선이 잘 안
+#         잡히거나, 잡혀도 각도가 들쭉날쭉해서 여기서 대부분 걸러진다.
+#   실차 미검증 튜닝값 — 반사광이 계속 새면 임계값/각도범위를, 점선차선이 끊기면
+#   MIN_LINE_LEN/MAX_LINE_GAP을 먼저 재조정할 것.
+CANNY_BLUR_KSIZE      = 5      # 가우시안 블러 커널(홀수). 너무 크면 가는 점선 차선까지 뭉개짐
+CANNY_LOW, CANNY_HIGH = 50, 150   # Canny 이력임계값(하/상). BEV가 CLAHE로 이미 대비를 올려놔서 낮게 잡음
+HOUGH_RHO             = 1             # 거리 해상도(px)
+HOUGH_THETA           = np.pi / 180   # 각도 해상도(rad)
+HOUGH_THRESHOLD       = 20            # 직선으로 인정할 최소 누적표(투표) 수
+HOUGH_MIN_LINE_LEN    = 15            # 최소 선분 길이(px) — 반사광 얼룩의 짧은 파편 제거용
+HOUGH_MAX_LINE_GAP    = 15            # 같은 직선으로 이어붙일 최대 틈(px) — 점선차선 조각 연결
+# 각도 필터 : BEV에서 정상 차선은 거의 수직(가로 기준 90° 부근)으로 나타난다.
+#   atan2(dy,dx) 결과를 0~180°로 접어서, 수직 ±20°(70~110°)만 차선으로 인정.
+#   실차 커브 구간에서 먼 쪽(화면 상단) 선분이 이 범위를 벗어나 잘리면 범위를 넓혀 재튜닝.
+HOUGH_ANGLE_MIN_DEG   = 70.0
+HOUGH_ANGLE_MAX_DEG   = 110.0
+HOUGH_LINE_THICKNESS  = 7    # 재구성 마스크에 그릴 선 두께(px) — 슬라이딩윈도우 margin(20px)보다 작게
+
 
 #def Debugging(flag):
 # DEBUG 상수들 모아놓자(외부 파일로 뺄지는 고민해보기)
@@ -51,6 +75,62 @@ class CameraProcessor:
 
         self.roi_h = 0
         self.roi_w = 0
+
+    def _hough_line_mask(self, gray):
+        """
+        Canny 엣지 → HoughLinesP 선분 추출 → 길이/각도 필터링 → 살아남은
+        선분만 굵게 재구성해서 '차선 모양(직선)' 이진 마스크를 만든다.
+          입력 : gray  — CLAHE까지 적용된 BEV 그레이스케일(호출부에서 재사용, 중복연산 방지)
+          출력 : hough_mask — gray와 동일 크기의 0/255 이진 마스크
+        반사광(글레어)은 대개 뭉툭한 덩어리라 여기서 직선으로 잘 안 잡히거나,
+        잡히더라도 각도가 수직에서 크게 벗어나 필터링 단계에서 제거된다.
+        """
+        # 1) 가우시안 블러 — Canny 전에 고주파 잡음(반사광 얼룩의 거친 경계) 완화
+        blur = cv2.GaussianBlur(
+            gray, (CANNY_BLUR_KSIZE, CANNY_BLUR_KSIZE), 0
+        )
+
+        # 2) Canny 엣지 검출
+        edges = cv2.Canny(blur, CANNY_LOW, CANNY_HIGH)
+
+        # 3) 확률적 허프 변환 — 엣지 중 "직선 구간"만 (x1,y1,x2,y2) 선분으로 추출
+        lines = cv2.HoughLinesP(
+            edges,
+            HOUGH_RHO,
+            HOUGH_THETA,
+            HOUGH_THRESHOLD,
+            minLineLength=HOUGH_MIN_LINE_LEN,
+            maxLineGap=HOUGH_MAX_LINE_GAP
+        )
+
+        hough_mask = np.zeros_like(gray)
+
+        if lines is None:
+            return hough_mask
+
+        # 4) 기하학적 필터링 (길이 + 각도) 후 살아남은 선분만 재구성 마스크에 그림
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+
+            dx = x2 - x1
+            dy = y2 - y1
+
+            # 길이 필터 : 짧은 파편(반사광 얼룩 경계 등) 제거
+            length = float(np.hypot(dx, dy))
+            if length < HOUGH_MIN_LINE_LEN:
+                continue
+
+            # 각도 필터 : 0~180°로 접어서 수직(90°) 근방(70~110°)만 통과
+            angle = np.degrees(np.arctan2(dy, dx)) % 180
+            if not (HOUGH_ANGLE_MIN_DEG <= angle <= HOUGH_ANGLE_MAX_DEG):
+                continue
+
+            cv2.line(
+                hough_mask, (x1, y1), (x2, y2),
+                255, HOUGH_LINE_THICKNESS
+            )
+
+        return hough_mask
 
     def processor(self, frame):
         # ROI
@@ -113,9 +193,19 @@ class CameraProcessor:
             hsv, np.array([0,0,150]), np.array([180,90,255])
         )
 
-        # Top-Hat + HSV 결합
-        self.white = cv2.bitwise_and(
+        # Top-Hat + HSV 결합 (색상/명암 조건 — "밝고 흰색인가")
+        white_color = cv2.bitwise_and(
             white_tophat, white_hsv
+        )
+
+        # Canny + Hough 직선 마스크 (형태 조건 — "직선 모양인가")
+        #   CLAHE까지 적용된 gray를 그대로 재사용(cvtColor 중복 호출 방지)
+        hough_mask = self._hough_line_mask(gray)
+
+        # 색상 조건 AND 형태 조건 → 둘 다 만족하는 픽셀만 흰 차선으로 인정
+        # (반사광 얼룩은 색상 조건은 통과해도 형태(직선) 조건에서 대부분 걸러짐)
+        self.white = cv2.bitwise_and(
+            white_color, hough_mask
         )
 
         #Yellow Lane
@@ -169,6 +259,7 @@ class CameraProcessor:
         #DEBUG
         if DEBUG_VIZ_LANE:
             cv2.imshow("lane_bev", self.bev)
+            cv2.imshow("lane_hough", hough_mask)   # 형태(직선) 필터만 통과한 마스크 — 반사광 걸러짐 확인용
             cv2.imshow("lane_white", self.white)
             cv2.imshow("lane_yellow", self.yellow)
 
