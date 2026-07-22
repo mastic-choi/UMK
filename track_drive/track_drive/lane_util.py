@@ -93,7 +93,7 @@ class CameraProcessor:
 
         # 3) Top-Hat(극소 대비)
         kernel_tophat = cv2.getStructuringElement(
-            cv2.MORPH_RECT, (15,15)
+            cv2.MORPH_RECT, (21,21)
         )
 
         contrast = cv2.morphologyEx(
@@ -102,7 +102,7 @@ class CameraProcessor:
 
         #Threshold
         _, white_tophat = cv2.threshold(
-            contrast, 15, 255, cv2.THRESH_BINARY
+            contrast, 10, 255, cv2.THRESH_BINARY
         )
 
         # HSV
@@ -110,7 +110,7 @@ class CameraProcessor:
 
         # white HSV Mask
         white_hsv = cv2.inRange(
-            hsv, np.array([0,0,170]), np.array([180,60,255])
+            hsv, np.array([0,0,150]), np.array([180,90,255])
         )
 
         # Top-Hat + HSV 결합
@@ -120,7 +120,7 @@ class CameraProcessor:
 
         #Yellow Lane
         self.yellow = cv2.inRange(
-            hsv, np.array([18,120,120]), np.array([35,255,255])
+            hsv, np.array([15,80,80]), np.array([40,255,255])
         )
         #Morphology
         kernel = cv2.getStructuringElement(
@@ -141,7 +141,7 @@ class CameraProcessor:
         for i in range(1, num) :
             area = stats[i, cv2.CC_STAT_AREA]
 
-            if area> 10 :
+            if area> 5 :
                 mask[labels == i] = 255
             
         self.white = mask
@@ -161,7 +161,7 @@ class CameraProcessor:
 
             width = stats[i, cv2.CC_STAT_WIDTH]
 
-            if area>20 and width < 40:
+            if area>20 and width < 80:
                 mask[labels == i] = 255
 
         self.yellow = mask
