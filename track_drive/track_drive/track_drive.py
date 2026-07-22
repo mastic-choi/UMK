@@ -76,14 +76,18 @@ SPEED_ACCEL_STEP = 0.85  # 가속 속도제한(주기당 최대 증가량)
 CORNER_HOLD_DECAY_LO = 0.92  # 저속 시 코너 hold 감쇠 (빠른 회복)
 CORNER_HOLD_DECAY_HI = 0.97  # 고속 시 코너 hold 감쇠 (느린 회복, 연속코너 대응)
 
-# ── 라이다 장착 각도 보정 (실측 2026-07-22) ──
-# 차량 정면에 사람을 세우고 라이다 BEV 디버그 창으로 확인한 결과, 그 클러스터가 "좌측 90도"
-# 위치로 찍힘 — 즉 라이다 인덱스(도) 원점이 차량 정면 기준 90도 어긋나 있다(자기가림 마스킹과는
-# 별개 문제). perc_obstacle()/perc_lavacon_trigger()에서 극좌표→직교좌표 변환 시
+# ── 라이다 장착 각도 보정 (재실측 2026-07-22) ──
+# 차량 정면에 사람을 세우고 라이다 BEV 디버그 창(각도/인덱스 컴퍼스)으로 확인한 결과,
+# 자기가림 마스크를 끄고 다시 보니 정면 클러스터가 인덱스 80에서 찍힘 — 즉 라이다 인덱스(도)
+# 원점이 차량 정면 기준 80도 어긋나 있다(자기가림 마스킹과는 별개 문제).
+# perc_obstacle()/perc_lavacon_trigger()에서 극좌표→직교좌표 변환 시
 # "deg = 인덱스(도) - LIDAR_ANGLE_OFFSET_DEG" 로 이 오프셋을 빼서 보정한다.
 #   보정 후 각도 약속: 0=정면, 90=좌측, 180=후방, 270(-90)=우측 (반시계 방향)
 # perc_lavacon.py의 동일 상수와 반드시 값을 일치시킬 것.
-LIDAR_ANGLE_OFFSET_DEG = 90.0
+LIDAR_ANGLE_OFFSET_DEG = 80.0  # 재실측(2026-07-22): i90이 아니라 i80이 정면
+
+# 차체 자기가림 마스킹(BODY_LO~BODY_HI) 전체 스위치.
+BODY_MASK_ENABLED = True  # 최종 확정(2026-07-22)
 
 # ── 튜닝 파라미터 (한곳에 모음) ──
 # 차선 PID — 출처: KUAC_2024-main lane_detection/src/lane_detection.py PID(safe모드)
@@ -369,7 +373,7 @@ class TrackDriverNode(Node):
         RIGHT_BLOCK_TH           = 5           # 우측 차단 임계
         SIDE_DEADZONE            = 0.25        # |EMA(mean_y)| 이하이면 'center'
         SIDE_EMA_ALPHA           = 0.3         # EMA 계수
-        BODY_LO, BODY_HI         = 99, 263     # 차체 자기가림 구간
+        BODY_LO, BODY_HI         = 215, 305    # 차체 자기가림 구간 (최종 확정 2026-07-22)
 
         if self.lidar_ranges is None:
             self.obstacle_front = False
@@ -389,7 +393,8 @@ class TrackDriverNode(Node):
         ranges = np.array(self.lidar_ranges, dtype=np.float32)
         ranges[~np.isfinite(ranges)] = 0.0
         ranges[ranges <= 0.0]        = 0.0
-        ranges[BODY_LO:BODY_HI]      = 0.0   # 차체 자기가림 마스킹
+        if BODY_MASK_ENABLED:
+            ranges[BODY_LO:BODY_HI]  = 0.0   # 차체 자기가림 마스킹
 
         n = len(ranges)
         m = min(n, 360)
@@ -424,17 +429,38 @@ class TrackDriverNode(Node):
         self.right_clear = int(np.count_nonzero(right_mask)) < RIGHT_BLOCK_TH
 
         if DEBUG_VIZ_LIDAR:
-            PPM = 50          # 1m = 50px
+            PPM = 125         # 1m = 125px (표시 범위 2m)
             W, H = 500, 500
-            EX, EY = 250, 450  # 자차 위치(하단 중앙)
+            EX, EY = 250, 250  # 자차 위치(캔버스 정중앙 — 전/후/좌/우 전체 360도가 다 보이도록)
             bev = np.zeros((H, W, 3), dtype=np.uint8)
 
-            for d in range(1, 6):
+            for d in range(1, 3):
                 cv2.circle(bev, (EX, EY), d * PPM, (50, 50, 50), 1)
                 cv2.putText(bev, f'{d}m', (EX + 4, EY - d*PPM + 12),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.35, (80, 80, 80), 1)
 
             def to_px(wx, wy): return (int(EX - wy*PPM), int(EY - wx*PPM))
+
+            # 각도/인덱스 컴퍼스 (보정후 각도 기준, 0°=정면=위쪽, 반시계 방향)
+            # 각 스포크의 'i라벨'은 현재 LIDAR_ANGLE_OFFSET_DEG 가정하에 그 방향이어야 할 원본 인덱스.
+            for a_deg in range(0, 360, 45):
+                raw_idx = int(round((a_deg + LIDAR_ANGLE_OFFSET_DEG) % 360))
+                px_, py_ = to_px(1.9 * math.cos(math.radians(a_deg)), 1.9 * math.sin(math.radians(a_deg)))
+                is_front = (a_deg == 0)
+                spoke_col = (255, 220, 0) if is_front else (70, 70, 70)
+                cv2.line(bev, (EX, EY), (px_, py_), spoke_col, 2 if is_front else 1)
+                cv2.putText(bev, f'i{raw_idx}', (px_ - 14, py_),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, spoke_col, 1, cv2.LINE_AA)
+
+            # 자기가림 마스킹 경계(BODY_LO~BODY_HI) — 이 두 스포크 사이 구간은 ranges가
+            # 무조건 0으로 지워져서 안 찍힘(왼쪽이 안 보이는 원인).
+            for body_idx, body_tag in ((BODY_LO, 'LO'), (BODY_HI, 'HI')):
+                body_ang = body_idx - LIDAR_ANGLE_OFFSET_DEG
+                bx_, by_ = to_px(1.9 * math.cos(math.radians(body_ang)), 1.9 * math.sin(math.radians(body_ang)))
+                cv2.line(bev, (EX, EY), (bx_, by_), (200, 0, 200), 1)
+                cv2.putText(bev, f'MASK_{body_tag}(i{body_idx})', (bx_ - 20, by_),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 0, 200), 1, cv2.LINE_AA)
+
             cv2.rectangle(bev, to_px(FRONT_X_MIN, FRONT_Y_HALF), to_px(FRONT_X_MAX, -FRONT_Y_HALF), (0, 220, 220), 1)
             cv2.rectangle(bev, to_px(0.8, 1.5),  to_px(5.5,  0.7), (0, 220, 0),   1)
             cv2.rectangle(bev, to_px(0.8, -0.7), to_px(5.5, -1.5), (0, 140, 255), 1)
@@ -449,6 +475,9 @@ class TrackDriverNode(Node):
                 elif right_mask[i]: col = (0, 140, 255)
                 else:               col = (60, 60, 60)
                 cv2.circle(bev, (sx, sy), 2, col, -1)
+                if i % 10 == 0:   # 실제 원본 인덱스 번호(참값) — 컴퍼스 가정과 대조용
+                    cv2.putText(bev, str(i), (sx + 3, sy - 3),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1, cv2.LINE_AA)
 
             cv2.circle(bev, (EX, EY), 7, (255, 220, 0), -1)
             cv2.line(bev, (EX, EY), (EX, EY - 18), (255, 220, 0), 2)
@@ -475,11 +504,11 @@ class TrackDriverNode(Node):
     #     여기서 독립적으로 계산한다. 좌우 동시검출이 LAVACON_TRIGGER_FRAMES 연속 유지되면 진입 확정(디바운스).
     def perc_lavacon_trigger(self):
         # ── 튜닝 파라미터 (실측 라바콘 간격 기준 추정치, 실차 튜닝 필요) ──
-        LON_MIN, LON_MAX = 0.3, 3.0   # 트리거 ROI 전방 종방향(m) — 너무 가깝거나(차체 반사) 먼 점 배제
+        LON_MIN, LON_MAX = 0.3, 0.5   # 트리거 ROI 전방 종방향(m) — 너무 가깝거나(차체 반사) 먼 점 배제
         LAT_MAX           = 2.0        # 트리거 ROI 횡방향 한계(m)
         CLUSTER_MIN_PTS   = 2          # 클러스터로 인정할 최소 연속 포인트 수(단일 반사점 노이즈 배제)
         CLUSTER_MAX_GAP   = 0.35       # 같은 클러스터로 볼 최대 거리편차(m) — 콘 지름 근사
-        BODY_LO, BODY_HI  = 99, 263    # 차체 자기가림 구간 (perc_obstacle과 동일)
+        BODY_LO, BODY_HI  = 215, 305   # 차체 자기가림 구간 (perc_obstacle과 동일, 최종 확정 2026-07-22)
 
         if self.lidar_ranges is None:
             self.lavacon_left_detected  = False
@@ -496,7 +525,7 @@ class TrackDriverNode(Node):
 
         ranges = ranges_raw.copy()
         n = len(ranges)
-        if n > BODY_LO:
+        if BODY_MASK_ENABLED and n > BODY_LO:
             ranges[BODY_LO:min(BODY_HI, n)] = 0.0   # 차체 자기가림 마스킹
 
         m = min(n, 360)
