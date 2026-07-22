@@ -14,11 +14,15 @@
 #   보로노이 정점(vertex)들로 나타난다. 이 정점들의 y좌표 평균을
 #   횡방향 편차(lavacon_offset)로 사용한다.
 #
-# [라이다 좌표 약속] (track_drive.py 실측 기준, 2026-06-19 확정)
+# [라이다 좌표 약속] (track_drive.py 실측 기준, 2026-07-22 재확정)
 #   · 360칸, 인덱스 = 각도(도), 반시계 방향
-#   · 인덱스 0 = 정면 / 90 = 좌측 / 180 = 정후방 / 270 = 우측
-#   · 인덱스 99~262 는 차체 자기가림 구간 → 항상 무효 처리
-#   · 직교좌표 변환: x = r·cos(deg) (전방+), y = r·sin(deg) (좌측+)
+#   · 2026-06-19에 "인덱스 0 = 정면"으로 확정했었으나, 2026-07-22 실측(차량 정면에 사람을
+#     세우고 디버그 BEV로 확인)에서 그 클러스터가 좌측 90도로 찍히는 오류를 발견 → 실제로는
+#     라이다 인덱스 원점이 차량 정면 기준 90도 어긋나 있었다. 아래처럼 LIDAR_ANGLE_OFFSET_DEG(90도)를
+#     빼서 보정한 뒤의 각도 기준이 진짜 차량 기준 각도다:
+#       (인덱스(도) - LIDAR_ANGLE_OFFSET_DEG) 기준 0 = 정면 / 90 = 좌측 / 180 = 정후방 / 270 = 우측
+#   · 인덱스 99~262 는 차체 자기가림 구간 → 항상 무효 처리 (원본 인덱스 기준이라 위 각도 보정과 무관)
+#   · 직교좌표 변환: x = r·cos(deg) (전방+), y = r·sin(deg) (좌측+)  [deg는 보정된 각도]
 #
 # [부호 약속] (track_drive.py 제어팀 합의와 동일)
 #   · lavacon_offset > 0 : 중심선이 차량 기준 '우측'에 있음 → 우조향
@@ -33,6 +37,7 @@ from scipy.spatial import Voronoi, QhullError   # 보로노이 다이어그램 +
 # 튜닝 상수 (track_drive.py 의 실측 ROI 값과 일치시킴)
 # ─────────────────────────────────────────────
 BODY_LO, BODY_HI = 99, 263      # 차체 가림 인덱스 구간 [99, 262] 마스킹 경계 (263은 미포함)
+LIDAR_ANGLE_OFFSET_DEG = 90.0   # 라이다 장착 각도 보정(실측 2026-07-22) — track_drive.py의 동일 상수와 반드시 일치시킬 것
 LON_MIN, LON_MAX = 0.0, 4.0     # 보로노이 정점 종방향(전방) 관심영역 (m)
 LAT_LIMIT        = 2.5          # 보로노이 정점 횡방향(좌우) 관심영역 한계 (m)
 CONE_LON_MAX     = 4.0          # 콘 후보 점의 전방 최대거리 (m) — 벽/원거리 잡음 배제
@@ -70,8 +75,9 @@ def process_lavacon(lidar_ranges):
         ranges[BODY_LO:min(BODY_HI, n)] = 0.0
  
     # ── 2) 극좌표 → 직교좌표 변환 (x: 전방+, y: 좌측+) ──
-    # 인덱스가 곧 각도(도)이고 0번이 정면이므로 영점 보정 없이 그대로 변환
-    deg = np.linspace(0.0, 2.0 * math.pi, n, endpoint=False)
+    # 인덱스가 각도(도)이지만 0번이 정면이 아니라 실측상 정면 기준 90도 어긋나 있으므로
+    # LIDAR_ANGLE_OFFSET_DEG를 빼서 영점을 보정한다.
+    deg = np.linspace(0.0, 2.0 * math.pi, n, endpoint=False) - math.radians(LIDAR_ANGLE_OFFSET_DEG)
     x = ranges * np.cos(deg)    # 종방향(전방거리) 성분
     y = ranges * np.sin(deg)    # 횡방향 성분 — y > 0 좌측, y < 0 우측
  
@@ -138,12 +144,17 @@ def process_lavacon(lidar_ranges):
 if __name__ == '__main__':
     # 가상 시나리오 : 좌측 콘 2 m, 우측 콘 1 m 거리에 배치된 직선 트랙
     # → 중심선은 y ≈ +0.5 (좌측) → offset ≈ -0.5 (좌조향) 기대
+    # 주의: 원본 라이다 인덱스는 LIDAR_ANGLE_OFFSET_DEG(90도)만큼 정면과 어긋나 있으므로,
+    # "차량 기준 목표각(target_deg)"에 오프셋을 더한 실제 인덱스에 테스트 값을 채운다.
     test = np.zeros(360, dtype=np.float32)
-    # 좌측 콘들 (인덱스 30~80 부근, 거리 조합으로 y ≈ +2.0 라인 근사)
-    for i in (40, 55, 70):
-        test[i] = 2.0 / math.sin(math.radians(i))      # y = r·sin(deg) = 2.0 이 되도록 역산
-    # 우측 콘들 (인덱스 280~330 부근, y ≈ -1.0 라인 근사)
-    for i in (290, 305, 320):
-        test[i] = -1.0 / math.sin(math.radians(i))     # y = r·sin(deg) = -1.0 (sin<0 이라 r>0)
+    offset_i = int(LIDAR_ANGLE_OFFSET_DEG)
+    # 좌측 콘들 (차량 기준 목표각 40~70도 부근, y ≈ +2.0 라인 근사)
+    for target_deg in (40, 55, 70):
+        i = (target_deg + offset_i) % 360
+        test[i] = 2.0 / math.sin(math.radians(target_deg))   # y = r·sin(target_deg) = 2.0 이 되도록 역산
+    # 우측 콘들 (차량 기준 목표각 290~320도 부근, y ≈ -1.0 라인 근사)
+    for target_deg in (290, 305, 320):
+        i = (target_deg + offset_i) % 360
+        test[i] = -1.0 / math.sin(math.radians(target_deg))  # y = r·sin(target_deg) = -1.0 (sin<0 이라 r>0)
     off, done = process_lavacon(test)
     print(f'offset={off:+.3f} (음수=좌조향 기대), done={done}')

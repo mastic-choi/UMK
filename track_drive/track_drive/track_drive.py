@@ -76,6 +76,15 @@ SPEED_ACCEL_STEP = 0.85  # 가속 속도제한(주기당 최대 증가량)
 CORNER_HOLD_DECAY_LO = 0.92  # 저속 시 코너 hold 감쇠 (빠른 회복)
 CORNER_HOLD_DECAY_HI = 0.97  # 고속 시 코너 hold 감쇠 (느린 회복, 연속코너 대응)
 
+# ── 라이다 장착 각도 보정 (실측 2026-07-22) ──
+# 차량 정면에 사람을 세우고 라이다 BEV 디버그 창으로 확인한 결과, 그 클러스터가 "좌측 90도"
+# 위치로 찍힘 — 즉 라이다 인덱스(도) 원점이 차량 정면 기준 90도 어긋나 있다(자기가림 마스킹과는
+# 별개 문제). perc_obstacle()/perc_lavacon_trigger()에서 극좌표→직교좌표 변환 시
+# "deg = 인덱스(도) - LIDAR_ANGLE_OFFSET_DEG" 로 이 오프셋을 빼서 보정한다.
+#   보정 후 각도 약속: 0=정면, 90=좌측, 180=후방, 270(-90)=우측 (반시계 방향)
+# perc_lavacon.py의 동일 상수와 반드시 값을 일치시킬 것.
+LIDAR_ANGLE_OFFSET_DEG = 90.0
+
 # ── 튜닝 파라미터 (한곳에 모음) ──
 # 차선 PID — 출처: KUAC_2024-main lane_detection/src/lane_detection.py PID(safe모드)
 #   safe: kp=0.70, ki=0.0008, kd=0.15 / fast: kp=0.78, ki=0.0005, kd=0.405 (참고, safe값 채택)
@@ -208,6 +217,7 @@ class TrackDriverNode(Node):
         self.lavacon_trigger        = False  # 좌우 동시검출이 디바운스 프레임수만큼 유지되면 True
         self._lavacon_trigger_cnt   = 0      # 동시검출 연속 프레임 수(디바운스 카운터)
         self._lavacon_dbg = (0, 0, 0, 0)     # 디버그용 (좌ROI점수, 좌최대연속묶음, 우ROI점수, 우최대연속묶음)
+        self._lavacon_mask_dbg = (0, -1.0)   # 디버그용 (BODY_LO~HI 마스킹 구간 원본 점수, 최소거리)
         # [2-6 방해차량 트리거]
         self.vehicle_trigger       = False   # 라이다 디바운스 통과 → B3 진입 트리거
         self._vehicle_trigger_cnt  = 0       # 동시검출 연속 프레임 수(디바운스 카운터)
@@ -372,7 +382,7 @@ class TrackDriverNode(Node):
 
         # LUT 지연 초기화 (최초 1회)
         if not hasattr(self, '_obs_cos'):
-            _deg = np.linspace(0.0, 2.0 * math.pi, 360, endpoint=False)
+            _deg = np.linspace(0.0, 2.0 * math.pi, 360, endpoint=False) - math.radians(LIDAR_ANGLE_OFFSET_DEG)
             self._obs_cos = np.cos(_deg).astype(np.float32)
             self._obs_sin = np.sin(_deg).astype(np.float32)
 
@@ -477,21 +487,36 @@ class TrackDriverNode(Node):
             self._lavacon_trigger_cnt   = 0
             self.lavacon_trigger        = False
             self._lavacon_dbg = (0, 0, 0, 0)
+            self._lavacon_mask_dbg = (0, -1.0)
             return
 
-        ranges = np.array(self.lidar_ranges, dtype=np.float32)
-        ranges[~np.isfinite(ranges)] = 0.0
-        ranges[ranges <= 0.0] = 0.0
+        ranges_raw = np.array(self.lidar_ranges, dtype=np.float32)
+        ranges_raw[~np.isfinite(ranges_raw)] = 0.0
+        ranges_raw[ranges_raw <= 0.0] = 0.0
+
+        ranges = ranges_raw.copy()
         n = len(ranges)
         if n > BODY_LO:
             ranges[BODY_LO:min(BODY_HI, n)] = 0.0   # 차체 자기가림 마스킹
 
         m = min(n, 360)
-        deg = np.linspace(0.0, 2.0 * math.pi, m, endpoint=False)
+        deg = np.linspace(0.0, 2.0 * math.pi, m, endpoint=False) - math.radians(LIDAR_ANGLE_OFFSET_DEG)
         r = ranges[:m]
+        r_raw = ranges_raw[:m]
         x = r * np.cos(deg)          # 전방(+앞)
         y = r * np.sin(deg)          # 횡방향(+좌/-우)
         roi = (r > 0.0) & (x > LON_MIN) & (x < LON_MAX) & (np.abs(y) < LAT_MAX)
+
+        # 진단용: BODY_LO~BODY_HI로 "차체 자기가림"이라 보고 지워버리는 구간에
+        # 마스킹 전 원본 raw range가 실제로 얼마나/얼마나 가깝게 찍히는지 확인.
+        # 여기 값이 크고 거리도 콘 간격과 비슷하면 이 마스크가 진짜 우측 콘 반사까지
+        # 같이 지우고 있다는 뜻(마스크 구간 자체를 재보정해야 함).
+        body_hi_eff = min(BODY_HI, n)
+        masked_raw = ranges_raw[BODY_LO:body_hi_eff]
+        masked_valid = masked_raw[masked_raw > 0.0]
+        masked_pts = int(masked_valid.size)
+        masked_min = float(masked_valid.min()) if masked_pts else -1.0
+        self._lavacon_mask_dbg = (masked_pts, masked_min)
 
         def _has_cluster(side_mask):
             idx = np.where(roi & side_mask)[0]
@@ -514,7 +539,8 @@ class TrackDriverNode(Node):
 
         if DEBUG_VIZ_LAVACON:
             self._draw_lavacon_bev(r, x, y, roi, LON_MIN, LON_MAX, LAT_MAX,
-                                    left_pts, left_run, right_pts, right_run)
+                                    left_pts, left_run, right_pts, right_run,
+                                    r_raw, deg, BODY_LO, body_hi_eff)
 
         # 좌우 클러스터 동시검출이 연속 프레임 유지되면 진입 확정(디바운스)
         if self.lavacon_left_detected and self.lavacon_right_detected:
@@ -525,10 +551,13 @@ class TrackDriverNode(Node):
 
     # [2-4c] [DEBUG_VIZ_LAVACON] 라바콘 트리거 ROI/좌우 클러스터 BEV 시각화
     #   perc_obstacle()의 DEBUG_VIZ_LIDAR 창과 같은 스타일, ROI/축척만 라바콘 트리거에 맞게 확대.
-    #   초록=좌측(y>0) ROI점, 주황=우측(y<0) ROI점, 회색=ROI 밖. 텍스트로 pts(ROI 내 점수)/run(최대 연속묶음,
-    #   CLUSTER_MIN_PTS=2 이상이어야 클러스터로 인정) 표시 — 왜 좌/우 클러스터가 안 잡히는지 진단용.
+    #   초록=좌측(y>0) ROI점, 주황=우측(y<0) ROI점, 회색=ROI 밖. 자홍(magenta)=BODY_LO~BODY_HI
+    #   "차체 자기가림"이라고 보고 지워버리는 구간의 마스킹 전 원본(raw) 점 — 이 구간에 실제
+    #   물체(콘)가 있는데도 마스크가 지우고 있는 건 아닌지 진단용. 텍스트로 pts(ROI 내 점수)/
+    #   run(최대 연속묶음, CLUSTER_MIN_PTS=2 이상이어야 클러스터로 인정) 표시.
     def _draw_lavacon_bev(self, r, x, y, roi, lon_min, lon_max, lat_max,
-                           left_pts, left_run, right_pts, right_run):
+                           left_pts, left_run, right_pts, right_run,
+                           r_raw, deg, body_lo, body_hi_eff):
         PPM = 80           # 1m = 80px (좁은 트리거 ROI라 perc_obstacle보다 확대)
         W, H = 500, 500
         EX, EY = 250, 460  # 자차 위치(하단 중앙)
@@ -541,6 +570,17 @@ class TrackDriverNode(Node):
 
         def to_px(wx, wy): return (int(EX - wy * PPM), int(EY - wx * PPM))
         cv2.rectangle(bev, to_px(lon_min, lat_max), to_px(lon_max, -lat_max), (0, 220, 220), 1)
+
+        # 마스킹 전 원본(raw) 점 중 BODY_LO~BODY_HI(자기가림 구간)에 해당하는 것만 자홍색으로 표시.
+        # ROI 필터 없이 원거리까지 전부 그려서, 이 "자기가림 구간"에 실제로 뭔가 찍히는지 그대로 보여준다.
+        masked_x = r_raw[body_lo:body_hi_eff] * np.cos(deg[body_lo:body_hi_eff])
+        masked_y = r_raw[body_lo:body_hi_eff] * np.sin(deg[body_lo:body_hi_eff])
+        for xi, yi, ri in zip(masked_x, masked_y, r_raw[body_lo:body_hi_eff]):
+            if ri <= 0.0:
+                continue
+            sx, sy = int(EX - yi * PPM), int(EY - xi * PPM)
+            if 0 <= sx < W and 0 <= sy < H:
+                cv2.circle(bev, (sx, sy), 2, (255, 0, 255), -1)
 
         left_mask, right_mask = roi & (y > 0.0), roi & (y < 0.0)
         for i in range(len(r)):
@@ -565,6 +605,10 @@ class TrackDriverNode(Node):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, r_col, 1, cv2.LINE_AA)
         cv2.putText(bev, f'trig={self._lavacon_trigger_cnt}/{LAVACON_TRIGGER_FRAMES}',
                     (8, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
+        masked_pts, masked_min = self._lavacon_mask_dbg
+        masked_min_s = f'{masked_min:.2f}m' if masked_min >= 0 else 'N/A'
+        cv2.putText(bev, f'masked(magenta) pts={masked_pts} min={masked_min_s}',
+                    (8, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1, cv2.LINE_AA)
         cv2.imshow('lavacon_bev', bev)
         cv2.waitKey(1)
 
@@ -1059,6 +1103,10 @@ class TrackDriverNode(Node):
                      (LON_MIN/MAX·LAT_MAX 범위나 콘 배치 확인), pts>0인데 run<2면 점은
                      있지만 서로 인덱스가 안 붙어있어 클러스터로 안 뭉치는 것(노이즈/각도해상도 문제).
                      DEBUG_VIZ_LAVACON=True로 켜면 'lavacon_bev' 창에서 같은 정보를 시각으로 확인 가능.
+                     masked= BODY_LO~BODY_HI(차체 자기가림 구간)를 "무조건 자기가림"으로 보고
+                     지워버리기 전, 원본(raw) 라이다 값 기준 그 구간 안의 점 개수/최소거리.
+                     이 값이 크고 거리도 콘 간격과 비슷하면, 그 마스크가 진짜 콘 반사까지
+                     같이 지우고 있다는 뜻 — BODY_LO/BODY_HI 구간 재보정이 필요할 수 있음.
           [SIG-S0](S0 상태에서만 출력) 신호등 원 검출이 어느 단계에서 막혔는지 진단:
             roi     = ROI 픽셀 좌표(t,b,l,r) — 신호등이 이 영역 안에 실제로 들어오는지 확인용
             circles = HoughCircles가 찾은 원 개수(0=원 자체를 못 찾음, 3이 아니면 배치/블러 의심)
@@ -1081,6 +1129,8 @@ class TrackDriverNode(Node):
             lidar_desc = 'NONE'
 
         lava_lp, lava_lrun, lava_rp, lava_rrun = self._lavacon_dbg
+        masked_pts, masked_min = self._lavacon_mask_dbg
+        masked_min_s = f'{masked_min:.2f}m' if masked_min >= 0 else 'N/A'
 
         sig_s0_line = ''
         if self.mission_state == MissionState.S0_WAIT_GREEN:
@@ -1102,7 +1152,8 @@ class TrackDriverNode(Node):
             f'(L{int(self.lavacon_left_detected)}R{int(self.lavacon_right_detected)}) '
             f'trigV={self._vehicle_trigger_cnt}/{VEHICLE_TRIGGER_FRAMES}\n'
             f'  [LAVA-ROI] L pts={lava_lp} run={lava_lrun}(need>=2) '
-            f'R pts={lava_rp} run={lava_rrun}(need>=2)'
+            f'R pts={lava_rp} run={lava_rrun}(need>=2) '
+            f'masked_raw_pts={masked_pts} masked_min={masked_min_s}'
             f'{sig_s0_line}')
 
 
