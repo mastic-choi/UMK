@@ -106,7 +106,7 @@ class CameraProcessor:
         hsv = cv2.cvtColor(self.bev, cv2.COLOR_BGR2HSV)
 
         # white HSV Mask
-        white_hsv = cv2.inRagne(
+        white_hsv = cv2.inRange(
             hsv, np.array([0,0,170]), np.array([180,60,255])
         )
 
