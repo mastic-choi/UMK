@@ -23,7 +23,7 @@ SIG4_BRIGHT_MARGIN  = 15
 #   param1 : Canny 상위임계값(하위임계값은 내부적으로 param1/2) — 낮을수록 흐린 테두리도 엣지로 인정
 #   param2 : 원 중심 확정에 필요한 누적표 수 — 낮을수록 불완전한 원도 통과
 HOUGH_PARAM1 = 30
-HOUGH_PARAM2 = 15
+HOUGH_PARAM2 = 20
 
 #Debug
 DEBUG_VIZ_SIGNAL = True
