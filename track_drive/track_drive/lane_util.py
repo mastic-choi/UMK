@@ -259,7 +259,13 @@ class CameraProcessor:
         #DEBUG
         if DEBUG_VIZ_LANE:
             cv2.imshow("lane_bev", self.bev)
-            cv2.imshow("lane_hough", hough_mask)   # 형태(직선) 필터만 통과한 마스크 — 반사광 걸러짐 확인용
+
+            # BEV(위에서 내려다본 카메라 화면) + Canny/Hough로 "차선"이라 추정한
+            # 형태 마스크를 한 창에 나란히 붙여서 비교 — 반사광이 걸러지는지 한눈에 확인용
+            hough_vis = cv2.cvtColor(hough_mask, cv2.COLOR_GRAY2BGR)
+            hough_debug = cv2.hconcat([self.bev, hough_vis])
+            cv2.imshow("lane_hough_debug", hough_debug)
+
             cv2.imshow("lane_white", self.white)
             cv2.imshow("lane_yellow", self.yellow)
 
