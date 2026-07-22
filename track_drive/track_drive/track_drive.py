@@ -33,8 +33,6 @@ from enum import Enum
 from rclpy.node import Node
 from sensor_msgs.msg import Image, LaserScan, Imu
 from std_msgs.msg import Float32MultiArray
-from std_srvs.srv import SetBool
-from yolo_msgs.msg import DetectionArray
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy, HistoryPolicy
 from cv_bridge import CvBridge
 from .perc_lavacon import process_lavacon
@@ -96,19 +94,7 @@ LAVACON_DONE_FRAMES = 80   # 우측콘 미검출이 연속 N프레임(20Hz→약
 LAVACON_TRIGGER_FRAMES = 5   # 좌우 클러스터 동시검출이 연속 N프레임 쌓이면 B1_LAVACON 진입 확정(디바운스)
 SAFETY_DIST      = 5.0    # B2(고정장애물) 발동 거리(m) — ★재설계 시 재검토
 OVERTAKE_TRIGGER = 6.5    # B3(방해차량) 발동 거리(m)   — ★재설계 시 재검토
-
-# ── YOLO 카메라 이중확인 (yolo_ros 연동) ──
-# 라이다는 "무언가 있다"만 알고 그것이 콘인지 차량인지 모르므로, 카메라 YOLO의
-# 클래스 판별을 라이다 트리거와 AND 결합해 이중확인한다.
-# yolo_node 인스턴스 2개(yolo_cone/yolo_vehicle)를 launch에서 항상 띄워두고,
-# Phase에 맞는 쪽만 enable 서비스(SetBool)로 켠다(모델 재로드 없이 즉시 전환).
-YOLO_FRESH_SEC         = 0.5   # 이 시간(s) 이내 수신된 detection만 유효(카메라 추론 지연/끊김 대비)
-YOLO_CONE_CLASSES      = ('cone',)          # 라바콘 파인튜닝 모델(cone_best.pt)의 클래스명
-YOLO_VEHICLE_CLASSES   = ('car', 'truck')   # COCO 모델에서 xycar가 잡히는 클래스(실측: truck 위주)
-VEHICLE_TRIGGER_FRAMES = 5     # (라이다+YOLO) 동시검출 연속 N프레임이면 B3_VEHICLE 진입 확정(디바운스)
-YOLO_FALLBACK_FRAMES   = 60    # 라이다 단독검출이 연속 N프레임(20Hz→3초) 지속되면 YOLO 미확인이라도 진입 확정.
-                               #   AND 결합이 만드는 단일 실패점(YOLO 노드 죽음/미검출 → 미션 전체 정지) 방어용 폴백.
-                               #   폴백 발동은 warn 로그로 남으므로 실차 테스트에서 자주 보이면 YOLO 쪽 점검할 것.
+VEHICLE_TRIGGER_FRAMES = 5     # 라이다 단독검출 연속 N프레임이면 B3_VEHICLE 진입 확정(디바운스)
 
 # ── 좌회전 공통 (실차 전환: 후진 없이 무난한 좌회전으로 단순화) ──
 # 시뮬 전용이던 "후진 후 최대조향 좌회전" 방식 폐기 — 실차 튜닝 필요한 임시값
@@ -219,23 +205,13 @@ class TrackDriverNode(Node):
         self._lavacon_empty_cnt = 0   # 우측콘 연속 미검출 프레임 수(Phase 전환 디바운스)
         self.lavacon_left_detected  = False  # 좌측 라이다 클러스터 검출 여부(B1 진입 트리거용)
         self.lavacon_right_detected = False  # 우측 라이다 클러스터 검출 여부(B1 진입 트리거용)
-        self.lavacon_trigger        = False  # (좌우 동시검출 AND YOLO 콘)이 디바운스 프레임수만큼 유지되면 True
+        self.lavacon_trigger        = False  # 좌우 동시검출이 디바운스 프레임수만큼 유지되면 True
         self._lavacon_trigger_cnt   = 0      # 동시검출 연속 프레임 수(디바운스 카운터)
-        self._lavacon_lidar_cnt     = 0      # 라이다 단독검출 연속 프레임 수(YOLO 미확인 폴백 카운터)
         self._lavacon_dbg = (0, 0, 0, 0)     # 디버그용 (좌ROI점수, 좌최대연속묶음, 우ROI점수, 우최대연속묶음)
-        # [2-6 YOLO 객체인식]
-        self.yolo_cone_detected    = False   # YOLO 콘 검출 여부(신선도 통과분만, B1 진입 AND 조건)
-        self.yolo_vehicle_detected = False   # YOLO 차량(car/truck) 검출 여부(B3 진입 AND 조건)
-        self._yolo_cone_msg        = None    # 최신 DetectionArray 버퍼(yolo_cone)
-        self._yolo_cone_t          = 0.0     # 최신 수신 시각(신선도 판정용)
-        self._yolo_vehicle_msg     = None    # 최신 DetectionArray 버퍼(yolo_vehicle)
-        self._yolo_vehicle_t       = 0.0     # 최신 수신 시각(신선도 판정용)
-        # [2-7 방해차량 트리거]
-        self.vehicle_trigger       = False   # (라이다 AND YOLO 차량) 디바운스 통과 → B3 진입 트리거
+        # [2-6 방해차량 트리거]
+        self.vehicle_trigger       = False   # 라이다 디바운스 통과 → B3 진입 트리거
         self._vehicle_trigger_cnt  = 0       # 동시검출 연속 프레임 수(디바운스 카운터)
-        self._vehicle_lidar_cnt    = 0       # 라이다 단독검출 연속 프레임 수(YOLO 미확인 폴백 카운터)
-        # [2-8 장애물 위치 판단]
-        self.obstacle_lane = None            # YOLO bbox 중심 vs 차선 중앙 비교 결과 ('LEFT'/'RIGHT'/None)
+        # [2-7 장애물 위치 판단]
         self.lane_center   = 320.0           # 차선 중앙 x좌표(px) — 첫 카메라 프레임 전까지 화면 중앙 기본값
 
         # ── 외부 차선 인식 모듈 (lane_util.py / perc_floor.py) 초기화 ──
@@ -285,12 +261,6 @@ class TrackDriverNode(Node):
         self.create_subscription(Image,     '/usb_cam/image_raw/behind', self.cb_img_behind, image_qos)
         self.create_subscription(LaserScan, '/scan',                     self.cb_scan,       qos_profile_sensor_data)
         self.create_subscription(Imu,       '/imu',                      self.cb_imu,        qos_profile_sensor_data)
-        # YOLO 검출 결과 (yolo_ros의 yolo_node 2개 — launch에서 namespace로 분리)
-        self.create_subscription(DetectionArray, '/yolo_cone/detections',    self.cb_yolo_cone,    10)
-        self.create_subscription(DetectionArray, '/yolo_vehicle/detections', self.cb_yolo_vehicle, 10)
-        # Phase 전환 시 yolo_node on/off용 서비스 클라이언트 (_switch_yolo에서 비동기 호출)
-        self._cli_yolo_cone_en    = self.create_client(SetBool, '/yolo_cone/enable')
-        self._cli_yolo_vehicle_en = self.create_client(SetBool, '/yolo_vehicle/enable')
         self.create_timer(0.05, self.control_loop)
 
         self.get_logger().info(f'초기화 완료 | 시작={START_STATE.name}')
@@ -313,10 +283,6 @@ class TrackDriverNode(Node):
     def cb_imu(self, msg):
         q = msg.orientation
         self.imu_yaw = math.atan2(2.0*(q.w*q.z + q.x*q.y), 1.0 - 2.0*(q.y*q.y + q.z*q.z))
-    # YOLO 검출은 카메라 추론 속도에 따라 비동기로 들어옴 → 버퍼+수신시각만 저장하고
-    # 유효성(신선도) 판정은 제어루프의 perc_yolo()에서 일괄 수행한다.
-    def cb_yolo_cone(self, msg):    self._yolo_cone_msg,    self._yolo_cone_t    = msg, time.time()
-    def cb_yolo_vehicle(self, msg): self._yolo_vehicle_msg, self._yolo_vehicle_t = msg, time.time()
 
     def drive(self, angle, speed):
         # ROS1 xycar_motor.py 노드가 XycarMotor 대신 Float32MultiArray(data=[angle, speed])를
@@ -335,11 +301,9 @@ class TrackDriverNode(Node):
         self.perc_lane()        # 비전
         self.perc_signal()      # 비전
         self.perc_obstacle()    # 라이다
-        self.perc_yolo()        # 비전 (YOLO 클래스 판별 — 아래 트리거들의 AND 조건 재료)
         self.perc_lavacon()     # 라이다
-        self.perc_lavacon_trigger()  # 라이다+YOLO (좌우 클러스터 AND 콘 검출 → B1_LAVACON 진입 트리거)
-        self.perc_vehicle_trigger()  # 라이다+YOLO (전방 장애물 AND 차량 검출 → B3_VEHICLE 진입 트리거)
-        self.perc_obstacle_lane()    # 비전 (YOLO bbox 중심 vs 차선 중앙 → 장애물 좌/우 판단, B2/B3 회피방향 재료)
+        self.perc_lavacon_trigger()  # 라이다 (좌우 클러스터 동시검출 → B1_LAVACON 진입 트리거)
+        self.perc_vehicle_trigger()  # 라이다 (전방 장애물 근접 → B3_VEHICLE 진입 트리거)
         self.perc_stopline()    # 비전
 
     # [2-1] 차선
@@ -492,17 +456,13 @@ class TrackDriverNode(Node):
         self.lavacon_offset, self.lavacon_done = process_lavacon(self.lidar_ranges)
 
     # [2-4b] 라바콘 좌우 클러스터 검출 → B1_LAVACON 진입 트리거
-    #   입력 self.lidar_ranges, self.yolo_cone_detected([2-6] 카메라)
+    #   입력 self.lidar_ranges
     #   출력 lavacon_left_detected/right_detected, lavacon_trigger
     #   설계 의도: 라이다 포인트가 "존재"하는 것만으로는 벽·바닥 잡음과 구분이 안 되므로,
     #     인접 인덱스(=인접 각도)로 붙어있는 포인트 묶음(클러스터)이 좌/우 각각 최소 1개씩
     #     동시에 있어야 "라바콘 구간 진입"으로 인정한다. perc_obstacle()과 동일한 차체 마스킹/
     #     극좌표 변환 방식을 사용하되, ROI와 목적은 별개(장애물 회피용이 아니라 콘 게이트 진입 판단용)이므로
-    #     여기서 독립적으로 계산한다.
-    #     + 카메라 이중확인: 좌우 클러스터가 있어도 그것이 콘이라는 보장은 없으므로(벽 모서리·
-    #     사람 다리 등), YOLO 콘 검출(yolo_cone_detected)까지 AND로 만족해야 카운트를 올린다.
-    #     + 폴백: 카메라/YOLO 실패가 미션 전체를 멈추는 단일 실패점이 되지 않도록,
-    #     라이다 단독검출이 YOLO_FALLBACK_FRAMES 연속 지속되면 YOLO 미확인이라도 진입한다.
+    #     여기서 독립적으로 계산한다. 좌우 동시검출이 LAVACON_TRIGGER_FRAMES 연속 유지되면 진입 확정(디바운스).
     def perc_lavacon_trigger(self):
         # ── 튜닝 파라미터 (실측 라바콘 간격 기준 추정치, 실차 튜닝 필요) ──
         LON_MIN, LON_MAX = 0.3, 3.0   # 트리거 ROI 전방 종방향(m) — 너무 가깝거나(차체 반사) 먼 점 배제
@@ -556,17 +516,12 @@ class TrackDriverNode(Node):
             self._draw_lavacon_bev(r, x, y, roi, LON_MIN, LON_MAX, LAT_MAX,
                                     left_pts, left_run, right_pts, right_run)
 
-        # 본선: (라이다 좌우 클러스터 AND YOLO 콘) 디바운스 / 폴백: 라이다 단독 장기지속(YOLO 실패 방어)
+        # 좌우 클러스터 동시검출이 연속 프레임 유지되면 진입 확정(디바운스)
         if self.lavacon_left_detected and self.lavacon_right_detected:
-            self._lavacon_lidar_cnt += 1
-            self._lavacon_trigger_cnt = self._lavacon_trigger_cnt + 1 if self.yolo_cone_detected else 0
+            self._lavacon_trigger_cnt += 1
         else:
-            self._lavacon_lidar_cnt   = 0
             self._lavacon_trigger_cnt = 0
-        if self._lavacon_lidar_cnt == YOLO_FALLBACK_FRAMES and self._lavacon_trigger_cnt < LAVACON_TRIGGER_FRAMES:
-            self.get_logger().warn('[LAVACON] YOLO 콘 미확인 — 라이다 단독 폴백으로 진입 (yolo_cone 노드 점검 요망)')
-        self.lavacon_trigger = (self._lavacon_trigger_cnt >= LAVACON_TRIGGER_FRAMES
-                                or self._lavacon_lidar_cnt >= YOLO_FALLBACK_FRAMES)
+        self.lavacon_trigger = self._lavacon_trigger_cnt >= LAVACON_TRIGGER_FRAMES
 
     # [2-4c] [DEBUG_VIZ_LAVACON] 라바콘 트리거 ROI/좌우 클러스터 BEV 시각화
     #   perc_obstacle()의 DEBUG_VIZ_LIDAR 창과 같은 스타일, ROI/축척만 라바콘 트리거에 맞게 확대.
@@ -608,89 +563,23 @@ class TrackDriverNode(Node):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, l_col, 1, cv2.LINE_AA)
         cv2.putText(bev, f'R pts={right_pts} run={right_run} (need run>=2)', (8, 44),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, r_col, 1, cv2.LINE_AA)
-        cv2.putText(bev, f'trig={self._lavacon_trigger_cnt}/{LAVACON_TRIGGER_FRAMES} '
-                         f'fb={self._lavacon_lidar_cnt}/{YOLO_FALLBACK_FRAMES} '
-                         f'yolo_cone={int(self.yolo_cone_detected)}',
+        cv2.putText(bev, f'trig={self._lavacon_trigger_cnt}/{LAVACON_TRIGGER_FRAMES}',
                     (8, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
         cv2.imshow('lavacon_bev', bev)
         cv2.waitKey(1)
 
-    # [2-6] YOLO 객체인식 (카메라)
-    #   입력 self._yolo_cone_msg / _yolo_vehicle_msg (yolo_ros DetectionArray 버퍼)
-    #   출력 yolo_cone_detected / yolo_vehicle_detected
-    #   설계 의도: 라이다 클러스터/점개수 판단은 "무언가 있다"까지만 알 수 있고
-    #     그것이 콘인지 차량인지 벽인지 구분하지 못한다. 카메라 YOLO의 클래스 판별을
-    #     각 트리거([2-4b], [2-7])에 AND 조건으로 결합해 이중확인한다.
-    #     카메라 추론은 제어루프(20Hz)보다 느릴 수 있으므로 YOLO_FRESH_SEC 이내
-    #     수신분만 유효 처리(멈춘 노드의 낡은 검출로 인한 유령 트리거 방지).
-    #     신뢰도(score) 필터는 yolo_node의 threshold 파라미터에서 이미 수행되므로 여기선 생략.
-    def perc_yolo(self):
-        now = time.time()
-
-        def _has_class(msg, t, classes):
-            if msg is None or (now - t) > YOLO_FRESH_SEC:
-                return False
-            return any(d.class_name in classes for d in msg.detections)
-
-        self.yolo_cone_detected    = _has_class(self._yolo_cone_msg,    self._yolo_cone_t,    YOLO_CONE_CLASSES)
-        self.yolo_vehicle_detected = _has_class(self._yolo_vehicle_msg, self._yolo_vehicle_t, YOLO_VEHICLE_CLASSES)
-
-    # [2-7] 방해차량 진입 트리거 (라이다 + YOLO 이중확인)
-    #   입력 obstacle_front/dist (라이다), yolo_vehicle_detected (카메라)
+    # [2-6] 방해차량 진입 트리거 (라이다)
+    #   입력 obstacle_front/dist (라이다)
     #   출력 vehicle_trigger
-    #   설계 의도: 기존 B3 진입은 라이다 거리 단독·즉시 판정이라 순간 오검출에 취약했다.
-    #     [2-4b] 라바콘 트리거와 동일한 패턴으로 (라이다 AND YOLO) 동시검출이
-    #     연속 N프레임 유지될 때만 진입을 확정한다(디바운스).
-    #     폴백도 [2-4b]와 동일: 라이다 단독검출이 YOLO_FALLBACK_FRAMES 지속되면
-    #     YOLO 미확인이라도 진입(카메라 실패로 미션이 멈추는 것 방지).
+    #   설계 의도: 라이다 거리 단독·즉시 판정은 순간 오검출에 취약하므로,
+    #     근접 상태가 VEHICLE_TRIGGER_FRAMES 연속 유지될 때만 진입을 확정한다(디바운스).
     def perc_vehicle_trigger(self):
         lidar_hit = self.obstacle_front and self.obstacle_dist < OVERTAKE_TRIGGER
         if lidar_hit:
-            self._vehicle_lidar_cnt += 1
-            self._vehicle_trigger_cnt = self._vehicle_trigger_cnt + 1 if self.yolo_vehicle_detected else 0
+            self._vehicle_trigger_cnt += 1
         else:
-            self._vehicle_lidar_cnt   = 0
             self._vehicle_trigger_cnt = 0
-        if self._vehicle_lidar_cnt == YOLO_FALLBACK_FRAMES and self._vehicle_trigger_cnt < VEHICLE_TRIGGER_FRAMES:
-            self.get_logger().warn('[VEHICLE] YOLO 차량 미확인 — 라이다 단독 폴백으로 진입 (yolo_vehicle 노드 점검 요망)')
-        self.vehicle_trigger = (self._vehicle_trigger_cnt >= VEHICLE_TRIGGER_FRAMES
-                                or self._vehicle_lidar_cnt >= YOLO_FALLBACK_FRAMES)
-        
-    # [2-8] 장애물 위치 판단
-
-    def perc_obstacle_lane(self):
-        self.obstacle_lane = None
-        if self._yolo_vehicle_msg is None:
-            return
-        # 오래된 메세지 무시
-        if time.time() - self._yolo_vehicle_t > YOLO_FRESH_SEC:
-            return
-        # 가장 큰 차량 하나 선택
-        best = None
-        best_area = 0
-
-        for det in self._yolo_vehicle_msg.detections:
-            if det.class_name not in YOLO_VEHICLE_CLASSES:
-                continue
-            area = det.bbox.size.x * det.bbox.size.y   # yolo_msgs/BoundingBox2D: size는 Vector2(x,y) 필드
-
-            if area > best_area:
-                best = det
-                best_area = area
-
-        if best is None:
-            return
-        
-        # Bounding Box 중심
-        cx = best.bbox.center.position.x
-
-        #화면 기준 좌/우 판단
-        if cx < self.lane_center:
-            self.obstacle_lane = "LEFT"
-        else:
-            self.obstacle_lane = "RIGHT"
-
-        
+        self.vehicle_trigger = self._vehicle_trigger_cnt >= VEHICLE_TRIGGER_FRAMES
 
     # [2-5] 정지선(굵은 가로 흰선)
     #   입력 self.img_front → 출력 self.stopline
@@ -867,24 +756,24 @@ class TrackDriverNode(Node):
         self.ctrl_angle, self.ctrl_speed = 0.0, SPEED_STOP
 
     # 목표 차선 결정
-    # obstacle_lane을 이용하여 회피할 목표 차선을 결정
+    # obstacle_side(라이다 기준 장애물 좌/우 위치)를 이용하여 회피할 목표 차선을 결정
     def decide_target_lane(self):
 
-        if self.obstacle_lane == "LEFT":
+        if self.obstacle_side == 'left':
 
             self.target_lane = "RIGHT"
 
             #현재 차선 기준으로 오른쪽으로 100px 이동
             self.target_offset = self.lane_center + AVOID_OFFSET
-        
-        elif self.obstacle_lane == "RIGHT":
+
+        elif self.obstacle_side == 'right':
             self.target_lane = "LEFT"
             #현재 차선 기준으로 왼쪽으로 100px 이동
             self.target_offset = self.lane_center - AVOID_OFFSET
-        
+
         else:
             self.target_lane = None
-            self.target_offset = self.lane_offset 
+            self.target_offset = self.lane_offset
 
     # ── 좌회전 공통 (실차 전환: 후진 없이 무난한 좌회전) ──
     def _begin_left_turn(self):
@@ -948,32 +837,13 @@ class TrackDriverNode(Node):
             if TEST_DISABLE_B2_B3:
                 self.behavior_state = BehaviorState.B0_NORMAL   # 테스트 범위 제한: B3 트리거 무시
                 return
-            # 진입 판정은 perc_vehicle_trigger()의 (라이다 AND YOLO) 디바운스 결과를 사용.
+            # 진입 판정은 perc_vehicle_trigger()의 라이다 디바운스 결과를 사용.
             # 한번 진입한 뒤(_overtake_phase_int != 0)에는 기존과 동일하게 라이다 단독으로 유지/종료 판단.
             self.behavior_state = (BehaviorState.B3_VEHICLE
                                     if (self.vehicle_trigger or self._overtake_phase_int != 0)
                                     else BehaviorState.B0_NORMAL)
         else:  # Phase.DONE
             self.behavior_state = BehaviorState.B0_NORMAL
-
-    # ── YOLO 노드 on/off 전환 (Phase 전환 시 호출) ──
-    def _switch_yolo(self, cone, vehicle):
-        """
-        yolo_cone/yolo_vehicle 노드의 enable 서비스(SetBool)를 비동기로 호출한다.
-          - 제어루프(20Hz)를 막지 않도록 응답을 기다리지 않음(call_async, fire-and-forget)
-          - 서비스 서버가 아직 없으면(노드 미실행) 경고만 남기고 넘어감 — 재시도 없으므로
-            launch에서 두 yolo_node를 반드시 함께 띄울 것
-        """
-        for cli, on, tag in ((self._cli_yolo_cone_en,    cone,    'yolo_cone'),
-                             (self._cli_yolo_vehicle_en, vehicle, 'yolo_vehicle')):
-            if not cli.service_is_ready():
-                self.get_logger().warn(f'[YOLO] {tag}/enable 서비스 미발견 — 전환 실패(노드 실행 여부 확인)')
-                continue
-            req = SetBool.Request()
-            req.data = bool(on)
-            cli.call_async(req)
-            self.get_logger().info(f'[YOLO] {tag} enable={on}')
-
 
     # #########################################################
     # [4] 제어 (Control)
@@ -1035,9 +905,6 @@ class TrackDriverNode(Node):
                 self._pid_integral   = 0.0
                 self._lavacon_engaged = False   # B1 진입 latch 해제 (구간 재진입 대비)
                 self.phase = Phase.FIXED_OBSTACLE
-                # 라바콘 구간 끝 → 콘 모델은 더 이상 불필요, 차량 모델을 미리 켜서
-                # 다음 Phase.VEHICLE 진입 판정([2-7])에 대비한다(고정장애물 구간은 라이다 단독 판단).
-                self._switch_yolo(cone=False, vehicle=True)
                 self.get_logger().info('[LAVACON] 구간 통과 완료 → 고정장애물 구간')
         else:
             self._lavacon_empty_cnt = 0
@@ -1184,16 +1051,14 @@ class TrackDriverNode(Node):
                  lidar = 유효포인트수(min거리m, 나이s)
           [LANE] 차선편차px(검출여부) / obs = 라이다 전방장애물(거리m,좌우,타입)
           lava   = 라바콘 보로노이 편차(구간종료 판정)
-          yolo   = YOLO 검출 플래그 cone/veh (0인데 dbg_image엔 잡히면 신선도(YOLO_FRESH_SEC) 탈락 의심)
-          trigL  = 라바콘 진입: 본선카운트/기준 (좌클러스터,우클러스터,폴백카운트/기준)
-          trigV  = 차량 진입:   본선카운트/기준 (폴백카운트/기준)
+          trigL  = 라바콘 진입: 본선카운트/기준 (좌클러스터,우클러스터 검출여부)
+          trigV  = 차량 진입:   본선카운트/기준
           [LAVA-ROI] 라바콘 트리거 ROI(전방0.3~3.0m,좌우2.0m) 안에 잡힌 점 개수(pts)와
                      그중 최대 연속(붙어있는 인덱스) 묶음 길이(run). run>=2여야 클러스터로
                      인정되어 L/R detected=True가 됨. pts=0이면 ROI 안에 아예 점이 없는 것
                      (LON_MIN/MAX·LAT_MAX 범위나 콘 배치 확인), pts>0인데 run<2면 점은
                      있지만 서로 인덱스가 안 붙어있어 클러스터로 안 뭉치는 것(노이즈/각도해상도 문제).
                      DEBUG_VIZ_LAVACON=True로 켜면 'lavacon_bev' 창에서 같은 정보를 시각으로 확인 가능.
-          obsLane= YOLO bbox 기준 장애물 좌/우 판단 (B2/B3 회피방향 재료)
           [SIG-S0](S0 상태에서만 출력) 신호등 원 검출이 어느 단계에서 막혔는지 진단:
             roi     = ROI 픽셀 좌표(t,b,l,r) — 신호등이 이 영역 안에 실제로 들어오는지 확인용
             circles = HoughCircles가 찾은 원 개수(0=원 자체를 못 찾음, 3이 아니면 배치/블러 의심)
@@ -1233,12 +1098,9 @@ class TrackDriverNode(Node):
             f'  [LANE] lane={self.lane_offset:+.1f}({int(self.lane_valid)}) '
             f'obs={self.obstacle_front}({self.obstacle_dist:.1f}m,{self.obstacle_side},{self.obstacle_type}) '
             f'lava={self.lavacon_offset:+.2f}(done={int(self.lavacon_done)})\n'
-            f'  [YOLO] cone:{int(self.yolo_cone_detected)}/veh:{int(self.yolo_vehicle_detected)} '
-            f'trigL={self._lavacon_trigger_cnt}/{LAVACON_TRIGGER_FRAMES}'
-            f'(L{int(self.lavacon_left_detected)}R{int(self.lavacon_right_detected)},'
-            f'fb{self._lavacon_lidar_cnt}/{YOLO_FALLBACK_FRAMES}) '
-            f'trigV={self._vehicle_trigger_cnt}/{VEHICLE_TRIGGER_FRAMES}'
-            f'(fb{self._vehicle_lidar_cnt}/{YOLO_FALLBACK_FRAMES}) obsLane={self.obstacle_lane}\n'
+            f'  [TRIG] trigL={self._lavacon_trigger_cnt}/{LAVACON_TRIGGER_FRAMES}'
+            f'(L{int(self.lavacon_left_detected)}R{int(self.lavacon_right_detected)}) '
+            f'trigV={self._vehicle_trigger_cnt}/{VEHICLE_TRIGGER_FRAMES}\n'
             f'  [LAVA-ROI] L pts={lava_lp} run={lava_lrun}(need>=2) '
             f'R pts={lava_rp} run={lava_rrun}(need>=2)'
             f'{sig_s0_line}')

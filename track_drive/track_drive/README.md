@@ -16,7 +16,7 @@ ros2 launch track_drive track_drive.launch.py
   카메라가 아예 안 잡히는 원인이 됩니다. 증상 발생 시:
   ```bash
   sudo fuser -k /dev/video0                      # 카메라만 문제일 때 가장 빠른 해결
-  ps -eo pid,stat,cmd | awk '$2 ~ /^T/ && /usb_cam|ros2 launch|yolo_node|debug_node|xycar_lidar|imu_node|track_drive/ {print $1}' | xargs -r kill -9   # 좀비 전체 정리
+  ps -eo pid,stat,cmd | awk '$2 ~ /^T/ && /usb_cam|ros2 launch|xycar_lidar|imu_node|track_drive/ {print $1}' | xargs -r kill -9   # 좀비 전체 정리
   ```
 - `SPEED_NORMAL`([track_drive.py:71](track_drive.py#L71))을 `0.0`으로 두지 마세요. `_lane_drive()`에서 나눗셈
   분모로도 쓰여서 `ZeroDivisionError`로 노드가 죽습니다. 저속 테스트는 `5.0`~`10.0` 같은 작은 양수를 쓰세요.
@@ -32,8 +32,10 @@ ros2 launch track_drive track_drive.launch.py
 |---|---|
 | 신호등 | `traffic_signal.py:23` `DEBUG_VIZ_SIGNAL` |
 | 차선 | `lane_util.py:38` `DEBUG_VIZ_LANE` |
-| 라이다 BEV | `track_drive.py:149` `DEBUG_VIZ_LIDAR` (이건 정상 연결됨) |
-| YOLO bbox | launch 인자 `use_debug:=true` → `rqt_image_view`에서 `/yolo_cone/dbg_image`, `/yolo_vehicle/dbg_image` |
+| 라이다 BEV(장애물) | `track_drive.py:149` `DEBUG_VIZ_LIDAR` (이건 정상 연결됨) |
+| 라이다 BEV(라바콘 트리거) | `track_drive.py:150` `DEBUG_VIZ_LAVACON` |
+
+> 이 프로젝트는 YOLO(yolo_ros)를 사용하지 않습니다 — 모든 인지는 카메라(차선/신호등)와 라이다(장애물/라바콘)만으로 수행합니다.
 
 ---
 
@@ -106,14 +108,15 @@ TEST_FORCE_BEHAVIOR = True    # S2를 거치지 않고 시작부터 Behavior(라
 `TEST_DISABLE_B2_B3 = True`(기본값)면 라바콘 구간이 끝나도 B2/B3로 안 넘어가고 그냥 일반 차선주행으로
 돌아오니, 라바콘만 격리 테스트하기 좋습니다.
 
-**전제조건:** `yolo_cone_node`가 켜져 있어야 함(launch 기본값 `enable: True`라 자동으로 켜져 있음). 라바콘
-회피는 **라이다 좌우 클러스터 동시검출 AND YOLO 콘 검출**이 `LAVACON_TRIGGER_FRAMES(5프레임)` 연속 유지돼야
-진입합니다(카메라/YOLO가 실패해도 라이다 단독이 `YOLO_FALLBACK_FRAMES(60프레임≈3초)` 지속되면 폴백 진입).
+라바콘 진입은 **라이다 좌우 클러스터 동시검출**이 `LAVACON_TRIGGER_FRAMES(5프레임)` 연속 유지돼야
+확정됩니다(`perc_lavacon_trigger()`, 라이다 단독 판단 — 카메라/YOLO 이중확인 없음).
 
 **디버그 방법:**
-- CLI 로그: `trigL=본선카운트/기준(L{좌클러스터}R{우클러스터},fb폴백카운트/기준)` — 라이다가 좌/우 중
-  어느 쪽을 못 잡는지, YOLO 콘이 안 잡혀서 폴백으로 가는지 바로 구분됨.
-- YOLO 확인: `rqt_image_view`로 `/yolo_cone/dbg_image` 열어서 실제 콘에 bbox가 그려지는지 확인.
+- CLI 로그: `trigL=본선카운트/기준(L{좌클러스터}R{우클러스터})` — 좌/우 중 어느 쪽을 못 잡는지 바로 구분됨.
+  추가로 `[LAVA-ROI] L pts=... run=... R pts=... run=...` 줄에서 ROI 안에 잡힌 점 개수(pts)와 그중 최대
+  연속 묶음 길이(run, 2 이상이어야 클러스터로 인정)까지 확인 가능.
+- 창: `track_drive.py:150` `DEBUG_VIZ_LAVACON = True` → `lavacon_bev` 창(트리거 ROI와 좌/우 클러스터를
+  시각으로 확인).
 
 **알려진 한계:**
 - `LAVACON_DONE_FRAMES=80`(우측 콘 연속 미검출 시 구간 종료 판정)이 실차 미검증 값.
@@ -130,20 +133,17 @@ TEST_FORCE_BEHAVIOR = True
 self.phase = Phase.FIXED_OBSTACLE   # __init__ 안의 self.phase 초기값을 임시로 변경 (격리 테스트용)
 ```
 정상 흐름은 라바콘(B1) 완료 후 자동으로 `Phase.FIXED_OBSTACLE`로 넘어가는 것이라, 이 기능만 격리
-테스트하려면 `__init__`의 `self.phase = Phase.LAVACON`을 위처럼 임시로 바꿔야 합니다. 이 경우
-`_switch_yolo(cone=False, vehicle=True)`가 자동으로 호출되지 않으므로, launch 인자로 `yolo_vehicle`을
-직접 켜거나 서비스 콜로 `/yolo_vehicle/enable`을 `true`로 켜줘야 `obstacle_lane` 판단이 그나마 동작합니다
-(다만 아래 한계 참고).
+테스트하려면 `__init__`의 `self.phase = Phase.LAVACON`을 위처럼 임시로 바꾸면 됩니다(YOLO 노드 전환 같은
+추가 조치는 필요 없음).
 
 **디버그 방법:**
-- CLI 로그: `obs=검출여부(거리m,좌/우/중앙,fixed/vehicle) obsLane=YOLO기준 좌우판단`.
+- CLI 로그: `obs=검출여부(거리m,좌/우/중앙,fixed/vehicle)`.
 
-**알려진 한계(중요 — 설계 결함급):**
-- `decide_target_lane()`의 좌우 회피 방향은 `perc_obstacle_lane()`이 채우는 `obstacle_lane`을 쓰는데,
-  이 함수는 `YOLO_VEHICLE_CLASSES=('car','truck')`만 필터링합니다([track_drive.py:614](track_drive.py#L614)).
-  고정장애물(콘/박스류)은 car/truck이 아니라서 YOLO가 절대 못 잡고, 결과적으로 B2에서 `obstacle_lane`은
-  거의 항상 `None`이라 실제 좌우 회피 오프셋이 안 걸립니다. 회피 방향 재료를 라이다 쪽(`obstacle_side`,
-  `_ema_y`)으로 바꾸거나, 고정장애물 전용 YOLO 클래스를 추가하기 전까지는 이 기능이 의도대로 동작 안 함.
+**알려진 한계:**
+- `decide_target_lane()`의 좌우 회피 방향은 라이다 기반 `obstacle_side`(`perc_obstacle()`이 전방 ROI
+  포인트의 횡위치 EMA로 산출)를 씁니다. 카메라/YOLO 이중확인이 없어 콘·차량 구분 없이 "뭔가 있으면" 방향만
+  판단하는 대신, 고정장애물(콘/박스류)도 동일하게 회피 방향이 잡힙니다. `_ema_y` 데드존(`SIDE_DEADZONE`)
+  안에 있으면 `'center'`로 판정되어 회피 방향이 정해지지 않으니, 실차 테스트 시 이 경계값 튜닝이 필요합니다.
 - 실제 회피 궤적 자체도 "감지되면 감속하고 버티다가 사라지면 복귀"하는 placeholder입니다
   ([track_drive.py:990](track_drive.py#L990) 주석 참고). 실제 회피 기동 아님.
 
@@ -158,45 +158,17 @@ TEST_DISABLE_B2_B3 = False
 TEST_FORCE_BEHAVIOR = True
 self.phase = Phase.VEHICLE     # 격리 테스트용 임시 변경
 ```
-B2와 마찬가지로 `_switch_yolo(vehicle=True)`가 자동 호출 안 되니 `yolo_vehicle` 노드를 직접 켜야 합니다.
-진입 조건은 **라이다(전방 장애물 + 거리 < `OVERTAKE_TRIGGER=6.5m`) AND YOLO 차량 검출**이
-`VEHICLE_TRIGGER_FRAMES(5프레임)` 연속 유지(라이다 단독 지속 시 `YOLO_FALLBACK_FRAMES` 폴백은 B1과 동일 패턴).
+B2와 마찬가지로 별도 노드 전환 없이 `self.phase = Phase.VEHICLE`만 바꾸면 격리 테스트할 수 있습니다.
+진입 조건은 **라이다 단독** — 전방 장애물 + 거리 < `OVERTAKE_TRIGGER=6.5m`가 `VEHICLE_TRIGGER_FRAMES(5프레임)`
+연속 유지되면 확정됩니다(`perc_vehicle_trigger()`).
 
 **디버그 방법:**
-- CLI 로그: `trigV=본선카운트/기준(fb폴백카운트/기준)`.
+- CLI 로그: `trigV=본선카운트/기준`.
 
 **알려진 한계:**
 - B2와 동일하게 실제 추월 궤적은 "감속하고 버티다가 차량 사라지면 종료"하는 placeholder입니다
   ([track_drive.py:1060](track_drive.py#L1060) 주석 참고). `decide_target_lane()`을 매 프레임 재호출하는데
   B2는 진입 시 한 번만 호출 — 두 Behavior 간 동작 방식이 비대칭이라는 점도 참고.
-
----
-
-## 6. YOLO (카메라 이중확인 신호 품질)
-
-라이다는 "뭔가 있다"만 알 뿐 그게 콘인지 차량인지 모르기 때문에, YOLO 클래스 판별을 라이다 트리거와
-AND로 결합해서 이중확인합니다(`perc_yolo()`). **"차량회피 하라고 신호를 잘 주는가"를 확인하려면:**
-
-**수정할 곳:** launch 인자
-```bash
-ros2 launch track_drive track_drive.launch.py \
-  cone_model:=$HOME/xycar_ws/src/yolo_ros/cone_best.pt \
-  vehicle_model:=$HOME/xycar_ws/src/yolo_ros/yolov8m.pt \
-  use_debug:=true \
-  vehicle_threshold:=0.3   # 검출 민감도 조정 (기본값, 실측 truck 0.40~0.71 기준으로 낮게 잡혀 있음)
-```
-
-**디버그 방법:**
-- 시각 확인: `rqt_image_view` → `/yolo_cone/dbg_image`, `/yolo_vehicle/dbg_image` (bbox가 실제 물체에
-  제대로 그려지는지). 켜진 노드만 detections를 발행하므로, 안 켜진 쪽 dbg_image는 안 움직이는 게 정상.
-- 신선도/주기 확인: `ros2 topic hz /yolo_cone/detections` — `YOLO_FRESH_SEC=0.5` 안에 안 들어오면
-  트리거 로직에서 무조건 미검출로 취급됨([track_drive.py:105](track_drive.py#L105)).
-- CLI 로그: `[YOLO] cone:0/1 veh:0/1` — 0인데 dbg_image엔 잡히면 신선도 탈락(`YOLO_FRESH_SEC`) 의심.
-- 클래스 내용 확인: `ros2 topic echo /yolo_cone/detections --once` (클래스명/score/bbox 직접 확인).
-
-**알려진 한계:**
-- `yolo_cone`/`yolo_vehicle` 두 노드 중 Phase에 맞는 쪽만 서비스로 켜고 끄는 구조라(`_switch_yolo()`),
-  Phase를 코드로 강제 변경해서 격리 테스트할 땐 이 서비스 호출이 자동으로 안 일어나므로 수동으로 켜야 함
-  (위 4/5번 항목 참고).
-- `vehicle_threshold=0.3`은 실측 truck 검출 스코어(0.40~0.71) 대비 낮게 잡아둔 값이라 오탐 가능성 있음
-  — 오탐이 잦으면 값을 올려서 재튜닝.
+- 카메라/YOLO 이중확인이 없어 콘·차량 구분 없이 라이다 근접만으로 트리거되므로, 콘이 남아있는 상태에서도
+  거리 조건만 맞으면 B3로 오인 진입할 수 있음(Phase 순서가 지켜지는 정상 흐름에서는 라바콘 구간을 먼저
+  통과한 뒤라 위험이 적지만, 격리 테스트 시에는 주의).
