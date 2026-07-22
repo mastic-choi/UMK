@@ -147,6 +147,7 @@ DEBUG_PERIOD    = 0.5
 DEBUG_VIZ       = True  # 신호등/4구 디버그 창
 DEBUG_VIZ_LANE  = True  # 차선 슬라이딩윈도우 디버그 창
 DEBUG_VIZ_LIDAR = False  # 라이다 BEV 장애물 감지 디버그 창
+DEBUG_VIZ_LAVACON = False  # 라바콘 트리거 좌우 클러스터 BEV 디버그 창
 
 # ── 실차 테스트 범위 제한 ──
 #   지금 단계에서 실차로 검증 가능한 건 딱 세 가지: ①신호등 인식 후 출발(S0) ②차선주행(S1)
@@ -221,6 +222,7 @@ class TrackDriverNode(Node):
         self.lavacon_trigger        = False  # (좌우 동시검출 AND YOLO 콘)이 디바운스 프레임수만큼 유지되면 True
         self._lavacon_trigger_cnt   = 0      # 동시검출 연속 프레임 수(디바운스 카운터)
         self._lavacon_lidar_cnt     = 0      # 라이다 단독검출 연속 프레임 수(YOLO 미확인 폴백 카운터)
+        self._lavacon_dbg = (0, 0, 0, 0)     # 디버그용 (좌ROI점수, 좌최대연속묶음, 우ROI점수, 우최대연속묶음)
         # [2-6 YOLO 객체인식]
         self.yolo_cone_detected    = False   # YOLO 콘 검출 여부(신선도 통과분만, B1 진입 AND 조건)
         self.yolo_vehicle_detected = False   # YOLO 차량(car/truck) 검출 여부(B3 진입 AND 조건)
@@ -514,6 +516,7 @@ class TrackDriverNode(Node):
             self.lavacon_right_detected = False
             self._lavacon_trigger_cnt   = 0
             self.lavacon_trigger        = False
+            self._lavacon_dbg = (0, 0, 0, 0)
             return
 
         ranges = np.array(self.lidar_ranges, dtype=np.float32)
@@ -532,17 +535,26 @@ class TrackDriverNode(Node):
 
         def _has_cluster(side_mask):
             idx = np.where(roi & side_mask)[0]
-            if len(idx) < CLUSTER_MIN_PTS:
-                return False
+            pts = len(idx)
+            if pts < CLUSTER_MIN_PTS:
+                return False, pts, 0
             # 인덱스(=각도) 순 배열이므로, 인덱스가 서로 붙어있으면 공간적으로도 인접한 점으로 보고 묶는다.
             splits = np.where(np.diff(idx) > 1)[0] + 1
+            found, best_run = False, 0
             for g in np.split(idx, splits):
+                best_run = max(best_run, len(g))
                 if len(g) >= CLUSTER_MIN_PTS and (np.max(r[g]) - np.min(r[g])) <= CLUSTER_MAX_GAP:
-                    return True   # 콘 하나 크기로 뭉친 클러스터 발견
-            return False
+                    found = True   # 콘 하나 크기로 뭉친 클러스터 발견
+            return found, pts, best_run
 
-        self.lavacon_left_detected  = _has_cluster(y > 0.0)   # 좌측(y>0)
-        self.lavacon_right_detected = _has_cluster(y < 0.0)   # 우측(y<0)
+        self.lavacon_left_detected,  left_pts,  left_run  = _has_cluster(y > 0.0)   # 좌측(y>0)
+        self.lavacon_right_detected, right_pts, right_run = _has_cluster(y < 0.0)   # 우측(y<0)
+        # 디버그용: ROI 안에 몇 점이 잡혔는지 / 그중 최대 연속 묶음 길이(클러스터 기준 CLUSTER_MIN_PTS=2 통과 여부 진단)
+        self._lavacon_dbg = (left_pts, left_run, right_pts, right_run)
+
+        if DEBUG_VIZ_LAVACON:
+            self._draw_lavacon_bev(r, x, y, roi, LON_MIN, LON_MAX, LAT_MAX,
+                                    left_pts, left_run, right_pts, right_run)
 
         # 본선: (라이다 좌우 클러스터 AND YOLO 콘) 디바운스 / 폴백: 라이다 단독 장기지속(YOLO 실패 방어)
         if self.lavacon_left_detected and self.lavacon_right_detected:
@@ -555,6 +567,53 @@ class TrackDriverNode(Node):
             self.get_logger().warn('[LAVACON] YOLO 콘 미확인 — 라이다 단독 폴백으로 진입 (yolo_cone 노드 점검 요망)')
         self.lavacon_trigger = (self._lavacon_trigger_cnt >= LAVACON_TRIGGER_FRAMES
                                 or self._lavacon_lidar_cnt >= YOLO_FALLBACK_FRAMES)
+
+    # [2-4c] [DEBUG_VIZ_LAVACON] 라바콘 트리거 ROI/좌우 클러스터 BEV 시각화
+    #   perc_obstacle()의 DEBUG_VIZ_LIDAR 창과 같은 스타일, ROI/축척만 라바콘 트리거에 맞게 확대.
+    #   초록=좌측(y>0) ROI점, 주황=우측(y<0) ROI점, 회색=ROI 밖. 텍스트로 pts(ROI 내 점수)/run(최대 연속묶음,
+    #   CLUSTER_MIN_PTS=2 이상이어야 클러스터로 인정) 표시 — 왜 좌/우 클러스터가 안 잡히는지 진단용.
+    def _draw_lavacon_bev(self, r, x, y, roi, lon_min, lon_max, lat_max,
+                           left_pts, left_run, right_pts, right_run):
+        PPM = 80           # 1m = 80px (좁은 트리거 ROI라 perc_obstacle보다 확대)
+        W, H = 500, 500
+        EX, EY = 250, 460  # 자차 위치(하단 중앙)
+        bev = np.zeros((H, W, 3), dtype=np.uint8)
+
+        for d in (1, 2, 3):
+            cv2.circle(bev, (EX, EY), d * PPM, (50, 50, 50), 1)
+            cv2.putText(bev, f'{d}m', (EX + 4, EY - d * PPM + 12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (80, 80, 80), 1)
+
+        def to_px(wx, wy): return (int(EX - wy * PPM), int(EY - wx * PPM))
+        cv2.rectangle(bev, to_px(lon_min, lat_max), to_px(lon_max, -lat_max), (0, 220, 220), 1)
+
+        left_mask, right_mask = roi & (y > 0.0), roi & (y < 0.0)
+        for i in range(len(r)):
+            if r[i] <= 0.0:
+                continue
+            sx, sy = int(EX - y[i] * PPM), int(EY - x[i] * PPM)
+            if not (0 <= sx < W and 0 <= sy < H):
+                continue
+            if left_mask[i]:    col = (0, 255, 0)
+            elif right_mask[i]: col = (0, 140, 255)
+            else:                col = (60, 60, 60)
+            cv2.circle(bev, (sx, sy), 3, col, -1)
+
+        cv2.circle(bev, (EX, EY), 6, (255, 220, 0), -1)
+        cv2.line(bev, (EX, EY), (EX, EY - 18), (255, 220, 0), 2)
+
+        l_col = (0, 255, 0)   if self.lavacon_left_detected  else (0, 0, 255)
+        r_col = (0, 140, 255) if self.lavacon_right_detected else (0, 0, 255)
+        cv2.putText(bev, f'L pts={left_pts} run={left_run} (need run>=2)',  (8, 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, l_col, 1, cv2.LINE_AA)
+        cv2.putText(bev, f'R pts={right_pts} run={right_run} (need run>=2)', (8, 44),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, r_col, 1, cv2.LINE_AA)
+        cv2.putText(bev, f'trig={self._lavacon_trigger_cnt}/{LAVACON_TRIGGER_FRAMES} '
+                         f'fb={self._lavacon_lidar_cnt}/{YOLO_FALLBACK_FRAMES} '
+                         f'yolo_cone={int(self.yolo_cone_detected)}',
+                    (8, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
+        cv2.imshow('lavacon_bev', bev)
+        cv2.waitKey(1)
 
     # [2-6] YOLO 객체인식 (카메라)
     #   입력 self._yolo_cone_msg / _yolo_vehicle_msg (yolo_ros DetectionArray 버퍼)
@@ -1128,6 +1187,12 @@ class TrackDriverNode(Node):
           yolo   = YOLO 검출 플래그 cone/veh (0인데 dbg_image엔 잡히면 신선도(YOLO_FRESH_SEC) 탈락 의심)
           trigL  = 라바콘 진입: 본선카운트/기준 (좌클러스터,우클러스터,폴백카운트/기준)
           trigV  = 차량 진입:   본선카운트/기준 (폴백카운트/기준)
+          [LAVA-ROI] 라바콘 트리거 ROI(전방0.3~3.0m,좌우2.0m) 안에 잡힌 점 개수(pts)와
+                     그중 최대 연속(붙어있는 인덱스) 묶음 길이(run). run>=2여야 클러스터로
+                     인정되어 L/R detected=True가 됨. pts=0이면 ROI 안에 아예 점이 없는 것
+                     (LON_MIN/MAX·LAT_MAX 범위나 콘 배치 확인), pts>0인데 run<2면 점은
+                     있지만 서로 인덱스가 안 붙어있어 클러스터로 안 뭉치는 것(노이즈/각도해상도 문제).
+                     DEBUG_VIZ_LAVACON=True로 켜면 'lavacon_bev' 창에서 같은 정보를 시각으로 확인 가능.
           obsLane= YOLO bbox 기준 장애물 좌/우 판단 (B2/B3 회피방향 재료)
           [SIG-S0](S0 상태에서만 출력) 신호등 원 검출이 어느 단계에서 막혔는지 진단:
             roi     = ROI 픽셀 좌표(t,b,l,r) — 신호등이 이 영역 안에 실제로 들어오는지 확인용
@@ -1150,6 +1215,8 @@ class TrackDriverNode(Node):
         else:
             lidar_desc = 'NONE'
 
+        lava_lp, lava_lrun, lava_rp, lava_rrun = self._lavacon_dbg
+
         sig_s0_line = ''
         if self.mission_state == MissionState.S0_WAIT_GREEN:
             sd = self.signal_detector
@@ -1171,7 +1238,9 @@ class TrackDriverNode(Node):
             f'(L{int(self.lavacon_left_detected)}R{int(self.lavacon_right_detected)},'
             f'fb{self._lavacon_lidar_cnt}/{YOLO_FALLBACK_FRAMES}) '
             f'trigV={self._vehicle_trigger_cnt}/{VEHICLE_TRIGGER_FRAMES}'
-            f'(fb{self._vehicle_lidar_cnt}/{YOLO_FALLBACK_FRAMES}) obsLane={self.obstacle_lane}'
+            f'(fb{self._vehicle_lidar_cnt}/{YOLO_FALLBACK_FRAMES}) obsLane={self.obstacle_lane}\n'
+            f'  [LAVA-ROI] L pts={lava_lp} run={lava_lrun}(need>=2) '
+            f'R pts={lava_rp} run={lava_rrun}(need>=2)'
             f'{sig_s0_line}')
 
 
