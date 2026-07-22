@@ -141,7 +141,7 @@ DEBUG_LOG       = True
 DEBUG_PERIOD    = 0.5
 DEBUG_VIZ       = True  # 신호등/4구 디버그 창
 DEBUG_VIZ_LANE  = True  # 차선 슬라이딩윈도우 디버그 창
-DEBUG_VIZ_LIDAR = False  # 라이다 BEV 장애물 감지 디버그 창
+DEBUG_VIZ_LIDAR = True  # 라이다 BEV 장애물 감지 디버그 창
 DEBUG_VIZ_LAVACON = False  # 라바콘 트리거 좌우 클러스터 BEV 디버그 창
 
 # ── 실차 테스트 범위 제한 ──
