@@ -265,85 +265,88 @@ class SlideWindow:
 
         self.vis[ploty,px]=color
 
-    def calc_center(self, left_idx, ly, lx, 
-                    right_idx, ry, rx,
-                    yellow_idx, yy, yx):
-        
+    def calc_center(self, left_idx, ly, lx,
+                right_idx, ry, rx,
+                yellow_idx, yy, yx):
+
         left_x = self.mean_x(left_idx, ly, lx)
         right_x = self.mean_x(right_idx, ry, rx)
         yellow_x = self.mean_x(yellow_idx, yy, yx)
-
+        
         lane_valid = False
         offset = 0
         lookahead = 0
 
         y_near = self.roi_h - 1
-        y_far = int(self.roi_h*LANE_LOOKAHEAD)
+        y_far = int(self.roi_h * LANE_LOOKAHEAD)
 
-        # 두 차선 모두 검출
+    # 1. 양쪽 차선 모두 검출
         if self.left_fit is not None and self.right_fit is not None:
+
             left_near = self.x_at(self.left_fit, y_near)
             right_near = self.x_at(self.right_fit, y_near)
 
             left_far = self.x_at(self.left_fit, y_far)
             right_far = self.x_at(self.right_fit, y_far)
 
-            width = right_near - left_near #차선 폭 갱신
-            if 180<width<400:
-                self.lane_width = width
+            width = right_near - left_near
+            if 180 < width < 400:
+                alpha = 0.1
+                self.lane_width = (
+                   (1 - alpha) * self.lane_width +
+                    alpha * width
+                )
 
             near_center = (left_near + right_near) / 2
             far_center = (left_far + right_far) / 2
-
             lane_valid = True
-        # 왼쪽 차선만 검출
+
+    # 2. 왼쪽 차선만 검출
         elif self.left_fit is not None:
+
             near_center = self.x_at(self.left_fit, y_near) + self.lane_width / 2
             far_center = self.x_at(self.left_fit, y_far) + self.lane_width / 2
-
             lane_valid = True
-        # 오른쪽 차선만 검출
+
+    # 3. 오른쪽 차선만 검출
         elif self.right_fit is not None:
-            near_center = self.x_at(self.right_fit, y_near) - self.lane_width/ 2
+
+            near_center = self.x_at(self.right_fit, y_near) - self.lane_width / 2
             far_center = self.x_at(self.right_fit, y_far) - self.lane_width / 2
+            lane_valid = True
 
-            lane_valid =True
-
-        # polyfit 실페 시 평균점 사용
+    # 4. Polyfit 실패 시 평균점 사용
         elif left_x is not None and right_x is not None:
+
             width = right_x - left_x
             if 180 < width < 400:
                 alpha = 0.1
                 self.lane_width = (
-                    (1-alpha)*self.lane_width + 
-                    alpha*width
+                    (1 - alpha) * self.lane_width +
+                    alpha * width
                 )
-
-            near_center = (left_x + right_x) /2
+   
+            near_center = (left_x + right_x) / 2
             far_center = near_center
-
             lane_valid = True
 
-        # 노란 차선만 보이는 경우
+    # 5. 흰 차선을 전혀 못 찾았을 때만 노란 차선 사용
         elif self.yellow_fit is not None:
-            near_center = self.x_at(self.yellow_fit, y_near) + self.lane_width/2
-            far_center = self.x_at(self.yellow_fit, y_far) + self.lane_width /2
-
+  
+            near_center = self.x_at(self.yellow_fit, y_near)
+            far_center = self.x_at(self.yellow_fit, y_far)
             lane_valid = True
+
         elif yellow_x is not None:
-            near_center = yellow_x + self.lane_width/2
-            far_center = near_center
 
+            near_center = yellow_x
+            far_center = yellow_x
             lane_valid = True
 
-        #offset 계산
-        if lane_valid :
+        if lane_valid:
             offset = near_center - self.roi_w / 2
-            lookahead = far_center - self.roi_w /2
-        
-        # 차선 중앙 x좌표(px) — offset 정의(center - roi_w/2)를 역산해 세 분기 모두에서 일관되게 산출.
-        # 미검출 시 offset=0 → 화면 중앙(roi_w/2)이 기본값이 된다.
-        # track_drive.perc_obstacle_lane()에서 YOLO bbox 중심과 비교해 장애물 좌/우 판단에 사용.
+            lookahead = far_center - self.roi_w / 2
+
         lane_center = self.roi_w / 2 + offset
 
         self.visualize(offset)
