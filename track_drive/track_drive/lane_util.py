@@ -90,7 +90,7 @@ class CameraProcessor:
 
         # 3) Top-Hat(극소 대비)
         kernel_tophat = cv2.getStructuringElement(
-            cv2.MORPH_RECT, (31,31)
+            cv2.MORPH_RECT, (15,15)
         )
 
         contrast = cv2.morphologyEx(
@@ -98,12 +98,22 @@ class CameraProcessor:
         )
 
         #Threshold
-        _, self.white = cv2.threshold(
-            contrast, 20, 255, cv2.THRESH_BINARY
+        _, white_tophat = cv2.threshold(
+            contrast, 15, 255, cv2.THRESH_BINARY
         )
 
-        # yellow Lane's HSV
+        # HSV
         hsv = cv2.cvtColor(self.bev, cv2.COLOR_BGR2HSV)
+
+        # white HSV Mask
+        white_hsv = cv2.inRagne(
+            hsv, np.array([0,0,170]), np.array([180,60,255])
+        )
+
+        # Top-Hat + HSV 결합
+        self.white = cv2.bitwise_and(
+            white_tophat, white_hsv
+        )
 
         #Yellow Lane
         self.yellow = cv2.inRange(
@@ -114,22 +124,11 @@ class CameraProcessor:
             cv2.MORPH_RECT, (3,3)
         )
 
-        self.white = cv2.morphologyEx(
-            self.white, cv2.MORPH_OPEN, kernel
-        )
-
+        # white cclosing
         self.white = cv2.morphologyEx(
             self.white, cv2.MORPH_CLOSE, kernel
         )
 
-        # 세로 성분만 강조
-        kernel_vertical = cv2.getStructuringElement(
-            cv2.MORPH_RECT, (3,10)
-        )
-
-        self.white = cv2.morphologyEx(
-            self.white, cv2.MORPH_OPEN, kernel_vertical
-        )
 
         # Connected Components
         num, labels, stats, _ = cv2.connectedComponentsWithStats(self.white)
@@ -139,12 +138,12 @@ class CameraProcessor:
         for i in range(1, num) :
             area = stats[i, cv2.CC_STAT_AREA]
 
-            if 20 < area < 1500:
+            if area> 10 :
                 mask[labels == i] = 255
             
         self.white = mask
 
-        #yellow morphology
+        # yellow morphology
         self.yellow = cv2.morphologyEx(
             self.yellow, cv2.MORPH_CLOSE, kernel
         )
@@ -159,7 +158,7 @@ class CameraProcessor:
 
             width = stats[i, cv2.CC_STAT_WIDTH]
 
-            if 20<area<1000 and width < 40:
+            if area>20 and width < 40:
                 mask[labels == i] = 255
 
         self.yellow = mask
