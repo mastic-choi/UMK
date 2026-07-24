@@ -1,12 +1,6 @@
 import numpy as np
 import cv2
-from retinex import multi_scale_retinex
-#SlidingWindow
-# 출처: 전전년도 타 팀 코드(KUAC_2024-main) lane_detection/src/slidewindow_both_lane.py
-#   nwindows=14, margin=20, minpix=10 을 그대로 초기값으로 이식 (실차 미검증, 튜닝 전제)
-SW_NWIN = 14
-SW_MARGIN = 20
-SW_MINPIX = 10
+
 #BEV
 # 출처: KUAC_2024-main lane_detection/src/utils.py warper() — 원본 픽셀좌표 그대로(640x150 ROI 기준, 반올림 없음)
 #   src 원본: 좌하[0,126] 좌상[175,46] 우상[456,38] 우하[640,103]
@@ -32,49 +26,70 @@ BEV_DST = np.float32([
 #   246/480=0.5125, 396/480=0.825 로 환산
 LANE_ROI_TOP = 0.45
 LANE_ROI_BOT = 0.825
-LANE_LOOKAHEAD = 0.35  # KUAC_2024엔 예측조향 개념 자체가 없어 대응값 없음 — 기존값 유지
-# Yellow Lane
-LANE_YELLOW_WEIGHT = 0.25
-LANE_YELLOW_MAX_DEV = 40
 #Debug
 DEBUG_VIZ_LANE = True
 
-# Canny + Hough 반사광(Glare) 필터
-#   문제 : 트랙 바닥 정반사가 CLAHE+Top-Hat+HSV 조건(밝고 흐릿한 흰색)을 흰 차선과
-#         똑같이 만족해버려서 슬라이딩 윈도우가 반사광 얼룩을 차선으로 오검출함.
-#   해결 : BEV 위에서 Canny 엣지 → HoughLinesP로 "직선 형태"만 추출해서 짧은
-#         파편(반사광 얼룩 경계 조각 등)을 제거한 뒤, 기존 색상/명암 마스크와
-#         AND로 결합한다. "밝고(색상 조건) + 선분 모양(형태 조건)"을 모두
-#         만족하는 픽셀만 최종 흰 차선으로 인정.
-#   ※ 각도(수직 근방) 필터는 제거했다 — 커브가 심한 구간에서 화면 위쪽(먼 거리)
-#     차선 선분이 수직에서 크게 벗어나(거의 눕는 각도) 잘려나가 커브 추종이
-#     깨지는 문제가 있었음. 대신 SlideWindow의 이전 프레임 기반 탐색
-#     (prior-based search, 아래 LANE_PRIOR_* 참고)이 반사광 방어를 주로 담당하고,
-#     여기 Hough 필터는 "길이 필터"만으로 짧은 파편 제거 역할만 한다.
-#   실차 미검증 튜닝값 — 반사광이 계속 새면 임계값을, 점선차선이 끊기면
-#   MIN_LINE_LEN/MAX_LINE_GAP을 먼저 재조정할 것.
-CANNY_BLUR_KSIZE      = 5      # 가우시안 블러 커널(홀수). 너무 크면 가는 점선 차선까지 뭉개짐
-CANNY_LOW, CANNY_HIGH = 50, 150   # Canny 이력임계값(하/상). BEV가 CLAHE로 이미 대비를 올려놔서 낮게 잡음
-HOUGH_RHO             = 1             # 거리 해상도(px)
-HOUGH_THETA           = np.pi / 180   # 각도 해상도(rad)
-HOUGH_THRESHOLD       = 20            # 직선으로 인정할 최소 누적표(투표) 수
-HOUGH_MIN_LINE_LEN    = 15            # 최소 선분 길이(px) — 반사광 얼룩의 짧은 파편 제거용
-HOUGH_MAX_LINE_GAP    = 15            # 같은 직선으로 이어붙일 최대 틈(px) — 점선차선 조각 연결
-HOUGH_LINE_THICKNESS  = 7    # 재구성 마스크에 그릴 선 두께(px) — 슬라이딩윈도우 margin(20px)보다 작게
+# Adaptive Thresholding — 흰 차선 마스킹
+#   기존 CLAHE+Top-Hat(21x21 국소대비)+고정 임계값(10)+HSV 조합 대신, CLAHE 다음
+#   단계를 cv2.adaptiveThreshold 하나로 단순화한다. 픽셀마다 자기 주변 blockSize
+#   이웃의 (가우시안 가중)평균 밝기를 기준으로 임계값을 다시 계산해주기 때문에,
+#   트랙 전체 조명이 불균일해도(한쪽은 밝고 한쪽은 그늘) 별도 튜닝 없이 안정적으로
+#   차선을 잡을 수 있다. THRESH_BINARY라 "주변 평균-C 보다 밝은 픽셀"이 흰색(255)이 된다.
+#   ※ 주의: 정반사(글레어)도 "주변보다 국소적으로 밝다"는 같은 성질을 가지므로
+#     adaptiveThreshold 하나로 반사광이 완전히 걸러지는 건 아니다 — 이후 CCA
+#     면적 필터로 작은 반사 얼룩 위주로 추가 제거한다(아래 CameraProcessor.processor 참고).
+#   ※★ C는 반드시 음수여야 한다(실측으로 확인됨, 아래 참고) ★
+#     T(x,y) = 주변평균 - C 이므로 C>0이면 T가 주변평균보다 낮아져서, 텍스처가
+#     거의 없는 평평한 바닥(에폭시처럼 매끈한 면)에서는 "픽셀값 ≈ 주변평균"이라
+#     사실상 전 영역이 threshold를 통과해버린다(합성 테스트 실측: C=+2일 때
+#     균일한 바닥의 96.6%가 흰색으로 오검출됨 — 차선 유무와 무관하게 화면 전체가
+#     "차선"으로 잡히는 셈이라 반사광보다 더 위험한 실패모드).
+#     C를 음수로 주면 T=주변평균+|C|가 되어 "주변보다 확실히 밝아야만" 통과하고,
+#     평평한 바닥은 정상적으로 검게 남는다(동일 테스트에서 C=-10부터 오검출 0%,
+#     동시에 실제 차선 검출률은 C=+2일 때와 동일하게 유지됨 — 손해 없이 안전해짐).
+ADAPTIVE_BLOCK_SIZE = 31   # 로컬 평균을 낼 이웃 크기(px, 홀수 필수) — 클수록 더 넓은 영역의 평균과 비교
+ADAPTIVE_C = -15           # 주변평균보다 이만큼(px 밝기값) 더 밝아야 흰색 인정. 반드시 음수로 유지할 것
 
-# 이전 프레임 기반 탐색 (prior-based / look-ahead search)
-#   문제 : 매 프레임 히스토그램으로 처음부터 다시 찾으면, 반사광이 순간적으로
-#         차선보다 밝게 찍혔을 때 히스토그램 최댓값 자리를 반사가 차지해버려
-#         바로 그쪽을 잘못 추종함. 밝기/모양으로는 반사광과 차선이 이 트랙에서
-#         잘 안 갈라진다는 게 확인됐음(HSV·Hough 각도 모두 시도 후 결론).
-#   해결 : 직전 프레임에 유효했던 fit(2차 곡선) 근방 margin(px) 안에서만
-#         픽셀을 모은다. 진짜 차선은 프레임 간 위치가 부드럽게 이어지지만,
-#         반사광은 엉뚱한 위치에서 순간적으로 나타났다 사라지는 경향이 있어
-#         애초에 탐색범위 밖이라 무시됨 — 색상/형태와 무관한 시간적 일관성 필터.
-#   fit이 없거나(첫 프레임) LANE_PRIOR_MISS_MAX 프레임 연속 실패하면 그때만
-#   histogram()+sliding_window()로 전체 재탐색(폴백)한다.
-LANE_PRIOR_MARGIN   = 30   # 이전 fit 곡선 좌우로 탐색할 폭(px). SW_MARGIN(20)보다 살짝 넓게
-LANE_PRIOR_MISS_MAX = 5    # 이 프레임 수 연속 실패하면 fit 폐기 + 전체 히스토그램 재탐색으로 폴백
+# Median Blur — 폭(굵기) 기준으로 얇은 반사 줄무늬 제거
+#   문제 : 골진(주름진) 반사면이 조명을 여러 갈래 가는 대각선 줄무늬로 반사시키는
+#     경우, adaptiveThreshold(밝기 기준)나 구간 간 일관성 체크(위치 기준)로는
+#     못 걸러진다 — 반사 줄무늬 하나하나가 그 자체로 밝고 매끄럽게 이어지는
+#     "그럴듯한 선"이기 때문. 지금까지의 밝기/일관성 축과 다른 "폭" 축으로 접근한다.
+#   해결 : adaptiveThreshold 전에 그레이스케일에 medianBlur를 적용. 커널 안에서
+#     다수결로 값을 정하는 특성상, 커널 폭의 절반보다 얇은 밝은 줄무늬는 주변
+#     어두운 배경에 묻혀 사라지고, 그보다 굵은 실제 차선은 살아남는다.
+#   ※ 전제 조건: "반사 줄무늬 폭 < MEDIAN_BLUR_KSIZE/2 < 실제 차선 폭"이 실측으로
+#     성립해야 한다. 두 폭이 비슷하면 반사도 안 지워지거나, 반대로 점선/커브 구간의
+#     가늘어 보이는 실제 차선까지 같이 지워질 수 있다 — 실차 영상에서 lane_white
+#     디버그 창으로 두 폭을 비교해보고 커널 크기를 재조정할 것.
+#   실차 미검증 튜닝값.
+MEDIAN_BLUR_KSIZE = 9      # 홀수 필수. 이 값의 절반(≈4~5px)보다 얇은 밝은 줄무늬를 지운다
+
+# 구간별 무게중심(Moments) 기반 차선 추적
+#   기존 슬라이딩 윈도우(14단 히스토그램 탐색 + 2차 polyfit + 이전 프레임 기반 탐색)를
+#   걷어내고, ROI를 아래→위로 MOMENT_N_SLICES개 구간으로 나눠 구간마다 cv2.moments()로
+#   무게중심(cx = M10/M00)만 구하는 방식으로 단순화한다. 구간마다 완전히 독립적으로
+#   계산하므로 한 구간이 반사/잡음으로 오염돼도 다른 구간엔 전혀 영향이 없고,
+#   폴리피팅 없이 구간별 점을 그대로 이으면 커브 형태를 직관적으로 따라간다.
+#   실차 미검증 튜닝값.
+MOMENT_N_SLICES = 5        # ROI를 세로로 나눌 구간 수(아래→위, 3~5 권장 — 많을수록 커브 추종이 촘촘해지지만 구간당 픽셀이 줄어 노이즈에 약해짐)
+MOMENT_MIN_PIXELS = 15     # 구간 내 흰/노랑 픽셀수(M00)가 이 미만이면 그 구간은 "차선 없음" 처리
+MOMENT_NEAR_SLICES = 2     # near_center(조향용 근거리 편차) 계산에 쓸 아래쪽(근거리) 구간 수
+MOMENT_FAR_SLICES = 2      # far_center(코너 예측용 원거리 편차) 계산에 쓸 위쪽(원거리) 구간 수
+
+# 구간 간 일관성 체크 (반사광 등 이상치 슬라이스 제거)
+#   문제 : 반사광은 특정 슬라이스 하나만 뜬금없이 튄 무게중심을 만들기 쉽다.
+#         밝기/색상만으로는 진짜 차선과 반사광을 못 가른다는 게 이미 여러 번
+#         확인됐으므로, 완전히 다른 축인 "슬라이스끼리의 위치 일관성"으로
+#         걸러낸다 — 진짜 차선은 슬라이스가 위로 갈수록 완만하게 이어지지만
+#         반사광은 그 흐름에서 혼자 튄다.
+#   방법 : 이번 프레임의 유효 슬라이스들에 1차(직선) 최소자승 추세선을 맞추고,
+#         그 추세에서 LANE_SLICE_OUTLIER_MAX(px) 이상 벗어난 슬라이스만 제외한다.
+#         프레임 간 기억이 필요 없어 가볍고(1패스, 폴백 없음), ROI가 짧아서
+#         커브 구간에서도 직선 근사가 크게 어긋나지 않는다.
+#   실차 미검증 튜닝값.
+LANE_SLICE_OUTLIER_MAX = 40   # 추세선에서 이 이상(px) 벗어난 슬라이스는 이상치로 제외
+LANE_SLICE_FIT_MIN = 3        # 유효 슬라이스가 이 개수 미만이면 추세 판단이 불안정하므로 검사 자체를 생략
 
 
 #def Debugging(flag):
@@ -88,58 +103,6 @@ class CameraProcessor:
 
         self.roi_h = 0
         self.roi_w = 0
-
-    def _hough_line_mask(self, gray):
-        """
-        Canny 엣지 → HoughLinesP 선분 추출 → 길이 필터링 → 살아남은
-        선분만 굵게 재구성해서 '차선 모양(직선)' 이진 마스크를 만든다.
-          입력 : gray  — CLAHE까지 적용된 BEV 그레이스케일(호출부에서 재사용, 중복연산 방지)
-          출력 : hough_mask — gray와 동일 크기의 0/255 이진 마스크
-        각도 필터는 두지 않는다(커브 심한 구간에서 차선 선분이 수직에서 크게
-        벗어나 잘려나가는 문제 때문에 제거함) — 반사광 방어는 이제 주로
-        SlideWindow의 이전 프레임 기반 탐색(prior-based search)이 담당한다.
-        """
-        # 1) 가우시안 블러 — Canny 전에 고주파 잡음(반사광 얼룩의 거친 경계) 완화
-        blur = cv2.GaussianBlur(
-            gray, (CANNY_BLUR_KSIZE, CANNY_BLUR_KSIZE), 0
-        )
-
-        # 2) Canny 엣지 검출
-        edges = cv2.Canny(blur, CANNY_LOW, CANNY_HIGH)
-
-        if DEBUG_VIZ_LANE:
-            cv2.imshow("lane_canny", edges)
-
-        # 3) 확률적 허프 변환 — 엣지 중 "직선 구간"만 (x1,y1,x2,y2) 선분으로 추출
-        lines = cv2.HoughLinesP(
-            edges,
-            HOUGH_RHO,
-            HOUGH_THETA,
-            HOUGH_THRESHOLD,
-            minLineLength=HOUGH_MIN_LINE_LEN,
-            maxLineGap=HOUGH_MAX_LINE_GAP
-        )
-
-        hough_mask = np.zeros_like(gray)
-
-        if lines is None:
-            return hough_mask
-
-        # 4) 길이 필터링 후 살아남은 선분만 재구성 마스크에 그림 (각도 무관)
-        for line in lines:
-            x1, y1, x2, y2 = line[0]
-
-            # 길이 필터 : 짧은 파편(반사광 얼룩 경계 등) 제거
-            length = float(np.hypot(x2 - x1, y2 - y1))
-            if length < HOUGH_MIN_LINE_LEN:
-                continue
-
-            cv2.line(
-                hough_mask, (x1, y1), (x2, y2),
-                255, HOUGH_LINE_THICKNESS
-            )
-
-        return hough_mask
 
     def processor(self, frame):
         # ROI
@@ -170,62 +133,50 @@ class CameraProcessor:
             (self.roi_w, self.roi_h)
         )
 
-        # white Lane : Local Contrast
+        # white Lane : Adaptive Thresholding
         # 1) Gray 변환
         gray = cv2.cvtColor(self.bev, cv2.COLOR_BGR2GRAY)
-        gray = multi_scale_retinex(gray)
-
-        if DEBUG_VIZ_LANE :
-            cv2.imshow("lane_retinex", gray)
-        # 2) CLAHE (극소 명암 향상)
+        # 2) CLAHE (국소 명암 향상) — adaptiveThreshold 전에 대비를 한 번 더 올려줌
         clahe = cv2.createCLAHE(
             clipLimit=2.0,
             tileGridSize=(8,8)
         )
         gray = clahe.apply(gray)
-        
 
-        # 3) Top-Hat(극소 대비)
-        kernel_tophat = cv2.getStructuringElement(
-            cv2.MORPH_RECT, (21,21)
-        )
+        # 3) Median Blur — 폭이 얇은 반사 줄무늬 제거(굵은 실제 차선은 보존)
+        gray = cv2.medianBlur(gray, MEDIAN_BLUR_KSIZE)
 
-        contrast = cv2.morphologyEx(
-            gray, cv2.MORPH_TOPHAT, kernel_tophat
-        )
-
-        #Threshold
-        _, white_tophat = cv2.threshold(
-            contrast, 10, 255, cv2.THRESH_BINARY
+        # 4) Adaptive Thresholding — 픽셀마다 주변 blockSize 영역의 가우시안 가중평균
+        #    밝기를 기준으로 이진화(THRESH_BINARY: 평균-C 보다 밝으면 흰색)
+        self.white = cv2.adaptiveThreshold(
+            gray, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            ADAPTIVE_BLOCK_SIZE, ADAPTIVE_C
         )
 
         # HSV
         hsv = cv2.cvtColor(self.bev, cv2.COLOR_BGR2HSV)
 
-        # white HSV Mask
-        white_hsv = cv2.inRange(
-            hsv, np.array([0,0,150]), np.array([180,90,255])
-        )
-
-        # Top-Hat + HSV 결합 (색상/명암 조건 — "밝고 흰색인가")
-        white_color = cv2.bitwise_and(
-            white_tophat, white_hsv
-        )
-
-        # Canny + Hough 직선 마스크 (형태 조건 — "직선 모양인가")
-        #   CLAHE까지 적용된 gray를 그대로 재사용(cvtColor 중복 호출 방지)
-        hough_mask = self._hough_line_mask(gray)
-
-        # 색상 조건 AND 형태 조건 → 둘 다 만족하는 픽셀만 흰 차선으로 인정
-        # (반사광 얼룩은 색상 조건은 통과해도 형태(직선) 조건에서 대부분 걸러짐)
-        self.white = cv2.bitwise_and(
-            white_color, hough_mask
-        )
-
         #Yellow Lane
         self.yellow = cv2.inRange(
             hsv, np.array([15,80,80]), np.array([40,255,255])
         )
+
+        # BEV 워프 유효 영역 밖(원근변환 사다리꼴 바깥) 마스킹
+        #   BEV_DST가 정의하는 x범위(169~489/640 비율) 밖은 실제 도로가 아니라
+        #   getPerspectiveTransform이 원근평면을 무한히 확장해서 만들어낸 외삽
+        #   픽셀이다(실측: 텍스처 없는 균일한 바닥에서도 이 바깥 테두리가
+        #   CLAHE+adaptiveThreshold를 통과해 흰색으로 오검출됨 — 게다가 바로
+        #   좌/우 절반 탐색범위 안쪽 끝에 걸쳐있어 차선 오판으로 이어지기 쉬움).
+        #   BEV_DST 비율로 유효 x범위를 계산해 그 밖은 흰/노랑 마스크에서 지운다.
+        valid_x_lo = int(BEV_DST[0, 0] * self.roi_w)
+        valid_x_hi = int(BEV_DST[1, 0] * self.roi_w)
+        self.white[:, :valid_x_lo] = 0
+        self.white[:, valid_x_hi:] = 0
+        self.yellow[:, :valid_x_lo] = 0
+        self.yellow[:, valid_x_hi:] = 0
+
         #Morphology
         kernel = cv2.getStructuringElement(
             cv2.MORPH_RECT, (3,3)
@@ -237,7 +188,7 @@ class CameraProcessor:
         )
 
 
-        # Connected Components
+        # Connected Components — 작은 반사광 얼룩/잡음 제거(면적 기준)
         num, labels, stats, _ = cv2.connectedComponentsWithStats(self.white)
 
         mask = np.zeros_like(self.white)
@@ -247,7 +198,7 @@ class CameraProcessor:
 
             if area> 5 :
                 mask[labels == i] = 255
-            
+
         self.white = mask
 
         # yellow morphology
@@ -270,53 +221,170 @@ class CameraProcessor:
 
         self.yellow = mask
 
+        # 흰색 마스크에서 노란색 확정 영역 제외
+        #   adaptiveThreshold는 그레이스케일(밝기)만 보기 때문에 채도가 높은
+        #   노란 중앙선도 "주변보다 밝다"는 조건을 만족해버려 self.white에 같이
+        #   잡힌다(실측으로 확인됨). self.yellow는 이미 색상 기반으로 노란색만
+        #   따로 걸러낸 마스크이므로, 여기 확정된 자리는 흰색일 수 없다는 관계를
+        #   그대로 강제한다. dilate로 살짝 여유를 줘서 노란선 가장자리의 안티
+        #   앨리어싱된 픽셀까지 같이 제외한다.
+        yellow_dilated = cv2.dilate(self.yellow, kernel)
+        self.white = cv2.bitwise_and(
+            self.white, cv2.bitwise_not(yellow_dilated)
+        )
+
         #DEBUG
         if DEBUG_VIZ_LANE:
             cv2.imshow("lane_bev", self.bev)
-
-            # BEV(위에서 내려다본 카메라 화면) + Canny/Hough로 "차선"이라 추정한
-            # 형태 마스크를 한 창에 나란히 붙여서 비교 — 반사광이 걸러지는지 한눈에 확인용
-            hough_vis = cv2.cvtColor(hough_mask, cv2.COLOR_GRAY2BGR)
-            hough_debug = cv2.hconcat([self.bev, hough_vis])
-            cv2.imshow("lane_hough_debug", hough_debug)
-
             cv2.imshow("lane_white", self.white)
             cv2.imshow("lane_yellow", self.yellow)
 
         return (self.bev, self.white, self.yellow)
-    
+
 class SlideWindow:
+    """
+    이름은 track_drive.py와의 인터페이스 호환을 위해 SlideWindow로 유지하지만,
+    내부 구현은 "히스토그램 슬라이딩 윈도우 + 2차 polyfit + 이전 프레임 기반 탐색"
+    대신 "구간별 무게중심(Moments)" 방식으로 교체됐다. ROI를 위아래로 나눠
+    구간마다 cv2.moments()로 무게중심만 구하고 그 점들을 그대로 잇기 때문에
+    폴리피팅이 필요 없고, 반사광으로 특정 구간이 오염돼도 다른 구간엔 영향이
+    없어 커브 대응이 더 직관적이다.
+    """
     def __init__(self):
-        self.left_base = -1
-        self.right_base = -1
-
-        self.left_idx = None
-        self.right_idx = None
-
-        self.left_fit = None
-        self.right_fit = None
-
-        self.yellow_fit = None
-        
         self.vis = None
 
         self.roi_h = 0
         self.roi_w = 0
 
-        #실시간 차선폭
+        #실시간 차선폭 (한쪽 차선만 보일 때 반대쪽 추정에 사용)
         self.lane_width = 260.0
 
-        # 이전 프레임 기반 탐색(prior-based search) 연속 실패 카운터
-        #   fit이 갱신되면 0으로 리셋, 실패할 때마다 +1. LANE_PRIOR_MISS_MAX
-        #   넘으면 fit을 폐기하고 다음 프레임에 전체 히스토그램 재탐색으로 폴백.
-        self._left_miss_cnt = 0
-        self._right_miss_cnt = 0
-        self._yellow_miss_cnt = 0
+        # 구간별 무게중심 저장 — calc_center()/시각화에서 재사용
+        #   각 리스트는 길이 MOMENT_N_SLICES, 인덱스 0=가장 아래(근거리) ~ 마지막=가장 위(원거리)
+        self.left_centers = []
+        self.right_centers = []
+        self.yellow_centers = []
+
+    def _slice_centers(self, mask, x_offset, color):
+        """
+        mask를 아래→위로 MOMENT_N_SLICES개 구간으로 나눠 구간마다 cv2.moments()로
+        무게중심(cx)을 구한다. 슬라이딩 윈도우처럼 이전 구간 위치를 이어받지
+        않고 구간마다 독립적으로 계산하므로, 한 구간이 반사/잡음으로 날아가도
+        다른 구간에는 전혀 영향이 없다.
+          입력 : mask     — 이진마스크(좌/우 절반 등으로 이미 열 방향이 잘려있을 수 있음)
+                x_offset — mask가 원본 ROI에서 잘려나온 경우의 x좌표 보정값(좌우 분리용)
+                color    — 디버그 사각형 색상
+          출력 : centers — 길이 MOMENT_N_SLICES 리스트. 각 원소는 (y_center, cx) 또는
+                 해당 구간 픽셀수가 MOMENT_MIN_PIXELS 미만이면 None
+        """
+        slice_h = self.roi_h // MOMENT_N_SLICES
+        centers = []
+
+        for i in range(MOMENT_N_SLICES):
+            y_high = self.roi_h - i * slice_h
+            # 마지막(가장 위) 구간은 정수나눗셈 나머지를 포함해 y=0까지 전부 커버
+            y_low = 0 if i == MOMENT_N_SLICES - 1 else self.roi_h - (i + 1) * slice_h
+
+            band = mask[y_low:y_high, :]
+
+            if DEBUG_VIZ_LANE:
+                cv2.rectangle(
+                    self.vis,
+                    (x_offset, y_low), (x_offset + mask.shape[1] - 1, max(y_high - 1, y_low)),
+                    color, 1
+                )
+
+            M = cv2.moments(band, binaryImage=True)
+
+            if M['m00'] < MOMENT_MIN_PIXELS:
+                centers.append(None)
+                continue
+
+            cx = M['m10'] / M['m00'] + x_offset
+            y_center = (y_low + y_high) / 2.0
+            centers.append((y_center, cx))
+
+        return centers
+
+    def _reject_outliers(self, centers):
+        """
+        구간별 무게중심들 사이의 위치 일관성을 체크해서 이상치(반사광 등으로
+        혼자 튄 값)를 제거한다. 진짜 차선은 슬라이스가 위로 갈수록 완만하게
+        이어지지만, 반사광은 특정 슬라이스 하나만 뜬금없이 튀는 값을 만들기
+        쉽다. 프레임 간 기억 없이 "이번 프레임 슬라이스들끼리"만 비교한다.
+          방법 : Leave-one-out — 각 슬라이스를 검사할 때 "자기 자신을 뺀"
+                나머지 유효 슬라이스들로만 1차(직선) 추세선을 맞추고, 그
+                추세에서 LANE_SLICE_OUTLIER_MAX(px) 이상 벗어나면 이상치로
+                None 처리한다. 전체 점으로 한 번에 추세선을 맞추면 이상치
+                자신이 추세선을 자기 쪽으로 끌어당겨서 오히려 안 걸러지는
+                문제가 있어(실측으로 확인됨) 반드시 leave-one-out으로 한다.
+                슬라이스가 3~5개뿐이라 매 프레임 여러 번 다시 피팅해도 비용은
+                무시할 수준이다.
+          입력/출력 : centers — _slice_centers()와 동일한 형식(길이 불변)
+        """
+        valid_idx = [i for i, c in enumerate(centers) if c is not None]
+        if len(valid_idx) < LANE_SLICE_FIT_MIN:
+            return centers   # 점이 너무 적으면 추세 판단 자체가 불안정 → 검사 생략
+
+        ys = np.array([centers[i][0] for i in valid_idx])
+        xs = np.array([centers[i][1] for i in valid_idx])
+
+        result = list(centers)
+
+        for k, i in enumerate(valid_idx):
+            other_y = np.delete(ys, k)
+            other_x = np.delete(xs, k)
+
+            if len(other_y) < 2:
+                continue   # 나머지가 1개뿐이면 직선을 정의할 수 없어 검사 생략
+
+            slope, intercept = np.polyfit(other_y, other_x, 1)
+            y_i, x_i = centers[i]
+            residual = abs(x_i - (slope * y_i + intercept))
+
+            if residual > LANE_SLICE_OUTLIER_MAX:
+                result[i] = None
+                if DEBUG_VIZ_LANE:
+                    cv2.drawMarker(
+                        self.vis,
+                        (int(np.clip(x_i, 0, self.roi_w - 1)), int(y_i)),
+                        (0, 0, 255), cv2.MARKER_TILTED_CROSS, 12, 2
+                    )
+
+        return result
+
+    def _group_mean(self, centers, count, from_start):
+        """
+        centers(길이 MOMENT_N_SLICES, 아래→위 순)에서 근거리(from_start=True,
+        앞쪽 count개) 또는 원거리(from_start=False, 뒤쪽 count개) 구간들의 cx
+        평균을 낸다. 여러 구간을 평균내서 구간 하나의 노이즈에 결과가 흔들리는
+        걸 줄인다. 유효한 구간이 하나도 없으면 None.
+        """
+        window = centers[:count] if from_start else centers[-count:]
+        vals = [c[1] for c in window if c is not None]
+
+        if not vals:
+            return None
+        return float(np.mean(vals))
+
+    def draw_centers(self, centers, color):
+        """구간별 무게중심을 점으로 찍고 인접한 점끼리 이어서 커브 형태로 시각화."""
+        pts = [
+            (int(np.clip(cx, 0, self.roi_w - 1)), int(y))
+            for c in centers if c is not None
+            for (y, cx) in [c]
+        ]
+
+        for pt in pts:
+            cv2.circle(self.vis, pt, 4, color, -1)
+
+        for p1, p2 in zip(pts, pts[1:]):
+            cv2.line(self.vis, p1, p2, color, 2)
 
     def visualize(self, offset):
-        self.draw_fit(self.left_fit, (0,255,255))
-        self.draw_fit(self.right_fit, (0,255,255))
-        self.draw_fit(self.yellow_fit, (0,165,255))
+        self.draw_centers(self.left_centers, (0,255,255))
+        self.draw_centers(self.right_centers, (0,255,255))
+        self.draw_centers(self.yellow_centers, (0,165,255))
 
         cv2.line(
             self.vis, (self.roi_w//2, 0), (self.roi_w//2, self.roi_h),
@@ -336,78 +404,23 @@ class SlideWindow:
             cv2.imshow("lane_result", self.vis)
             cv2.waitKey(1)
 
-    def histogram(self, mask, search=None):
-        hist = np.sum(mask[int(self.roi_h*0.65):, :], axis=0)
+    def calc_center(self):
+        near_left   = self._group_mean(self.left_centers,   MOMENT_NEAR_SLICES, True)
+        far_left    = self._group_mean(self.left_centers,   MOMENT_FAR_SLICES,  False)
+        near_right  = self._group_mean(self.right_centers,  MOMENT_NEAR_SLICES, True)
+        far_right   = self._group_mean(self.right_centers,  MOMENT_FAR_SLICES,  False)
+        near_yellow = self._group_mean(self.yellow_centers, MOMENT_NEAR_SLICES, True)
+        far_yellow  = self._group_mean(self.yellow_centers, MOMENT_FAR_SLICES,  False)
 
-        if search is None:
-            hist_part = hist
-            offset = 0
-        else:
-            lo, hi = search
-            hist_part = hist[lo:hi]
-            offset = lo
-
-        if hist_part.max() == 0:
-            return -1
-        
-        return int(np.argmax(hist_part)+offset)
-    
-    def fit_curve(self, idx, y, x, threshold):
-        if len(idx) < threshold:
-            return None
-        
-        return np.polyfit(y[idx], x[idx], 2)
-    def x_at(self, fit, y):
-        if fit is None:
-            return None
-        return fit[0]*y*y + fit[1]*y + fit[2]
-    
-    def mean_x(self,idx, y, x, limit=5):
-        if len(idx) == 0:
-            return None
-        pts = x[idx]
-
-        if len(pts)<limit:
-            return None
-        return float(np.mean(pts))
-    
-    def draw_fit(self, fit, color):
-        if fit is None:
-            return
-        
-        ploty = np.arange(self.roi_h)
-
-        px = np.clip(
-            self.x_at(fit,ploty), 0, self.roi_w-1
-        ).astype(int)
-
-        self.vis[ploty,px]=color
-
-    def calc_center(self, left_idx, ly, lx,
-                right_idx, ry, rx,
-                yellow_idx, yy, yx):
-
-        left_x = self.mean_x(left_idx, ly, lx)
-        right_x = self.mean_x(right_idx, ry, rx)
-        yellow_x = self.mean_x(yellow_idx, yy, yx)
-        
         lane_valid = False
         offset = 0
         lookahead = 0
-
-        y_near = self.roi_h - 1
-        y_far = int(self.roi_h * LANE_LOOKAHEAD)
+        near_center = far_center = None
 
     # 1. 양쪽 차선 모두 검출
-        if self.left_fit is not None and self.right_fit is not None:
+        if near_left is not None and near_right is not None:
 
-            left_near = self.x_at(self.left_fit, y_near)
-            right_near = self.x_at(self.right_fit, y_near)
-
-            left_far = self.x_at(self.left_fit, y_far)
-            right_far = self.x_at(self.right_fit, y_far)
-
-            width = right_near - left_near
+            width = near_right - near_left
             if 180 < width < 400:
                 alpha = 0.1
                 self.lane_width = (
@@ -415,50 +428,35 @@ class SlideWindow:
                     alpha * width
                 )
 
-            near_center = (left_near + right_near) / 2
-            far_center = (left_far + right_far) / 2
+            near_center = (near_left + near_right) / 2
+            far_center = (
+                (far_left  if far_left  is not None else near_left) +
+                (far_right if far_right is not None else near_right)
+            ) / 2
             lane_valid = True
 
     # 2. 왼쪽 차선만 검출
-        elif self.left_fit is not None:
+        elif near_left is not None:
 
-            near_center = self.x_at(self.left_fit, y_near) + self.lane_width / 2
-            far_center = self.x_at(self.left_fit, y_far) + self.lane_width / 2
+            far_ref = far_left if far_left is not None else near_left
+            near_center = near_left + self.lane_width / 2
+            far_center = far_ref + self.lane_width / 2
             lane_valid = True
 
     # 3. 오른쪽 차선만 검출
-        elif self.right_fit is not None:
+        elif near_right is not None:
 
-            near_center = self.x_at(self.right_fit, y_near) - self.lane_width / 2
-            far_center = self.x_at(self.right_fit, y_far) - self.lane_width / 2
+            far_ref = far_right if far_right is not None else near_right
+            near_center = near_right - self.lane_width / 2
+            far_center = far_ref - self.lane_width / 2
             lane_valid = True
 
-    # 4. Polyfit 실패 시 평균점 사용
-        elif left_x is not None and right_x is not None:
+    # 4. 흰 차선을 전혀 못 찾았을 때만 노란 차선 사용
+        elif near_yellow is not None:
 
-            width = right_x - left_x
-            if 180 < width < 400:
-                alpha = 0.1
-                self.lane_width = (
-                    (1 - alpha) * self.lane_width +
-                    alpha * width
-                )
-   
-            near_center = (left_x + right_x) / 2
-            far_center = near_center
-            lane_valid = True
-
-    # 5. 흰 차선을 전혀 못 찾았을 때만 노란 차선 사용
-        elif self.yellow_fit is not None:
-  
-            near_center = self.x_at(self.yellow_fit, y_near)
-            far_center = self.x_at(self.yellow_fit, y_far)
-            lane_valid = True
-
-        elif yellow_x is not None:
-
-            near_center = yellow_x
-            far_center = yellow_x
+            far_ref = far_yellow if far_yellow is not None else near_yellow
+            near_center = near_yellow
+            far_center = far_ref
             lane_valid = True
 
         if lane_valid:
@@ -471,156 +469,25 @@ class SlideWindow:
 
         return lane_valid, offset, lookahead, lane_center
 
-    def sliding_window(self, mask, base, minpix, color):
-        nz = mask.nonzero()
-        nzy = np.array(nz[0])
-        nzx = np.array(nz[1])
-
-        current = base
-        idx = []
-
-        win_h = self.roi_h // SW_NWIN
-        
-        for win in range(SW_NWIN):
-            if current < 0:
-                break
-
-            y_low = self.roi_h - (win + 1)*win_h
-            y_high = self.roi_h - win*win_h
-
-            if DEBUG_VIZ_LANE:
-                cv2.rectangle(
-                    self.vis,
-                    (current - SW_MARGIN, y_low),
-                    (current + SW_MARGIN, y_high),
-                    color,
-                    2
-                )
-            good = np.where(
-                (nzy >= y_low)&(nzy < y_high)&
-                (nzx >= current - SW_MARGIN)&(nzx < current + SW_MARGIN)
-            )[0]
-
-            idx.append(good)
-
-            if len(good) > minpix:
-                current = int(np.mean(nzx[good]))
-        if len(idx):
-            idx = np.concatenate(idx)
-        else:
-            idx = np.array([], dtype=int)
-
-        return idx, nzy, nzx
-
-    def _search_near_fit(self, mask, fit, margin):
-        """
-        직전 프레임에 유효했던 fit(2차 곡선) 좌우 margin(px) 안에서만 픽셀을 모은다.
-        진짜 차선은 프레임 간 위치가 부드럽게 이어지지만, 반사광은 엉뚱한 위치에서
-        순간적으로 나타났다 사라지는 경향이 있어 애초에 이 탐색범위 밖이면 무시된다
-        (색상/형태와 무관한 시간적 일관성 필터).
-          입력 : mask — white/yellow 이진 마스크, fit — 직전 프레임 polyfit 계수, margin — 탐색 반폭(px)
-          출력 : sliding_window()와 동일한 형식 (idx, nzy, nzx)
-        """
-        nz = mask.nonzero()
-        nzy = np.array(nz[0])
-        nzx = np.array(nz[1])
-
-        if len(nzy) == 0:
-            return np.array([], dtype=int), nzy, nzx
-
-        x_pred = self.x_at(fit, nzy)
-        idx = np.where(np.abs(nzx - x_pred) < margin)[0]
-
-        if DEBUG_VIZ_LANE:
-            ploty = np.arange(self.roi_h)
-            x_band = np.clip(self.x_at(fit, ploty), 0, self.roi_w - 1).astype(int)
-            for y, x in zip(ploty[::4], x_band[::4]):
-                cv2.line(
-                    self.vis, (max(x - margin, 0), y), (min(x + margin, self.roi_w - 1), y),
-                    (80, 80, 80), 1
-                )
-
-        return idx, nzy, nzx
-
-    def _track_lane(self, mask, prev_fit, miss_cnt, base_search, minpix, color, margin=LANE_PRIOR_MARGIN):
-        """
-        좌/우/노랑 차선 공통 탐색 로직 — prior-based 탐색을 우선 시도하고,
-        prev_fit이 없거나 연속 실패가 LANE_PRIOR_MISS_MAX를 넘으면 histogram()+
-        sliding_window()로 전체 재탐색(폴백)한다.
-          입력 : mask — 이진 마스크, prev_fit — 직전 프레임 fit(없으면 None),
-                miss_cnt — 현재까지 연속 실패 횟수, base_search — histogram() 탐색 구간(lo,hi),
-                minpix/color — sliding_window()에 그대로 전달
-          출력 : (idx, y, x, used_prior) — used_prior는 prior 탐색 사용 여부(디버그용)
-        """
-        if prev_fit is not None and miss_cnt < LANE_PRIOR_MISS_MAX:
-            idx, y, x = self._search_near_fit(mask, prev_fit, margin)
-            return idx, y, x, True
-
-        base = self.histogram(mask, base_search)
-        idx, y, x = self.sliding_window(mask, base, minpix, color)
-        return idx, y, x, False
-
     def detect(self, bev, white, yellow):
         self.roi_h, self.roi_w = white.shape
         self.vis = bev.copy()
 
-        yellow_minpix = max(SW_MINPIX // 2, 5)
+        half = self.roi_w // 2
+        # 노란선은 중앙부만 탐색(기존 히스토그램 탐색 구간과 동일한 취지)
+        q_lo = self.roi_w // 4
+        q_hi = self.roi_w * 3 // 4
 
-        # ── 좌측 흰 차선 ──
-        left_idx, ly, lx, left_prior = self._track_lane(
-            white, self.left_fit, self._left_miss_cnt,
-            (0, self.roi_w // 2), SW_MINPIX, (0, 255, 0)
-        )
-        new_left_fit = self.fit_curve(left_idx, ly, lx, SW_MINPIX * 2)
-        if new_left_fit is not None:
-            self.left_fit = new_left_fit
-            self._left_miss_cnt = 0
-        else:
-            self._left_miss_cnt += 1
-            if self._left_miss_cnt >= LANE_PRIOR_MISS_MAX:
-                self.left_fit = None   # 오래된 fit 폐기 → 다음 프레임 전체 재탐색 + calc_center 폴백
+        # 좌/우 절반으로 나눠 각각 구간별 무게중심 계산 →
+        # 구간 간 일관성 체크로 반사광 등 이상치 슬라이스 제외
+        self.left_centers = self._reject_outliers(self._slice_centers(
+            white[:, :half], 0, (0,255,0)
+        ))
+        self.right_centers = self._reject_outliers(self._slice_centers(
+            white[:, half:], half, (0,255,0)
+        ))
+        self.yellow_centers = self._reject_outliers(self._slice_centers(
+            yellow[:, q_lo:q_hi], q_lo, (0,180,255)
+        ))
 
-        # ── 우측 흰 차선 ──
-        right_idx, ry, rx, right_prior = self._track_lane(
-            white, self.right_fit, self._right_miss_cnt,
-            (self.roi_w // 2, self.roi_w), SW_MINPIX, (0, 255, 0)
-        )
-        new_right_fit = self.fit_curve(right_idx, ry, rx, SW_MINPIX * 2)
-        if new_right_fit is not None:
-            self.right_fit = new_right_fit
-            self._right_miss_cnt = 0
-        else:
-            self._right_miss_cnt += 1
-            if self._right_miss_cnt >= LANE_PRIOR_MISS_MAX:
-                self.right_fit = None
-
-        # ── 노란 차선 ──
-        yellow_idx, yy, yx, yellow_prior = self._track_lane(
-            yellow, self.yellow_fit, self._yellow_miss_cnt,
-            (self.roi_w // 4, self.roi_w * 3 // 4), yellow_minpix, (0, 180, 255)
-        )
-        new_yellow_fit = self.fit_curve(yellow_idx, yy, yx, yellow_minpix * 3)
-        if new_yellow_fit is not None:
-            self.yellow_fit = new_yellow_fit
-            self._yellow_miss_cnt = 0
-        else:
-            self._yellow_miss_cnt += 1
-            if self._yellow_miss_cnt >= LANE_PRIOR_MISS_MAX:
-                self.yellow_fit = None
-
-        if DEBUG_VIZ_LANE:
-            mode = lambda p: 'PRIOR' if p else 'SCAN'
-            cv2.putText(
-                self.vis,
-                f'L:{mode(left_prior)} R:{mode(right_prior)} Y:{mode(yellow_prior)}',
-                (10, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA
-            )
-
-        return self.calc_center(
-            left_idx, ly, lx,
-            right_idx, ry, rx,
-            yellow_idx, yy, yx
-            )
-    
-
-
+        return self.calc_center()
