@@ -197,8 +197,10 @@ class CameraProcessor:
         #   CLAHE+adaptiveThreshold를 통과해 흰색으로 오검출됨 — 게다가 바로
         #   좌/우 절반 탐색범위 안쪽 끝에 걸쳐있어 차선 오판으로 이어지기 쉬움).
         #   BEV_DST 비율로 유효 x범위를 계산해 그 밖은 흰/노랑 마스크에서 지운다.
-        valid_x_lo = int(BEV_DST[0, 0] * self.roi_w)
-        valid_x_hi = int(BEV_DST[1, 0] * self.roi_w)
+        MARGIN = 20
+
+        valid_x_lo = int(BEV_DST[0, 0] * self.roi_w - MARGIN)
+        valid_x_hi = int(BEV_DST[1, 0] * self.roi_w + MARGIN)
         self.white[:, :valid_x_lo] = 0
         self.white[:, valid_x_hi:] = 0
         self.yellow[:, :valid_x_lo] = 0
