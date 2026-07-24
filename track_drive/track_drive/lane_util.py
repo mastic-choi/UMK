@@ -42,12 +42,16 @@ DEBUG_VIZ_LANE = True
 # Canny + Hough 반사광(Glare) 필터
 #   문제 : 트랙 바닥 정반사가 CLAHE+Top-Hat+HSV 조건(밝고 흐릿한 흰색)을 흰 차선과
 #         똑같이 만족해버려서 슬라이딩 윈도우가 반사광 얼룩을 차선으로 오검출함.
-#   해결 : BEV 위에서 Canny 엣지 → HoughLinesP로 "직선 형태"만 추출 → 수직에 가까운
-#         (차선다운) 선분만 남긴 뒤, 기존 색상/명암 마스크와 AND로 결합한다.
-#         즉 "밝고(색상 조건) + 선분 모양(형태 조건)"을 모두 만족하는 픽셀만
-#         최종 흰 차선으로 인정 — 반사광 얼룩은 대개 뭉툭한 덩어리라 직선이 잘 안
-#         잡히거나, 잡혀도 각도가 들쭉날쭉해서 여기서 대부분 걸러진다.
-#   실차 미검증 튜닝값 — 반사광이 계속 새면 임계값/각도범위를, 점선차선이 끊기면
+#   해결 : BEV 위에서 Canny 엣지 → HoughLinesP로 "직선 형태"만 추출해서 짧은
+#         파편(반사광 얼룩 경계 조각 등)을 제거한 뒤, 기존 색상/명암 마스크와
+#         AND로 결합한다. "밝고(색상 조건) + 선분 모양(형태 조건)"을 모두
+#         만족하는 픽셀만 최종 흰 차선으로 인정.
+#   ※ 각도(수직 근방) 필터는 제거했다 — 커브가 심한 구간에서 화면 위쪽(먼 거리)
+#     차선 선분이 수직에서 크게 벗어나(거의 눕는 각도) 잘려나가 커브 추종이
+#     깨지는 문제가 있었음. 대신 SlideWindow의 이전 프레임 기반 탐색
+#     (prior-based search, 아래 LANE_PRIOR_* 참고)이 반사광 방어를 주로 담당하고,
+#     여기 Hough 필터는 "길이 필터"만으로 짧은 파편 제거 역할만 한다.
+#   실차 미검증 튜닝값 — 반사광이 계속 새면 임계값을, 점선차선이 끊기면
 #   MIN_LINE_LEN/MAX_LINE_GAP을 먼저 재조정할 것.
 CANNY_BLUR_KSIZE      = 5      # 가우시안 블러 커널(홀수). 너무 크면 가는 점선 차선까지 뭉개짐
 CANNY_LOW, CANNY_HIGH = 50, 150   # Canny 이력임계값(하/상). BEV가 CLAHE로 이미 대비를 올려놔서 낮게 잡음
@@ -56,12 +60,21 @@ HOUGH_THETA           = np.pi / 180   # 각도 해상도(rad)
 HOUGH_THRESHOLD       = 20            # 직선으로 인정할 최소 누적표(투표) 수
 HOUGH_MIN_LINE_LEN    = 15            # 최소 선분 길이(px) — 반사광 얼룩의 짧은 파편 제거용
 HOUGH_MAX_LINE_GAP    = 15            # 같은 직선으로 이어붙일 최대 틈(px) — 점선차선 조각 연결
-# 각도 필터 : BEV에서 정상 차선은 거의 수직(가로 기준 90° 부근)으로 나타난다.
-#   atan2(dy,dx) 결과를 0~180°로 접어서, 수직 ±20°(70~110°)만 차선으로 인정.
-#   실차 커브 구간에서 먼 쪽(화면 상단) 선분이 이 범위를 벗어나 잘리면 범위를 넓혀 재튜닝.
-HOUGH_ANGLE_MIN_DEG   = 70.0
-HOUGH_ANGLE_MAX_DEG   = 110.0
 HOUGH_LINE_THICKNESS  = 7    # 재구성 마스크에 그릴 선 두께(px) — 슬라이딩윈도우 margin(20px)보다 작게
+
+# 이전 프레임 기반 탐색 (prior-based / look-ahead search)
+#   문제 : 매 프레임 히스토그램으로 처음부터 다시 찾으면, 반사광이 순간적으로
+#         차선보다 밝게 찍혔을 때 히스토그램 최댓값 자리를 반사가 차지해버려
+#         바로 그쪽을 잘못 추종함. 밝기/모양으로는 반사광과 차선이 이 트랙에서
+#         잘 안 갈라진다는 게 확인됐음(HSV·Hough 각도 모두 시도 후 결론).
+#   해결 : 직전 프레임에 유효했던 fit(2차 곡선) 근방 margin(px) 안에서만
+#         픽셀을 모은다. 진짜 차선은 프레임 간 위치가 부드럽게 이어지지만,
+#         반사광은 엉뚱한 위치에서 순간적으로 나타났다 사라지는 경향이 있어
+#         애초에 탐색범위 밖이라 무시됨 — 색상/형태와 무관한 시간적 일관성 필터.
+#   fit이 없거나(첫 프레임) LANE_PRIOR_MISS_MAX 프레임 연속 실패하면 그때만
+#   histogram()+sliding_window()로 전체 재탐색(폴백)한다.
+LANE_PRIOR_MARGIN   = 30   # 이전 fit 곡선 좌우로 탐색할 폭(px). SW_MARGIN(20)보다 살짝 넓게
+LANE_PRIOR_MISS_MAX = 5    # 이 프레임 수 연속 실패하면 fit 폐기 + 전체 히스토그램 재탐색으로 폴백
 
 
 #def Debugging(flag):
@@ -78,12 +91,13 @@ class CameraProcessor:
 
     def _hough_line_mask(self, gray):
         """
-        Canny 엣지 → HoughLinesP 선분 추출 → 길이/각도 필터링 → 살아남은
+        Canny 엣지 → HoughLinesP 선분 추출 → 길이 필터링 → 살아남은
         선분만 굵게 재구성해서 '차선 모양(직선)' 이진 마스크를 만든다.
           입력 : gray  — CLAHE까지 적용된 BEV 그레이스케일(호출부에서 재사용, 중복연산 방지)
           출력 : hough_mask — gray와 동일 크기의 0/255 이진 마스크
-        반사광(글레어)은 대개 뭉툭한 덩어리라 여기서 직선으로 잘 안 잡히거나,
-        잡히더라도 각도가 수직에서 크게 벗어나 필터링 단계에서 제거된다.
+        각도 필터는 두지 않는다(커브 심한 구간에서 차선 선분이 수직에서 크게
+        벗어나 잘려나가는 문제 때문에 제거함) — 반사광 방어는 이제 주로
+        SlideWindow의 이전 프레임 기반 탐색(prior-based search)이 담당한다.
         """
         # 1) 가우시안 블러 — Canny 전에 고주파 잡음(반사광 얼룩의 거친 경계) 완화
         blur = cv2.GaussianBlur(
@@ -108,21 +122,13 @@ class CameraProcessor:
         if lines is None:
             return hough_mask
 
-        # 4) 기하학적 필터링 (길이 + 각도) 후 살아남은 선분만 재구성 마스크에 그림
+        # 4) 길이 필터링 후 살아남은 선분만 재구성 마스크에 그림 (각도 무관)
         for line in lines:
             x1, y1, x2, y2 = line[0]
 
-            dx = x2 - x1
-            dy = y2 - y1
-
             # 길이 필터 : 짧은 파편(반사광 얼룩 경계 등) 제거
-            length = float(np.hypot(dx, dy))
+            length = float(np.hypot(x2 - x1, y2 - y1))
             if length < HOUGH_MIN_LINE_LEN:
-                continue
-
-            # 각도 필터 : 0~180°로 접어서 수직(90°) 근방(70~110°)만 통과
-            angle = np.degrees(np.arctan2(dy, dx)) % 180
-            if not (HOUGH_ANGLE_MIN_DEG <= angle <= HOUGH_ANGLE_MAX_DEG):
                 continue
 
             cv2.line(
@@ -290,7 +296,14 @@ class SlideWindow:
         self.roi_w = 0
 
         #실시간 차선폭
-        self.lane_width = 260.0 
+        self.lane_width = 260.0
+
+        # 이전 프레임 기반 탐색(prior-based search) 연속 실패 카운터
+        #   fit이 갱신되면 0으로 리셋, 실패할 때마다 +1. LANE_PRIOR_MISS_MAX
+        #   넘으면 fit을 폐기하고 다음 프레임에 전체 히스토그램 재탐색으로 폴백.
+        self._left_miss_cnt = 0
+        self._right_miss_cnt = 0
+        self._yellow_miss_cnt = 0
 
     def visualize(self, offset):
         self.draw_fit(self.left_fit, (0,255,255))
@@ -490,52 +503,110 @@ class SlideWindow:
             idx = np.array([], dtype=int)
 
         return idx, nzy, nzx
-    
+
+    def _search_near_fit(self, mask, fit, margin):
+        """
+        직전 프레임에 유효했던 fit(2차 곡선) 좌우 margin(px) 안에서만 픽셀을 모은다.
+        진짜 차선은 프레임 간 위치가 부드럽게 이어지지만, 반사광은 엉뚱한 위치에서
+        순간적으로 나타났다 사라지는 경향이 있어 애초에 이 탐색범위 밖이면 무시된다
+        (색상/형태와 무관한 시간적 일관성 필터).
+          입력 : mask — white/yellow 이진 마스크, fit — 직전 프레임 polyfit 계수, margin — 탐색 반폭(px)
+          출력 : sliding_window()와 동일한 형식 (idx, nzy, nzx)
+        """
+        nz = mask.nonzero()
+        nzy = np.array(nz[0])
+        nzx = np.array(nz[1])
+
+        if len(nzy) == 0:
+            return np.array([], dtype=int), nzy, nzx
+
+        x_pred = self.x_at(fit, nzy)
+        idx = np.where(np.abs(nzx - x_pred) < margin)[0]
+
+        if DEBUG_VIZ_LANE:
+            ploty = np.arange(self.roi_h)
+            x_band = np.clip(self.x_at(fit, ploty), 0, self.roi_w - 1).astype(int)
+            for y, x in zip(ploty[::4], x_band[::4]):
+                cv2.line(
+                    self.vis, (max(x - margin, 0), y), (min(x + margin, self.roi_w - 1), y),
+                    (80, 80, 80), 1
+                )
+
+        return idx, nzy, nzx
+
+    def _track_lane(self, mask, prev_fit, miss_cnt, base_search, minpix, color, margin=LANE_PRIOR_MARGIN):
+        """
+        좌/우/노랑 차선 공통 탐색 로직 — prior-based 탐색을 우선 시도하고,
+        prev_fit이 없거나 연속 실패가 LANE_PRIOR_MISS_MAX를 넘으면 histogram()+
+        sliding_window()로 전체 재탐색(폴백)한다.
+          입력 : mask — 이진 마스크, prev_fit — 직전 프레임 fit(없으면 None),
+                miss_cnt — 현재까지 연속 실패 횟수, base_search — histogram() 탐색 구간(lo,hi),
+                minpix/color — sliding_window()에 그대로 전달
+          출력 : (idx, y, x, used_prior) — used_prior는 prior 탐색 사용 여부(디버그용)
+        """
+        if prev_fit is not None and miss_cnt < LANE_PRIOR_MISS_MAX:
+            idx, y, x = self._search_near_fit(mask, prev_fit, margin)
+            return idx, y, x, True
+
+        base = self.histogram(mask, base_search)
+        idx, y, x = self.sliding_window(mask, base, minpix, color)
+        return idx, y, x, False
+
     def detect(self, bev, white, yellow):
         self.roi_h, self.roi_w = white.shape
         self.vis = bev.copy()
 
-        #histogram
-        self.left_base = self.histogram(
-            white,
-            (0, self.roi_w // 2)
-        )
+        yellow_minpix = max(SW_MINPIX // 2, 5)
 
-        self.right_base = self.histogram(
-            white,
-            (self.roi_w // 2, self.roi_w)
+        # ── 좌측 흰 차선 ──
+        left_idx, ly, lx, left_prior = self._track_lane(
+            white, self.left_fit, self._left_miss_cnt,
+            (0, self.roi_w // 2), SW_MINPIX, (0, 255, 0)
         )
+        new_left_fit = self.fit_curve(left_idx, ly, lx, SW_MINPIX * 2)
+        if new_left_fit is not None:
+            self.left_fit = new_left_fit
+            self._left_miss_cnt = 0
+        else:
+            self._left_miss_cnt += 1
+            if self._left_miss_cnt >= LANE_PRIOR_MISS_MAX:
+                self.left_fit = None   # 오래된 fit 폐기 → 다음 프레임 전체 재탐색 + calc_center 폴백
 
-        yellow_base = self.histogram(
-            yellow,
-            (self.roi_w // 4, self.roi_w*3 // 4)
+        # ── 우측 흰 차선 ──
+        right_idx, ry, rx, right_prior = self._track_lane(
+            white, self.right_fit, self._right_miss_cnt,
+            (self.roi_w // 2, self.roi_w), SW_MINPIX, (0, 255, 0)
         )
+        new_right_fit = self.fit_curve(right_idx, ry, rx, SW_MINPIX * 2)
+        if new_right_fit is not None:
+            self.right_fit = new_right_fit
+            self._right_miss_cnt = 0
+        else:
+            self._right_miss_cnt += 1
+            if self._right_miss_cnt >= LANE_PRIOR_MISS_MAX:
+                self.right_fit = None
 
-        #sliding window
-        left_idx, ly, lx = self.sliding_window(
-            white, self.left_base, SW_MINPIX, (0,255,0)
+        # ── 노란 차선 ──
+        yellow_idx, yy, yx, yellow_prior = self._track_lane(
+            yellow, self.yellow_fit, self._yellow_miss_cnt,
+            (self.roi_w // 4, self.roi_w * 3 // 4), yellow_minpix, (0, 180, 255)
         )
+        new_yellow_fit = self.fit_curve(yellow_idx, yy, yx, yellow_minpix * 3)
+        if new_yellow_fit is not None:
+            self.yellow_fit = new_yellow_fit
+            self._yellow_miss_cnt = 0
+        else:
+            self._yellow_miss_cnt += 1
+            if self._yellow_miss_cnt >= LANE_PRIOR_MISS_MAX:
+                self.yellow_fit = None
 
-        right_idx, ry, rx = self.sliding_window(
-            white, self.right_base, SW_MINPIX, (0,255,0)
-        )
-
-        yellow_idx, yy, yx = self.sliding_window(
-            yellow, yellow_base, max(SW_MINPIX//2,5),(0,180,255)
-        )
-
-        #polyfit
-        self.left_fit = self.fit_curve(
-            left_idx, ly, lx, SW_MINPIX*2
-        )
-
-        self.right_fit = self.fit_curve(
-            right_idx, ry, rx, SW_MINPIX*2
-        )
-
-        self.yellow_fit = self.fit_curve(
-            yellow_idx, yy, yx, max(SW_MINPIX//2, 5)*3
-        )
+        if DEBUG_VIZ_LANE:
+            mode = lambda p: 'PRIOR' if p else 'SCAN'
+            cv2.putText(
+                self.vis,
+                f'L:{mode(left_prior)} R:{mode(right_prior)} Y:{mode(yellow_prior)}',
+                (10, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA
+            )
 
         return self.calc_center(
             left_idx, ly, lx,
