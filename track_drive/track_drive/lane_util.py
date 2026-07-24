@@ -50,6 +50,21 @@ DEBUG_VIZ_LANE = True
 ADAPTIVE_BLOCK_SIZE = 31   # 로컬 평균을 낼 이웃 크기(px, 홀수 필수) — 클수록 더 넓은 영역의 평균과 비교
 ADAPTIVE_C = -15           # 주변평균보다 이만큼(px 밝기값) 더 밝아야 흰색 인정. 반드시 음수로 유지할 것
 
+# Median Blur — 폭(굵기) 기준으로 얇은 반사 줄무늬 제거
+#   문제 : 골진(주름진) 반사면이 조명을 여러 갈래 가는 대각선 줄무늬로 반사시키는
+#     경우, adaptiveThreshold(밝기 기준)나 구간 간 일관성 체크(위치 기준)로는
+#     못 걸러진다 — 반사 줄무늬 하나하나가 그 자체로 밝고 매끄럽게 이어지는
+#     "그럴듯한 선"이기 때문. 지금까지의 밝기/일관성 축과 다른 "폭" 축으로 접근한다.
+#   해결 : adaptiveThreshold 전에 그레이스케일에 medianBlur를 적용. 커널 안에서
+#     다수결로 값을 정하는 특성상, 커널 폭의 절반보다 얇은 밝은 줄무늬는 주변
+#     어두운 배경에 묻혀 사라지고, 그보다 굵은 실제 차선은 살아남는다.
+#   ※ 전제 조건: "반사 줄무늬 폭 < MEDIAN_BLUR_KSIZE/2 < 실제 차선 폭"이 실측으로
+#     성립해야 한다. 두 폭이 비슷하면 반사도 안 지워지거나, 반대로 점선/커브 구간의
+#     가늘어 보이는 실제 차선까지 같이 지워질 수 있다 — 실차 영상에서 lane_white
+#     디버그 창으로 두 폭을 비교해보고 커널 크기를 재조정할 것.
+#   실차 미검증 튜닝값.
+MEDIAN_BLUR_KSIZE = 9      # 홀수 필수. 이 값의 절반(≈4~5px)보다 얇은 밝은 줄무늬를 지운다
+
 # 구간별 무게중심(Moments) 기반 차선 추적
 #   기존 슬라이딩 윈도우(14단 히스토그램 탐색 + 2차 polyfit + 이전 프레임 기반 탐색)를
 #   걷어내고, ROI를 아래→위로 MOMENT_N_SLICES개 구간으로 나눠 구간마다 cv2.moments()로
@@ -128,7 +143,10 @@ class CameraProcessor:
         )
         gray = clahe.apply(gray)
 
-        # 3) Adaptive Thresholding — 픽셀마다 주변 blockSize 영역의 가우시안 가중평균
+        # 3) Median Blur — 폭이 얇은 반사 줄무늬 제거(굵은 실제 차선은 보존)
+        gray = cv2.medianBlur(gray, MEDIAN_BLUR_KSIZE)
+
+        # 4) Adaptive Thresholding — 픽셀마다 주변 blockSize 영역의 가우시안 가중평균
         #    밝기를 기준으로 이진화(THRESH_BINARY: 평균-C 보다 밝으면 흰색)
         self.white = cv2.adaptiveThreshold(
             gray, 255,
