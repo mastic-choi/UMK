@@ -30,7 +30,7 @@ BEV_DST = np.float32([
 #Lane ROI
 # 출처: KUAC_2024-main lane_detection/src/utils.py roi_for_lane() → image[246:396, :] (640x480 기준)
 #   246/480=0.5125, 396/480=0.825 로 환산
-LANE_ROI_TOP = 0.5125
+LANE_ROI_TOP = 0.45
 LANE_ROI_BOT = 0.825
 LANE_LOOKAHEAD = 0.35  # KUAC_2024엔 예측조향 개념 자체가 없어 대응값 없음 — 기존값 유지
 # Yellow Lane
