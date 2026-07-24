@@ -94,7 +94,6 @@ BODY_MASK_ENABLED = True  # 최종 확정(2026-07-22)
 #   safe: kp=0.70, ki=0.0008, kd=0.15 / fast: kp=0.78, ki=0.0005, kd=0.405 (참고, safe값 채택)
 #   기존 0.14/0.0/1.40 대비 Kp 5배↑ Kd 9배↓ 로 큰 변화 — 실차 저속에서 오실레이션 여부 먼저 확인 후 정속 테스트 권장
 LANE_KP, LANE_KI, LANE_KD = 0.70, 0.0008, 0.15  # 차선 PID
-LANE_SIDE = 1               # 주행 차선: +1=노란선 오른쪽(우측차선), -1=왼쪽
 LANE_CORNER_BOOST = 1.8    # 코너(큰 offset) 조향 가중
 LANE_CORNER_REF   = 120.0  # 이 offset(px)에서 가중 최대
 LANE_CORNER_MIN   = 40.0   # 코너 가중 시작 임계(px)
@@ -144,7 +143,6 @@ ENABLE_BEHAVIOR = True
 DEBUG_LOG       = True
 DEBUG_PERIOD    = 0.5
 DEBUG_VIZ       = True  # 신호등/4구 디버그 창
-DEBUG_VIZ_LANE  = True  # 차선 슬라이딩윈도우 디버그 창
 DEBUG_VIZ_LIDAR = True  # 라이다 BEV 장애물 감지 디버그 창
 DEBUG_VIZ_LAVACON = False  # 라바콘 트리거 좌우 클러스터 BEV 디버그 창
 
@@ -230,7 +228,7 @@ class TrackDriverNode(Node):
         self.lane_center   = 320.0           # 차선 중앙 x좌표(px) — 첫 카메라 프레임 전까지 화면 중앙 기본값
 
         # ── 외부 차선 인식 모듈 (lane_util.py / perc_floor.py) 초기화 ──
-        self.camera_processor = CameraProcessor()       # BEV 변환 및 색상 마스크(흰/노랑) 처리기
+        self.camera_processor = CameraProcessor()       # BEV 변환 및 노란색 마스크 처리기
         self.slide_window_processor = SlideWindow()     # 슬라이딩 윈도우 기반 차선 탐색 및 피팅기
         self.lane_detector = LaneDetector(self.camera_processor, self.slide_window_processor)
         self.signal_detector = SignalDetector()          # 신호등(3구/4구) Hough Circle 인식기

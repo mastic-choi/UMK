@@ -29,41 +29,8 @@ LANE_ROI_BOT = 0.825
 #Debug
 DEBUG_VIZ_LANE = True
 
-# Adaptive Thresholding — 흰 차선 마스킹
-#   기존 CLAHE+Top-Hat(21x21 국소대비)+고정 임계값(10)+HSV 조합 대신, CLAHE 다음
-#   단계를 cv2.adaptiveThreshold 하나로 단순화한다. 픽셀마다 자기 주변 blockSize
-#   이웃의 (가우시안 가중)평균 밝기를 기준으로 임계값을 다시 계산해주기 때문에,
-#   트랙 전체 조명이 불균일해도(한쪽은 밝고 한쪽은 그늘) 별도 튜닝 없이 안정적으로
-#   차선을 잡을 수 있다. THRESH_BINARY라 "주변 평균-C 보다 밝은 픽셀"이 흰색(255)이 된다.
-#   ※ 주의: 정반사(글레어)도 "주변보다 국소적으로 밝다"는 같은 성질을 가지므로
-#     adaptiveThreshold 하나로 반사광이 완전히 걸러지는 건 아니다 — 이후 CCA
-#     면적 필터로 작은 반사 얼룩 위주로 추가 제거한다(아래 CameraProcessor.processor 참고).
-#   ※★ C는 반드시 음수여야 한다(실측으로 확인됨, 아래 참고) ★
-#     T(x,y) = 주변평균 - C 이므로 C>0이면 T가 주변평균보다 낮아져서, 텍스처가
-#     거의 없는 평평한 바닥(에폭시처럼 매끈한 면)에서는 "픽셀값 ≈ 주변평균"이라
-#     사실상 전 영역이 threshold를 통과해버린다(합성 테스트 실측: C=+2일 때
-#     균일한 바닥의 96.6%가 흰색으로 오검출됨 — 차선 유무와 무관하게 화면 전체가
-#     "차선"으로 잡히는 셈이라 반사광보다 더 위험한 실패모드).
-#     C를 음수로 주면 T=주변평균+|C|가 되어 "주변보다 확실히 밝아야만" 통과하고,
-#     평평한 바닥은 정상적으로 검게 남는다(동일 테스트에서 C=-10부터 오검출 0%,
-#     동시에 실제 차선 검출률은 C=+2일 때와 동일하게 유지됨 — 손해 없이 안전해짐).
-ADAPTIVE_BLOCK_SIZE = 31   # 로컬 평균을 낼 이웃 크기(px, 홀수 필수) — 클수록 더 넓은 영역의 평균과 비교
-ADAPTIVE_C = -15           # 주변평균보다 이만큼(px 밝기값) 더 밝아야 흰색 인정. 반드시 음수로 유지할 것
-
-# Median Blur — 폭(굵기) 기준으로 얇은 반사 줄무늬 제거
-#   문제 : 골진(주름진) 반사면이 조명을 여러 갈래 가는 대각선 줄무늬로 반사시키는
-#     경우, adaptiveThreshold(밝기 기준)나 구간 간 일관성 체크(위치 기준)로는
-#     못 걸러진다 — 반사 줄무늬 하나하나가 그 자체로 밝고 매끄럽게 이어지는
-#     "그럴듯한 선"이기 때문. 지금까지의 밝기/일관성 축과 다른 "폭" 축으로 접근한다.
-#   해결 : adaptiveThreshold 전에 그레이스케일에 medianBlur를 적용. 커널 안에서
-#     다수결로 값을 정하는 특성상, 커널 폭의 절반보다 얇은 밝은 줄무늬는 주변
-#     어두운 배경에 묻혀 사라지고, 그보다 굵은 실제 차선은 살아남는다.
-#   ※ 전제 조건: "반사 줄무늬 폭 < MEDIAN_BLUR_KSIZE/2 < 실제 차선 폭"이 실측으로
-#     성립해야 한다. 두 폭이 비슷하면 반사도 안 지워지거나, 반대로 점선/커브 구간의
-#     가늘어 보이는 실제 차선까지 같이 지워질 수 있다 — 실차 영상에서 lane_white
-#     디버그 창으로 두 폭을 비교해보고 커널 크기를 재조정할 것.
-#   실차 미검증 튜닝값.
-MEDIAN_BLUR_KSIZE = 9      # 홀수 필수. 이 값의 절반(≈4~5px)보다 얇은 밝은 줄무늬를 지운다
+# 흰 차선은 실차에서 전혀 검출되지 않아(실측 확인) 백색 검출 파이프라인을 걷어내고
+# 노란색 중앙선 검출만으로 주행경로를 산출한다(차선 자체를 목표로 그대로 추종).
 
 # 구간별 무게중심(Moments) 기반 차선 추적
 #   기존 슬라이딩 윈도우(14단 히스토그램 탐색 + 2차 polyfit + 이전 프레임 기반 탐색)를
@@ -98,7 +65,6 @@ class CameraProcessor:
     def __init__(self):
         self.roi = None
         self.bev = None
-        self.white = None
         self.yellow = None
 
         self.roi_h = 0
@@ -133,28 +99,6 @@ class CameraProcessor:
             (self.roi_w, self.roi_h)
         )
 
-        # white Lane : Adaptive Thresholding
-        # 1) Gray 변환
-        gray = cv2.cvtColor(self.bev, cv2.COLOR_BGR2GRAY)
-        # 2) CLAHE (국소 명암 향상) — adaptiveThreshold 전에 대비를 한 번 더 올려줌
-        clahe = cv2.createCLAHE(
-            clipLimit=2.0,
-            tileGridSize=(8,8)
-        )
-        gray = clahe.apply(gray)
-
-        # 3) Median Blur — 폭이 얇은 반사 줄무늬 제거(굵은 실제 차선은 보존)
-        gray = cv2.medianBlur(gray, MEDIAN_BLUR_KSIZE)
-
-        # 4) Adaptive Thresholding — 픽셀마다 주변 blockSize 영역의 가우시안 가중평균
-        #    밝기를 기준으로 이진화(THRESH_BINARY: 평균-C 보다 밝으면 흰색)
-        self.white = cv2.adaptiveThreshold(
-            gray, 255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY,
-            ADAPTIVE_BLOCK_SIZE, ADAPTIVE_C
-        )
-
         # HSV
         hsv = cv2.cvtColor(self.bev, cv2.COLOR_BGR2HSV)
 
@@ -166,14 +110,11 @@ class CameraProcessor:
         # BEV 워프 유효 영역 밖(원근변환 사다리꼴 바깥) 마스킹
         #   BEV_DST가 정의하는 x범위(169~489/640 비율) 밖은 실제 도로가 아니라
         #   getPerspectiveTransform이 원근평면을 무한히 확장해서 만들어낸 외삽
-        #   픽셀이다(실측: 텍스처 없는 균일한 바닥에서도 이 바깥 테두리가
-        #   CLAHE+adaptiveThreshold를 통과해 흰색으로 오검출됨 — 게다가 바로
-        #   좌/우 절반 탐색범위 안쪽 끝에 걸쳐있어 차선 오판으로 이어지기 쉬움).
-        #   BEV_DST 비율로 유효 x범위를 계산해 그 밖은 흰/노랑 마스크에서 지운다.
+        #   픽셀이다(실측: 텍스처 없는 균일한 바닥에서도 이 바깥 테두리가 오검출됨
+        #   — 게다가 바로 좌/우 절반 탐색범위 안쪽 끝에 걸쳐있어 차선 오판으로
+        #   이어지기 쉬움). BEV_DST 비율로 유효 x범위를 계산해 그 밖은 마스크에서 지운다.
         valid_x_lo = int(BEV_DST[0, 0] * self.roi_w)
         valid_x_hi = int(BEV_DST[1, 0] * self.roi_w)
-        self.white[:, :valid_x_lo] = 0
-        self.white[:, valid_x_hi:] = 0
         self.yellow[:, :valid_x_lo] = 0
         self.yellow[:, valid_x_hi:] = 0
 
@@ -181,25 +122,6 @@ class CameraProcessor:
         kernel = cv2.getStructuringElement(
             cv2.MORPH_RECT, (3,3)
         )
-
-        # white cclosing
-        self.white = cv2.morphologyEx(
-            self.white, cv2.MORPH_CLOSE, kernel
-        )
-
-
-        # Connected Components — 작은 반사광 얼룩/잡음 제거(면적 기준)
-        num, labels, stats, _ = cv2.connectedComponentsWithStats(self.white)
-
-        mask = np.zeros_like(self.white)
-
-        for i in range(1, num) :
-            area = stats[i, cv2.CC_STAT_AREA]
-
-            if area> 5 :
-                mask[labels == i] = 255
-
-        self.white = mask
 
         # yellow morphology
         self.yellow = cv2.morphologyEx(
@@ -221,25 +143,12 @@ class CameraProcessor:
 
         self.yellow = mask
 
-        # 흰색 마스크에서 노란색 확정 영역 제외
-        #   adaptiveThreshold는 그레이스케일(밝기)만 보기 때문에 채도가 높은
-        #   노란 중앙선도 "주변보다 밝다"는 조건을 만족해버려 self.white에 같이
-        #   잡힌다(실측으로 확인됨). self.yellow는 이미 색상 기반으로 노란색만
-        #   따로 걸러낸 마스크이므로, 여기 확정된 자리는 흰색일 수 없다는 관계를
-        #   그대로 강제한다. dilate로 살짝 여유를 줘서 노란선 가장자리의 안티
-        #   앨리어싱된 픽셀까지 같이 제외한다.
-        yellow_dilated = cv2.dilate(self.yellow, kernel)
-        self.white = cv2.bitwise_and(
-            self.white, cv2.bitwise_not(yellow_dilated)
-        )
-
         #DEBUG
         if DEBUG_VIZ_LANE:
             cv2.imshow("lane_bev", self.bev)
-            cv2.imshow("lane_white", self.white)
             cv2.imshow("lane_yellow", self.yellow)
 
-        return (self.bev, self.white, self.yellow)
+        return (self.bev, self.yellow)
 
 class SlideWindow:
     """
@@ -249,6 +158,9 @@ class SlideWindow:
     구간마다 cv2.moments()로 무게중심만 구하고 그 점들을 그대로 잇기 때문에
     폴리피팅이 필요 없고, 반사광으로 특정 구간이 오염돼도 다른 구간엔 영향이
     없어 커브 대응이 더 직관적이다.
+
+    흰 차선은 실차에서 검출이 안 되는 게 확인되어 제외하고, 노란 중앙선의
+    무게중심 위치 자체를 주행목표로 그대로 사용한다.
     """
     def __init__(self):
         self.vis = None
@@ -256,13 +168,8 @@ class SlideWindow:
         self.roi_h = 0
         self.roi_w = 0
 
-        #실시간 차선폭 (한쪽 차선만 보일 때 반대쪽 추정에 사용)
-        self.lane_width = 260.0
-
         # 구간별 무게중심 저장 — calc_center()/시각화에서 재사용
-        #   각 리스트는 길이 MOMENT_N_SLICES, 인덱스 0=가장 아래(근거리) ~ 마지막=가장 위(원거리)
-        self.left_centers = []
-        self.right_centers = []
+        #   리스트 길이는 MOMENT_N_SLICES, 인덱스 0=가장 아래(근거리) ~ 마지막=가장 위(원거리)
         self.yellow_centers = []
 
     def _slice_centers(self, mask, x_offset, color):
@@ -382,8 +289,6 @@ class SlideWindow:
             cv2.line(self.vis, p1, p2, color, 2)
 
     def visualize(self, offset):
-        self.draw_centers(self.left_centers, (0,255,255))
-        self.draw_centers(self.right_centers, (0,255,255))
         self.draw_centers(self.yellow_centers, (0,165,255))
 
         cv2.line(
@@ -405,63 +310,25 @@ class SlideWindow:
             cv2.waitKey(1)
 
     def calc_center(self):
-        near_left   = self._group_mean(self.left_centers,   MOMENT_NEAR_SLICES, True)
-        far_left    = self._group_mean(self.left_centers,   MOMENT_FAR_SLICES,  False)
-        near_right  = self._group_mean(self.right_centers,  MOMENT_NEAR_SLICES, True)
-        far_right   = self._group_mean(self.right_centers,  MOMENT_FAR_SLICES,  False)
         near_yellow = self._group_mean(self.yellow_centers, MOMENT_NEAR_SLICES, True)
         far_yellow  = self._group_mean(self.yellow_centers, MOMENT_FAR_SLICES,  False)
 
         lane_valid = False
         offset = 0
         lookahead = 0
-        near_center = far_center = None
 
-    # 1. 양쪽 차선 모두 검출
-        if near_left is not None and near_right is not None:
-
-            width = near_right - near_left
-            if 180 < width < 400:
-                alpha = 0.1
-                self.lane_width = (
-                   (1 - alpha) * self.lane_width +
-                    alpha * width
-                )
-
-            near_center = (near_left + near_right) / 2
-            far_center = (
-                (far_left  if far_left  is not None else near_left) +
-                (far_right if far_right is not None else near_right)
-            ) / 2
-            lane_valid = True
-
-    # 2. 왼쪽 차선만 검출
-        elif near_left is not None:
-
-            far_ref = far_left if far_left is not None else near_left
-            near_center = near_left + self.lane_width / 2
-            far_center = far_ref + self.lane_width / 2
-            lane_valid = True
-
-    # 3. 오른쪽 차선만 검출
-        elif near_right is not None:
-
-            far_ref = far_right if far_right is not None else near_right
-            near_center = near_right - self.lane_width / 2
-            far_center = far_ref - self.lane_width / 2
-            lane_valid = True
-
-    # 4. 흰 차선을 전혀 못 찾았을 때만 노란 차선 사용
-        elif near_yellow is not None:
-
+        # 노란 중앙선 자체를 주행목표로 삼는다(기존 "흰선 미검출시 노란선 폴백"과 동일한
+        # 산식). LANE_SIDE/YELLOW_LANE_OFFSET 식 고정 오프셋을 더했더니 실제로는 항상
+        # 그 값(약 130px)만큼 목표가 화면 중앙에서 어긋난 것으로 계산되어, PID가 코너로
+        # 오인해 조향각이 계속 최대치로 포화되고 그 결과 코너용 감속 로직이 속도를
+        # 바닥값(SPEED_NORMAL*0.15 ≈ 0.75)에 계속 묶어놓는 문제가 있었다(실측으로 확인:
+        # "속도 0.8에서 멈춤" 재현). 그래서 오프셋 없이 노란선 위치 그대로 사용한다.
+        if near_yellow is not None:
             far_ref = far_yellow if far_yellow is not None else near_yellow
-            near_center = near_yellow
-            far_center = far_ref
             lane_valid = True
 
-        if lane_valid:
-            offset = near_center - self.roi_w / 2
-            lookahead = far_center - self.roi_w / 2
+            offset = near_yellow - self.roi_w / 2
+            lookahead = far_ref - self.roi_w / 2
 
         lane_center = self.roi_w / 2 + offset
 
@@ -469,23 +336,14 @@ class SlideWindow:
 
         return lane_valid, offset, lookahead, lane_center
 
-    def detect(self, bev, white, yellow):
-        self.roi_h, self.roi_w = white.shape
+    def detect(self, bev, yellow):
+        self.roi_h, self.roi_w = yellow.shape
         self.vis = bev.copy()
 
-        half = self.roi_w // 2
         # 노란선은 중앙부만 탐색(기존 히스토그램 탐색 구간과 동일한 취지)
         q_lo = self.roi_w // 4
         q_hi = self.roi_w * 3 // 4
 
-        # 좌/우 절반으로 나눠 각각 구간별 무게중심 계산 →
-        # 구간 간 일관성 체크로 반사광 등 이상치 슬라이스 제외
-        self.left_centers = self._reject_outliers(self._slice_centers(
-            white[:, :half], 0, (0,255,0)
-        ))
-        self.right_centers = self._reject_outliers(self._slice_centers(
-            white[:, half:], half, (0,255,0)
-        ))
         self.yellow_centers = self._reject_outliers(self._slice_centers(
             yellow[:, q_lo:q_hi], q_lo, (0,180,255)
         ))
