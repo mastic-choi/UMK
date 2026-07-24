@@ -39,7 +39,7 @@ LANE_YELLOW_MAX_DEV = 40
 # 정반사(대각선 광택 반사)는 R≈G≈B≈매우 밝음 이라는 특성을 이용해,
 # 각 픽셀에서 (R,G,B 중 최솟값)을 빼서 정반사 성분만 골라 깎아냄.
 # 흰색 페인트(실제 무채색 재질 반사율)는 포화(saturate)되지 않는 경우가 많아 상대적으로 덜 깎임.
-SPECULAR_SUPPRESS_ENABLE = True
+SPECULAR_SUPPRESS_ENABLE = False
 
 # --- White Lane: 색상(HSV) + Top-hat(형태) 결합 ---
 # specular-free 전처리 후에도 남는 잔여 반사광은 "폭이 좁은가"라는 형태 조건으로 2차 필터링.
