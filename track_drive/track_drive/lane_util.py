@@ -32,17 +32,27 @@ DEBUG_VIZ_LANE = True
 # 흰 차선은 실차에서 전혀 검출되지 않아(실측 확인) 백색 검출 파이프라인을 걷어내고
 # 노란색 중앙선 검출만으로 주행경로를 산출한다(차선 자체를 목표로 그대로 추종).
 
+# BEV 유효영역 좌우 여유폭 — 커브 대응
+#   BEV_DST가 정의하는 x범위(169~489/640, 폭 50%)만 유효영역으로 인정하면 커브
+#   진입 시 노란선이 이 폭을 벗어나자마자 마스킹되어 사라져 직진으로 오인하는
+#   문제가 있었다(실측 확인). BEV_DST 경계에서 좌우로 이 비율(roi_w 기준)만큼
+#   더 여유를 줘서, 원근변환 사다리꼴 경계 밖(기하학적으로는 다소 부정확한
+#   외삽 픽셀)이라도 색상 기반 검출은 계속 시도한다 — 좌표 정밀도보다 "커브에서
+#   선을 놓치지 않는 것"이 우선이라는 판단. 실차 미검증 튜닝값.
+BEV_VALID_MARGIN_RATIO = 0.15
+
 # 구간별 무게중심(Moments) 기반 차선 추적
 #   기존 슬라이딩 윈도우(14단 히스토그램 탐색 + 2차 polyfit + 이전 프레임 기반 탐색)를
 #   걷어내고, ROI를 아래→위로 MOMENT_N_SLICES개 구간으로 나눠 구간마다 cv2.moments()로
 #   무게중심(cx = M10/M00)만 구하는 방식으로 단순화한다. 구간마다 완전히 독립적으로
-#   계산하므로 한 구간이 반사/잡음으로 오염돼도 다른 구간엔 전혀 영향이 없고,
-#   폴리피팅 없이 구간별 점을 그대로 이으면 커브 형태를 직관적으로 따라간다.
+#   계산하므로 한 구간이 반사/잡음으로 오염돼도 다른 구간엔 전혀 영향이 없다.
+#   점들은 직선이 아니라 다항회귀(_fit_curve, 아래 SlideWindow) 곡선으로 이어
+#   커브 형태를 완만하게 근사한다.
 #   실차 미검증 튜닝값.
-MOMENT_N_SLICES = 5        # ROI를 세로로 나눌 구간 수(아래→위, 3~5 권장 — 많을수록 커브 추종이 촘촘해지지만 구간당 픽셀이 줄어 노이즈에 약해짐)
-MOMENT_MIN_PIXELS = 15     # 구간 내 흰/노랑 픽셀수(M00)가 이 미만이면 그 구간은 "차선 없음" 처리
-MOMENT_NEAR_SLICES = 2     # near_center(조향용 근거리 편차) 계산에 쓸 아래쪽(근거리) 구간 수
-MOMENT_FAR_SLICES = 2      # far_center(코너 예측용 원거리 편차) 계산에 쓸 위쪽(원거리) 구간 수
+MOMENT_N_SLICES = 8        # ROI를 세로로 나눌 구간 수(아래→위 — 많을수록 회귀 곡선이 촘촘해지지만 구간당 픽셀이 줄어 노이즈에 약해짐)
+MOMENT_MIN_PIXELS = 15     # 구간 내 노랑 픽셀수(M00)가 이 미만이면 그 구간은 "차선 없음" 처리
+MOMENT_NEAR_SLICES = 2     # near_center(조향용 근거리 편차) 평가에 쓸 아래쪽(근거리) 구간 수
+MOMENT_FAR_SLICES = 2      # far_center(코너 예측용 원거리 편차) 평가에 쓸 위쪽(원거리) 구간 수
 
 # 구간 간 일관성 체크 (반사광 등 이상치 슬라이스 제거)
 #   문제 : 반사광은 특정 슬라이스 하나만 뜬금없이 튄 무게중심을 만들기 쉽다.
@@ -110,11 +120,14 @@ class CameraProcessor:
         # BEV 워프 유효 영역 밖(원근변환 사다리꼴 바깥) 마스킹
         #   BEV_DST가 정의하는 x범위(169~489/640 비율) 밖은 실제 도로가 아니라
         #   getPerspectiveTransform이 원근평면을 무한히 확장해서 만들어낸 외삽
-        #   픽셀이다(실측: 텍스처 없는 균일한 바닥에서도 이 바깥 테두리가 오검출됨
-        #   — 게다가 바로 좌/우 절반 탐색범위 안쪽 끝에 걸쳐있어 차선 오판으로
-        #   이어지기 쉬움). BEV_DST 비율로 유효 x범위를 계산해 그 밖은 마스크에서 지운다.
-        valid_x_lo = int(BEV_DST[0, 0] * self.roi_w)
-        valid_x_hi = int(BEV_DST[1, 0] * self.roi_w)
+        #   픽셀이다. 다만 그 경계선을 곧이곧대로 유효영역으로 쓰면 커브 진입 시
+        #   노란선이 사다리꼴 밖으로 살짝만 밀려도 바로 지워져 직진으로 오인한다
+        #   (실측 확인). BEV_VALID_MARGIN_RATIO만큼 좌우로 여유를 더 줘서 다소
+        #   부정확한 외삽 영역까지 색상 검출을 허용한다(좌표 정밀도보다 놓치지
+        #   않는 게 우선).
+        margin_px = BEV_VALID_MARGIN_RATIO * self.roi_w
+        valid_x_lo = max(0, int(BEV_DST[0, 0] * self.roi_w - margin_px))
+        valid_x_hi = min(self.roi_w, int(BEV_DST[1, 0] * self.roi_w + margin_px))
         self.yellow[:, :valid_x_lo] = 0
         self.yellow[:, valid_x_hi:] = 0
 
@@ -155,12 +168,12 @@ class SlideWindow:
     이름은 track_drive.py와의 인터페이스 호환을 위해 SlideWindow로 유지하지만,
     내부 구현은 "히스토그램 슬라이딩 윈도우 + 2차 polyfit + 이전 프레임 기반 탐색"
     대신 "구간별 무게중심(Moments)" 방식으로 교체됐다. ROI를 위아래로 나눠
-    구간마다 cv2.moments()로 무게중심만 구하고 그 점들을 그대로 잇기 때문에
-    폴리피팅이 필요 없고, 반사광으로 특정 구간이 오염돼도 다른 구간엔 영향이
-    없어 커브 대응이 더 직관적이다.
+    구간마다 cv2.moments()로 무게중심만 구하고, 그 점들을 직선이 아니라
+    다항회귀(_fit_curve) 곡선으로 이어 커브 형태를 완만하게 근사한다.
+    한 구간이 반사/점선 틈으로 비어도 다른 구간들의 추세로 메꿔진다.
 
-    흰 차선은 실차에서 검출이 안 되는 게 확인되어 제외하고, 노란 중앙선의
-    무게중심 위치 자체를 주행목표로 그대로 사용한다.
+    흰 차선은 실차에서 검출이 안 되는 게 확인되어 제외하고, 노란 중앙선
+    검출만으로 주행목표(회귀곡선의 근거리/원거리 지점)를 산출한다.
     """
     def __init__(self):
         self.vis = None
@@ -260,36 +273,58 @@ class SlideWindow:
 
         return result
 
-    def _group_mean(self, centers, count, from_start):
+    def _band_y_centers(self):
         """
-        centers(길이 MOMENT_N_SLICES, 아래→위 순)에서 근거리(from_start=True,
-        앞쪽 count개) 또는 원거리(from_start=False, 뒤쪽 count개) 구간들의 cx
-        평균을 낸다. 여러 구간을 평균내서 구간 하나의 노이즈에 결과가 흔들리는
-        걸 줄인다. 유효한 구간이 하나도 없으면 None.
+        _slice_centers()와 동일한 기하학으로 MOMENT_N_SLICES개 구간의 y중심 좌표만
+        계산한다(픽셀 유무와 무관, 순수 기하학). near_y/far_y 평가지점을 구할 때
+        해당 구간이 실제로 검출됐는지 여부와 상관없이 "그 위치의 곡선값"을 뽑기
+        위해 쓴다.
         """
-        window = centers[:count] if from_start else centers[-count:]
-        vals = [c[1] for c in window if c is not None]
+        slice_h = self.roi_h // MOMENT_N_SLICES
+        ys = []
+        for i in range(MOMENT_N_SLICES):
+            y_high = self.roi_h - i * slice_h
+            y_low = 0 if i == MOMENT_N_SLICES - 1 else self.roi_h - (i + 1) * slice_h
+            ys.append((y_low + y_high) / 2.0)
+        return ys
 
-        if not vals:
+    def _fit_curve(self, centers):
+        """
+        유효한 (y, cx) 점들에 다항회귀를 맞춰 x = f(y) 곡선(계수)을 반환한다.
+        점 사이를 직선으로 잇는 대신 완만한 곡선으로 커브 형태를 근사하기 위함
+        —  slice 하나가 반사/점선 틈으로 비어도 나머지 점들의 추세로 메꿔진다.
+        점 개수가 적을수록 과적합을 피하려고 차수를 낮춘다(3개 이상=2차,
+        2개=1차, 1개=상수). 유효 점이 하나도 없으면 None.
+        """
+        pts = [c for c in centers if c is not None]
+        if not pts:
             return None
-        return float(np.mean(vals))
+
+        ys = np.array([p[0] for p in pts])
+        xs = np.array([p[1] for p in pts])
+        degree = 2 if len(pts) >= 3 else (1 if len(pts) >= 2 else 0)
+
+        return np.polyfit(ys, xs, degree)
 
     def draw_centers(self, centers, color):
-        """구간별 무게중심을 점으로 찍고 인접한 점끼리 이어서 커브 형태로 시각화."""
-        pts = [
-            (int(np.clip(cx, 0, self.roi_w - 1)), int(y))
-            for c in centers if c is not None
-            for (y, cx) in [c]
-        ]
+        """구간별 무게중심을 점으로만 찍는다(연결은 _draw_curve의 회귀곡선이 담당)."""
+        for c in centers:
+            if c is None:
+                continue
+            y, cx = c
+            cv2.circle(self.vis, (int(np.clip(cx, 0, self.roi_w - 1)), int(y)), 4, color, -1)
 
-        for pt in pts:
-            cv2.circle(self.vis, pt, 4, color, -1)
+    def _draw_curve(self, curve, color, samples=30):
+        """다항회귀 곡선을 y방향으로 촘촘히 샘플링해 완만한 곡선으로 그린다(직선 연결 대체)."""
+        ys = np.linspace(0, self.roi_h - 1, samples)
+        xs = np.clip(np.polyval(curve, ys), 0, self.roi_w - 1)
+        pts = np.stack([xs, ys], axis=1).astype(np.int32)
+        cv2.polylines(self.vis, [pts], False, color, 2)
 
-        for p1, p2 in zip(pts, pts[1:]):
-            cv2.line(self.vis, p1, p2, color, 2)
-
-    def visualize(self, offset):
+    def visualize(self, offset, curve):
         self.draw_centers(self.yellow_centers, (0,165,255))
+        if curve is not None:
+            self._draw_curve(curve, (255,0,255))
 
         cv2.line(
             self.vis, (self.roi_w//2, 0), (self.roi_w//2, self.roi_h),
@@ -310,29 +345,30 @@ class SlideWindow:
             cv2.waitKey(1)
 
     def calc_center(self):
-        near_yellow = self._group_mean(self.yellow_centers, MOMENT_NEAR_SLICES, True)
-        far_yellow  = self._group_mean(self.yellow_centers, MOMENT_FAR_SLICES,  False)
+        curve = self._fit_curve(self.yellow_centers)
 
-        lane_valid = False
+        lane_valid = curve is not None
         offset = 0
         lookahead = 0
 
-        # 노란 중앙선 자체를 주행목표로 삼는다(기존 "흰선 미검출시 노란선 폴백"과 동일한
-        # 산식). LANE_SIDE/YELLOW_LANE_OFFSET 식 고정 오프셋을 더했더니 실제로는 항상
-        # 그 값(약 130px)만큼 목표가 화면 중앙에서 어긋난 것으로 계산되어, PID가 코너로
-        # 오인해 조향각이 계속 최대치로 포화되고 그 결과 코너용 감속 로직이 속도를
-        # 바닥값(SPEED_NORMAL*0.15 ≈ 0.75)에 계속 묶어놓는 문제가 있었다(실측으로 확인:
-        # "속도 0.8에서 멈춤" 재현). 그래서 오프셋 없이 노란선 위치 그대로 사용한다.
-        if near_yellow is not None:
-            far_ref = far_yellow if far_yellow is not None else near_yellow
-            lane_valid = True
+        # 회귀곡선에서 근거리/원거리 대표 y지점의 x값을 평가해 offset/lookahead를 구한다.
+        # 원본 슬라이스 평균(그 슬라이스가 검출됐을 때만 유효) 대신 곡선을 쓰면, 딱 그
+        # 대표 y지점 슬라이스가 반사/점선 틈으로 비어 있어도 다른 슬라이스들의 추세로
+        # 값을 뽑아낼 수 있어 커브 진입 구간에서 더 안정적이다.
+        if lane_valid:
+            band_ys = self._band_y_centers()
+            near_y = float(np.mean(band_ys[:MOMENT_NEAR_SLICES]))
+            far_y  = float(np.mean(band_ys[-MOMENT_FAR_SLICES:]))
 
-            offset = near_yellow - self.roi_w / 2
-            lookahead = far_ref - self.roi_w / 2
+            near_center = float(np.polyval(curve, near_y))
+            far_center  = float(np.polyval(curve, far_y))
+
+            offset = near_center - self.roi_w / 2
+            lookahead = far_center - self.roi_w / 2
 
         lane_center = self.roi_w / 2 + offset
 
-        self.visualize(offset)
+        self.visualize(offset, curve)
 
         return lane_valid, offset, lookahead, lane_center
 
@@ -340,12 +376,10 @@ class SlideWindow:
         self.roi_h, self.roi_w = yellow.shape
         self.vis = bev.copy()
 
-        # 노란선은 중앙부만 탐색(기존 히스토그램 탐색 구간과 동일한 취지)
-        q_lo = self.roi_w // 4
-        q_hi = self.roi_w * 3 // 4
-
+        # BEV 유효영역 마스킹(CameraProcessor.processor)이 이미 열 방향을 걸러주므로
+        # 여기서 별도로 폭을 다시 자르지 않는다(중복 제한 시 커브에서 선을 놓치기 쉬움).
         self.yellow_centers = self._reject_outliers(self._slice_centers(
-            yellow[:, q_lo:q_hi], q_lo, (0,180,255)
+            yellow, 0, (0,180,255)
         ))
 
         return self.calc_center()
