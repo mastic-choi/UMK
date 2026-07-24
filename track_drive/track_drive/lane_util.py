@@ -110,7 +110,7 @@ class CameraProcessor:
 
         # white HSV Mask
         white_hsv = cv2.inRange(
-            hsv, np.array([0,0,150]), np.array([180,90,255])
+            hsv, np.array([0,0,195]), np.array([180,35,255])
         )
 
         # Top-Hat + HSV 결합
@@ -120,7 +120,7 @@ class CameraProcessor:
 
         #Yellow Lane
         self.yellow = cv2.inRange(
-            hsv, np.array([15,80,80]), np.array([40,255,255])
+            hsv, np.array([15,45,130]), np.array([40,255,255])
         )
         #Morphology
         kernel = cv2.getStructuringElement(
