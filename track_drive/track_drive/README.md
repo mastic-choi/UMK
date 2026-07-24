@@ -1,5 +1,8 @@
 # track_drive 테스트 가이드
 
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu opencv-python
+
+
 `track_drive.py`는 하나의 노드 안에서 신호등/차선/라바콘/장애물/추월을 전부 처리하는 2중 FSM 구조입니다
 (`MissionState` S0~S4 + `BehaviorState`/`Phase`). 기능별로 **부분만 골라서** 테스트하려면 파일 상단의
 "개발/테스트 플래그" 블록([track_drive.py:142-176](track_drive.py#L142))만 조합해서 바꾸면 됩니다.

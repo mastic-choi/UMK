@@ -40,31 +40,3 @@ def check_stopline(image):
         cv2.waitKey(1)
 
     return detected
-
-
-class LaneDetector:
-    """CameraProcessor(BEV/마스크) + SlideWindow(차선 탐색/피팅)을 묶은 최종 통합 인식기."""
-
-    def __init__(self, camera_processor=None, slide_window_processor=None):
-        self.camera_processor = camera_processor
-        self.slide_window_processor = slide_window_processor
-
-    def set_processor(self, camera, slide_window):
-        self.camera_processor = camera
-        self.slide_window_processor = slide_window
-
-    def detect(self, frame):
-        """
-        입력 : 전방 카메라 BGR 프레임
-        출력 : (lane_valid, lane_offset, lane_lookahead, lane_center, bev)
-        """
-        bev, white_mask, yellow_mask = self.camera_processor.processor(frame)
-
-        if bev is None:
-            return False, 0.0, 0.0, 320.0, None   # lane_center는 화면 중앙(640/2)을 기본값으로
-
-        lane_valid, lane_offset, lookahead, lane_center = self.slide_window_processor.detect(
-            bev, white_mask, yellow_mask
-        )
-
-        return lane_valid, lane_offset, lookahead, lane_center, bev

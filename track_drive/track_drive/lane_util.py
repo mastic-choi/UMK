@@ -1,493 +1,362 @@
+"""
+PolyLaneNet-based lane perception utility.
+
+Replaces the previous OpenCV pipeline (BEV homography, adaptive-threshold
+color masking, moments-based slice tracking, outlier rejection) with the
+deep polynomial regression approach from:
+
+    Tabelini et al., "PolyLaneNet: Lane Estimation via Deep Polynomial
+    Regression" (arXiv:2004.10924).
+
+Core idea (paper Eq. 1): a CNN backbone + single FC head directly regresses,
+in one forward pass over the raw camera frame, M_MAX lane-marking candidates,
+each a 3rd-order polynomial
+
+        p(y) = a*y^3 + b*y^2 + c*y + d                              (Eq. 1, K=3)
+
+together with a confidence score c_j and a vertical validity range for that
+polynomial. The paper's Eq. 2 additionally lists a single global horizon `h`
+shared across all lanes -- but the officially released weights (which this
+module is built to load directly, e.g. `tusimple_resnet34/model_2695.pt`)
+never actually expose that as its own output slot: `models.py`'s `decode()`
+only sigmoids the confidence column, and `share_top_y` -- the mechanism meant
+to make one lane's "lower" bound track the shared horizon -- is dead-code
+even in the reference repo. What every release actually predicts, and what
+`lane_dataset.py`'s own visualization code consumes, is a *per-candidate*
+`(lower, upper)` pair used directly as that polynomial's valid y-domain. This
+module follows that real, checkpoint-compatible layout:
+
+    per lane candidate: (c_j, lower_j, upper_j, a_j, b_j, c_j, d_j)  -- 7 values
+    FC head output     : M_MAX * 7 values, no separate global output
+
+There is no segmentation, clustering, anchor shifting, or curve-fitting here:
+the lanes returned by this module ARE the network's raw polynomial outputs,
+only gated by the confidence threshold from the paper (Sec. IV-B).
+
+`x`/`y` polynomial coordinates are normalized to [0, 1] (fraction of frame
+width/height), exactly as they were during training -- pixel coordinates are
+only reconstructed at the very end, for control/visualization.
+"""
+
+import os
+from dataclasses import dataclass
+from typing import List
+
+import cv2  # only used for input resize/color-convert and optional debug drawing
 import numpy as np
-import cv2
+import torch
+import torch.nn as nn
+from torchvision import models as tv_models
 
-#BEV
-# 출처: KUAC_2024-main lane_detection/src/utils.py warper() — 원본 픽셀좌표 그대로(640x150 ROI 기준, 반올림 없음)
-#   src 원본: 좌하[0,126] 좌상[175,46] 우상[456,38] 우하[640,103]
-#   dst 원본: x=169~489, y=0~150(ROI 높이 그대로)
-#   같은 640x480 카메라·같은 ROI 높이(150px) 사용 가정 → 원본 수치/640,150 그대로 기입
-#   (우리 점 순서인 좌상,우상,우하,좌하로 재배열만 함). 카메라 마운트 다르면 실차에서 재확인 필요.
-BEV_SRC = np.float32([
-        [175/640, 46/150],
-        [456/640, 38/150],
-        [640/640, 103/150],
-        [0/640,   126/150],
-    ])
-BEV_DST = np.float32([
-        [169/640, 0/150],
-        [489/640, 0/150],
-        [489/640, 150/150],
-        [169/640, 150/150],
-    ])
+# ----------------------------------------------------------------------------
+# PolyLaneNet architecture constants
+# ----------------------------------------------------------------------------
+POLY_ORDER = 3                               # K in Eq. 1 -- paper's chosen (default) polynomial degree
+NUM_COEFFS = POLY_ORDER + 1                  # (a, b, c, d) per lane candidate
+M_MAX = 5                                    # max simultaneous lane candidates the FC head predicts
+                                              #   (paper: real scenes have M<=4 annotated lanes; the official
+                                              #   tusimple_resnet34 checkpoint uses 5 slots -- kept identical
+                                              #   here so those released weights load without reshaping)
+OUTPUTS_PER_LANE = 3 + NUM_COEFFS            # c_j, lower, upper, + 4 poly coeffs = 7 (matches official repo)
+TOTAL_OUTPUTS = M_MAX * OUTPUTS_PER_LANE     # no extra global-h slot -- see module docstring
 
+CONF_THRESHOLD = 0.5                         # c_j < 0.5 candidates are discarded at inference (paper Sec. IV-B)
 
-#Lane ROI
-# 출처: KUAC_2024-main lane_detection/src/utils.py roi_for_lane() → image[246:396, :] (640x480 기준)
-#   246/480=0.5125, 396/480=0.825 로 환산
-LANE_ROI_TOP = 0.45
-LANE_ROI_BOT = 0.825
-#Debug
-DEBUG_VIZ_LANE = True
+NET_INPUT_W, NET_INPUT_H = 640, 360          # network input resolution (paper's TuSimple training setup)
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
-# Adaptive Thresholding — 흰 차선 마스킹
-#   기존 CLAHE+Top-Hat(21x21 국소대비)+고정 임계값(10)+HSV 조합 대신, CLAHE 다음
-#   단계를 cv2.adaptiveThreshold 하나로 단순화한다. 픽셀마다 자기 주변 blockSize
-#   이웃의 (가우시안 가중)평균 밝기를 기준으로 임계값을 다시 계산해주기 때문에,
-#   트랙 전체 조명이 불균일해도(한쪽은 밝고 한쪽은 그늘) 별도 튜닝 없이 안정적으로
-#   차선을 잡을 수 있다. THRESH_BINARY라 "주변 평균-C 보다 밝은 픽셀"이 흰색(255)이 된다.
-#   ※ 주의: 정반사(글레어)도 "주변보다 국소적으로 밝다"는 같은 성질을 가지므로
-#     adaptiveThreshold 하나로 반사광이 완전히 걸러지는 건 아니다 — 이후 CCA
-#     면적 필터로 작은 반사 얼룩 위주로 추가 제거한다(아래 CameraProcessor.processor 참고).
-#   ※★ C는 반드시 음수여야 한다(실측으로 확인됨, 아래 참고) ★
-#     T(x,y) = 주변평균 - C 이므로 C>0이면 T가 주변평균보다 낮아져서, 텍스처가
-#     거의 없는 평평한 바닥(에폭시처럼 매끈한 면)에서는 "픽셀값 ≈ 주변평균"이라
-#     사실상 전 영역이 threshold를 통과해버린다(합성 테스트 실측: C=+2일 때
-#     균일한 바닥의 96.6%가 흰색으로 오검출됨 — 차선 유무와 무관하게 화면 전체가
-#     "차선"으로 잡히는 셈이라 반사광보다 더 위험한 실패모드).
-#     C를 음수로 주면 T=주변평균+|C|가 되어 "주변보다 확실히 밝아야만" 통과하고,
-#     평평한 바닥은 정상적으로 검게 남는다(동일 테스트에서 C=-10부터 오검출 0%,
-#     동시에 실제 차선 검출률은 C=+2일 때와 동일하게 유지됨 — 손해 없이 안전해짐).
-ADAPTIVE_BLOCK_SIZE = 31   # 로컬 평균을 낼 이웃 크기(px, 홀수 필수) — 클수록 더 넓은 영역의 평균과 비교
-ADAPTIVE_C = -15           # 주변평균보다 이만큼(px 밝기값) 더 밝아야 흰색 인정. 반드시 음수로 유지할 것
+LOOKAHEAD_Y_NORM = 0.6                       # normalized y sampled for the "far" (lookahead) offset
 
-# Median Blur — 폭(굵기) 기준으로 얇은 반사 줄무늬 제거
-#   문제 : 골진(주름진) 반사면이 조명을 여러 갈래 가는 대각선 줄무늬로 반사시키는
-#     경우, adaptiveThreshold(밝기 기준)나 구간 간 일관성 체크(위치 기준)로는
-#     못 걸러진다 — 반사 줄무늬 하나하나가 그 자체로 밝고 매끄럽게 이어지는
-#     "그럴듯한 선"이기 때문. 지금까지의 밝기/일관성 축과 다른 "폭" 축으로 접근한다.
-#   해결 : adaptiveThreshold 전에 그레이스케일에 medianBlur를 적용. 커널 안에서
-#     다수결로 값을 정하는 특성상, 커널 폭의 절반보다 얇은 밝은 줄무늬는 주변
-#     어두운 배경에 묻혀 사라지고, 그보다 굵은 실제 차선은 살아남는다.
-#   ※ 전제 조건: "반사 줄무늬 폭 < MEDIAN_BLUR_KSIZE/2 < 실제 차선 폭"이 실측으로
-#     성립해야 한다. 두 폭이 비슷하면 반사도 안 지워지거나, 반대로 점선/커브 구간의
-#     가늘어 보이는 실제 차선까지 같이 지워질 수 있다 — 실차 영상에서 lane_white
-#     디버그 창으로 두 폭을 비교해보고 커널 크기를 재조정할 것.
-#   실차 미검증 튜닝값.
-MEDIAN_BLUR_KSIZE = 9      # 홀수 필수. 이 값의 절반(≈4~5px)보다 얇은 밝은 줄무늬를 지운다
-
-# 구간별 무게중심(Moments) 기반 차선 추적
-#   기존 슬라이딩 윈도우(14단 히스토그램 탐색 + 2차 polyfit + 이전 프레임 기반 탐색)를
-#   걷어내고, ROI를 아래→위로 MOMENT_N_SLICES개 구간으로 나눠 구간마다 cv2.moments()로
-#   무게중심(cx = M10/M00)만 구하는 방식으로 단순화한다. 구간마다 완전히 독립적으로
-#   계산하므로 한 구간이 반사/잡음으로 오염돼도 다른 구간엔 전혀 영향이 없고,
-#   폴리피팅 없이 구간별 점을 그대로 이으면 커브 형태를 직관적으로 따라간다.
-#   실차 미검증 튜닝값.
-MOMENT_N_SLICES = 5        # ROI를 세로로 나눌 구간 수(아래→위, 3~5 권장 — 많을수록 커브 추종이 촘촘해지지만 구간당 픽셀이 줄어 노이즈에 약해짐)
-MOMENT_MIN_PIXELS = 15     # 구간 내 흰/노랑 픽셀수(M00)가 이 미만이면 그 구간은 "차선 없음" 처리
-MOMENT_NEAR_SLICES = 2     # near_center(조향용 근거리 편차) 계산에 쓸 아래쪽(근거리) 구간 수
-MOMENT_FAR_SLICES = 2      # far_center(코너 예측용 원거리 편차) 계산에 쓸 위쪽(원거리) 구간 수
-
-# 구간 간 일관성 체크 (반사광 등 이상치 슬라이스 제거)
-#   문제 : 반사광은 특정 슬라이스 하나만 뜬금없이 튄 무게중심을 만들기 쉽다.
-#         밝기/색상만으로는 진짜 차선과 반사광을 못 가른다는 게 이미 여러 번
-#         확인됐으므로, 완전히 다른 축인 "슬라이스끼리의 위치 일관성"으로
-#         걸러낸다 — 진짜 차선은 슬라이스가 위로 갈수록 완만하게 이어지지만
-#         반사광은 그 흐름에서 혼자 튄다.
-#   방법 : 이번 프레임의 유효 슬라이스들에 1차(직선) 최소자승 추세선을 맞추고,
-#         그 추세에서 LANE_SLICE_OUTLIER_MAX(px) 이상 벗어난 슬라이스만 제외한다.
-#         프레임 간 기억이 필요 없어 가볍고(1패스, 폴백 없음), ROI가 짧아서
-#         커브 구간에서도 직선 근사가 크게 어긋나지 않는다.
-#   실차 미검증 튜닝값.
-LANE_SLICE_OUTLIER_MAX = 40   # 추세선에서 이 이상(px) 벗어난 슬라이스는 이상치로 제외
-LANE_SLICE_FIT_MIN = 3        # 유효 슬라이스가 이 개수 미만이면 추세 판단이 불안정하므로 검사 자체를 생략
+# Off by default: the vehicle's Jetson normally runs this node headless (no attached
+# display / no X session over SSH), and cv2.imshow() there either errors or hangs.
+# Set XYCAR_LANE_DEBUG_VIZ=1 in the environment to see the "polylanenet_result" window
+# during on-desk/dev-machine testing (e.g. test_lane_webcam.py).
+DEBUG_VIZ_LANE = os.environ.get('XYCAR_LANE_DEBUG_VIZ', '0') == '1'
 
 
-#def Debugging(flag):
-# DEBUG 상수들 모아놓자(외부 파일로 뺄지는 고민해보기)
-class CameraProcessor:
-    def __init__(self):
-        self.roi = None
-        self.bev = None
-        self.white = None
-        self.yellow = None
-
-        self.roi_h = 0
-        self.roi_w = 0
-
-    def processor(self, frame):
-        # ROI
-        h, w = frame.shape[:2]
-
-        self.roi = frame[
-            int(h*LANE_ROI_TOP): int(h*LANE_ROI_BOT), :
-            ]
-        self.roi_h, self.roi_w = self.roi.shape[:2]
-
-        #BEV
-        bev_src = BEV_SRC*np.array(
-            [self.roi_w, self.roi_h],
-            dtype = np.float32
-        )
-
-        bev_dst = BEV_DST*np.array(
-            [self.roi_w, self.roi_h],
-            dtype = np.float32
-        )
-
-        M = cv2.getPerspectiveTransform(
-            bev_src, bev_dst
-        )
-        self.bev = cv2.warpPerspective(
-            self.roi,
-            M,
-            (self.roi_w, self.roi_h)
-        )
-
-        # white Lane : Adaptive Thresholding
-        # 1) Gray 변환
-        gray = cv2.cvtColor(self.bev, cv2.COLOR_BGR2GRAY)
-        # 2) CLAHE (국소 명암 향상) — adaptiveThreshold 전에 대비를 한 번 더 올려줌
-        clahe = cv2.createCLAHE(
-            clipLimit=2.0,
-            tileGridSize=(8,8)
-        )
-        gray = clahe.apply(gray)
-
-        # 3) Median Blur — 폭이 얇은 반사 줄무늬 제거(굵은 실제 차선은 보존)
-        gray = cv2.medianBlur(gray, MEDIAN_BLUR_KSIZE)
-
-        # 4) Adaptive Thresholding — 픽셀마다 주변 blockSize 영역의 가우시안 가중평균
-        #    밝기를 기준으로 이진화(THRESH_BINARY: 평균-C 보다 밝으면 흰색)
-        self.white = cv2.adaptiveThreshold(
-            gray, 255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY,
-            ADAPTIVE_BLOCK_SIZE, ADAPTIVE_C
-        )
-
-        # HSV
-        hsv = cv2.cvtColor(self.bev, cv2.COLOR_BGR2HSV)
-
-        #Yellow Lane
-        self.yellow = cv2.inRange(
-            hsv, np.array([15,80,80]), np.array([40,255,255])
-        )
-
-        # BEV 워프 유효 영역 밖(원근변환 사다리꼴 바깥) 마스킹
-        #   BEV_DST가 정의하는 x범위(169~489/640 비율) 밖은 실제 도로가 아니라
-        #   getPerspectiveTransform이 원근평면을 무한히 확장해서 만들어낸 외삽
-        #   픽셀이다(실측: 텍스처 없는 균일한 바닥에서도 이 바깥 테두리가
-        #   CLAHE+adaptiveThreshold를 통과해 흰색으로 오검출됨 — 게다가 바로
-        #   좌/우 절반 탐색범위 안쪽 끝에 걸쳐있어 차선 오판으로 이어지기 쉬움).
-        #   BEV_DST 비율로 유효 x범위를 계산해 그 밖은 흰/노랑 마스크에서 지운다.
-        valid_x_lo = int(BEV_DST[0, 0] * self.roi_w)
-        valid_x_hi = int(BEV_DST[1, 0] * self.roi_w)
-        self.white[:, :valid_x_lo] = 0
-        self.white[:, valid_x_hi:] = 0
-        self.yellow[:, :valid_x_lo] = 0
-        self.yellow[:, valid_x_hi:] = 0
-
-        #Morphology
-        kernel = cv2.getStructuringElement(
-            cv2.MORPH_RECT, (3,3)
-        )
-
-        # white cclosing
-        self.white = cv2.morphologyEx(
-            self.white, cv2.MORPH_CLOSE, kernel
-        )
+def _imshow(window_name, image):
+    """cv2.imshow guarded against a missing display -- logs once and disables
+    further attempts instead of taking down the control loop mid-drive."""
+    global DEBUG_VIZ_LANE
+    if not DEBUG_VIZ_LANE or image is None:
+        return
+    try:
+        cv2.imshow(window_name, image)
+        cv2.waitKey(1)
+    except cv2.error as exc:
+        print(f'[lane_util] disabling debug visualization (no display available?): {exc}')
+        DEBUG_VIZ_LANE = False
 
 
-        # Connected Components — 작은 반사광 얼룩/잡음 제거(면적 기준)
-        num, labels, stats, _ = cv2.connectedComponentsWithStats(self.white)
+def _resolve_weights_dir():
+    """Prefer the ROS2-installed share directory (colcon build copies `weights/`
+    there via setup.py's data_files); fall back to the path next to this source
+    file for dev runs (symlink-install, or a plain `python3 test_lane_webcam.py`
+    with no ROS2 environment sourced at all)."""
+    try:
+        from ament_index_python.packages import get_package_share_directory
+        share_weights = os.path.join(get_package_share_directory('track_drive'), 'weights')
+        if os.path.isdir(share_weights):
+            return share_weights
+    except Exception:
+        pass  # not running under a sourced ROS2 install (e.g. plain dev-machine test script)
+    return os.path.join(os.path.dirname(__file__), 'weights')
 
-        mask = np.zeros_like(self.white)
 
-        for i in range(1, num) :
-            area = stats[i, cv2.CC_STAT_AREA]
+# Official released checkpoint (e.g. tusimple_resnet34/model_2695.pt) expected as
+# weights/polylanenet.{pt,pth} -- either extension is accepted since torch.save()
+# doesn't care and the official releases ship as .pt. Falls back to None (random-init
+# backbone -- inference runs but produces meaningless lanes) until a checkpoint is
+# placed there or a path is passed explicitly to PolyLaneNetDetector.
+_WEIGHTS_DIR = _resolve_weights_dir()
+DEFAULT_WEIGHTS_PATH = next(
+    (p for ext in ('.pt', '.pth') if os.path.isfile(p := os.path.join(_WEIGHTS_DIR, f'polylanenet{ext}'))),
+    None,
+)
 
-            if area> 5 :
-                mask[labels == i] = 255
 
-        self.white = mask
+@dataclass
+class LaneCandidate:
+    """One decoded lane-marking candidate: a 3rd-order polynomial p(y) = a*y^3 + b*y^2 + c*y + d,
+    valid on the normalized y-range [lower, upper] (lower is nearer the horizon/top of frame,
+    upper is nearer the camera/bottom of frame -- matches the official repo's own convention).
 
-        # yellow morphology
-        self.yellow = cv2.morphologyEx(
-            self.yellow, cv2.MORPH_CLOSE, kernel
-        )
-
-        # Connected Components
-        num, labels, stats, _ = cv2.connectedComponentsWithStats(self.yellow)
-
-        mask = np.zeros_like(self.yellow)
-
-        for i in range(1, num):
-            area = stats[i, cv2.CC_STAT_AREA]
-
-            width = stats[i, cv2.CC_STAT_WIDTH]
-
-            if area>20 and width < 80:
-                mask[labels == i] = 255
-
-        self.yellow = mask
-
-        # 흰색 마스크에서 노란색 확정 영역 제외
-        #   adaptiveThreshold는 그레이스케일(밝기)만 보기 때문에 채도가 높은
-        #   노란 중앙선도 "주변보다 밝다"는 조건을 만족해버려 self.white에 같이
-        #   잡힌다(실측으로 확인됨). self.yellow는 이미 색상 기반으로 노란색만
-        #   따로 걸러낸 마스크이므로, 여기 확정된 자리는 흰색일 수 없다는 관계를
-        #   그대로 강제한다. dilate로 살짝 여유를 줘서 노란선 가장자리의 안티
-        #   앨리어싱된 픽셀까지 같이 제외한다.
-        yellow_dilated = cv2.dilate(self.yellow, kernel)
-        self.white = cv2.bitwise_and(
-            self.white, cv2.bitwise_not(yellow_dilated)
-        )
-
-        #DEBUG
-        if DEBUG_VIZ_LANE:
-            cv2.imshow("lane_bev", self.bev)
-            cv2.imshow("lane_white", self.white)
-            cv2.imshow("lane_yellow", self.yellow)
-
-        return (self.bev, self.white, self.yellow)
-
-class SlideWindow:
+    `coeffs` is ordered (a, b, c, d) -- highest degree first -- matching the
+    reference implementation's use of `np.polyval`, not the paper's
+    increasing-order a_k indexing (they are the same 4 numbers, just reversed).
     """
-    이름은 track_drive.py와의 인터페이스 호환을 위해 SlideWindow로 유지하지만,
-    내부 구현은 "히스토그램 슬라이딩 윈도우 + 2차 polyfit + 이전 프레임 기반 탐색"
-    대신 "구간별 무게중심(Moments)" 방식으로 교체됐다. ROI를 위아래로 나눠
-    구간마다 cv2.moments()로 무게중심만 구하고 그 점들을 그대로 잇기 때문에
-    폴리피팅이 필요 없고, 반사광으로 특정 구간이 오염돼도 다른 구간엔 영향이
-    없어 커브 대응이 더 직관적이다.
+    coeffs: np.ndarray   # shape (4,): (a, b, c, d)
+    lower: float         # normalized y where this lane's predicted extent begins (near horizon)
+    upper: float         # normalized y where this lane's predicted extent ends (near camera / bottom)
+    confidence: float    # c_j in [0, 1], already passed the CONF_THRESHOLD gate in decode_predictions()
+
+    def evaluate_x(self, y_norm):
+        """p(y) via Horner's method. `y_norm` may be a scalar or an array, both normalized to [0, 1]."""
+        a, b, c, d = self.coeffs
+        y = np.asarray(y_norm, dtype=np.float32)
+        return ((a * y + b) * y + c) * y + d
+
+    def to_pixel_points(self, img_w, img_h, y_lo=None, y_hi=None, num_points=50):
+        """Sample the polynomial on [y_lo, y_hi] (normalized, defaults to this lane's own [lower, upper])
+        and project to pixel space."""
+        y_lo = self.lower if y_lo is None else y_lo
+        y_hi = self.upper if y_hi is None else y_hi
+        ys = np.linspace(y_lo, y_hi, num_points, dtype=np.float32)
+        xs = self.evaluate_x(ys)
+        pts = np.stack([xs * img_w, ys * img_h], axis=1).astype(np.int32)
+        # drop points the polynomial extrapolated outside the visible frame
+        pts = pts[(pts[:, 0] >= 0) & (pts[:, 0] < img_w)]
+        return pts
+
+
+def _build_backbone(backbone, pretrained):
+    """torchvision's pretrained-weights API changed across versions; support both."""
+    if backbone == 'resnet34':
+        ctor, weights_enum = tv_models.resnet34, getattr(tv_models, 'ResNet34_Weights', None)
+    elif backbone == 'resnet50':
+        ctor, weights_enum = tv_models.resnet50, getattr(tv_models, 'ResNet50_Weights', None)
+    else:
+        raise NotImplementedError(f'Unsupported backbone: {backbone}')
+
+    if weights_enum is not None:
+        return ctor(weights=weights_enum.IMAGENET1K_V1 if pretrained else None)
+    return ctor(pretrained=pretrained)
+
+
+class _OutputLayer(nn.Module):
+    """Verbatim structure of the official repo's `OutputLayer` (lib/models.py).
+
+    Kept name-for-name (`regular_outputs_layer` / `extra_outputs_layer`) so a
+    released checkpoint's state_dict -- which stores exactly these submodule
+    names -- loads via plain `load_state_dict(strict=True)`, no key remapping.
     """
-    def __init__(self):
-        self.vis = None
 
-        self.roi_h = 0
-        self.roi_w = 0
+    def __init__(self, fc, num_extra=0):
+        super().__init__()
+        self.regular_outputs_layer = fc
+        self.num_extra = num_extra
+        if num_extra > 0:
+            self.extra_outputs_layer = nn.Linear(fc.in_features, num_extra)
 
-        #실시간 차선폭 (한쪽 차선만 보일 때 반대쪽 추정에 사용)
-        self.lane_width = 260.0
+    def forward(self, x):
+        regular_outputs = self.regular_outputs_layer(x)
+        extra_outputs = self.extra_outputs_layer(x) if self.num_extra > 0 else None
+        return regular_outputs, extra_outputs
 
-        # 구간별 무게중심 저장 — calc_center()/시각화에서 재사용
-        #   각 리스트는 길이 MOMENT_N_SLICES, 인덱스 0=가장 아래(근거리) ~ 마지막=가장 위(원거리)
-        self.left_centers = []
-        self.right_centers = []
-        self.yellow_centers = []
 
-    def _slice_centers(self, mask, x_offset, color):
-        """
-        mask를 아래→위로 MOMENT_N_SLICES개 구간으로 나눠 구간마다 cv2.moments()로
-        무게중심(cx)을 구한다. 슬라이딩 윈도우처럼 이전 구간 위치를 이어받지
-        않고 구간마다 독립적으로 계산하므로, 한 구간이 반사/잡음으로 날아가도
-        다른 구간에는 전혀 영향이 없다.
-          입력 : mask     — 이진마스크(좌/우 절반 등으로 이미 열 방향이 잘려있을 수 있음)
-                x_offset — mask가 원본 ROI에서 잘려나온 경우의 x좌표 보정값(좌우 분리용)
-                color    — 디버그 사각형 색상
-          출력 : centers — 길이 MOMENT_N_SLICES 리스트. 각 원소는 (y_center, cx) 또는
-                 해당 구간 픽셀수가 MOMENT_MIN_PIXELS 미만이면 None
-        """
-        slice_h = self.roi_h // MOMENT_N_SLICES
-        centers = []
+class PolyLaneNet(nn.Module):
+    """Backbone + FC head producing the raw TOTAL_OUTPUTS regression vector.
 
-        for i in range(MOMENT_N_SLICES):
-            y_high = self.roi_h - i * slice_h
-            # 마지막(가장 위) 구간은 정수나눗셈 나머지를 포함해 y=0까지 전부 커버
-            y_low = 0 if i == MOMENT_N_SLICES - 1 else self.roi_h - (i + 1) * slice_h
+    The resnet instance is stored as `self.model` (not e.g. `self.backbone`)
+    and its head wrapped in `_OutputLayer`, both purely so this module's
+    state_dict layout matches the officially released checkpoints exactly.
 
-            band = mask[y_low:y_high, :]
+    No decoding (sigmoid/thresholding) happens here -- that is decode_predictions()'s
+    job, kept separate so the network stays a plain regressor.
+    """
 
-            if DEBUG_VIZ_LANE:
-                cv2.rectangle(
-                    self.vis,
-                    (x_offset, y_low), (x_offset + mask.shape[1] - 1, max(y_high - 1, y_low)),
-                    color, 1
-                )
+    def __init__(self, backbone='resnet34', pretrained=True, m_max=M_MAX, extra_outputs=0):
+        super().__init__()
+        self.m_max = m_max
+        total_outputs = m_max * OUTPUTS_PER_LANE
 
-            M = cv2.moments(band, binaryImage=True)
+        self.model = _build_backbone(backbone, pretrained)
+        in_features = self.model.fc.in_features
+        self.model.fc = nn.Linear(in_features, total_outputs)
+        self.model.fc = _OutputLayer(self.model.fc, extra_outputs)
 
-            if M['m00'] < MOMENT_MIN_PIXELS:
-                centers.append(None)
-                continue
+    def forward(self, x):
+        regular_outputs, _ = self.model(x)
+        return regular_outputs  # raw logits; caller must run decode_predictions()
 
-            cx = M['m10'] / M['m00'] + x_offset
-            y_center = (y_low + y_high) / 2.0
-            centers.append((y_center, cx))
 
-        return centers
+def decode_predictions(raw_output, m_max=M_MAX, conf_threshold=CONF_THRESHOLD):
+    """Parse one FC-layer output vector into confidence-filtered lane candidates.
 
-    def _reject_outliers(self, centers):
-        """
-        구간별 무게중심들 사이의 위치 일관성을 체크해서 이상치(반사광 등으로
-        혼자 튄 값)를 제거한다. 진짜 차선은 슬라이스가 위로 갈수록 완만하게
-        이어지지만, 반사광은 특정 슬라이스 하나만 뜬금없이 튀는 값을 만들기
-        쉽다. 프레임 간 기억 없이 "이번 프레임 슬라이스들끼리"만 비교한다.
-          방법 : Leave-one-out — 각 슬라이스를 검사할 때 "자기 자신을 뺀"
-                나머지 유효 슬라이스들로만 1차(직선) 추세선을 맞추고, 그
-                추세에서 LANE_SLICE_OUTLIER_MAX(px) 이상 벗어나면 이상치로
-                None 처리한다. 전체 점으로 한 번에 추세선을 맞추면 이상치
-                자신이 추세선을 자기 쪽으로 끌어당겨서 오히려 안 걸러지는
-                문제가 있어(실측으로 확인됨) 반드시 leave-one-out으로 한다.
-                슬라이스가 3~5개뿐이라 매 프레임 여러 번 다시 피팅해도 비용은
-                무시할 수준이다.
-          입력/출력 : centers — _slice_centers()와 동일한 형식(길이 불변)
-        """
-        valid_idx = [i for i, c in enumerate(centers) if c is not None]
-        if len(valid_idx) < LANE_SLICE_FIT_MIN:
-            return centers   # 점이 너무 적으면 추세 판단 자체가 불안정 → 검사 생략
+    Implements the "Network Outputs Extraction" + "Confidence Filtering" steps:
+    reshapes the flat vector into M_MAX blocks of (c_j, lower, upper, a, b, c, d),
+    sigmoids only the confidence column (matching the official `decode()` in
+    lib/models.py -- lower/upper/coeffs are left as raw regression outputs,
+    never squashed at inference), and strictly discards any candidate with
+    c_j < conf_threshold.
 
-        ys = np.array([centers[i][0] for i in valid_idx])
-        xs = np.array([centers[i][1] for i in valid_idx])
+    Args:
+        raw_output: 1-D tensor of length `m_max * OUTPUTS_PER_LANE`
+                    (i.e. a single image's network output, batch dim already removed).
+    Returns:
+        A confidence-filtered list of LaneCandidate (never containing
+        c_j < conf_threshold entries).
+    """
+    expected = m_max * OUTPUTS_PER_LANE
+    if raw_output.shape[-1] != expected:
+        raise ValueError(f'expected {expected} outputs for m_max={m_max}, got {raw_output.shape[-1]}')
 
-        result = list(centers)
+    lane_block = raw_output.view(m_max, OUTPUTS_PER_LANE)
+    confidences = torch.sigmoid(lane_block[:, 0])
+    lowers = lane_block[:, 1]
+    uppers = lane_block[:, 2]
+    coeffs = lane_block[:, 3:]
 
-        for k, i in enumerate(valid_idx):
-            other_y = np.delete(ys, k)
-            other_x = np.delete(xs, k)
-
-            if len(other_y) < 2:
-                continue   # 나머지가 1개뿐이면 직선을 정의할 수 없어 검사 생략
-
-            slope, intercept = np.polyfit(other_y, other_x, 1)
-            y_i, x_i = centers[i]
-            residual = abs(x_i - (slope * y_i + intercept))
-
-            if residual > LANE_SLICE_OUTLIER_MAX:
-                result[i] = None
-                if DEBUG_VIZ_LANE:
-                    cv2.drawMarker(
-                        self.vis,
-                        (int(np.clip(x_i, 0, self.roi_w - 1)), int(y_i)),
-                        (0, 0, 255), cv2.MARKER_TILTED_CROSS, 12, 2
-                    )
-
-        return result
-
-    def _group_mean(self, centers, count, from_start):
-        """
-        centers(길이 MOMENT_N_SLICES, 아래→위 순)에서 근거리(from_start=True,
-        앞쪽 count개) 또는 원거리(from_start=False, 뒤쪽 count개) 구간들의 cx
-        평균을 낸다. 여러 구간을 평균내서 구간 하나의 노이즈에 결과가 흔들리는
-        걸 줄인다. 유효한 구간이 하나도 없으면 None.
-        """
-        window = centers[:count] if from_start else centers[-count:]
-        vals = [c[1] for c in window if c is not None]
-
-        if not vals:
-            return None
-        return float(np.mean(vals))
-
-    def draw_centers(self, centers, color):
-        """구간별 무게중심을 점으로 찍고 인접한 점끼리 이어서 커브 형태로 시각화."""
-        pts = [
-            (int(np.clip(cx, 0, self.roi_w - 1)), int(y))
-            for c in centers if c is not None
-            for (y, cx) in [c]
-        ]
-
-        for pt in pts:
-            cv2.circle(self.vis, pt, 4, color, -1)
-
-        for p1, p2 in zip(pts, pts[1:]):
-            cv2.line(self.vis, p1, p2, color, 2)
-
-    def visualize(self, offset):
-        self.draw_centers(self.left_centers, (0,255,255))
-        self.draw_centers(self.right_centers, (0,255,255))
-        self.draw_centers(self.yellow_centers, (0,165,255))
-
-        cv2.line(
-            self.vis, (self.roi_w//2, 0), (self.roi_w//2, self.roi_h),
-            (0,0,255), 1
-        )
-        cv2.putText(
-            self.vis,
-            f'offset : {offset:+.1f}',
-            (10,25),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (255,255,255),
-            2
-        )
-
-        if DEBUG_VIZ_LANE:
-            cv2.imshow("lane_result", self.vis)
-            cv2.waitKey(1)
-
-    def calc_center(self):
-        near_left   = self._group_mean(self.left_centers,   MOMENT_NEAR_SLICES, True)
-        far_left    = self._group_mean(self.left_centers,   MOMENT_FAR_SLICES,  False)
-        near_right  = self._group_mean(self.right_centers,  MOMENT_NEAR_SLICES, True)
-        far_right   = self._group_mean(self.right_centers,  MOMENT_FAR_SLICES,  False)
-        near_yellow = self._group_mean(self.yellow_centers, MOMENT_NEAR_SLICES, True)
-        far_yellow  = self._group_mean(self.yellow_centers, MOMENT_FAR_SLICES,  False)
-
-        lane_valid = False
-        offset = 0
-        lookahead = 0
-        near_center = far_center = None
-
-    # 1. 양쪽 차선 모두 검출
-        if near_left is not None and near_right is not None:
-
-            width = near_right - near_left
-            if 180 < width < 400:
-                alpha = 0.1
-                self.lane_width = (
-                   (1 - alpha) * self.lane_width +
-                    alpha * width
-                )
-
-            near_center = (near_left + near_right) / 2
-            far_center = (
-                (far_left  if far_left  is not None else near_left) +
-                (far_right if far_right is not None else near_right)
-            ) / 2
-            lane_valid = True
-
-    # 2. 왼쪽 차선만 검출
-        elif near_left is not None:
-
-            far_ref = far_left if far_left is not None else near_left
-            near_center = near_left + self.lane_width / 2
-            far_center = far_ref + self.lane_width / 2
-            lane_valid = True
-
-    # 3. 오른쪽 차선만 검출
-        elif near_right is not None:
-
-            far_ref = far_right if far_right is not None else near_right
-            near_center = near_right - self.lane_width / 2
-            far_center = far_ref - self.lane_width / 2
-            lane_valid = True
-
-    # 4. 흰 차선을 전혀 못 찾았을 때만 노란 차선 사용
-        elif near_yellow is not None:
-
-            far_ref = far_yellow if far_yellow is not None else near_yellow
-            near_center = near_yellow
-            far_center = far_ref
-            lane_valid = True
-
-        if lane_valid:
-            offset = near_center - self.roi_w / 2
-            lookahead = far_center - self.roi_w / 2
-
-        lane_center = self.roi_w / 2 + offset
-
-        self.visualize(offset)
-
-        return lane_valid, offset, lookahead, lane_center
-
-    def detect(self, bev, white, yellow):
-        self.roi_h, self.roi_w = white.shape
-        self.vis = bev.copy()
-
-        half = self.roi_w // 2
-        # 노란선은 중앙부만 탐색(기존 히스토그램 탐색 구간과 동일한 취지)
-        q_lo = self.roi_w // 4
-        q_hi = self.roi_w * 3 // 4
-
-        # 좌/우 절반으로 나눠 각각 구간별 무게중심 계산 →
-        # 구간 간 일관성 체크로 반사광 등 이상치 슬라이스 제외
-        self.left_centers = self._reject_outliers(self._slice_centers(
-            white[:, :half], 0, (0,255,0)
+    candidates = []
+    for j in range(m_max):
+        c_j = confidences[j].item()
+        if c_j < conf_threshold:
+            continue  # strict filtering: below-threshold candidates are dropped entirely, not zeroed
+        candidates.append(LaneCandidate(
+            coeffs=coeffs[j].detach().cpu().numpy().astype(np.float32),
+            lower=float(lowers[j].item()),
+            upper=float(uppers[j].item()),
+            confidence=c_j,
         ))
-        self.right_centers = self._reject_outliers(self._slice_centers(
-            white[:, half:], half, (0,255,0)
-        ))
-        self.yellow_centers = self._reject_outliers(self._slice_centers(
-            yellow[:, q_lo:q_hi], q_lo, (0,180,255)
-        ))
+    return candidates
 
-        return self.calc_center()
+
+class PolyLaneNetDetector:
+    """PolyLaneNet-only replacement for the previous CameraProcessor + SlideWindow pipeline.
+
+    Consumes the raw front-camera BGR frame directly -- no ROI crop, no BEV
+    warp, no color thresholding, no moments/outlier-rejection clustering. The
+    lanes are read straight off the network's polynomial outputs.
+    """
+
+    def __init__(self, weights_path=None, backbone='resnet34', m_max=M_MAX,
+                 conf_threshold=CONF_THRESHOLD, device=None):
+        self.m_max = m_max
+        self.conf_threshold = conf_threshold
+        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+
+        self.model = PolyLaneNet(backbone=backbone, pretrained=weights_path is None, m_max=m_max)
+        if weights_path is not None:
+            checkpoint = torch.load(weights_path, map_location=self.device)
+            # official train.py saves {'model': state_dict, 'optimizer': ..., 'epoch': ...};
+            # also accept a bare state_dict for checkpoints saved some other way.
+            state_dict = checkpoint['model'] if isinstance(checkpoint, dict) and 'model' in checkpoint else checkpoint
+            self.model.load_state_dict(state_dict)
+        self.model.to(self.device).eval()
+
+        self._mean = torch.tensor(IMAGENET_MEAN, device=self.device).view(1, 3, 1, 1)
+        self._std = torch.tensor(IMAGENET_STD, device=self.device).view(1, 3, 1, 1)
+
+    def _preprocess(self, frame_bgr):
+        """Resize + ImageNet-normalize. This is the *only* preprocessing PolyLaneNet needs."""
+        resized = cv2.resize(frame_bgr, (NET_INPUT_W, NET_INPUT_H))
+        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        tensor = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).to(self.device)
+        return (tensor - self._mean) / self._std
+
+    @torch.inference_mode()
+    def infer(self, frame_bgr) -> List[LaneCandidate]:
+        """Run the network on one frame and return decoded, confidence-filtered candidates."""
+        x = self._preprocess(frame_bgr)
+        raw_output = self.model(x)[0]  # drop batch dim -> (TOTAL_OUTPUTS,)
+        return decode_predictions(raw_output, self.m_max, self.conf_threshold)
+
+    def detect(self, frame_bgr):
+        """
+        Drop-in entry point for the perception pipeline (mirrors the previous
+        CameraProcessor.processor() + SlideWindow.detect() contract).
+
+        Returns: (lane_valid, lane_offset, lane_lookahead, lane_center, vis)
+        """
+        if frame_bgr is None:
+            return False, 0.0, 0.0, NET_INPUT_W / 2.0, None
+
+        img_h, img_w = frame_bgr.shape[:2]
+        candidates = self.infer(frame_bgr)
+        vis = frame_bgr.copy() if DEBUG_VIZ_LANE else None
+
+        center_x_norm = 0.5
+        near_y, far_y = 1.0, LOOKAHEAD_Y_NORM
+
+        # Ego-lane = the candidates immediately left/right of bottom-center,
+        # following the paper's ego-lane definition (Sec. IV-D): "the lane
+        # markings that are closer to the middle of the bottom part of the
+        # image", one to the left and one to the right.
+        left = right = None
+        best_left_x, best_right_x = -np.inf, np.inf
+        for cand in candidates:
+            x_near = float(cand.evaluate_x(near_y))
+            if x_near < center_x_norm and x_near > best_left_x:
+                left, best_left_x = cand, x_near
+            elif x_near >= center_x_norm and x_near < best_right_x:
+                right, best_right_x = cand, x_near
+
+        def offset_px(y_norm):
+            xs = [c.evaluate_x(y_norm) for c in (left, right) if c is not None]
+            return (float(np.mean(xs)) - center_x_norm) * img_w if xs else None
+
+        near_offset = offset_px(near_y)
+
+        if near_offset is None:
+            _imshow('polylanenet_result', vis)
+            return False, 0.0, 0.0, img_w / 2.0, vis
+
+        far_offset = offset_px(far_y)
+        if far_offset is None:
+            far_offset = near_offset
+        lane_center = img_w / 2.0 + near_offset
+
+        if DEBUG_VIZ_LANE and vis is not None:
+            self._draw_debug(vis, candidates, left, right, img_w, img_h)
+        _imshow('polylanenet_result', vis)
+
+        return True, near_offset, far_offset, lane_center, vis
+
+    @staticmethod
+    def _draw_debug(vis, candidates, left, right, img_w, img_h):
+        """Render each decoded polynomial directly -- pure visualization of network output, no re-fitting."""
+        for cand in candidates:
+            color = (0, 255, 255)
+            if cand is left:
+                color = (0, 255, 0)
+            elif cand is right:
+                color = (0, 0, 255)
+            pts = cand.to_pixel_points(img_w, img_h)  # defaults to this lane's own [lower, upper]
+            for p1, p2 in zip(pts[:-1], pts[1:]):
+                cv2.line(vis, tuple(p1), tuple(p2), color, 2)
+            if len(pts):
+                cv2.putText(vis, f'{cand.confidence:.2f}', tuple(pts[0]),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+        cv2.line(vis, (img_w // 2, 0), (img_w // 2, img_h), (255, 255, 255), 1)

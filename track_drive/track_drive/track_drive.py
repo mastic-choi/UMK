@@ -36,8 +36,8 @@ from std_msgs.msg import Float32MultiArray
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy, HistoryPolicy
 from cv_bridge import CvBridge
 from .perc_lavacon import process_lavacon, HALF_WIDTH_DEFAULT
-from .lane_util import CameraProcessor, SlideWindow
-from .perc_floor import LaneDetector, check_stopline
+from .lane_util import PolyLaneNetDetector, DEFAULT_WEIGHTS_PATH
+from .perc_floor import check_stopline
 from .traffic_signal import SignalDetector
 
 
@@ -229,10 +229,11 @@ class TrackDriverNode(Node):
         # [2-7 장애물 위치 판단]
         self.lane_center   = 320.0           # 차선 중앙 x좌표(px) — 첫 카메라 프레임 전까지 화면 중앙 기본값
 
-        # ── 외부 차선 인식 모듈 (lane_util.py / perc_floor.py) 초기화 ──
-        self.camera_processor = CameraProcessor()       # BEV 변환 및 색상 마스크(흰/노랑) 처리기
-        self.slide_window_processor = SlideWindow()     # 슬라이딩 윈도우 기반 차선 탐색 및 피팅기
-        self.lane_detector = LaneDetector(self.camera_processor, self.slide_window_processor)
+        # ── 외부 차선 인식 모듈 (lane_util.py) 초기화 ──
+        #   PolyLaneNet 딥러닝 회귀 기반 차선 인식기. weights_path가 None이면 랜덤 초기화된
+        #   backbone으로 동작하므로(=차선 인식 불가), 실차 투입 전 반드시 학습된 체크포인트를
+        #   DEFAULT_WEIGHTS_PATH 경로에 배치하거나 아래 인자로 별도 경로를 지정할 것.
+        self.lane_detector = PolyLaneNetDetector(weights_path=DEFAULT_WEIGHTS_PATH)
         self.signal_detector = SignalDetector()          # 신호등(3구/4구) Hough Circle 인식기
 
         # ── 판단/제어 상태 ──
@@ -328,7 +329,7 @@ class TrackDriverNode(Node):
             self.lane_valid = False
             return
 
-        # lane_util.py의 LaneDetector를 사용하여 차선 인식 수행
+        # lane_util.py의 PolyLaneNetDetector로 차선 인식 수행 (딥러닝 다항식 회귀, CV 후처리 없음)
         valid, offset, lookahead, lane_center, bev = self.lane_detector.detect(self.img_front)
 
         self.lane_center = lane_center
