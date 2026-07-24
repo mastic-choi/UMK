@@ -30,9 +30,7 @@ LANE_ROI_BOT = 0.825
 DEBUG_VIZ_LANE = True
 
 # 흰 차선은 실차에서 전혀 검출되지 않아(실측 확인) 백색 검출 파이프라인을 걷어내고
-# 노란색 중앙선 검출만으로 주행경로를 산출한다. 노란선 기준 주행 오프셋은 아래 참고.
-LANE_SIDE = 1              # 노란 중앙선 기준 주행 위치: +1=오른쪽 차로, -1=왼쪽 차로
-YELLOW_LANE_OFFSET = 130.0 # 노란 중앙선 ~ 주행 목표지점까지 거리(px)
+# 노란색 중앙선 검출만으로 주행경로를 산출한다(차선 자체를 목표로 그대로 추종).
 
 # 구간별 무게중심(Moments) 기반 차선 추적
 #   기존 슬라이딩 윈도우(14단 히스토그램 탐색 + 2차 polyfit + 이전 프레임 기반 탐색)를
@@ -161,9 +159,8 @@ class SlideWindow:
     폴리피팅이 필요 없고, 반사광으로 특정 구간이 오염돼도 다른 구간엔 영향이
     없어 커브 대응이 더 직관적이다.
 
-    흰 차선은 실차에서 검출이 안 되는 게 확인되어 제외하고, 노란 중앙선
-    검출만으로 주행경로(LANE_SIDE 방향으로 YELLOW_LANE_OFFSET만큼 떨어진 지점)를
-    산출한다.
+    흰 차선은 실차에서 검출이 안 되는 게 확인되어 제외하고, 노란 중앙선의
+    무게중심 위치 자체를 주행목표로 그대로 사용한다.
     """
     def __init__(self):
         self.vis = None
@@ -291,15 +288,8 @@ class SlideWindow:
         for p1, p2 in zip(pts, pts[1:]):
             cv2.line(self.vis, p1, p2, color, 2)
 
-    def visualize(self, offset, target_pts):
+    def visualize(self, offset):
         self.draw_centers(self.yellow_centers, (0,165,255))
-
-        # 노란선 기준 실제 주행목표(near/far)를 별도 점+선으로 표시 — LANE_SIDE 오프셋이
-        # 반영된 "예상 경로"라 yellow_centers(노란선 자체)와는 다른 위치를 가리킨다.
-        for pt in target_pts:
-            cv2.circle(self.vis, pt, 5, (255, 0, 255), -1)
-        for p1, p2 in zip(target_pts, target_pts[1:]):
-            cv2.line(self.vis, p1, p2, (255, 0, 255), 2)
 
         cv2.line(
             self.vis, (self.roi_w//2, 0), (self.roi_w//2, self.roi_h),
@@ -326,32 +316,23 @@ class SlideWindow:
         lane_valid = False
         offset = 0
         lookahead = 0
-        target_pts = []
 
-        # 노란 중앙선만으로 주행목표 산출: 검출된 중앙선에서 LANE_SIDE 방향으로
-        # YELLOW_LANE_OFFSET(px)만큼 떨어진 지점을 목표 경로로 삼는다.
+        # 노란 중앙선 자체를 주행목표로 삼는다(기존 "흰선 미검출시 노란선 폴백"과 동일한
+        # 산식). LANE_SIDE/YELLOW_LANE_OFFSET 식 고정 오프셋을 더했더니 실제로는 항상
+        # 그 값(약 130px)만큼 목표가 화면 중앙에서 어긋난 것으로 계산되어, PID가 코너로
+        # 오인해 조향각이 계속 최대치로 포화되고 그 결과 코너용 감속 로직이 속도를
+        # 바닥값(SPEED_NORMAL*0.15 ≈ 0.75)에 계속 묶어놓는 문제가 있었다(실측으로 확인:
+        # "속도 0.8에서 멈춤" 재현). 그래서 오프셋 없이 노란선 위치 그대로 사용한다.
         if near_yellow is not None:
             far_ref = far_yellow if far_yellow is not None else near_yellow
-
-            near_center = near_yellow + LANE_SIDE * YELLOW_LANE_OFFSET
-            far_center = far_ref + LANE_SIDE * YELLOW_LANE_OFFSET
             lane_valid = True
 
-            offset = near_center - self.roi_w / 2
-            lookahead = far_center - self.roi_w / 2
-
-            near_y = self.yellow_centers[0][0] if self.yellow_centers and self.yellow_centers[0] is not None \
-                else self.roi_h - (self.roi_h // MOMENT_N_SLICES) / 2.0
-            far_y = self.yellow_centers[-1][0] if self.yellow_centers and self.yellow_centers[-1] is not None \
-                else (self.roi_h // MOMENT_N_SLICES) / 2.0
-            target_pts = [
-                (int(np.clip(near_center, 0, self.roi_w - 1)), int(near_y)),
-                (int(np.clip(far_center, 0, self.roi_w - 1)), int(far_y)),
-            ]
+            offset = near_yellow - self.roi_w / 2
+            lookahead = far_ref - self.roi_w / 2
 
         lane_center = self.roi_w / 2 + offset
 
-        self.visualize(offset, target_pts)
+        self.visualize(offset)
 
         return lane_valid, offset, lookahead, lane_center
 

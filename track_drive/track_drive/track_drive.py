@@ -94,7 +94,6 @@ BODY_MASK_ENABLED = True  # 최종 확정(2026-07-22)
 #   safe: kp=0.70, ki=0.0008, kd=0.15 / fast: kp=0.78, ki=0.0005, kd=0.405 (참고, safe값 채택)
 #   기존 0.14/0.0/1.40 대비 Kp 5배↑ Kd 9배↓ 로 큰 변화 — 실차 저속에서 오실레이션 여부 먼저 확인 후 정속 테스트 권장
 LANE_KP, LANE_KI, LANE_KD = 0.70, 0.0008, 0.15  # 차선 PID
-# LANE_SIDE(주행 차선 방향)·노란선 오프셋 관련 상수는 lane_util.py로 이관(노란선 단독 검출 로직에 속함)
 LANE_CORNER_BOOST = 1.8    # 코너(큰 offset) 조향 가중
 LANE_CORNER_REF   = 120.0  # 이 offset(px)에서 가중 최대
 LANE_CORNER_MIN   = 40.0   # 코너 가중 시작 임계(px)
