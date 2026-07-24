@@ -24,7 +24,8 @@ BEV_DST = np.float32([
 #Lane ROI
 # 출처: KUAC_2024-main lane_detection/src/utils.py roi_for_lane() → image[246:396, :] (640x480 기준)
 #   246/480=0.5125, 396/480=0.825 로 환산
-LANE_ROI_TOP = 0.45
+# TOP을 더 낮은 비율로 내려서(화면 위쪽=먼 거리) ROI를 더 멀리까지 보도록 확장.
+LANE_ROI_TOP = 0.35
 LANE_ROI_BOT = 0.825
 #Debug
 DEBUG_VIZ_LANE = True
@@ -578,21 +579,24 @@ class SlideWindow:
         self.roi_h, self.roi_w = white.shape
         self.vis = bev.copy()
 
-        half = self.roi_w // 2
-        # 노란선은 중앙부만 탐색(기존 히스토그램 탐색 구간과 동일한 취지)
-        q_lo = self.roi_w // 4
-        q_hi = self.roi_w * 3 // 4
+        # 폭을 5등분해서 가운데 1/5(중앙선 자리)는 노란색 전용, 좌/우 나머지
+        # 2/5씩은 흰색 전용으로 나눈다 — 이전엔 흰색 좌/우 절반과 노란색 중앙
+        # 탐색범위(quarter)가 서로 겹쳐서 경계 부근 픽셀을 두 마스크가 같이
+        # 훑었다. 이제 세 구간이 겹치지 않게 나눠 각자의 색만 본다.
+        fifth = self.roi_w // 5
+        mid_lo = fifth * 2
+        mid_hi = fifth * 3
 
-        # 좌/우 절반으로 나눠 각각 구간별 무게중심 계산 →
+        # 좌/우로 나눠 각각 구간별 무게중심 계산 →
         # 구간 간 일관성 체크로 반사광 등 이상치 슬라이스 제외
         self.left_centers = self._reject_outliers(self._slice_centers(
-            white[:, :half], 0, (0,255,0)
+            white[:, :mid_lo], 0, (0,255,0)
         ))
         self.right_centers = self._reject_outliers(self._slice_centers(
-            white[:, half:], half, (0,255,0)
+            white[:, mid_hi:], mid_hi, (0,255,0)
         ))
         self.yellow_centers = self._reject_outliers(self._slice_centers(
-            yellow[:, q_lo:q_hi], q_lo, (0,180,255)
+            yellow[:, mid_lo:mid_hi], mid_lo, (0,180,255)
         ))
 
         return self.calc_center()
