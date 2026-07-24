@@ -1,6 +1,6 @@
 import numpy as np
 import cv2
-
+from retinex import multi_scale_retinex
 #SlidingWindow
 # 출처: 전전년도 타 팀 코드(KUAC_2024-main) lane_detection/src/slidewindow_both_lane.py
 #   nwindows=14, margin=20, minpix=10 을 그대로 초기값으로 이식 (실차 미검증, 튜닝 전제)
@@ -176,6 +176,7 @@ class CameraProcessor:
             tileGridSize=(8,8)
         )
         gray = clahe.apply(gray)
+        gray = multi_scale_retinex(gray)
 
         # 3) Top-Hat(극소 대비)
         kernel_tophat = cv2.getStructuringElement(
