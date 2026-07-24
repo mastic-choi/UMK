@@ -107,6 +107,9 @@ class CameraProcessor:
         # 2) Canny 엣지 검출
         edges = cv2.Canny(blur, CANNY_LOW, CANNY_HIGH)
 
+        if DEBUG_VIZ_LANE:
+            cv2.imshow("lane_canny", edges)
+
         # 3) 확률적 허프 변환 — 엣지 중 "직선 구간"만 (x1,y1,x2,y2) 선분으로 추출
         lines = cv2.HoughLinesP(
             edges,
@@ -170,13 +173,17 @@ class CameraProcessor:
         # white Lane : Local Contrast
         # 1) Gray 변환
         gray = cv2.cvtColor(self.bev, cv2.COLOR_BGR2GRAY)
+        gray = multi_scale_retinex(gray)
+
+        if DEBUG_VIZ_LANE :
+            cv2.imshow("lane_retinex", gray)
         # 2) CLAHE (극소 명암 향상)
         clahe = cv2.createCLAHE(
             clipLimit=2.0,
             tileGridSize=(8,8)
         )
         gray = clahe.apply(gray)
-        gray = multi_scale_retinex(gray)
+        
 
         # 3) Top-Hat(극소 대비)
         kernel_tophat = cv2.getStructuringElement(
