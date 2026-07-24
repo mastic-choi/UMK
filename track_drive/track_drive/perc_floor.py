@@ -58,13 +58,13 @@ class LaneDetector:
         입력 : 전방 카메라 BGR 프레임
         출력 : (lane_valid, lane_offset, lane_lookahead, lane_center, bev)
         """
-        bev, white_mask, yellow_mask = self.camera_processor.processor(frame)
+        bev, yellow_mask = self.camera_processor.processor(frame)
 
         if bev is None:
             return False, 0.0, 0.0, 320.0, None   # lane_center는 화면 중앙(640/2)을 기본값으로
 
         lane_valid, lane_offset, lookahead, lane_center = self.slide_window_processor.detect(
-            bev, white_mask, yellow_mask
+            bev, yellow_mask
         )
 
         return lane_valid, lane_offset, lookahead, lane_center, bev
