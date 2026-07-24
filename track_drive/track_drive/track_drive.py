@@ -35,7 +35,7 @@ from sensor_msgs.msg import Image, LaserScan, Imu
 from std_msgs.msg import Float32MultiArray
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy, HistoryPolicy
 from cv_bridge import CvBridge
-from .perc_lavacon import process_lavacon
+from .perc_lavacon import process_lavacon, HALF_WIDTH_DEFAULT
 from .lane_util import CameraProcessor, SlideWindow
 from .perc_floor import LaneDetector, check_stopline
 from .traffic_signal import SignalDetector
@@ -215,6 +215,7 @@ class TrackDriverNode(Node):
         # [2-4 라바콘]
         self.lavacon_offset = 0.0
         self.lavacon_done   = False
+        self.lavacon_half_width = HALF_WIDTH_DEFAULT
         self._lavacon_empty_cnt = 0   # 우측콘 연속 미검출 프레임 수(Phase 전환 디바운스)
         self.lavacon_left_detected  = False  # 좌측 라이다 클러스터 검출 여부(B1 진입 트리거용)
         self.lavacon_right_detected = False  # 우측 라이다 클러스터 검출 여부(B1 진입 트리거용)
@@ -492,7 +493,8 @@ class TrackDriverNode(Node):
 
     # [2-4] 라바콘
     def perc_lavacon(self):
-        self.lavacon_offset, self.lavacon_done = process_lavacon(self.lidar_ranges)
+        self.lavacon_offset, self.lavacon_done, self.lavacon_half_width = process_lavacon(
+            self.lidar_ranges, self.lavacon_half_width)
 
     # [2-4b] 라바콘 좌우 클러스터 검출 → B1_LAVACON 진입 트리거
     #   입력 self.lidar_ranges
