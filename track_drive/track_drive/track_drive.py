@@ -39,6 +39,8 @@ from .perc_lavacon import process_lavacon, HALF_WIDTH_DEFAULT
 from .lane_util import CameraProcessor, SlideWindow
 from .perc_floor import LaneDetector, check_stopline
 from .traffic_signal import SignalDetector
+from .controller.obstacle_avoidance import ObstacleAvoidance
+from .controller.vehicle_overtake import VehicleOvertake
 
 
 # #############################################################
@@ -128,7 +130,6 @@ APPROACH_EXIT_SPEED = 2.0  # [진출] S3 탈출 정지선 감지 후 감속 속�
 APPROACH_EXIT_TIME  = 1.0  # [진출] 감속 유지 시간(s)
 
 # 장애물회피 판단
-AVOID_OFFSET = 100      # 차선 중앙에서 좌우로 이동할 거리(px)
 RETURN_THRESHOLD = 10 
 # ── 신호등 ROI/임계값은 traffic_signal.py(SignalDetector)로 이관 — 여기서 중복 정의하지 않음 ──
 
@@ -253,17 +254,13 @@ class TrackDriverNode(Node):
         self._exit_approach_t0 = None # [진출] S3 탈출 정지선 감지 후 감속 시작 시각
         self._shortcut_t0    = None   # 지름길 진입 시각(끝감지 타이밍용)
         self._shortcut_ref_yaw = None # S3 진입 1초 후 기록한 기준 yaw (탈출 좌회전 전 보정용)
-        self._overtake_phase_int = 0   # 방해차량(B3) 단계 정수 FSM (0=대기) — ★재설계 예정
-        self._overtake_frame_cnt = 0   # 현재 단계 경과 프레임 수
-        self._obstacle_phase     = 'idle'  # 고정장애물(B2) 단계 ('idle'/그 외)      — ★재설계 예정
-        self._obstacle_frame_cnt = 0       # 현재 단계 경과 프레임 수
         self._prev_speed     = 0.0    # 가속 속도제한용(직전 출력 속도)
         self._corner_hold    = 0.0    # 코너 활성도(감쇠 peak-hold)
         self._last_debug_t   = 0.0
 
-        self.target_lane = None       # LEFT / RIGHT
-        self.target_offset = 0.0      # 목표 편차 (px)
-        self._return_cnt = 0
+        self.obstacle_controller = ObstacleAvoidance()
+        self.vehicle_controller = VehicleOvertake()
+        
 
         # ── ROS 통신 ──
         self.motor_msg = Float32MultiArray()
@@ -830,25 +827,7 @@ class TrackDriverNode(Node):
     def _s4_finish(self):
         self.ctrl_angle, self.ctrl_speed = 0.0, SPEED_STOP
 
-    # 목표 차선 결정
-    # obstacle_side(라이다 기준 장애물 좌/우 위치)를 이용하여 회피할 목표 차선을 결정
-    def decide_target_lane(self):
 
-        if self.obstacle_side == 'left':
-
-            self.target_lane = "RIGHT"
-
-            #현재 차선 기준으로 오른쪽으로 100px 이동
-            self.target_offset = self.lane_center + AVOID_OFFSET
-
-        elif self.obstacle_side == 'right':
-            self.target_lane = "LEFT"
-            #현재 차선 기준으로 왼쪽으로 100px 이동
-            self.target_offset = self.lane_center - AVOID_OFFSET
-
-        else:
-            self.target_lane = None
-            self.target_offset = self.lane_offset
 
     # ── 좌회전 공통 (실차 전환: 후진 없이 무난한 좌회전) ──
     def _begin_left_turn(self):
@@ -992,66 +971,21 @@ class TrackDriverNode(Node):
         지금은 감지되면 감속만 하고 버티다가, 장애물이 사라지면 방해차량 구간으로 넘어가는
         임시(placeholder) 동작이다. 실제 회피 궤적/조향은 팀에서 별도로 설계해서 교체할 것.
         """
-        is_obstacle = (
-            self.obstacle_front and 
-            self.obstacle_type == "fixed"
+        steer_offset, speed, done = self.obstacle_controller.update(
+            obstacle_front = self.obstacle_front,
+            obstacle_type = self.obstacle_type,
+            obstacle_side = self.obstacle_side,
+            lane_offset = self.lane_offset,
+            lane_lookahead = self.lane_lookahead
         )
 
-        #idle
-        if self._obstacle_phase == "idle":
-            if is_obstacle:
-                #회피 방향을 딱 한번 결정
-                self.decide_target_lane()
-                self._obstacle_phase = "avoid"
-                self.get_logger().info(
-                    f"[OBSTACLE] START lane={self.target_lane}"
-                )
-            return
-        
-        #avoid
-        elif self._obstacle_phase == "avoid":
-            steer_offset = (
-                (1.0-LANE_PREVIEW)*self.target_offset + 
-                LANE_PREVIEW*self.lane_lookahead
-            )
+        self.ctrl_angle = self._lane_pid(steer_offset)
+        self.ctrl_speed = speed
 
-            self.ctrl_angle = self._lane_pid(steer_offset)
-            self.ctrl_speed = SPEED_LAVACON
-
-            #장애물이 일전 프레임 동안 사라졌으면 복귀 시작
-            if not is_obstacle:
-                self._return_cnt += 1
-            else:
-                self._return_cnt = 0
-            if self._return_cnt >= 5:
-                self._return_cnt = 0
-                self._obstacle_phase = "return"
-
-                self.target_offset = 0.0
-
-                self.get_logger().info("[OBSTACLE] RETURN")
-
-        #return
-        elif self._obstacle_phase == "return":
-            steer_offset = (
-                (1.0-LANE_PREVIEW)*self.lane_offset +
-                LANE_PREVIEW*self.lane_lookahead
-            )
-
-            self.ctrl_angle = self._lane_pid(steer_offset)
-            self.ctrl_speed = SPEED_NORMAL
-
-            # 차선 중앙으로 거의 복귀
-            if abs(self.lane_offset) < RETURN_THRESHOLD:
-                self._obstacle_phase = "idle"
-                self.phase = Phase.VEHICLE
-
-                self._return_cnt = 0
-                
-                self._pid_prev_error = 0
-                self._pid_integral = 0
-
-                self.get_logger().info("[OBSTACLE] DONE")
+        if done:
+            self.phase = Phase.VEHICLE
+            self._pid_prev_error = 0.0
+            self._pid_integral = 0.0
 
     # ── B3-방해차량 추월 ──★재설계 예정(임시 placeholder) ──
     # target_lane 반영 수정
@@ -1062,33 +996,20 @@ class TrackDriverNode(Node):
         지금은 감지되면 감속만 하고 버티다가, 차량이 사라지면 DONE으로 넘어가는
         임시(placeholder) 동작이다. 실제 추월 궤적/조향은 팀에서 별도로 설계해서 교체할 것.
         """
-        is_vehicle = self.obstacle_front and self.obstacle_dist < OVERTAKE_TRIGGER
-
-        if self._overtake_phase_int == 0:
-            if is_vehicle:
-                self._overtake_phase_int = 1
-                self._overtake_frame_cnt = 0
-                self.get_logger().info(f'[VEHICLE] 감지 dist={self.obstacle_dist:.2f}m')
-            return
-
-        # 활성 상태 — TODO: 실제 추월 기동으로 교체
-        self.decide_target_lane()
-
-        steer_offset = (
-            (1.0 - LANE_PREVIEW) * self.target_offset
-            + LANE_PREVIEW * self.lane_lookahead
-        )
-        self.ctrl_angle = self._lane_pid(steer_offset) 
-        self.ctrl_speed = SPEED_LAVACON
-        self._overtake_frame_cnt += 1
-
-        if not is_vehicle and self._overtake_frame_cnt > 10:
-            self._overtake_phase_int = 0
-            self._overtake_frame_cnt = 0
-            self._pid_prev_error = 0.0
-            self._pid_integral   = 0.0
+        steer_offset, speed, done = self.vehicle_controller.update(
+                    obstacle_front = self.obstacle_front,
+                    obstacle_dist = self.obstacle_dist,
+                    lane_offset = self.lane_offset,
+                    lane_lookahead = self.lane_lookahead,
+                )
+        
+        self.ctrl_angle = self._lane_pid(steer_offset)
+        self.ctrl_speed = speed
+        
+        if done:
             self.phase = Phase.DONE
-            self.get_logger().info('[VEHICLE] 추월 완료(placeholder) → DONE')
+            self._pid_prev_error = 0.0
+            self._pid_integral = 0.0
 
 
     # #########################################################

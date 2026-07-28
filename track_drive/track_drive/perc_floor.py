@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 
+from .lane_util import CameraProcessor, SlideWindow
 # ── 정지선 감지 튜닝 파라미터 (전전년도 팀 실측값 그대로, 카메라 해상도 640x480 고정 가정) ──
 #   프로젝트 전체가 640x480 한 대의 카메라를 전제로 캘리브레이션돼 있어(BEV_SRC/DST, SIG_ROI 등)
 #   해상도가 달라지면 이 값들 전부 재보정 대상이므로, 비율 변환 없이 절대픽셀 그대로 사용.
@@ -61,7 +62,7 @@ class LaneDetector:
         bev, white_mask, yellow_mask = self.camera_processor.processor(frame)
 
         if bev is None:
-            return False, 0.0, 0.0, 320.0, None   # lane_center는 화면 중앙(640/2)을 기본값으로
+            return False, 0.0, 0.0, self.camera_processor.roi_w / 2, None   # lane_center는 화면 중앙(640/2)을 기본값으로
 
         lane_valid, lane_offset, lookahead, lane_center = self.slide_window_processor.detect(
             bev, white_mask, yellow_mask
