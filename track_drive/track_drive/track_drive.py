@@ -44,7 +44,7 @@ from .controller.vehicle_overtake import VehicleOvertake
 from .planner.hybrid_astar import HybridAStar
 from .planner.occupancy import OccupancyGrid
 from .controller.stanley import StanleyController
-
+from .planner.node import Node as PlannerNode
 # #############################################################
 # [0] 설정 (Config)
 # #############################################################
@@ -265,20 +265,33 @@ class TrackDriverNode(Node):
         self.obstacle_controller = ObstacleAvoidance()
         self.vehicle_controller = VehicleOvertake()
 
-        self.occupancy = OccupancyGrid(resolution=0.1, width=10, height=10)
+        # OccupancyGrid의 angle_offset_deg/body_lo/body_hi는 perc_obstacle()의
+        # LIDAR_ANGLE_OFFSET_DEG(88행 부근), BODY_LO/BODY_HI(395행 부근)와 반드시
+        # 같은 값이어야 한다 — 라이다 장착 보정이 여기만 빠지면 장애물이 실제와
+        # 다른 각도에 찍힌다.
+        self.occupancy = OccupancyGrid(
+            resolution=0.1, width=10, height=10,
+            angle_offset_deg=LIDAR_ANGLE_OFFSET_DEG,
+            body_lo=215, body_hi=305
+        )
         self.planner = HybridAStar()
         self.stanley = StanleyController()
+
         self.path = None
         self.grid = None
         self.replan_count = 0
         self.goal = None
 
-        # pose 변수 - 추후 수정
+
+        # pose 변수 - 추후 수정(정식 오도메트리 연동 전까지는 _handle_fixed_obstacle에서
+        # replan 시점을 원점으로 삼아 IMU yaw 실측값 + 명령속도 적분으로 근사 추적)
         self.vehicle_x = 0.0
         self.vehicle_y = 0.0
         self.vehicle_yaw = 0.0
         self.vehicle_speed = 0.0
-        
+        self._plan_ref_yaw = 0.0
+        self._plan_last_t = 0.0
+
 
         # ── ROS 통신 ──
         self.motor_msg = Float32MultiArray()
@@ -990,8 +1003,13 @@ class TrackDriverNode(Node):
             self.grid = self.occupancy.build(
                 self.lidar_ranges
             )
-            # Local Frame 시작점
-            start = self.planner.Node(0.0,0.0,0.0)
+            # Local Frame 시작점 — 이번 replan 시점을 로컬 pose 원점으로 리셋
+            start = PlannerNode(0.0,0.0,0.0)
+            self.vehicle_x = 0.0
+            self.vehicle_y = 0.0
+            self.vehicle_yaw = 0.0
+            self._plan_ref_yaw = self.imu_yaw
+            self._plan_last_t = time.time()
             # Goal 생성
             if self.goal is None:
                 self.goal = self.planner.make_goal(
@@ -1008,11 +1026,22 @@ class TrackDriverNode(Node):
             self.ctrl_speed = 0
             return
 
+        # 로컬 pose 갱신 — yaw는 IMU 실측값 기준(_yaw_delta), x/y는 명령속도(ctrl_speed,
+        # 미보정 단위) 적분 근사치. 정식 오도메트리가 생기기 전까지의 임시 추정값이다.
+        now = time.time()
+        dt = now - self._plan_last_t
+        self._plan_last_t = now
+
+        self.vehicle_yaw = self._yaw_delta(self._plan_ref_yaw)
+        self.vehicle_speed = self.ctrl_speed
+        self.vehicle_x += self.vehicle_speed * math.cos(self.vehicle_yaw) * dt
+        self.vehicle_y += self.vehicle_speed * math.sin(self.vehicle_yaw) * dt
+
         # Stanley
         steer, speed = self.stanley.control(
-            0.0,
-            0.0,
-            0.0,
+            self.vehicle_x,
+            self.vehicle_y,
+            self.vehicle_yaw,
             self.vehicle_speed,
             self.path
         )
@@ -1027,7 +1056,7 @@ class TrackDriverNode(Node):
             self.replan_count = 0
             return
 
-        if self.stanley.goal_reached(0.0,0.0, self.path):
+        if self.stanley.goal_reached(self.vehicle_x, self.vehicle_y, self.path):
             self.path = None
             self.goal = None
             self.replan_count = 0

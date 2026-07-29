@@ -1,6 +1,6 @@
 import math
 import numpy as np
-from planner.node import Node
+
 
 class StanleyController:
     def __init__(self):

@@ -18,5 +18,5 @@ class Node:
         return(
             round(self.x / xy_resolution),
             round(self.y / xy_resolution),
-            round(self.yaw / xy_resolution)
+            round(self.yaw / yaw_resolution)
         )

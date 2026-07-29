@@ -1,16 +1,13 @@
 import math, heapq, time
 import numpy as np
 
-from node import Node
+from .node import Node
 
 class HybridAStar:
 
     def __init__(self, resolution=0.1, wheelbase=1.04):
         self.resolution = resolution
         self.wheelbase = wheelbase
-
-        # 한 번에 이동할 거리(m)
-        self.step = 0.5
 
         # 최대 조향각
         self.max_steer = math.radians(30)
@@ -32,19 +29,19 @@ class HybridAStar:
         self.vehicle_width = 0.45
         self.vehicle_length = 0.70
 
-    def make_goal(self):
-    
+    def make_goal(self, obstacle_dist, left_clear, right_clear):
+
         forward = min(
-            self.obstacle_dist + 2.5, 6.0
+            obstacle_dist + 2.5, 6.0
         )
-    
-        if self.left_clear:
+
+        if left_clear:
             lateral = 1.5
-        elif self.right_clear:
+        elif right_clear:
             lateral = -1.5
         else:
             lateral = 0.0
-    
+
         return Node(forward, lateral,0.0)
     
     # Heuristic
@@ -64,10 +61,10 @@ class HybridAStar:
         else:
             step = self.step_backward
 
-        x = node.x + self.step * math.cos(node.yaw)
-        y = node.y + self.step * math.sin(node.yaw)
+        x = node.x + step * math.cos(node.yaw)
+        y = node.y + step * math.sin(node.yaw)
         yaw = node.yaw + (
-            self.step / self.wheelbase * math.tan(steer)
+            step / self.wheelbase * math.tan(steer)
         )
 
         nxt = Node(
@@ -114,8 +111,10 @@ class HybridAStar:
     # Cost
     def cost(self, current, nxt, goal, steer, direction):
 
+        step = self.step_forward if direction > 0 else self.step_backward
+
         g = current.g
-        g += abs(direction) * self.step_forward
+        g += abs(step)
         g += abs(steer) * self.steer_weight
 
         yaw_error = abs(nxt.yaw - current.yaw)
@@ -168,7 +167,7 @@ class HybridAStar:
         return path
 
     # Path Smoothing
-    def smooth(path):
+    def smooth(self, path):
         new=[]
         
         for i in range(1, len(path)-1):
