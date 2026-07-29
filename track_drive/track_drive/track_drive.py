@@ -41,7 +41,9 @@ from .perc_floor import LaneDetector, check_stopline
 from .traffic_signal import SignalDetector
 from .controller.obstacle_avoidance import ObstacleAvoidance
 from .controller.vehicle_overtake import VehicleOvertake
-
+from .planner.hybrid_astar import HybridAStar
+from .planner.occupancy import OccupancyGrid
+from .controller.stanley import StanleyController
 
 # #############################################################
 # [0] 설정 (Config)
@@ -148,6 +150,7 @@ DEBUG_VIZ       = True  # 신호등/4구 디버그 창
 DEBUG_VIZ_LANE  = True  # 차선 슬라이딩윈도우 디버그 창
 DEBUG_VIZ_LIDAR = True  # 라이다 BEV 장애물 감지 디버그 창
 DEBUG_VIZ_LAVACON = False  # 라바콘 트리거 좌우 클러스터 BEV 디버그 창
+DEBUG_PLANNER = False   # planner 디버그 창
 
 # ── 실차 테스트 범위 제한 ──
 #   지금 단계에서 실차로 검증 가능한 건 딱 세 가지: ①신호등 인식 후 출발(S0) ②차선주행(S1)
@@ -258,8 +261,23 @@ class TrackDriverNode(Node):
         self._corner_hold    = 0.0    # 코너 활성도(감쇠 peak-hold)
         self._last_debug_t   = 0.0
 
+        # hybridA*위해 추가
         self.obstacle_controller = ObstacleAvoidance()
         self.vehicle_controller = VehicleOvertake()
+
+        self.occupancy = OccupancyGrid(resolution=0.1, width=10, height=10)
+        self.planner = HybridAStar()
+        self.stanley = StanleyController()
+        self.path = None
+        self.grid = None
+        self.replan_count = 0
+        self.goal = None
+
+        # pose 변수 - 추후 수정
+        self.vehicle_x = 0.0
+        self.vehicle_y = 0.0
+        self.vehicle_yaw = 0.0
+        self.vehicle_speed = 0.0
         
 
         # ── ROS 통신 ──
@@ -966,26 +984,75 @@ class TrackDriverNode(Node):
     # ── B2-고정장애물 회피 ──★재설계 예정(임시 placeholder) ──
     # target_lane을 반영해 수정
     def _handle_fixed_obstacle(self):
-        """
-        ★ TODO: 실차 회피 기동 재설계 필요. 시뮬 전용이던 역C자 고정 프레임 시퀀스는 폐기.
-        지금은 감지되면 감속만 하고 버티다가, 장애물이 사라지면 방해차량 구간으로 넘어가는
-        임시(placeholder) 동작이다. 실제 회피 궤적/조향은 팀에서 별도로 설계해서 교체할 것.
-        """
-        steer_offset, speed, done = self.obstacle_controller.update(
-            obstacle_front = self.obstacle_front,
-            obstacle_type = self.obstacle_type,
-            obstacle_side = self.obstacle_side,
-            lane_offset = self.lane_offset,
-            lane_lookahead = self.lane_lookahead
+
+        if self.path is None:
+            # Local Occupancy 생성
+            self.grid = self.occupancy.build(
+                self.lidar_ranges
+            )
+            # Local Frame 시작점
+            start = self.planner.Node(0.0,0.0,0.0)
+            # Goal 생성
+            if self.goal is None:
+                self.goal = self.planner.make_goal(
+                    self.obstacle_dist,
+                    self.left_clear,
+                    self.right_clear
+                )
+            # Hybrid A*
+            self.path = self.planner.plan(start,self.goal,self.grid)
+
+        if not self.path:
+            self.path = None
+            self.goal = None
+            self.ctrl_speed = 0
+            return
+
+        # Stanley
+        steer, speed = self.stanley.control(
+            0.0,
+            0.0,
+            0.0,
+            self.vehicle_speed,
+            self.path
         )
 
-        self.ctrl_angle = self._lane_pid(steer_offset)
+        self.ctrl_angle = math.degrees(steer)
         self.ctrl_speed = speed
 
-        if done:
+        self.replan_count += 1
+        if self.replan_count >= 20:
+            self.path = None
+            self.goal = None
+            self.replan_count = 0
+            return
+
+        if self.stanley.goal_reached(0.0,0.0, self.path):
+            self.path = None
+            self.goal = None
+            self.replan_count = 0
+
+            self.stanley.reset()
+
             self.phase = Phase.VEHICLE
+            self.behavior_state = BehaviorState.B0_NORMAL
+
             self._pid_prev_error = 0.0
             self._pid_integral = 0.0
+
+        
+
+        if DEBUG_PLANNER:
+            cv2.imshow(
+                "Occupancy",
+                cv2.resize(self.grid,None,
+                           fx=4,
+                           fy=4)
+                )
+
+            cv2.waitKey(1)
+
+    
 
     # ── B3-방해차량 추월 ──★재설계 예정(임시 placeholder) ──
     # target_lane 반영 수정
