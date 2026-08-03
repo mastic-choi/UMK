@@ -14,11 +14,17 @@
 #   보로노이 정점(vertex)들로 나타난다. 이 정점들의 y좌표 평균을
 #   횡방향 편차(lavacon_offset)로 사용한다.
 #
-# [라이다 좌표 약속] (track_drive.py 실측 기준, 2026-06-19 확정)
+# [라이다 좌표 약속] (track_drive.py 재실측 기준, 2026-07-22 확정)
 #   · 360칸, 인덱스 = 각도(도), 반시계 방향
-#   · 인덱스 0 = 정면 / 90 = 좌측 / 180 = 정후방 / 270 = 우측
-#   · 인덱스 99~262 는 차체 자기가림 구간 → 항상 무효 처리
-#   · 직교좌표 변환: x = r·cos(deg) (전방+), y = r·sin(deg) (좌측+)
+#   · ★인덱스 0이 정면이 아니다★ — 라이다 장착 각도가 80도 어긋나 있어
+#     "보정후각도 = 인덱스 - LIDAR_ANGLE_OFFSET_DEG" 로 빼줘야 한다.
+#     보정 후: 0 = 정면 / 90 = 좌측 / 180 = 정후방 / 270 = 우측
+#   · 인덱스 215~304 는 차체 자기가림 구간 → 항상 무효 처리
+#   · 직교좌표 변환: x = r·cos(보정후각도) (전방+), y = r·sin(보정후각도) (좌측+)
+#   ※ 이 두 상수(LIDAR_ANGLE_OFFSET_DEG / BODY_LO,HI)는 track_drive.py의 동일 상수와
+#     반드시 값을 일치시킬 것. 2026-06-19 구 규약(오프셋 0, 마스크 99~262)을 쓰던 시절
+#     코드가 남아 실제 좌측 콘이 마스크에 지워지고 우측 콘이 좌측으로 반전 해석되어
+#     done 이 항상 True 가 되는 버그가 있었다.
 #
 # [부호 약속] (track_drive.py 제어팀 합의와 동일)
 #   · lavacon_offset > 0 : 중심선이 차량 기준 '우측'에 있음 → 우조향
@@ -32,7 +38,8 @@ from scipy.spatial import Voronoi, QhullError   # 보로노이 다이어그램 +
 # ─────────────────────────────────────────────
 # 튜닝 상수 (track_drive.py 의 실측 ROI 값과 일치시킴)
 # ─────────────────────────────────────────────
-BODY_LO, BODY_HI = 99, 263      # 차체 가림 인덱스 구간 [99, 262] 마스킹 경계 (263은 미포함)
+LIDAR_ANGLE_OFFSET_DEG = 80.0   # 라이다 장착 각도 보정(track_drive.py와 동일값 유지)
+BODY_LO, BODY_HI = 215, 305     # 차체 가림 인덱스 구간 [215, 304] 마스킹 경계 (305는 미포함)
 LON_MIN, LON_MAX = 0.0, 4.0     # 보로노이 정점 종방향(전방) 관심영역 (m)
 LAT_LIMIT        = 2.5          # 보로노이 정점 횡방향(좌우) 관심영역 한계 (m)
 CONE_LON_MAX     = 4.0          # 콘 후보 점의 전방 최대거리 (m) — 벽/원거리 잡음 배제
@@ -70,8 +77,8 @@ def process_lavacon(lidar_ranges):
         ranges[BODY_LO:min(BODY_HI, n)] = 0.0
  
     # ── 2) 극좌표 → 직교좌표 변환 (x: 전방+, y: 좌측+) ──
-    # 인덱스가 곧 각도(도)이고 0번이 정면이므로 영점 보정 없이 그대로 변환
-    deg = np.linspace(0.0, 2.0 * math.pi, n, endpoint=False)
+    # 인덱스 0이 정면이 아니므로 LIDAR_ANGLE_OFFSET_DEG 만큼 빼서 영점을 보정한다.
+    deg = np.linspace(0.0, 2.0 * math.pi, n, endpoint=False) - math.radians(LIDAR_ANGLE_OFFSET_DEG)
     x = ranges * np.cos(deg)    # 종방향(전방거리) 성분
     y = ranges * np.sin(deg)    # 횡방향 성분 — y > 0 좌측, y < 0 우측
  
@@ -82,13 +89,20 @@ def process_lavacon(lidar_ranges):
     px = x[cone_mask]           # 콘 후보 점들의 x (전방)
     py = y[cone_mask]           # 콘 후보 점들의 y (좌측+)
  
-    # ── 4) 종료 판정 : 우측(y<0) 콘 소멸 = 라바콘 구간 끝 ──
-    # (코스 특성상 우측 콘이 먼저 사라짐 — 디바운스는 상위 FSM(_s1_lavacon)에서 수행)
-    lavacon_done = not bool(np.any(py < 0.0))
- 
-    # ── 5) 안전 폴백 : 유효 점이 4개 미만이면 보로노이 계산 불가 → 직진 + 종료 신호 ──
+    # ── 4) 종료 판정 : 좌·우 어느 쪽에도 콘이 없어야 라바콘 구간 끝 ──
+    # 구 로직은 "우측(y<0) 콘 소멸"만 봤는데, 콘 간격이 유동적인 코스에서는
+    # 우측에 넓은 틈이 하나만 있어도 곧바로 '구간 끝'으로 오판한다.
+    # 한쪽 줄이라도 보이면 아직 구간 안이라고 보는 편이 안전하다.
+    # (디바운스는 상위 FSM(_handle_lavacon)의 LAVACON_DONE_FRAMES에서 수행)
+    has_left  = bool(np.any(py > 0.0))
+    has_right = bool(np.any(py < 0.0))
+    lavacon_done = not (has_left or has_right)
+
+    # ── 5) 안전 폴백 : 유효 점이 4개 미만이면 보로노이 계산 불가 → 직진 ──
+    # 종료 신호는 위에서 구한 실제 콘 유무를 그대로 쓴다. 여기서 무조건 True를
+    # 돌려주면 "점이 잠깐 적게 잡힌 것"과 "구간이 끝난 것"이 구분되지 않는다.
     if len(px) < MIN_POINTS:
-        return (0.0, True)
+        return (0.0, lavacon_done)
  
     # ── 6) 보로노이 다이어그램 계산 ──
     # 콘 점군을 시드로 하면, 좌/우 콘 경계 '사이의 등거리 능선'이
@@ -136,14 +150,20 @@ def process_lavacon(lidar_ranges):
 # 간단 자가 테스트 (ROS 없이 로직 검증용)
 # ─────────────────────────────────────────────
 if __name__ == '__main__':
-    # 가상 시나리오 : 좌측 콘 2 m, 우측 콘 1 m 거리에 배치된 직선 트랙
+    # 가상 시나리오 : 좌측 콘 줄 y=+2.0 m, 우측 콘 줄 y=-1.0 m 인 직선 트랙
     # → 중심선은 y ≈ +0.5 (좌측) → offset ≈ -0.5 (좌조향) 기대
+    # ※ 인덱스 0이 정면이 아니므로 "인덱스 = 실제각 + LIDAR_ANGLE_OFFSET_DEG" 로 배치한다.
     test = np.zeros(360, dtype=np.float32)
-    # 좌측 콘들 (인덱스 30~80 부근, 거리 조합으로 y ≈ +2.0 라인 근사)
-    for i in (40, 55, 70):
-        test[i] = 2.0 / math.sin(math.radians(i))      # y = r·sin(deg) = 2.0 이 되도록 역산
-    # 우측 콘들 (인덱스 280~330 부근, y ≈ -1.0 라인 근사)
-    for i in (290, 305, 320):
-        test[i] = -1.0 / math.sin(math.radians(i))     # y = r·sin(deg) = -1.0 (sin<0 이라 r>0)
+
+    def put(true_deg, lateral_y):
+        """실제각 true_deg 방향에 y=lateral_y 가 되도록 콘 하나를 놓는다."""
+        idx = int(round(true_deg + LIDAR_ANGLE_OFFSET_DEG)) % 360
+        test[idx] = lateral_y / math.sin(math.radians(true_deg))
+
+    for t in (30, 45, 60):      # 좌측 줄 (y = +2.0)
+        put(t, 2.0)
+    for t in (-20, -35, -50):   # 우측 줄 (y = -1.0)
+        put(t, -1.0)
+
     off, done = process_lavacon(test)
-    print(f'offset={off:+.3f} (음수=좌조향 기대), done={done}')
+    print(f'offset={off:+.3f} (음수=좌조향 기대), done={done} (False 기대)')

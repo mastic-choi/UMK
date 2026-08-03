@@ -35,12 +35,14 @@ from sensor_msgs.msg import Image, LaserScan, Imu
 from std_msgs.msg import Float32MultiArray
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy, HistoryPolicy
 from cv_bridge import CvBridge
-from .perc_lavacon import process_lavacon, HALF_WIDTH_DEFAULT
+from .perc_lavacon import process_lavacon
 from .lane_util import CameraProcessor, SlideWindow
 from .perc_floor import LaneDetector, check_stopline
 from .traffic_signal import SignalDetector
-from .controller.obstacle_avoidance import ObstacleAvoidance
-from .controller.vehicle_overtake import VehicleOvertake
+from .controller.obstacle_avoidance import ObstacleAvoidance, AvoidPhase
+# vehicle_overtake.py 의 구 VehicleOvertake 는 더 이상 쓰지 않는다.
+#   추월/회피가 규정상 같은 기동("타겟이 없는 차선으로 지나간다")이라
+#   obstacle_avoidance.TargetPassing 한 클래스로 통합했다(moving 플래그로 구분).
 from .planner.hybrid_astar import HybridAStar
 from .planner.occupancy import OccupancyGrid
 from .controller.stanley import StanleyController
@@ -112,6 +114,65 @@ LAVACON_TRIGGER_FRAMES = 5   # 좌우 클러스터 동시검출이 연속 N프�
 SAFETY_DIST      = 5.0    # B2(고정장애물) 발동 거리(m) — ★재설계 시 재검토
 OVERTAKE_TRIGGER = 6.5    # B3(방해차량) 발동 거리(m)   — ★재설계 시 재검토
 VEHICLE_TRIGGER_FRAMES = 5     # 라이다 단독검출 연속 N프레임이면 B3_VEHICLE 진입 확정(디바운스)
+
+# ── [15] 단위 환산 상수 — ★B단계 실측 후 값만 채울 것 ──
+#   지금 코드에는 '모터 단위'(drive()가 ±100으로 클립하는 값)와 '미터'가 섞여 있다.
+#   아래 값이 0.0 이면 아직 미실측 상태라는 뜻이고, 거리 기반 로직은 보수적으로 동작한다.
+METERS_PER_SPEED_UNIT    = 0.0   # ★B-2: 모터 속도단위 1 당 m/s. (SPEED_NORMAL로 5초 직진 후 거리÷5÷SPEED_NORMAL)
+LANE_WIDTH_M             = 0.0   # ★B-1: 차선 폭(m)
+PIXELS_PER_METER         = 0.0   # ★B-1: BEV 픽셀 ↔ 미터 환산
+VEHICLE_WIDTH_M          = 0.0   # ★B-3: 자차 폭(m)
+# 각폭 분류 임계 — 이 폭 이상이면 '차량', 미만이면 '고정장애물'.
+#   ★B-3(장애물 차량 실측 폭) 후 조정. 지금은 xycar급 차폭 추정치.
+OBSTACLE_VEHICLE_WIDTH_M = 0.25
+
+# ── [5] 조향 변화율 제한 (openpilot 안전원칙: 액추에이터를 플래너와 분리해 구속) ──
+#   속도에는 이미 SPEED_ACCEL_STEP 이 있는데 조향축에만 없었다. drive() 가 모든 명령이
+#   지나는 단일 통로이므로 여기서 묶으면 어떤 Behavior/FSM 버그에도 서보 명령은 온전하다.
+#   20Hz 기준 12도/주기 = 240도/초.
+ANGLE_RATE_MAX = 12.0
+
+# ── [9] 인식 끊김 보상 (Autoware max_compensation_time 2.0s 의 축소판) ──
+#   라이다 한두 프레임 누락에 obstacle_front 가 즉시 False 로 떨어져 기동이 흔들리던 문제.
+OBSTACLE_HOLD_T = 0.6   # 마지막 관측 후 이 시간(s)까지는 장애물이 있다고 본다
+
+# ── [10] 교차로 근처 기동 금지 (Apollo IsBlockingObstacleFarFromIntersection) ──
+#   Apollo 는 신호/정지선 20m, 접속부 15m 클리어런스를 쓴다. 우리는 거리 환산이
+#   아직 없으므로 '정지선을 최근에 봤는가'(시간)로 근사한다. B-2 실측 후 거리 기준으로 교체 가능.
+MANEUVER_BLOCK_AFTER_STOPLINE_T = 2.0
+
+# ── 바퀴(Lap) 카운트 ──
+#   대회는 3바퀴 주행이고, 지름길은 3바퀴 중 1번만 통과 가능하다.
+#   좌회전(지름길) 신호는 2바퀴째 또는 3바퀴째에 랜덤으로 나오므로
+#   신호 점등 패턴만으로는 몇 바퀴째인지 특정할 수 없다 → 독립적인 카운터가 필요하다.
+#
+#   [원리] 트랙은 닫힌 곡선이므로 한 바퀴를 돌면 누적 yaw 변화가 정확히 360도가 된다.
+#     · 지름길로 가도 그 경로 역시 닫힌 단순곡선이라 똑같이 360도다(경로 선택과 무관).
+#     · 라바콘 슬라럼·회피 기동처럼 차선으로 되돌아오는 움직임은 좌우가 상쇄되어
+#       누적값에 거의 영향이 없다(이게 '누적 절대값'이 아니라 '순 누적'을 쓰는 이유).
+#   [보조] 정지선(교차로 통과)을 조기 확정 신호로 함께 본다. 단, 흰 노면표시를
+#     정지선으로 오검출하는 일이 실제로 있어서(테스트 중 재현됨) "충분히 돌았을 때만"
+#     인정한다. 반대로 정지선을 놓쳐도 yaw가 임계를 넘으면 카운트되므로 서로를 덮는다.
+TOTAL_LAPS = 3
+LAP_YAW_FULL   = math.radians(330.0)  # 이만큼 돌면 한 바퀴 완주로 확정(360도에 여유)
+LAP_YAW_MIN    = math.radians(270.0)  # 정지선으로 조기 확정하려면 최소 이만큼은 돌아야 함
+LAP_MIN_T      = 20.0                 # 한 바퀴 최소 소요시간(s) — 연속 오검출 차단
+LAP_YAW_CONFIRM_FRAMES = 10
+#   누적 임계를 넘은 상태가 연속 N프레임(20Hz→0.5초) 유지돼야 확정한다.
+#   라바콘 슬라럼처럼 좌우로 흔들리는 구간이 바퀴 끝자락(누적 300도대)에 겹치면
+#   순간 피크가 임계를 스쳐 조기 카운트될 수 있다(테스트로 재현됨).
+#   진짜 완주는 임계를 넘은 뒤 계속 커지지만 흔들림 피크는 곧 되돌아오므로 이걸로 갈린다.
+RESET_PHASE_EACH_LAP = True
+#   True : 새 바퀴가 시작되면 Phase 를 LAVACON 으로 되돌린다.
+#          라바콘·고정장애물·방해차량은 트랙에 물리적으로 계속 있으므로 매 바퀴 다시 만난다.
+#   False: Phase 를 유지한다(1바퀴만 미션 수행하고 이후 순수 차선주행).
+
+# ── [12] B2 회피 방식 선택 ──
+#   False = ObstacleAvoidance(차선 기반 횡이동, 기본값)
+#   True  = Hybrid A* + OccupancyGrid + Stanley (기존 구현, 비교/보존용)
+#   차선이 2개뿐이고 노란선만 넘으면 되는 구조화된 환경이라 Hybrid A* 는 과하고,
+#   명령속도(모터단위)를 m/s 로 적분하는 단위 불일치도 있어 기본은 False 로 둔다.
+USE_HYBRID_ASTAR_FOR_B2 = False
 
 # ── 좌회전 공통 (실차 전환: 후진 없이 무난한 좌회전으로 단순화) ──
 # 시뮬 전용이던 "후진 후 최대조향 좌회전" 방식 폐기 — 실차 튜닝 필요한 임시값
@@ -201,6 +262,8 @@ class TrackDriverNode(Node):
         self.lane_valid  = False    # 차선 검출 여부
         self.lane_lookahead = 0.0   # 원거리(앞쪽) 편차 → 코너 진입 전 예측감속용
         self._lane_prev_width = 448.0  # 도로폭 직전값(px, EMA)
+        self.lane_side   = LANE_SIDE   # 현재 주행 차선: +1=우측차선(노란선이 왼쪽) / -1=좌측차선
+                                        #   노란 중앙선 위치로 매 프레임 갱신(_update_lane_side)
         # [2-2 신호등]
         self.signal_color   = 'unknown'  # [S0] 'red'/'yellow'/'blue'/'unknown'
         self.signal_red_on      = False  # [S2] 빨강
@@ -208,6 +271,7 @@ class TrackDriverNode(Node):
         self.signal_left_on     = False  # [S2] 좌회전(점등 위치)
         self.stopline = False            # 굵은 가로 흰선(정지선/지름길 끝 단서)
         self._stopline_cooldown_t = 0.0  # 이 시각까지 정지선 재감지 무시
+        self._last_stopline_t = 0.0      # [10] 정지선을 마지막으로 본 시각(교차로 근처 기동 금지용)
         # [2-3 장애물(전방/측면)]
         self.obstacle_front = False   # 전방 장애물
         self.obstacle_dist  = 999.0   # 전방 거리(m)
@@ -216,10 +280,18 @@ class TrackDriverNode(Node):
         self.left_clear     = True    # 좌측 차선 비었는지(추월 복귀 판단)
         self.right_clear    = True    # 우측 차선 비었는지(추월 이동 판단)
         self._ema_y         = 0.0     # 전방 장애물 횡위치 EMA(obstacle_side 안정화)
+        self.obstacle_width = 0.0     # [6] 전방 장애물 실측 횡폭(m) — 거리무관 분류 기준
+        self._obstacle_last_seen = 0.0  # [9] 마지막으로 실제 검출된 시각(인식 끊김 보상)
+        # ── 추월 판단용 타겟 정보 (가장 가까운 전방 클러스터 기준) ──
+        self.obstacle_y     = 0.0     # 타겟 횡중심(m, +=좌). 어느 쪽으로 비킬지의 1차 근거
+        self.obstacle_y_min = 0.0     # 타겟 우측 끝(m)
+        self.obstacle_y_max = 0.0     # 타겟 좌측 끝(m)
+        self.obstacle_rate  = 0.0     # 접근율(m/s, 음수=접근). 추돌 방지·교차확인용
+        self._obstacle_prev_dist = None
+        self._obstacle_prev_t    = 0.0
         # [2-4 라바콘]
         self.lavacon_offset = 0.0
         self.lavacon_done   = False
-        self.lavacon_half_width = HALF_WIDTH_DEFAULT
         self._lavacon_empty_cnt = 0   # 우측콘 연속 미검출 프레임 수(Phase 전환 디바운스)
         self.lavacon_left_detected  = False  # 좌측 라이다 클러스터 검출 여부(B1 진입 트리거용)
         self.lavacon_right_detected = False  # 우측 라이다 클러스터 검출 여부(B1 진입 트리거용)
@@ -249,6 +321,7 @@ class TrackDriverNode(Node):
                                                  #   끊겨도 중간에 일반주행으로 안 튀도록 유지, lavacon_done으로 해제)
         self.ctrl_angle = 0.0
         self.ctrl_speed = SPEED_STOP
+        self._prev_angle_out = 0.0    # [5] 직전 발행 조향각(변화율 제한용)
         self._pid_prev_error = 0.0
         self._pid_integral   = 0.0
         self._turn_yaw_start = None   # 좌회전 진행 중 플래그 (None=미회전)
@@ -261,9 +334,20 @@ class TrackDriverNode(Node):
         self._corner_hold    = 0.0    # 코너 활성도(감쇠 peak-hold)
         self._last_debug_t   = 0.0
 
-        # hybridA*위해 추가
-        self.obstacle_controller = ObstacleAvoidance()
-        self.vehicle_controller = VehicleOvertake()
+        # ── 바퀴 카운트 상태 ──
+        self.lap = 1                    # 현재 몇 바퀴째 (출발 직후 = 1바퀴째 주행중)
+        self._yaw_accum = 0.0           # 이번 바퀴 시작 이후 누적 yaw(rad, 부호 유지)
+        self._prev_yaw_accum_ref = None # 누적 계산용 직전 yaw (첫 호출 때 초기화)
+        self._lap_t0 = time.time()      # 이번 바퀴 시작 시각
+        self._lap_stopline_used = False # 이번 바퀴에서 정지선으로 이미 확정했는지
+        self._lap_yaw_over_cnt = 0      # 누적 임계 초과 연속 프레임 수(디바운스)
+
+        # 전방 차량 통과 컨트롤러 — 두 미션이 같은 기동이라 같은 클래스를 쓰고
+        # moving 플래그로 재평가 강도만 다르게 한다.
+        #   B2 고정장애물 = '고장난 차량'(정지)  → moving=False
+        #   B3 방해차량   = 느리게 주행하며 차선을 오감 → moving=True
+        self.obstacle_controller = ObstacleAvoidance(moving=False)
+        self.vehicle_controller  = ObstacleAvoidance(moving=True)
 
         # OccupancyGrid의 angle_offset_deg/body_lo/body_hi는 perc_obstacle()의
         # LIDAR_ANGLE_OFFSET_DEG(88행 부근), BODY_LO/BODY_HI(395행 부근)와 반드시
@@ -331,6 +415,13 @@ class TrackDriverNode(Node):
         # ROS1 xycar_motor.py 노드가 XycarMotor 대신 Float32MultiArray(data=[angle, speed])를
         # 구독하도록 이미 전환되어 있음(ros1_bridge가 커스텀 XycarMotor 타입을 못 넘기는 문제 우회).
         clipped_angle = float(np.clip(angle, -ANGLE_MAX, ANGLE_MAX))
+        # [5] 변화율 제한: 크기(clip)만으로는 한 주기에 0도→-60도 같은 계단 명령이 그대로 나간다
+        #     (_do_left_turn 의 즉시 대입, B0→B1 전환, Stanley 출력 교체 등에서 실제로 발생).
+        #     서보 기계부하와 제어 오실레이션을 동시에 줄인다.
+        clipped_angle = float(np.clip(clipped_angle,
+                                      self._prev_angle_out - ANGLE_RATE_MAX,
+                                      self._prev_angle_out + ANGLE_RATE_MAX))
+        self._prev_angle_out = clipped_angle
         clipped_speed = float(np.clip(speed, -100.0, 100.0))
         self.motor_msg.data = [clipped_angle, clipped_speed]
         for _ in range(7):
@@ -365,6 +456,27 @@ class TrackDriverNode(Node):
             # 기존 제어 코드와 호환되도록 필터링 적용
             self.lane_offset = 0.7 * self.lane_offset + 0.3 * offset
             self.lane_lookahead = 0.5 * self.lane_lookahead + 0.5 * lookahead
+
+        self._update_lane_side()
+
+    def _update_lane_side(self):
+        """노란 중앙선이 화면 어느 쪽에 있는지로 '지금 어느 차선에 있는지'를 판정한다.
+
+        코스는 차선 2개 + 가운데 점선 노란선 + 바깥 흰 실선 구조다. 회피는 항상
+        노란선을 넘어 반대편 차선으로 가야 하므로(흰 실선은 넘으면 안 됨),
+        회피 방향은 '장애물이 어디 있나'가 아니라 '내가 어느 차선에 있나'로 정해진다.
+          노란선이 화면 왼쪽  → 나는 우측 차선 (+1) → 회피는 왼쪽으로
+          노란선이 화면 오른쪽 → 나는 좌측 차선 (-1) → 회피는 오른쪽으로
+        노란선이 안 보이는 프레임은 직전 판정을 유지한다(점선이라 끊기는 구간이 있음).
+        """
+        sw = self.slide_window_processor
+        centers = getattr(sw, 'yellow_centers', None)
+        if not centers or not sw.roi_w:
+            return
+        xs = [c[1] for c in centers if c is not None]
+        if not xs:
+            return
+        self.lane_side = 1 if (sum(xs) / len(xs)) < (sw.roi_w / 2.0) else -1
 
     # [2-2] 신호등
     #   입력 self.img_front
@@ -436,20 +548,65 @@ class TrackDriverNode(Node):
         # ── 전방 장애물 (고정장애물/차량 공통) ──
         front_mask = valid & (x > FRONT_X_MIN) & (x < FRONT_X_MAX) & (np.abs(y) < FRONT_Y_HALF)
         front_cnt  = int(np.count_nonzero(front_mask))
-        self.obstacle_front = front_cnt > FRONT_MIN_PTS
-        if self.obstacle_front:
-            self.obstacle_dist = float(np.min(r[front_mask]))
-            self.obstacle_type = 'vehicle' if front_cnt >= FRONT_VEHICLE_PTS else 'fixed'
-            mean_y = float(np.mean(y[front_mask]))
+        detected_now = front_cnt > FRONT_MIN_PTS
+        now = time.time()
+
+        if detected_now:
+            self._obstacle_last_seen = now
+            self.obstacle_front = True
+
+            # ── 타겟 분리: 전방 점들을 인접 인덱스(=인접 각도)끼리 묶고, 가장 가까운
+            #    묶음 하나만 '지금 문제되는 타겟'으로 삼는다.
+            #    구 구현은 ROI 안 점을 전부 뭉뚱그려 평균냈다. 벽과 차량이 같이 잡히면
+            #    횡위치가 둘의 중간으로 나와서 '어느 쪽으로 비킬까' 판단이 통째로 틀어진다.
+            fidx = np.where(front_mask)[0]
+            groups = np.split(fidx, np.where(np.diff(fidx) > 1)[0] + 1)
+            tgt = min(groups, key=lambda g: float(np.min(r[g])))
+
+            ty = y[tgt]
+            self.obstacle_dist  = float(np.min(r[tgt]))
+            # [6] 분류 기준을 '점 개수' → '실제 횡폭(m)' 으로.
+            #   점 개수는 거리에 반비례해서 같은 물체도 거리에 따라 분류가 뒤집힌다
+            #   (실측: 폭 0.35m 차량이 2.0m 에선 fixed(11점), 1.5m 에선 vehicle(13점)).
+            #   y 범위는 거리와 무관한 물리적 폭이라 안정적이다.
+            self.obstacle_y_min = float(np.min(ty))
+            self.obstacle_y_max = float(np.max(ty))
+            self.obstacle_width = self.obstacle_y_max - self.obstacle_y_min
+            self.obstacle_type = ('vehicle' if self.obstacle_width >= OBSTACLE_VEHICLE_WIDTH_M
+                                  else 'fixed')
+
+            # 접근율(m/s). obstacle_dist 는 라이다 실측이라 이 값은 '진짜 m/s' 다
+            # (자차 속도만 모터단위라 미보정). 음수 = 가까워지는 중.
+            #   정지 타겟이면 ≈ -자차속도, 같은 방향으로 달리는 차면 그보다 훨씬 작다.
+            #   분류의 주 근거는 Phase 이고, 이 값은 교차확인·추돌방지용이다.
+            if self._obstacle_prev_dist is not None:
+                dt_o = now - self._obstacle_prev_t
+                if dt_o > 1e-3:
+                    raw = (self.obstacle_dist - self._obstacle_prev_dist) / dt_o
+                    self.obstacle_rate = 0.7 * self.obstacle_rate + 0.3 * raw
+            self._obstacle_prev_dist = self.obstacle_dist
+            self._obstacle_prev_t    = now
+
+            mean_y = float(np.mean(ty))
             self._ema_y = SIDE_EMA_ALPHA * mean_y + (1.0 - SIDE_EMA_ALPHA) * self._ema_y
+            self.obstacle_y = self._ema_y
             if   self._ema_y >  SIDE_DEADZONE: self.obstacle_side = 'left'
             elif self._ema_y < -SIDE_DEADZONE: self.obstacle_side = 'right'
             else:                              self.obstacle_side = 'center'
+        elif (now - self._obstacle_last_seen) < OBSTACLE_HOLD_T:
+            # [9] 인식 끊김 보상: 마지막 관측 후 OBSTACLE_HOLD_T 안이면 계속 있다고 본다.
+            #   직전 dist/type/side/width 를 그대로 유지한다(새로 계산할 근거가 없으므로).
+            self.obstacle_front = True
         else:
+            self.obstacle_front = False
             self.obstacle_dist = 999.0
             self.obstacle_side = 'none'
             self.obstacle_type = 'none'
+            self.obstacle_width = 0.0
+            self.obstacle_rate = 0.0
+            self._obstacle_prev_dist = None
             self._ema_y *= (1.0 - SIDE_EMA_ALPHA)
+            self.obstacle_y = self._ema_y
 
         # ── 좌/우 차선 공간 (추월 이동·복귀 판단) ──
         left_mask  = valid & (x > SIDE_X_MIN) & (x < SIDE_X_MAX) & (y >  LEFT_Y_MIN)  & (y <  LEFT_Y_MAX)
@@ -521,8 +678,7 @@ class TrackDriverNode(Node):
 
     # [2-4] 라바콘
     def perc_lavacon(self):
-        self.lavacon_offset, self.lavacon_done, self.lavacon_half_width = process_lavacon(
-            self.lidar_ranges, self.lavacon_half_width)
+        self.lavacon_offset, self.lavacon_done = process_lavacon(self.lidar_ranges)
 
     # [2-4b] 라바콘 좌우 클러스터 검출 → B1_LAVACON 진입 트리거
     #   입력 self.lidar_ranges
@@ -692,10 +848,97 @@ class TrackDriverNode(Node):
             self.stopline = False
             return
         self.stopline = check_stopline(self.img_front)
+        if self.stopline:
+            self._last_stopline_t = time.time()   # [10] 교차로 근처 기동 금지 타이머
 
     # #########################################################
     # [3] 판단 (Decision)
     # #########################################################
+    # ── 기동 진행중 여부 ──
+    #   B2/B3는 한번 진입하면 트리거가 사라져도 기동이 끝날 때까지 유지돼야 한다.
+    #   진행중 플래그를 별도 변수로 따로 들고 있으면 실제 컨트롤러 상태와 어긋날 수 있으므로,
+    #   각 기동이 이미 들고 있는 실제 진행상태를 그대로 읽어서 판단한다.
+    @property
+    def _obstacle_active(self):
+        """B2(고정장애물): 회피 기동이 진행 중인가."""
+        if USE_HYBRID_ASTAR_FOR_B2:
+            return self.path is not None
+        return self.obstacle_controller.phase != AvoidPhase.IDLE
+
+    @property
+    def _maneuver_allowed(self):
+        """[10] 교차로(정지선) 근처에서는 회피/추월 기동을 시작하지 않는다.
+        Apollo 는 신호/정지선 20m·접속부 15m 클리어런스를 쓰지만, 우리는 거리 환산이
+        아직 없으므로 '정지선을 최근에 봤는가'로 근사한다(B-2 실측 후 거리 기준 전환 가능).
+        교차로 한복판에서 회피 기동이 걸리는 것을 막는 가드다."""
+        return (time.time() - self._last_stopline_t) > MANEUVER_BLOCK_AFTER_STOPLINE_T
+
+    @property
+    def _overtake_active(self):
+        """B3(방해차량): 추월 기동이 진행 중인가."""
+        return self.vehicle_controller.phase != AvoidPhase.IDLE
+
+    # ── 바퀴 카운트 ──
+    def _update_lap(self):
+        """누적 yaw(주) + 정지선(보조)으로 바퀴 수를 센다. 매 제어주기 1회 호출.
+
+        누적은 ±pi 경계를 넘어가도 끊기지 않도록 '직전 yaw 대비 증분'을 더해서
+        만든다(20Hz면 한 주기 변화가 pi를 넘을 일이 없으므로 언랩이 항상 안전하다).
+        imu_yaw 자체는 -pi~pi 로 감기기 때문에 그 값을 직접 비교하면 안 된다.
+        """
+        if self._prev_yaw_accum_ref is None:
+            self._prev_yaw_accum_ref = self.imu_yaw
+            return
+
+        d = self.imu_yaw - self._prev_yaw_accum_ref
+        self._yaw_accum += math.atan2(math.sin(d), math.cos(d))   # 언랩된 증분
+        self._prev_yaw_accum_ref = self.imu_yaw
+
+        # 최소 소요시간 가드 — 제자리 회전이나 순간 오검출로 연속 카운트되는 것 방지
+        if (time.time() - self._lap_t0) < LAP_MIN_T:
+            return
+
+        turned = abs(self._yaw_accum)
+        # 임계 초과가 연속 유지돼야 확정 — 슬라럼 순간 피크 배제
+        if turned >= LAP_YAW_FULL:
+            self._lap_yaw_over_cnt += 1
+        else:
+            self._lap_yaw_over_cnt = 0
+        by_yaw = self._lap_yaw_over_cnt >= LAP_YAW_CONFIRM_FRAMES
+        # 정지선은 '충분히 돈 상태'에서만 인정한다. 흰 노면표시를 정지선으로
+        # 오검출하는 경우가 있어(재현됨) 단독 신뢰는 위험하다.
+        by_stopline = (self.stopline and turned >= LAP_YAW_MIN
+                       and not self._lap_stopline_used)
+
+        if by_yaw or by_stopline:
+            self._begin_new_lap('yaw' if by_yaw else 'stopline', turned)
+
+    def _begin_new_lap(self, cause, turned):
+        self.lap += 1
+        self.get_logger().info(
+            f'[LAP] {self.lap - 1} → {self.lap} 바퀴 (근거={cause}, '
+            f'누적={math.degrees(turned):.0f}도, {time.time() - self._lap_t0:.1f}s)')
+
+        self._yaw_accum = 0.0
+        self._lap_t0 = time.time()
+        self._lap_stopline_used = (cause == 'stopline')
+        self._lap_yaw_over_cnt = 0
+
+        if self.lap > TOTAL_LAPS:
+            self._change_state(MissionState.S4_FINISH)
+            return
+
+        if RESET_PHASE_EACH_LAP:
+            # 장애물은 트랙에 그대로 있으므로 매 바퀴 처음부터 다시 만난다.
+            self.phase = Phase.LAVACON
+            self._lavacon_engaged = False
+            self._lavacon_empty_cnt = 0
+            self._lavacon_trigger_cnt = 0
+            self._vehicle_trigger_cnt = 0
+            self.obstacle_controller.reset()
+            self.vehicle_controller.reset()
+            self.behavior_state = BehaviorState.B0_NORMAL
+
     def run_mission_fsm(self):
         {
             MissionState.S0_WAIT_GREEN  : self._s0_wait_green,
@@ -730,6 +973,11 @@ class TrackDriverNode(Node):
             # 출발(S0) 직후 첫 S1 진입 시 잠깐 정지선 오검출 억제
             if prev_state == MissionState.S0_WAIT_GREEN:
                 self._stopline_cooldown_t = time.time() + 3.0
+                # 실제 주행은 지금부터 — 신호 대기하며 서 있던 시간이 1바퀴 시간에
+                # 섞이지 않도록 바퀴 기준점을 여기서 다시 잡는다.
+                self._lap_t0 = time.time()
+                self._yaw_accum = 0.0
+                self._prev_yaw_accum_ref = self.imu_yaw
         # S3 진입 시 탈출 감속 플래그 + 기준 yaw 초기화
         if new_state == MissionState.S3_SHORTCUT:
             self._exit_approach_t0 = None
@@ -760,7 +1008,7 @@ class TrackDriverNode(Node):
         # 여기서 안 걸리고 아래 else 분기의 일반 차선주행(_lane_drive)이 계속 돈다.
         if self._behavior_enabled and self.phase == Phase.LAVACON and self._lavacon_engaged:
             return
-        if self._obstacle_phase != 'idle' or self._overtake_phase_int != 0:
+        if self._obstacle_active or self._overtake_active:
             return
 
         if self._approach_t0 is not None:
@@ -913,9 +1161,17 @@ class TrackDriverNode(Node):
             if TEST_DISABLE_B2_B3:
                 self.behavior_state = BehaviorState.B0_NORMAL   # 테스트 범위 제한: B2 트리거 무시
                 return
-            triggered = self.obstacle_front and self.obstacle_type == 'fixed' and self.obstacle_dist < SAFETY_DIST
+            # 트리거에서 obstacle_type=='fixed' 조건을 뺐다.
+            #   [6]에서 분류 기준을 실폭으로 바꾸면서, 차선을 막고 선 '차량'(폭 넓음)은
+            #   'vehicle' 로 분류된다. 옛 조건대로면 이 Phase 에서 영영 트리거되지 않아
+            #   Phase.VEHICLE 로 넘어가지도 못하고 교착된다.
+            #   회피 기동 자체는 고정물이든 차량이든 '반대편 차선으로 비킨다'로 동일하므로
+            #   여기서는 '앞을 막고 있는가'만 본다(순서는 Phase 가 이미 강제하고 있음).
+            triggered = (self.obstacle_front
+                         and self.obstacle_dist < SAFETY_DIST
+                         and self._maneuver_allowed)
             self.behavior_state = (BehaviorState.B2_OBSTACLE
-                                    if (triggered or self._obstacle_phase != 'idle')
+                                    if (triggered or self._obstacle_active)
                                     else BehaviorState.B0_NORMAL)
         elif self.phase == Phase.VEHICLE:
             # 위와 동일한 이유로 트리거 검사를 건너뛰고 B0로 고정(placeholder 추월 기동 비활성화)
@@ -923,9 +1179,10 @@ class TrackDriverNode(Node):
                 self.behavior_state = BehaviorState.B0_NORMAL   # 테스트 범위 제한: B3 트리거 무시
                 return
             # 진입 판정은 perc_vehicle_trigger()의 라이다 디바운스 결과를 사용.
-            # 한번 진입한 뒤(_overtake_phase_int != 0)에는 기존과 동일하게 라이다 단독으로 유지/종료 판단.
+            # 한번 진입한 뒤(_overtake_active)에는 기존과 동일하게 라이다 단독으로 유지/종료 판단.
             self.behavior_state = (BehaviorState.B3_VEHICLE
-                                    if (self.vehicle_trigger or self._overtake_phase_int != 0)
+                                    if ((self.vehicle_trigger and self._maneuver_allowed)
+                                        or self._overtake_active)
                                     else BehaviorState.B0_NORMAL)
         else:  # Phase.DONE
             self.behavior_state = BehaviorState.B0_NORMAL
@@ -994,9 +1251,22 @@ class TrackDriverNode(Node):
         else:
             self._lavacon_empty_cnt = 0
 
-    # ── B2-고정장애물 회피 ──★재설계 예정(임시 placeholder) ──
-    # target_lane을 반영해 수정
+    # ── B2-고정장애물 회피 ──
+    #   차선 2개 + 넘어도 되는 노란 중앙선 구조라, 방향은 '반대편 차선' 하나로 정해진다.
+    #   좌우 선택 로직은 ObstacleAvoidance.decide_lane() 이 lane_side 로 처리한다.
     def _handle_fixed_obstacle(self):
+        if USE_HYBRID_ASTAR_FOR_B2:
+            self._handle_fixed_obstacle_astar()
+            return
+
+        self._run_passing(self.obstacle_controller, 'B2',
+                          done_next_phase=Phase.VEHICLE)
+
+    # ── B2 대안: Hybrid A* 경로계획 방식 (USE_HYBRID_ASTAR_FOR_B2=True 일 때만) ──
+    #   구조화된 2차선 환경에는 과한 방식이라 기본은 비활성. 비교/보존용으로 남겨둔다.
+    #   ※ 이 경로는 아직 명령속도(모터단위)를 m/s 로 적분하는 단위 불일치가 남아있다
+    #     — B-2(METERS_PER_SPEED_UNIT) 실측 후에 정리할 것.
+    def _handle_fixed_obstacle_astar(self):
 
         if self.path is None:
             # Local Occupancy 생성
@@ -1087,25 +1357,44 @@ class TrackDriverNode(Node):
     # target_lane 반영 수정
     # 회피 후 복귀하는 로직 추가 : idle -> avoid -> idle+Phase.VEHICLE => idel -> avoid -> return -> idle
     def _handle_overtake(self):
-        """
-        ★ TODO: 실차 추월 기동 재설계 필요. 시뮬 전용이던 6단계 고정 프레임 시퀀스는 폐기.
-        지금은 감지되면 감속만 하고 버티다가, 차량이 사라지면 DONE으로 넘어가는
-        임시(placeholder) 동작이다. 실제 추월 궤적/조향은 팀에서 별도로 설계해서 교체할 것.
-        """
-        steer_offset, speed, done = self.vehicle_controller.update(
-                    obstacle_front = self.obstacle_front,
-                    obstacle_dist = self.obstacle_dist,
-                    lane_offset = self.lane_offset,
-                    lane_lookahead = self.lane_lookahead,
-                )
-        
+        """방해차량 추월. 규정상 '방해차량이 주행하지 않는 차선'으로 지나가야 하고,
+        그 차량이 1·2차선을 오가므로 매 프레임 타겟 횡위치를 다시 보고 필요하면
+        진행 방향을 바꾼다(moving=True 로 생성된 컨트롤러가 이걸 처리)."""
+        self._run_passing(self.vehicle_controller, 'B3',
+                          done_next_phase=Phase.DONE)
+
+    # ── B2/B3 공통 실행부 ──
+    def _run_passing(self, controller, tag, done_next_phase):
+        steer_offset, speed, done, status = controller.update(
+            obstacle_front=self.obstacle_front,
+            obstacle_dist=self.obstacle_dist,
+            obstacle_y=self.obstacle_y,
+            lane_offset=self.lane_offset,
+            lane_lookahead=self.lane_lookahead,
+            lane_side=self.lane_side,
+            left_clear=self.left_clear,
+            right_clear=self.right_clear,
+            allow_maneuver=self._maneuver_allowed,
+        )
+
         self.ctrl_angle = self._lane_pid(steer_offset)
+
+        if status == 'blocked':
+            # 양쪽 다 막혔다 → 흰 실선 밖으로 나가지 않고 서행하며 기다린다.
+            #   규정상 '주행 중 정지'는 위험하다(멈춘 뒤 1분 내 재개 못하면 실격).
+            #   그래서 완전정지 대신 최저속으로 유지하며 다음 프레임에 다시 판단한다.
+            self.ctrl_speed = max(SPEED_NORMAL * 0.15, 0.5)
+            self.get_logger().warn(f'[{tag}] 양쪽 통과 불가 — 서행 후 재시도',
+                                   throttle_duration_sec=1.0)
+            return
+
         self.ctrl_speed = speed
-        
+
         if done:
-            self.phase = Phase.DONE
+            self.phase = done_next_phase
             self._pid_prev_error = 0.0
             self._pid_integral = 0.0
+            self.get_logger().info(f'[{tag}] 통과 완료 → {done_next_phase.name}')
 
 
     # #########################################################
@@ -1119,6 +1408,7 @@ class TrackDriverNode(Node):
           (S0/S2/S3 및 S1 최초 진입 구간에서는 꺼져서 오검출로 인한 오작동을 막는다)
         """
         self.perceive_all()                 # 1. 인지
+        self._update_lap()                  #    바퀴 카운트(누적 yaw + 정지선)
         self.run_mission_fsm()              # 2. 판단(Mission)
 
         if ENABLE_BEHAVIOR and self.mission_state == MissionState.S1_LANE_FOLLOW and self._behavior_enabled:
@@ -1192,9 +1482,13 @@ class TrackDriverNode(Node):
         self.get_logger().info(
             f'[{self.mission_state.name}|{self.behavior_state.name}|{self.phase.name}] '
             f'ang={self.ctrl_angle:+.1f} spd={self.ctrl_speed:.1f}\n'
+            f'  [LAP] {self.lap}/{TOTAL_LAPS} 바퀴 '
+            f'누적={math.degrees(self._yaw_accum):+.0f}도/{math.degrees(LAP_YAW_FULL):.0f} '
+            f'경과={time.time() - self._lap_t0:.0f}s\n'
             f'  [SENS] cam={cam_age:.1f}s sig={self.signal_color} lidar={lidar_desc}\n'
             f'  [LANE] lane={self.lane_offset:+.1f}({int(self.lane_valid)}) '
-            f'obs={self.obstacle_front}({self.obstacle_dist:.1f}m,{self.obstacle_side},{self.obstacle_type}) '
+            f'side={"R" if self.lane_side >= 0 else "L"}차선 '
+            f'obs={self.obstacle_front}({self.obstacle_dist:.1f}m,w={self.obstacle_width:.2f}m,{self.obstacle_type}) '
             f'lava={self.lavacon_offset:+.2f}(done={int(self.lavacon_done)})\n'
             f'  [TRIG] trigL={self._lavacon_trigger_cnt}/{LAVACON_TRIGGER_FRAMES}'
             f'(L{int(self.lavacon_left_detected)}R{int(self.lavacon_right_detected)}) '

@@ -12,11 +12,12 @@ class HybridAStar:
         # 최대 조향각
         self.max_steer = math.radians(30)
 
-        # Motion Primitive
+        # Motion Primitive — max_steer 에서 유도한다.
+        #   예전에는 ±30을 하드코딩해서 max_steer 를 바꿔도 실제 확장각은 그대로였다
+        #   (한쪽만 고치면 조용히 어긋나는 구조). 이제 max_steer 하나만 바꾸면 된다.
+        _max_deg = math.degrees(self.max_steer)
         self.steer_set = [
-            -30, -20, -10,
-            0,
-            10, 20, 30
+            _max_deg * k / 3.0 for k in (-3, -2, -1, 0, 1, 2, 3)
         ]
 
         self.step_forward = 0.5
@@ -115,7 +116,10 @@ class HybridAStar:
 
         g = current.g
         g += abs(step)
-        g += abs(steer) * self.steer_weight
+        # steer 는 '도' 단위로 넘어오는데 아래 yaw_error 는 라디안이라 그대로 더하면
+        # 단위가 섞인다(최대조향 30도 → 30*0.02=0.6 으로 이동거리 비용 0.5보다 커짐).
+        # 라디안으로 변환해서 두 항의 스케일을 맞춘다.
+        g += abs(math.radians(steer)) * self.steer_weight
 
         yaw_error = abs(nxt.yaw - current.yaw)
 
@@ -168,21 +172,31 @@ class HybridAStar:
 
     # Path Smoothing
     def smooth(self, path):
-        new=[]
-        
+        """3점 이동평균. 시작점·끝점은 평활 없이 그대로 보존한다.
+        구 구현은 range(1, len-1) 결과만 돌려줘서 첫/마지막 waypoint 를 버렸다.
+          · 2점짜리 경로면 [] 이 되어 호출부가 '플래닝 실패'로 오인
+          · 끝점이 사라져 경로가 목표에 도달하지 않게 되고,
+            Stanley 의 goal_reached() 가 path[-1] 기준이라 종료 판정이 어긋남"""
+        if len(path) <= 2:
+            return list(path)
+
+        new = [path[0]]
+
         for i in range(1, len(path)-1):
             x=(
                 path[i-1][0] + path[i][0] + path[i+1][0]
                 )/3
-        
+
             y=(
                 path[i-1][1] + path[i][1] + path[i+1][1]
                 )/3
-        
+
             yaw = path[i][2]
-        
+
             new.append((x,y,yaw))
-        
+
+        new.append(path[-1])
+
         return new
         
 
