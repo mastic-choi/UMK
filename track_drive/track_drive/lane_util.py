@@ -133,6 +133,20 @@ STABLE_JUMP_MAX = 15   # 이 이상(px) 차이나면 "같은 흐름"이 아닌 �
 PATH_N_WAYPOINTS = 12       # 피팅한 곡선에서 뽑아낼 웨이포인트 수
 PATH_EXTRAPOLATE_MARGIN = 1.5  # 다항식 외삽이 튀는 걸 막는 안전클램프(roi_w의 배수)
 
+# 경로(웨이포인트) 프레임 간 EMA 스무딩 — offset/lookahead(_debounce(), perc_lane()의
+#   0.7/0.3 EMA)는 이미 두 겹으로 걸러지는데, pure_pursuit이 실제로 추종하는 self.path는
+#   매 프레임 그 프레임의 관측점만으로 처음부터 다시 피팅돼 대입되고 있어(계보: dl_lane.py
+#   detect(), lane_util.calc_center() 모두 "fitted_path 있으면 그대로 self.path에 대입") 아무
+#   필터도 안 거친다. pure_pursuit.py의 조향각 1탭 EMA(alpha=0.5)만으로는 입력 경로 자체의
+#   프레임간 흔들림(특히 밴드 8개뿐인 DL 쪽에서 두드러짐)을 못 죽여서 조향이 실제 운전보다
+#   과민하게 자주 바뀌는 원인이 된다. 그래서 offset과 같은 패턴(가중 EMA)을 경로에도 적용한다
+#   — 웨이포인트 인덱스별로 새 값과 직전 값을 블렌딩(y도 함께 블렌딩 — y_far가 프레임마다
+#   조금씩 달라지므로 x만 블렌딩하면 인덱스가 가리키는 실제 지점이 어긋난다).
+#   PATH_N_WAYPOINTS가 고정값이라 fitted_path 길이는 항상 self.path와 같다(첫 프레임 등
+#   길이가 다르면 스무딩을 생략하고 그대로 대입).
+#   실차 미검증 튜닝값 — 값을 낮추면(더 스무딩) 저킹은 줄지만 실제 코너 진입 반응이 늦어짐.
+PATH_EMA_ALPHA = 0.3   # 새 프레임에 줄 가중치(작을수록 더 부드럽고, 더 느리게 반응)
+
 
 #def Debugging(flag):
 # DEBUG 상수들 모아놓자(외부 파일로 뺄지는 고민해보기)
@@ -591,6 +605,26 @@ class SlideWindow:
 
         return [(float(x), float(y)) for x, y in zip(sample_xs, sample_ys)]
 
+    def _update_path(self, fitted_path):
+        """새로 피팅된 경로(fitted_path)를 직전 self.path와 웨이포인트 인덱스별로
+        EMA 블렌딩해서 반영한다(모듈 상단 PATH_EMA_ALPHA 주석 참고). fitted_path가
+        None이면(유효 슬라이스 2개 미만) 아무것도 안 하고 직전 경로를 그대로 둔다 —
+        기존 "무효 프레임엔 마지막 값 유지" 원칙과 동일. 직전 경로가 비어있거나
+        (첫 프레임) 길이가 다르면(PATH_N_WAYPOINTS 변경 등 비정상 상황) 블렌딩할
+        기준이 없으므로 새 경로를 그대로 채택한다."""
+        if fitted_path is None:
+            return
+
+        if not self.path or len(self.path) != len(fitted_path):
+            self.path = fitted_path
+            return
+
+        a = PATH_EMA_ALPHA
+        self.path = [
+            (a * nx + (1.0 - a) * px, a * ny + (1.0 - a) * py)
+            for (px, py), (nx, ny) in zip(self.path, fitted_path)
+        ]
+
     def calc_center(self):
         near_left   = self._group_mean(self.left_centers,   self.near_slices, True)
         far_left    = self._group_mean(self.left_centers,   self.far_slices,  False)
@@ -660,11 +694,12 @@ class SlideWindow:
         # 명시적 경로(웨이포인트) — self.lane_width가 위에서 이번 프레임 값으로 이미
         # 갱신됐으므로(양쪽 검출+폭 정상 분기), _build_centerline_points()의 한쪽-차선
         # 폴백이 최신 추정 폭을 쓴다. 유효 슬라이스가 2개 미만이면 fitted_path가 None이
-        # 되고, 그 경우 self.path는 갱신하지 않아(직전 프레임 값 유지) offset/lane_offset과
-        # 동일한 "무효 프레임엔 마지막 값 유지" 원칙을 따른다.
+        # 되고, 그 경우 _update_path()가 self.path를 갱신하지 않아(직전 프레임 값 유지)
+        # offset/lane_offset과 동일한 "무효 프레임엔 마지막 값 유지" 원칙을 따른다.
+        # 유효할 때도 그대로 대입하지 않고 직전 경로와 EMA 블렌딩한다(PATH_EMA_ALPHA
+        # 주석 참고) — 조향이 매 프레임 새로 피팅된 경로에 과민하게 반응하는 걸 막기 위함.
         fitted_path = self._fit_and_sample_path(self._build_centerline_points())
-        if fitted_path is not None:
-            self.path = fitted_path
+        self._update_path(fitted_path)
 
         lane_valid, offset, lookahead, lane_center = self._debounce(
             lane_valid, offset, lookahead, lane_center

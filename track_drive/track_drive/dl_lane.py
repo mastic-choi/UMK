@@ -420,14 +420,15 @@ class DLSlideWindow(SlideWindow):
         lane_center = self.roi_w / 2.0 + offset
 
         # 명시적 경로(웨이포인트) — da 밴드 중심점에 다항식을 피팅해 만든다. 유효 밴드가
-        # 2개 미만이면 fitted_path가 None이 되고, 그 경우 self.path를 갱신하지 않아
-        # (직전 프레임 값 유지) offset/lane_offset과 동일한 "무효 프레임엔 마지막 값
-        # 유지" 원칙을 따른다.
+        # 2개 미만이면 fitted_path가 None이 되고, 그 경우 _update_path()가 self.path를
+        # 갱신하지 않아(직전 프레임 값 유지) offset/lane_offset과 동일한 "무효 프레임엔
+        # 마지막 값 유지" 원칙을 따른다. 유효할 때도 그대로 대입하지 않고 직전 경로와
+        # EMA 블렌딩한다(lane_util.PATH_EMA_ALPHA 주석 참고) — 조향이 매 프레임 새로
+        # 피팅된 경로에 과민하게 반응하는 걸 막기 위함.
         fitted_path = self._fit_and_sample_path(
             [c for c in self.centerline if c is not None]
         )
-        if fitted_path is not None:
-            self.path = fitted_path
+        self._update_path(fitted_path)
 
         lane_valid, offset, lookahead, lane_center = self._debounce(
             lane_valid, offset, lookahead, lane_center

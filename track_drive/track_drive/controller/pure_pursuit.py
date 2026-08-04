@@ -29,7 +29,8 @@ class PurePursuitController:
     반환한다. path가 비어있으면(첫 프레임 등) 직전 조향각을 그대로 유지한다 —
     lane_util._debounce()가 무효 프레임에 직전 확정값을 유지하는 것과 같은 원칙."""
 
-    def __init__(self, lookahead_px=90.0, wheelbase_px=220.0, angle_max_deg=100.0, alpha=0.5):
+    def __init__(self, lookahead_px=90.0, wheelbase_px=220.0, angle_max_deg=100.0, alpha=0.5,
+                 min_lookahead_px=40.0):
         # 목표점을 찾는 전방주시거리(px). ROI가 짧은 백엔드(hough_lane은 ROI 높이가
         # ~70px로 매우 짧다)에서는 경로 전체 길이가 lookahead_px보다 짧아져 자동으로
         # path의 가장 먼 점이 목표점이 된다(_target_point() 참고) — 그 자체로는 안전한
@@ -45,6 +46,17 @@ class PurePursuitController:
         self.wheelbase_px = wheelbase_px
 
         self.angle_max_deg = angle_max_deg
+
+        # 목표점까지 남은 실제거리(ld)가 이보다 짧으면 곡률 계산을 하지 않고 직전 조향각을
+        # 유지한다 — 유효 슬라이스가 적어 path가 짧게 잘린 프레임(부분 가림, 순간 노이즈
+        # 등)에서 _target_point()가 lookahead_px에 못 미쳐 path[-1](아주 가까운 점)을
+        # 목표점으로 쓰게 되는데, curvature = 2*sin(alpha)/ld 는 ld가 작을수록 같은 dx도
+        # 훨씬 큰 곡률로 증폭시킨다. 실측 예: ld=42px, dx=3px(육안으론 거의 직진)여도
+        # alpha≈4.1°, curvature≈0.0034 → atan(curvature*wheelbase_px=220)≈37° — 픽셀
+        # 몇 개짜리 잡음이 30도대 조향 스파이크로 증폭되는 걸 실제로 재현 가능. path가
+        # 비었을 때(위 return self.prev_steer_deg)와 같은 "못 믿을 프레임은 직전 값 유지"
+        # 원칙을 짧은 ld에도 동일하게 적용한다. 실차 미검증 튜닝값.
+        self.min_lookahead_px = min_lookahead_px
 
         # 프레임 간 조향각 스파이크 저역통과 — controller/stanley.py의 self.alpha와
         # 동일한 패턴(1프레임짜리 경로 튐이 조향에 그대로 실리지 않도록).
@@ -83,9 +95,14 @@ class PurePursuitController:
         # 목표점이 차량과 같은 행(dy<=0)에 있는 뒤틀린 경로라도 나눗셈이 죽지 않도록
         # 최소값을 준다.
         dy = max(vehicle_xy[1] - ty, 1e-3)
+        ld = math.hypot(dx, dy)
+
+        # ld가 너무 짧으면(위 min_lookahead_px 주석 참고) 곡률 계산 자체를 건너뛰고
+        # 직전 조향각을 유지한다 — 짧은 ld에서는 픽셀 노이즈가 조향각으로 크게 증폭된다.
+        if ld < self.min_lookahead_px:
+            return self.prev_steer_deg
 
         alpha = math.atan2(dx, dy)
-        ld = math.hypot(dx, dy)
         curvature = 2.0 * math.sin(alpha) / ld
         steer_deg = math.degrees(math.atan(curvature * self.wheelbase_px))
 
