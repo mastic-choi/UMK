@@ -48,6 +48,7 @@ from .controller.obstacle_avoidance import ObstacleAvoidance, AvoidPhase
 from .planner.hybrid_astar import HybridAStar
 from .planner.occupancy import OccupancyGrid
 from .controller.stanley import StanleyController
+from .controller.pure_pursuit import PurePursuitController
 from .planner.node import Node as PlannerNode
 # #############################################################
 # [0] 설정 (Config)
@@ -107,9 +108,8 @@ LANE_SIDE = 1               # 주행 차선: +1=노란선 오른쪽(우측차선
 LANE_CORNER_BOOST = 1.8    # 코너(큰 offset) 조향 가중
 LANE_CORNER_REF   = 120.0  # 이 offset(px)에서 가중 최대
 LANE_CORNER_MIN   = 40.0   # 코너 가중 시작 임계(px)
-LANE_DEADZONE     = 40.0   # 중앙 데드존(px)
-LANE_PREVIEW      = 0.38   # 코너 예측 조향 비중(0~1)
-LANE_LOOKAHEAD_REF = 220.0  # 예측감속 최대가 되는 lookahead 편차(px)
+LANE_DEADZONE     = 40.0   # 중앙 데드존(px) — _lane_pid()(B2/B3 behavior가 여전히 사용)용
+LANE_LOOKAHEAD_REF = 220.0  # 예측감속 최대가 되는 lookahead 편차(px) — _lane_drive() 속도계획용
 
 LAVACON_KP   = 210.0
 LAVACON_DONE_FRAMES = 80   # 우측콘 미검출이 연속 N프레임(20Hz→약 4초) 쌓이면 Phase 전환(순간누락 디바운스)
@@ -220,8 +220,9 @@ DEBUG_PLANNER = False   # planner 디버그 창
 
 # ── 차선인식 백엔드 선택 ──
 #   perc_lane()은 self.lane_detector.detect(frame) -> (valid, offset, lookahead, lane_center,
-#   debug_img) 인터페이스에만 의존하는 pluggable 구조라, 아래 셋 중 하나로 자유롭게 바꿔
-#   끼울 수 있다(perc_lane()/_update_lane_side() 수정 불필요).
+#   path, debug_img) 인터페이스에만 의존하는 pluggable 구조라, 아래 셋 중 하나로 자유롭게 바꿔
+#   끼울 수 있다(perc_lane()/_update_lane_side() 수정 불필요). path(ROI 픽셀좌표 웨이포인트)는
+#   _pure_pursuit_steer()가 조향각 계산에 쓴다.
 #     'hough'      : hough_lane.HoughLaneDetector (현재 기본, 실차 라바콘 테스트까지 검증됨)
 #     'classic_cv' : lane_util.CameraProcessor+SlideWindow (BEV+adaptiveThreshold/HSV+moments,
 #                    perc_floor.LaneDetector로 조립. 보존용, 현재 라이브 미검증)
@@ -276,9 +277,11 @@ class TrackDriverNode(Node):
 
         # ── 인터페이스 변수 (인지 → 판단/제어) ──
         # [2-1 차선]
-        self.lane_offset = 0.0      # 근거리 중앙편차(px, 우측+)
+        self.lane_offset = 0.0      # 근거리 중앙편차(px, 우측+) — [4] 속도계획(turn_preview)에 계속 사용
         self.lane_valid  = False    # 차선 검출 여부
         self.lane_lookahead = 0.0   # 원거리(앞쪽) 편차 → 코너 진입 전 예측감속용
+        self.lane_path = []         # 명시적 경로(ROI 픽셀좌표 웨이포인트, 가까운점→먼점)
+                                     #   perc_lane()이 갱신, _pure_pursuit_steer()가 조향각 계산에 사용
         self._lane_prev_width = 448.0  # 도로폭 직전값(px, EMA)
         self.lane_side   = LANE_SIDE   # 현재 주행 차선: +1=우측차선(노란선이 왼쪽) / -1=좌측차선
                                         #   노란 중앙선 위치로 매 프레임 갱신(_update_lane_side)
@@ -377,6 +380,11 @@ class TrackDriverNode(Node):
         self.planner = HybridAStar()
         self.stanley = StanleyController()
 
+        # 차선 세그멘테이션 경로(self.lane_path) 추종용 — _lane_pid()(PID)를 대체.
+        # _lane_pid()는 B2/B3 장애물회피 behavior(apply_behavior_override())가 여전히
+        # 쓰므로 그대로 남겨둔다 — 없앤 게 아니라 "일반 차선주행" 용도에서만 교체한 것.
+        self.pure_pursuit = PurePursuitController(angle_max_deg=ANGLE_MAX)
+
         self.path = None
         self.grid = None
         self.replan_count = 0
@@ -446,7 +454,7 @@ class TrackDriverNode(Node):
 
     def _build_lane_detector(self, backend):
         """LANE_DETECTOR_BACKEND 값에 따라 차선인식 백엔드 객체를 만든다. 셋 다
-        detect(frame) -> (valid, offset, lookahead, lane_center, debug_img) 인터페이스가
+        detect(frame) -> (valid, offset, lookahead, lane_center, path, debug_img) 인터페이스가
         동일하므로 perc_lane()/_update_lane_side()는 어떤 백엔드가 골라졌는지 몰라도 된다."""
         if backend == 'classic_cv':
             detector = ClassicLaneDetector()
@@ -486,7 +494,7 @@ class TrackDriverNode(Node):
             return
 
         # hough_lane.py의 HoughLaneDetector를 사용하여 차선 인식 수행
-        valid, offset, lookahead, lane_center, debug_img = self.lane_detector.detect(self.img_front)
+        valid, offset, lookahead, lane_center, path, debug_img = self.lane_detector.detect(self.img_front)
         # DL 백엔드는 추론이 별도 스레드에서 도는데, cv2.imshow()/waitKey()는 스레드
         # 세이프하지 않아 반드시 메인 스레드(여기, control_loop 타이머 콜백)에서만 호출해야
         # 한다(dl_lane.DLLaneDetector.show_debug_windows() 주석 참고). hough/classic_cv
@@ -499,6 +507,10 @@ class TrackDriverNode(Node):
             # 기존 제어 코드와 호환되도록 필터링 적용
             self.lane_offset = 0.7 * self.lane_offset + 0.3 * offset
             self.lane_lookahead = 0.5 * self.lane_lookahead + 0.5 * lookahead
+        if path:
+            # path가 빈 리스트면(이번 프레임 유효 슬라이스 2개 미만) 갱신하지 않고
+            # 직전 경로를 유지한다 — lane_offset의 "무효 프레임엔 직전 값 유지" 폴백과 동일.
+            self.lane_path = path
 
         self._update_lane_side()
 
@@ -1057,8 +1069,7 @@ class TrackDriverNode(Node):
         if self._approach_t0 is not None:
             # 감속 구간: 차선 조향 유지 + 극저속 → 거의 정지 상태로 S2 진입
             elapsed = time.time() - self._approach_t0
-            self.ctrl_angle = self._lane_pid(
-                (1.0 - LANE_PREVIEW) * self.lane_offset + LANE_PREVIEW * self.lane_lookahead)
+            self.ctrl_angle = self._pure_pursuit_steer()
             self.ctrl_speed = APPROACH_SPEED
             self._prev_speed = APPROACH_SPEED
             if elapsed >= APPROACH_TIME:
@@ -1235,8 +1246,7 @@ class TrackDriverNode(Node):
     # #########################################################
     def _lane_drive(self):
         """S1/S3 공통 차선 조향+감속 로직. ctrl_angle·ctrl_speed·_prev_speed·_corner_hold 갱신."""
-        steer_offset = (1.0 - LANE_PREVIEW) * self.lane_offset + LANE_PREVIEW * self.lane_lookahead
-        self.ctrl_angle = self._lane_pid(steer_offset)
+        self.ctrl_angle = self._pure_pursuit_steer()
         turn_now     = min(1.0, abs(self.ctrl_angle) / ANGLE_MAX)
         turn_preview = min(1.0, abs(self.lane_lookahead) / LANE_LOOKAHEAD_REF)
         turn_for_speed = max(turn_now, turn_preview * 0.3)
@@ -1250,6 +1260,20 @@ class TrackDriverNode(Node):
             target_speed = self._prev_speed + accel_step
         self.ctrl_speed = target_speed
         self._prev_speed = target_speed
+
+    def _pure_pursuit_steer(self):
+        """self.lane_path(DL/classic_cv/hough 백엔드가 만든 ROI 픽셀좌표 경로, 가까운점→
+        먼점)를 Pure Pursuit으로 추종해 조향각(도)을 계산한다. 차량 기준점은 항상
+        ROI 하단 중앙(roi_w/2, path의 가장 가까운 점의 y좌표)으로 둔다 — path[0].y는
+        lane_util._fit_and_sample_path()가 self.roi_h로 샘플링해둔 값이라 별도로
+        백엔드별 roi_h를 조회할 필요가 없다.
+        경로가 비어있으면(첫 프레임, 혹은 roi_w를 아직 모르는 백엔드) 직전 조향각을
+        그대로 유지한다 — PurePursuitController.control()이 내부적으로 처리."""
+        roi_w = getattr(self.lane_detector, 'roi_w', 0) or 0
+        if not self.lane_path or not roi_w:
+            return self.pure_pursuit.prev_steer_deg
+        vehicle_xy = (roi_w / 2.0, self.lane_path[0][1])
+        return self.pure_pursuit.control(self.lane_path, vehicle_xy)
 
     def _lane_pid(self, offset, deadzone=LANE_DEADZONE):
         """차선 중앙편차(offset)를 PID 제어로 조향각(angle)으로 변환한다."""

@@ -49,6 +49,10 @@ class LaneDetector:
     def __init__(self, camera_processor=None, slide_window_processor=None):
         self.camera_processor = camera_processor
         self.slide_window_processor = slide_window_processor
+        # hough_lane.HoughLaneDetector/dl_lane.DLLaneDetector와 동일하게 노출 —
+        # _update_lane_side()/controller.pure_pursuit이 백엔드 구분 없이 참조한다.
+        self.roi_w = 0
+        self.yellow_centers = []
 
     def set_processor(self, camera, slide_window):
         self.camera_processor = camera
@@ -57,15 +61,20 @@ class LaneDetector:
     def detect(self, frame):
         """
         입력 : 전방 카메라 BGR 프레임
-        출력 : (lane_valid, lane_offset, lane_lookahead, lane_center, bev)
+        출력 : (lane_valid, lane_offset, lane_lookahead, lane_center, path, bev)
+          path — ROI 픽셀좌표 (x,y) 웨이포인트 리스트, 가까운점→먼점 순
+          (lane_util.SlideWindow.calc_center()가 생성, controller.pure_pursuit이 소비)
         """
         bev, white_mask, yellow_mask = self.camera_processor.processor(frame)
 
         if bev is None:
-            return False, 0.0, 0.0, self.camera_processor.roi_w / 2, None   # lane_center는 화면 중앙(640/2)을 기본값으로
+            # lane_center는 화면 중앙(640/2)을 기본값으로
+            return False, 0.0, 0.0, self.camera_processor.roi_w / 2, [], None
 
-        lane_valid, lane_offset, lookahead, lane_center = self.slide_window_processor.detect(
+        lane_valid, lane_offset, lookahead, lane_center, path = self.slide_window_processor.detect(
             bev, white_mask, yellow_mask
         )
+        self.roi_w = self.slide_window_processor.roi_w
+        self.yellow_centers = self.slide_window_processor.yellow_centers
 
-        return lane_valid, lane_offset, lookahead, lane_center, bev
+        return lane_valid, lane_offset, lookahead, lane_center, path, bev

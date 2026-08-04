@@ -124,6 +124,15 @@ WHITE_CCA_MIN_AREA = 15
 STABLE_FRAME_MIN = 3   # 후보를 확정값으로 승격시키기 위해 필요한 연속 프레임 수
 STABLE_JUMP_MAX = 15   # 이 이상(px) 차이나면 "같은 흐름"이 아닌 새 후보로 취급
 
+# 명시적 경로(곡선/웨이포인트) 생성 — controller/pure_pursuit.py가 소비
+#   기존 offset/lookahead(근거리·원거리 두 그룹의 평균 스칼라)만으로는 Pure Pursuit이
+#   목표점을 고를 "경로"가 없다. 그래서 슬라이스별 중심점(구간마다 독립 계산된 값,
+#   반사광 등은 이미 _reject_outliers()로 제외된 상태)에 다항식을 피팅해 ROI 픽셀
+#   좌표계의 명시적 곡선을 만들고, 그 위를 일정 간격으로 샘플링해 웨이포인트로 쓴다.
+#   실차 미검증 튜닝값.
+PATH_N_WAYPOINTS = 12       # 피팅한 곡선에서 뽑아낼 웨이포인트 수
+PATH_EXTRAPOLATE_MARGIN = 1.5  # 다항식 외삽이 튀는 걸 막는 안전클램프(roi_w의 배수)
+
 
 #def Debugging(flag):
 # DEBUG 상수들 모아놓자(외부 파일로 뺄지는 고민해보기)
@@ -312,7 +321,7 @@ class SlideWindow:
     def __init__(self, *, n_slices=None, min_pixels=None, near_slices=None, far_slices=None,
                  slice_outlier_max=None, slice_fit_min=None, stable_frame_min=None,
                  stable_jump_max=None, lane_width_init=None, lane_width_min=None,
-                 lane_width_max=None):
+                 lane_width_max=None, path_n_waypoints=None):
         self.vis = None
 
         self.roi_h = 0
@@ -341,6 +350,14 @@ class SlideWindow:
         self.left_centers = []
         self.right_centers = []
         self.yellow_centers = []
+
+        # 명시적 경로(웨이포인트) — controller/pure_pursuit.py가 소비
+        #   [(x,y), ...] ROI 픽셀좌표, 인덱스 0=차량과 가장 가까운 점 ~ 마지막=가장 먼 점.
+        #   calc_center()가 매 프레임 갱신하되, 이번 프레임에 유효 슬라이스가 2개 미만이면
+        #   갱신하지 않고 직전 값을 그대로 유지한다(perc_lane()이 lane_offset을 무효 프레임에
+        #   직전 EMA값으로 유지하는 것과 같은 원칙 — 폴백은 "값을 0으로 지우지 않고 유지").
+        self.path_n_waypoints = path_n_waypoints if path_n_waypoints is not None else PATH_N_WAYPOINTS
+        self.path = []
 
         # 프레임 간 스파이크 필터링(디바운스) 상태 — _debounce()에서 사용
         self._confirmed = None    # 마지막으로 확정되어 실제 출력되는 (valid, offset, lookahead, center)
@@ -463,10 +480,26 @@ class SlideWindow:
         for p1, p2 in zip(pts, pts[1:]):
             cv2.line(self.vis, p1, p2, color, 2)
 
+    def draw_path(self, path):
+        """피팅된 명시적 경로(웨이포인트)를 자홍색 폴리라인으로 시각화.
+        left/right/yellow_centers(노란/청록 점)와 색을 겹치지 않게 구분해서,
+        "슬라이스별 원본 관측점"과 "그걸 피팅해 만든 최종 경로"를 한눈에 대조할 수 있게 한다."""
+        if not path:
+            return
+        pts = [
+            (int(np.clip(x, 0, self.roi_w - 1)), int(np.clip(y, 0, self.roi_h - 1)))
+            for x, y in path
+        ]
+        for p1, p2 in zip(pts, pts[1:]):
+            cv2.line(self.vis, p1, p2, (255, 0, 255), 2)
+        for p in pts:
+            cv2.circle(self.vis, p, 3, (255, 0, 255), -1)
+
     def visualize(self, offset):
         self.draw_centers(self.left_centers, (0,255,255))
         self.draw_centers(self.right_centers, (0,255,255))
         self.draw_centers(self.yellow_centers, (0,165,255))
+        self.draw_path(self.path)
 
         cv2.line(
             self.vis, (self.roi_w//2, 0), (self.roi_w//2, self.roi_h),
@@ -485,6 +518,78 @@ class SlideWindow:
         if DEBUG_VIZ_LANE:
             cv2.imshow("lane_result", self.vis)
             cv2.waitKey(1)
+
+    def _build_centerline_points(self):
+        """슬라이스별(구간별) 차선 중심점을 만든다 — calc_center()의 근거리/원거리
+        "그룹 평균" 로직과 같은 4단계 폴백을 슬라이스 하나하나에 적용한 버전이다.
+          1. 양쪽 다 검출 + 폭이 정상범위  → 중점
+          2. 왼쪽만 검출                  → 왼쪽 + lane_width/2 (EMA 추적값, calc_center()가
+                                            이미 이번 프레임 값으로 갱신해둔 것을 그대로 씀)
+          3. 오른쪽만 검출                → 오른쪽 - lane_width/2
+          4. 흰 차선 둘 다 없음           → 노란 중심선 그대로 사용
+          양쪽은 검출됐는데 폭이 비정상이면 그 슬라이스는 스킵한다(반사광 등으로 한쪽이
+          오검출됐을 가능성이 높은데 슬라이스 하나만으로는 어느 쪽인지 판단 근거가 없음 —
+          calc_center()가 이 경우 프레임 전체를 무효 처리하는 것과 같은 이유, 다만 여기서는
+          슬라이스 단위라 그 슬라이스만 빼고 나머지로 곡선을 피팅할 수 있다).
+        출력 : [(y, cx), ...] 유효한 슬라이스만, 순서는 self.left_centers와 동일(근거리→원거리).
+        """
+        points = []
+        for i in range(self.n_slices):
+            l = self.left_centers[i] if i < len(self.left_centers) else None
+            r = self.right_centers[i] if i < len(self.right_centers) else None
+
+            if l is not None and r is not None:
+                width = r[1] - l[1]
+                if not (self.lane_width_min < width < self.lane_width_max):
+                    continue
+                y_ref, cx = (l[0] + r[0]) / 2.0, (l[1] + r[1]) / 2.0
+            elif l is not None:
+                y_ref, cx = l[0], l[1] + self.lane_width / 2.0
+            elif r is not None:
+                y_ref, cx = r[0], r[1] - self.lane_width / 2.0
+            else:
+                yc = self.yellow_centers[i] if i < len(self.yellow_centers) else None
+                if yc is None:
+                    continue
+                y_ref, cx = yc
+
+            points.append((y_ref, cx))
+        return points
+
+    def _fit_and_sample_path(self, points):
+        """슬라이스 중심점에 다항식(x = f(y))을 피팅하고, 차량 근처(roi_h)부터 가장 먼
+        유효 슬라이스까지 균등 간격으로 self.path_n_waypoints개를 샘플링한다.
+        점이 2개 미만이면(직선조차 정의 못함) None — 호출부(calc_center())가 직전 경로를
+        유지하는 폴백을 담당한다.
+        점이 3개 이상이면 2차식(커브 대응), 정확히 2개면 1차식(직선)으로 피팅한다.
+        슬라이스가 3~5개뿐인 저차수 피팅이라 roi_h까지 살짝 외삽하는데, 노이즈가 큰
+        프레임에서 계수가 튀면 외삽 구간에서 x가 화면 밖으로 크게 벗어날 수 있어
+        PATH_EXTRAPOLATE_MARGIN으로 안전하게 clamp한다(그 이상은 물리적으로 말이 안 되는
+        조향각으로 이어지므로).
+        """
+        if len(points) < 2:
+            return None
+
+        ys = np.array([p[0] for p in points], dtype=np.float64)
+        xs = np.array([p[1] for p in points], dtype=np.float64)
+        deg = 2 if len(points) >= 3 else 1
+
+        try:
+            coeffs = np.polyfit(ys, xs, deg)
+        except np.linalg.LinAlgError:
+            return None
+        poly = np.poly1d(coeffs)
+
+        y_near = float(self.roi_h)
+        y_far = float(np.min(ys))
+        if y_near <= y_far:
+            return None
+
+        sample_ys = np.linspace(y_near, y_far, self.path_n_waypoints)
+        lo, hi = -PATH_EXTRAPOLATE_MARGIN * self.roi_w, (1.0 + PATH_EXTRAPOLATE_MARGIN) * self.roi_w
+        sample_xs = np.clip(poly(sample_ys), lo, hi)
+
+        return [(float(x), float(y)) for x, y in zip(sample_xs, sample_ys)]
 
     def calc_center(self):
         near_left   = self._group_mean(self.left_centers,   self.near_slices, True)
@@ -552,13 +657,22 @@ class SlideWindow:
 
         lane_center = self.roi_w / 2 + offset
 
+        # 명시적 경로(웨이포인트) — self.lane_width가 위에서 이번 프레임 값으로 이미
+        # 갱신됐으므로(양쪽 검출+폭 정상 분기), _build_centerline_points()의 한쪽-차선
+        # 폴백이 최신 추정 폭을 쓴다. 유효 슬라이스가 2개 미만이면 fitted_path가 None이
+        # 되고, 그 경우 self.path는 갱신하지 않아(직전 프레임 값 유지) offset/lane_offset과
+        # 동일한 "무효 프레임엔 마지막 값 유지" 원칙을 따른다.
+        fitted_path = self._fit_and_sample_path(self._build_centerline_points())
+        if fitted_path is not None:
+            self.path = fitted_path
+
         lane_valid, offset, lookahead, lane_center = self._debounce(
             lane_valid, offset, lookahead, lane_center
         )
 
         self.visualize(offset)
 
-        return lane_valid, offset, lookahead, lane_center
+        return lane_valid, offset, lookahead, lane_center, self.path
 
     def _debounce(self, valid, offset, lookahead, center):
         """

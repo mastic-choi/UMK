@@ -5,9 +5,11 @@
 #
 # https://github.com/harrylal/TwinLiteNet-onnxruntime 의 사전학습 가중치(models/best.onnx)를
 # 그대로 사용한다. hough_lane.HoughLaneDetector / perc_floor.LaneDetector와 동일하게
-#   detect(frame) -> (lane_valid, lane_offset, lane_lookahead, lane_center, debug_img)
+#   detect(frame) -> (lane_valid, lane_offset, lane_lookahead, lane_center, path, debug_img)
 # 인터페이스를 구현하므로 track_drive.py의 perc_lane()은 수정 없이 그대로 재사용된다
-# (LANE_DETECTOR_BACKEND 플래그로 세 백엔드 중 하나를 고른다).
+# (LANE_DETECTOR_BACKEND 플래그로 세 백엔드 중 하나를 고른다). path는 lane_util.SlideWindow
+# .calc_center()가 만드는 명시적 경로(ROI 픽셀좌표 웨이포인트, 가까운점→먼점) —
+# controller/pure_pursuit.py가 조향각 계산에 직접 사용한다.
 #
 # ── 실시간 전략: 제어루프와 분리된 백그라운드 스레드 ──
 #   control_loop()는 0.05s(20Hz) 고정 타이머라 조향 명령(drive(), ANGLE_RATE_MAX 등)이
@@ -255,7 +257,7 @@ class DLSlideWindow(SlideWindow):
         """입력 : resized_bgr — (DL_INPUT_H,DL_INPUT_W,3) BGR
                  da_prob, ll_prob — (DL_INPUT_H,DL_INPUT_W) float32 foreground 확률
                  yellow_mask — (DL_INPUT_H,DL_INPUT_W) uint8 이진마스크(HSV 기반, ll과 무관)
-          출력 : lane_valid, offset, lookahead, lane_center — SlideWindow.calc_center()와 동일 계약
+          출력 : lane_valid, offset, lookahead, lane_center, path — SlideWindow.calc_center()와 동일 계약
         """
         h, _ = ll_prob.shape
         y0, y1 = int(h * DL_ROI_TOP), int(h * DL_ROI_BOT)
@@ -317,6 +319,7 @@ class DLSlideWindow(SlideWindow):
         self.draw_centers(self.left_centers, (0, 255, 255))
         self.draw_centers(self.right_centers, (0, 255, 255))
         self.draw_centers(self.yellow_centers, (0, 165, 255))
+        self.draw_path(self.path)
 
         cv2.line(self.vis, (self.roi_w // 2, 0), (self.roi_w // 2, self.roi_h), (0, 0, 255), 1)
         lane_center = self.roi_w / 2.0 + offset
@@ -328,7 +331,7 @@ class DLSlideWindow(SlideWindow):
 
 class DLLaneDetector:
     """HoughLaneDetector/perc_floor.LaneDetector와 동일한
-        detect(frame) -> (lane_valid, lane_offset, lane_lookahead, lane_center, debug_img)
+        detect(frame) -> (lane_valid, lane_offset, lane_lookahead, lane_center, path, debug_img)
     인터페이스를 제공하는 DL(TwinLiteNet) 백엔드. track_drive.py의 perc_lane()은 수정 없이
     그대로 재사용된다(roi_w/yellow_centers 속성도 _update_lane_side() 호환용으로 노출).
 
@@ -347,7 +350,7 @@ class DLLaneDetector:
         default_center = DL_INPUT_W / 2.0
         self._lock = threading.Lock()
         self._latest_frame = None
-        self._latest_result = (False, 0.0, 0.0, default_center, None)
+        self._latest_result = (False, 0.0, 0.0, default_center, [], None)
         # 디버그 창에 띄울 최근 프레임(초록/빨강 오버레이가 이미 그려진 vis, da/ll 원본 마스크).
         # 워커 스레드가 여기 값만 갱신하고, 실제 cv2.imshow()는 show_debug_windows()가
         # 메인 스레드에서만 호출한다(스레드 간 GUI 호출 혼용 방지 — 아래 _worker()/
@@ -383,7 +386,7 @@ class DLLaneDetector:
                 yellow_mask = cv2.inRange(
                     cv2.cvtColor(resized_bgr, cv2.COLOR_BGR2HSV), YELLOW_LOWER, YELLOW_UPPER
                 )
-                lane_valid, offset, lookahead, lane_center = self._slide.detect(
+                lane_valid, offset, lookahead, lane_center, path = self._slide.detect(
                     resized_bgr, da_prob, ll_prob, yellow_mask
                 )
                 debug_img = self._slide.vis
@@ -393,7 +396,7 @@ class DLLaneDetector:
 
             with self._lock:
                 self.yellow_centers = self._slide.yellow_centers
-                self._latest_result = (lane_valid, offset, lookahead, lane_center, debug_img)
+                self._latest_result = (lane_valid, offset, lookahead, lane_center, path, debug_img)
                 self._latest_debug = (self._slide.vis, self._slide.da_mask_roi, self._slide.ll_mask_roi)
 
             now = time.time()

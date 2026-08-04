@@ -57,6 +57,13 @@ GROUP_X_TOL = 25.0
 NEAR_ROW_RATIO = 0.80
 FAR_ROW_RATIO = 0.20
 
+# 명시적 경로(웨이포인트) — lane_util.SlideWindow와 인터페이스를 맞추기 위해 이
+# 백엔드도 path를 반환한다. 다만 Hough는 애초에 대표직선(m,b) 하나만 피팅하므로
+# 여기서 만드는 path도 근거리/원거리 두 점을 잇는 "직선"을 균등 샘플링한 것일 뿐,
+# lane_util처럼 슬라이스별 다항식 커브 피팅을 하는 건 아니다(이 백엔드의 구조적
+# 한계 — 커브 추종 품질이 중요하면 dl/classic_cv 백엔드를 쓸 것).
+HOUGH_PATH_N_WAYPOINTS = 6
+
 # 한쪽 차선만 검출됐을 때 반대쪽 위치 추정에 쓰는 도로폭(px) 초기값 및 그 후 EMA 갱신.
 #   원본 app_hough_drive.py의 "x_left = x_right - 380"/"x_right = x_left + 380" 그대로.
 #   실차 재검증 필요(카메라 마운트가 다르면 이 폭도 다시 재봐야 함).
@@ -81,7 +88,7 @@ DEBUG_VIZ_HOUGH_LANE = True
 class HoughLaneDetector:
     """
     기존 LaneDetector(BEV+moments, perc_floor.py)와 동일한
-        detect(frame) -> (lane_valid, lane_offset, lane_lookahead, lane_center, debug_img)
+        detect(frame) -> (lane_valid, lane_offset, lane_lookahead, lane_center, path, debug_img)
     인터페이스를 유지한다. track_drive.py의 perc_lane()은 수정 없이 그대로 재사용 가능.
     """
 
@@ -97,7 +104,7 @@ class HoughLaneDetector:
     def detect(self, frame):
         if frame is None:
             lane_center = self.roi_w / 2.0 if self.roi_w else 0.0
-            return False, 0.0, 0.0, lane_center, None
+            return False, 0.0, 0.0, lane_center, [], None
 
         h, w = frame.shape[:2]
         y0, y1 = int(h * HOUGH_ROI_TOP), int(h * HOUGH_ROI_BOT)
@@ -187,10 +194,18 @@ class HoughLaneDetector:
         lookahead = far_center - self.roi_w / 2.0
         lane_center = self.roi_w / 2.0 + offset
 
+        # 근거리(near_row,near_center)-원거리(far_row,far_center) 두 점을 잇는 직선을
+        # N개 점으로 선형보간해 웨이포인트로 만든다. 순서는 lane_util과 동일하게
+        # 가까운점(near_row)→먼점(far_row)이 되도록 rows를 near_row에서 far_row로 스캔한다.
+        rows = np.linspace(near_row, far_row, HOUGH_PATH_N_WAYPOINTS)
+        t = (rows - near_row) / (far_row - near_row) if far_row != near_row else np.zeros_like(rows)
+        xs = near_center + t * (far_center - near_center)
+        path = list(zip(xs.tolist(), rows.tolist()))
+
         if DEBUG_VIZ_HOUGH_LANE:
             self._draw_debug(debug_img, near_row, x_left_near, x_right_near, near_center)
 
-        return self._finish(True, offset, lookahead, debug_img, edge_img, lane_center)
+        return self._finish(True, offset, lookahead, debug_img, edge_img, lane_center, path)
 
     def _select_main_group(self, lines):
         """기준행(ROI 중간)에서의 x위치가 가까운 선분들을 그룹으로 묶고, 총 길이가
@@ -276,11 +291,13 @@ class HoughLaneDetector:
         cv2.rectangle(img, (int(x_mid) - 5, y - 5), (int(x_mid) + 5, y + 5), BLUE, 2)
         cv2.rectangle(img, (self.roi_w // 2 - 5, y - 5), (self.roi_w // 2 + 5, y + 5), RED, 2)
 
-    def _finish(self, valid, offset, lookahead, debug_img, edge_img, lane_center=None):
+    def _finish(self, valid, offset, lookahead, debug_img, edge_img, lane_center=None, path=None):
         if lane_center is None:
             lane_center = self.roi_w / 2.0 if self.roi_w else 0.0
+        if path is None:
+            path = []
         if DEBUG_VIZ_HOUGH_LANE:
             cv2.imshow('hough_lane_edges', edge_img)
             cv2.imshow('hough_lane_result', debug_img)
             cv2.waitKey(1)
-        return valid, offset, lookahead, lane_center, debug_img
+        return valid, offset, lookahead, lane_center, path, debug_img
