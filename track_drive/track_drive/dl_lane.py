@@ -37,9 +37,12 @@
 #   ConnectedComponents로 가장 큰 덩어리 하나만 남기고(DL_DA_MIN_COMPONENT_AREA 미만이면
 #   그 프레임은 아예 무효 처리) 나머지 파편에 중심선이 끌려가지 않게 막는다
 #   (_largest_da_component() 참고).
-#   ll은 이제 경로 계산에 직접 쓰이지 않고, ROI 내 커버리지가 DL_LL_SANITY_MIN_RATIO
-#   미만이면(사실상 차선 신호가 전혀 없는 프레임 — 모션블러 등) da가 뭘 내놓든 이번
-#   프레임을 무효 처리하는 sanity check 용도로만 남는다. 디버그 시각화(빨강 반투명
+#   ll은 경로를 직접 만드는 데는 안 쓰지만, da가 점선 틈으로 옆 차선 da와 하나의
+#   덩어리로 이어붙는 실패모드에 대한 방어선 역할을 한다 — DLSlideWindow._clip_da_by_ll()이
+#   ll 라인이 보이는 구간에서는 그 바깥(옆 차선 쪽) da 픽셀을 밴드별로 잘라내고 나서
+#   _largest_da_component()를 적용한다. 그 외엔 여전히 sanity check 용도로, ROI 내
+#   커버리지가 DL_LL_SANITY_MIN_RATIO 미만이면(사실상 차선 신호가 전혀 없는 프레임 —
+#   모션블러 등) da가 뭘 내놓든 이번 프레임을 무효 처리한다. 디버그 시각화(빨강 반투명
 #   오버레이)에도 그대로 쓴다.
 #=============================================
 import argparse
@@ -121,6 +124,11 @@ DL_DA_MIN_COMPONENT_AREA = 800
 # 넓이 자체가 원래 작아서(정상 상태에서도 대략 1%대) 문턱을 낮게 잡았다 — 이보다 높이면
 # 차선이 정상적으로 보이는 프레임까지 무효 처리될 수 있다. 실차 미검증 튜닝값.
 DL_LL_SANITY_MIN_RATIO = 0.005
+
+# da가 점선 틈으로 옆 차선 da와 하나의 덩어리로 이어붙었을 때, ll(차선 마킹) 라인을
+# 경계로 그 바깥(옆 차선 쪽) 픽셀을 잘라내는 여유폭(px) — DLSlideWindow._clip_da_by_ll()
+# 참고. ll 선 자체의 두께 + 약간의 여유를 더한 값. 실차 미검증 튜닝값.
+DL_LL_CLIP_MARGIN_PX = 15
 
 DEBUG_VIZ_DL_LANE = True   # lane_util.DEBUG_VIZ_LANE과 동일한 패턴의 디버그 창 on/off 스위치
 
@@ -272,8 +280,9 @@ class DLSlideWindow(SlideWindow):
     양쪽→한쪽→노랑→무효) 대신, da(주행가능영역) 마스크 자체를 "이미 자아-차선 중심을
     담고 있는 하나의 덩어리"로 보고 그 가로 중심선을 행별로 바로 뽑는다 — 좌/우 두 갈래를
     따로 다룰 필요가 없어져 calc_center()의 분기 로직 자체가 필요 없다(그래서 calc_center()를
-    호출하지 않고 detect() 안에서 직접 조립한다). ll은 이제 경로 계산에 안 쓰이고 sanity
-    check로만 쓴다(모듈 상단 "da를 경로의 주 신호로" 주석 참고).
+    호출하지 않고 detect() 안에서 직접 조립한다). ll은 경로를 직접 만드는 데는 안 쓰지만,
+    da가 옆 차선까지 이어붙었을 때 그 경계를 잘라내는 방어선(_clip_da_by_ll())과 sanity
+    check로 쓴다(모듈 상단 "da를 경로의 주 신호로" 주석 참고).
     """
 
     def __init__(self):
@@ -300,6 +309,49 @@ class DLSlideWindow(SlideWindow):
             return np.zeros_like(da_mask)
         return np.where(labels == best, np.uint8(255), np.uint8(0))
 
+    def _clip_da_by_ll(self, da_mask, ll_mask, ref_x):
+        """da_mask에서 ll(차선) 라인을 경계로 "내 차선 바깥"에 해당하는 픽셀을 지운다.
+        da는 점선 틈으로 옆 차선 da와 하나의 덩어리로 이어붙는 실패모드가 있는데, 이 경우
+        _largest_da_component()의 "가장 큰 덩어리" 기준만으로는 옆 차선까지 통째로 살아남는다.
+        ll(차선 마킹)이 실제로 보이는 한 그 선을 경계로 반대편을 잘라내면 이 문제를 막을 수
+        있다.
+        밴드(_slice_centers와 동일한 n_slices 분할)마다 독립적으로 자른다 — 한 번에 직선
+        기준으로 자르면 커브에서 밴드마다 달라지는 ll 위치를 못 따라간다. ref_x는 "내 차선이
+        어디쯤인가"의 기준점으로, 근거리(아래) 밴드부터 원거리(위) 밴드로 올라가며 방금
+        잘라낸 da 밴드의 실제 중심으로 갱신한다(커브를 따라 기준점도 같이 휘어지게). 밴드 안에
+        ll이 한쪽만 보이면 그쪽만 자르고, 양쪽 다 안 보이면(가려짐/마모 등) 이번 밴드는 자르지
+        않고 da를 그대로 둔다 — ll이 확실할 때만 개입한다("da를 경로의 주 신호로, ll은 보강" —
+        모듈 상단 주석 참고).
+          입력 : da_mask, ll_mask — 동일 shape의 (roi_h, roi_w) uint8 이진마스크
+                 ref_x           — 첫(근거리) 밴드의 기준 x좌표. 보통 직전 프레임 lane_center.
+          출력 : da_mask에서 ll 경계 밖 픽셀만 0으로 지운 복사본(shape 동일).
+        """
+        h, w = da_mask.shape
+        slice_h = h // self.n_slices
+        clipped = da_mask.copy()
+        cur_ref = ref_x
+
+        for i in range(self.n_slices):
+            y_high = h - i * slice_h
+            y_low = 0 if i == self.n_slices - 1 else h - (i + 1) * slice_h
+
+            ll_cols = np.nonzero(np.any(ll_mask[y_low:y_high, :] > 0, axis=0))[0]
+            if ll_cols.size:
+                left_cols = ll_cols[ll_cols < cur_ref]
+                right_cols = ll_cols[ll_cols > cur_ref]
+                if left_cols.size:
+                    cut = min(w, int(left_cols.max()) + DL_LL_CLIP_MARGIN_PX)
+                    clipped[y_low:y_high, :cut] = 0
+                if right_cols.size:
+                    cut = max(0, int(right_cols.min()) - DL_LL_CLIP_MARGIN_PX)
+                    clipped[y_low:y_high, cut:] = 0
+
+            band_da_cols = np.nonzero(np.any(clipped[y_low:y_high, :] > 0, axis=0))[0]
+            if band_da_cols.size:
+                cur_ref = float(np.mean(band_da_cols))
+
+        return clipped
+
     def detect(self, raw_bgr, da_prob, ll_prob, yellow_mask):
         """입력 : raw_bgr — 원본 카메라 프레임 그대로의 (H,W,3) BGR(크롭/리사이즈 없음)
                  da_prob, ll_prob — 위와 같은 (H,W) float32 foreground 확률(모델은 360행
@@ -313,14 +365,27 @@ class DLSlideWindow(SlideWindow):
         y0 = max(0, min(DL_ROI_Y0, h))
         y1 = max(y0, min(DL_ROI_Y1, h))
 
-        da_roi = da_prob[y0:y1]
-        da_mask = (da_roi >= DL_FG_THRESHOLD).astype(np.uint8) * 255
-        # 급커브 파편화 대응: 가장 큰 덩어리만 남긴다(모듈 상단 주석 참고).
-        da_mask = self._largest_da_component(da_mask)
-
         ll_roi = ll_prob[y0:y1]
         ll_mask = (ll_roi >= DL_FG_THRESHOLD).astype(np.uint8) * 255
         self.ll_coverage = float(np.count_nonzero(ll_mask)) / ll_mask.size if ll_mask.size else 0.0
+
+        da_roi = da_prob[y0:y1]
+        da_mask = (da_roi >= DL_FG_THRESHOLD).astype(np.uint8) * 255
+        # 급커브 파편화 대응: 가장 큰 덩어리만 남긴다(모듈 상단 주석 참고). ll 클리핑보다
+        # 먼저 해야 한다 — 이 시점엔 da가 아직 하나의 연결된 덩어리라 "가장 큰 덩어리"가
+        # 곧 도로 전체를 뜻하지만, 클리핑을 먼저 하면 밴드마다 독립적으로 좌우를 잘라
+        # 인접 밴드끼리 남은 x범위가 안 겹치는 경우가 생겨(ll 경계가 밴드마다 조금씩
+        # 다르게 잡히면 흔함) 마스크가 밴드별로 끊기고, 그 뒤 largest_da_component가
+        # "가장 큰 덩어리"로 폭 넓은 밴드 하나만 통째로 골라버려 도로 모양이 아니라
+        # 네모난 밴드 하나만 남는 문제가 생긴다(실측으로 확인됨).
+        da_mask = self._largest_da_component(da_mask)
+        # 옆 차선 침범 대응: ll 라인이 보이는 구간에서는 그 바깥(옆 차선 쪽) da를 잘라낸다
+        # (모듈 상단 주석 참고). ref_x는 직전 프레임 확정 lane_center — 아직 없으면(첫
+        # 프레임) ROI 중앙을 기준으로 시작한다. 이 클리핑이 밴드 간 연결을 끊어도 상관없다
+        # — 아래 _slice_centers()는 밴드별로 독립적으로 moments를 구하므로 전역 연결성이
+        # 필요 없다(그래서 여기선 largest_da_component를 다시 돌리지 않는다).
+        ref_x = self._confirmed[3] if self._confirmed is not None else da_mask.shape[1] / 2.0
+        da_mask = self._clip_da_by_ll(da_mask, ll_mask, ref_x)
 
         yellow_roi = yellow_mask[y0:y1]
 
