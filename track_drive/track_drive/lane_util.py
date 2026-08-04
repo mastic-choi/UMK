@@ -48,8 +48,8 @@ DEBUG_VIZ_LANE = True
 #     C를 음수로 주면 T=주변평균+|C|가 되어 "주변보다 확실히 밝아야만" 통과하고,
 #     평평한 바닥은 정상적으로 검게 남는다(동일 테스트에서 C=-10부터 오검출 0%,
 #     동시에 실제 차선 검출률은 C=+2일 때와 동일하게 유지됨 — 손해 없이 안전해짐).
-ADAPTIVE_BLOCK_SIZE = 31   # 로컬 평균을 낼 이웃 크기(px, 홀수 필수) — 클수록 더 넓은 영역의 평균과 비교
-ADAPTIVE_C = -15           # 주변평균보다 이만큼(px 밝기값) 더 밝아야 흰색 인정. 반드시 음수로 유지할 것
+ADAPTIVE_BLOCK_SIZE = 41   # 로컬 평균을 낼 이웃 크기(px, 홀수 필수) — 클수록 더 넓은 영역의 평균과 비교
+ADAPTIVE_C = -8        # 주변평균보다 이만큼(px 밝기값) 더 밝아야 흰색 인정. 반드시 음수로 유지할 것
 
 # Median Blur — 폭(굵기) 기준으로 얇은 반사 줄무늬 제거
 #   문제 : 골진(주름진) 반사면이 조명을 여러 갈래 가는 대각선 줄무늬로 반사시키는
@@ -64,7 +64,7 @@ ADAPTIVE_C = -15           # 주변평균보다 이만큼(px 밝기값) 더 밝�
 #     가늘어 보이는 실제 차선까지 같이 지워질 수 있다 — 실차 영상에서 lane_white
 #     디버그 창으로 두 폭을 비교해보고 커널 크기를 재조정할 것.
 #   실차 미검증 튜닝값.
-MEDIAN_BLUR_KSIZE = 9      # 홀수 필수. 이 값의 절반(≈4~5px)보다 얇은 밝은 줄무늬를 지운다
+MEDIAN_BLUR_KSIZE = 11 #13      # 홀수 필수. 이 값의 절반(≈4~5px)보다 얇은 밝은 줄무늬를 지운다
 
 # Canny Edge Detection — adaptiveThreshold가 놓치는 저대비 차선 경계 보강
 #   adaptiveThreshold는 "주변 평균보다 밝은가"라는 밝기 기준 하나만 보기 때문에,
@@ -76,8 +76,8 @@ MEDIAN_BLUR_KSIZE = 9      # 홀수 필수. 이 값의 절반(≈4~5px)보다 �
 #   계산이 센서 노이즈에 과민 반응해 잔가지 엣지를 만드는 걸 막는 표준 전처리다.
 #   실차 미검증 튜닝값.
 GAUSSIAN_BLUR_KSIZE = 5    # 홀수 필수. Canny 전 노이즈 억제용
-CANNY_LOW = 50             # 약한 엣지를 강한 엣지에 연결할지 판단하는 하위 임계값
-CANNY_HIGH = 150           # 이 값을 넘으면 바로 강한 엣지로 확정(보통 LOW의 2~3배 권장)
+CANNY_LOW = 80    #100         # 약한 엣지를 강한 엣지에 연결할지 판단하는 하위 임계값
+CANNY_HIGH = 200  #220        # 이 값을 넘으면 바로 강한 엣지로 확정(보통 LOW의 2~3배 권장)
 
 # 구간별 무게중심(Moments) 기반 차선 추적
 #   기존 슬라이딩 윈도우(14단 히스토그램 탐색 + 2차 polyfit + 이전 프레임 기반 탐색)를
@@ -186,7 +186,7 @@ class CameraProcessor:
         gray = cv2.cvtColor(self.bev, cv2.COLOR_BGR2GRAY)
         # 2) CLAHE (국소 명암 향상) — adaptiveThreshold 전에 대비를 한 번 더 올려줌
         clahe = cv2.createCLAHE(
-            clipLimit=2.0,
+            clipLimit=1.5, #1.2
             tileGridSize=(8,8)
         )
         gray = clahe.apply(gray)
