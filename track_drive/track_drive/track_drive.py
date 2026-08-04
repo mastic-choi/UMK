@@ -209,7 +209,7 @@ RETURN_THRESHOLD = 10
 
 # ── 개발/테스트 플래그 ──
 START_STATE     = MissionState.S1_LANE_FOLLOW
-ENABLE_BEHAVIOR = True
+ENABLE_BEHAVIOR = False
 DEBUG_LOG       = True
 DEBUG_PERIOD    = 0.5
 DEBUG_VIZ       = True  # 신호등/4구 디버그 창
