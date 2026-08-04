@@ -36,8 +36,8 @@ from std_msgs.msg import Float32MultiArray
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy, HistoryPolicy
 from cv_bridge import CvBridge
 from .perc_lavacon import process_lavacon
-from .lane_util import CameraProcessor, SlideWindow
-from .perc_floor import LaneDetector, check_stopline
+from .hough_lane import HoughLaneDetector
+from .perc_floor import check_stopline
 from .traffic_signal import SignalDetector
 from .controller.obstacle_avoidance import ObstacleAvoidance, AvoidPhase
 # vehicle_overtake.py 의 구 VehicleOvertake 는 더 이상 쓰지 않는다.
@@ -307,10 +307,8 @@ class TrackDriverNode(Node):
         # [2-7 장애물 위치 판단]
         self.lane_center   = 320.0           # 차선 중앙 x좌표(px) — 첫 카메라 프레임 전까지 화면 중앙 기본값
 
-        # ── 외부 차선 인식 모듈 (lane_util.py / perc_floor.py) 초기화 ──
-        self.camera_processor = CameraProcessor()       # BEV 변환 및 색상 마스크(흰/노랑) 처리기
-        self.slide_window_processor = SlideWindow()     # 슬라이딩 윈도우 기반 차선 탐색 및 피팅기
-        self.lane_detector = LaneDetector(self.camera_processor, self.slide_window_processor)
+        # ── 외부 차선 인식 모듈 (hough_lane.py, app_hough_drive.py의 HoughLinesP 로직 이식) 초기화 ──
+        self.lane_detector = HoughLaneDetector()
         self.signal_detector = SignalDetector()          # 신호등(3구/4구) Hough Circle 인식기
 
         # ── 판단/제어 상태 ──
@@ -449,8 +447,8 @@ class TrackDriverNode(Node):
             self.lane_valid = False
             return
 
-        # lane_util.py의 LaneDetector를 사용하여 차선 인식 수행
-        valid, offset, lookahead, lane_center, bev = self.lane_detector.detect(self.img_front)
+        # hough_lane.py의 HoughLaneDetector를 사용하여 차선 인식 수행
+        valid, offset, lookahead, lane_center, debug_img = self.lane_detector.detect(self.img_front)
 
         self.lane_center = lane_center
         self.lane_valid = valid
@@ -471,14 +469,14 @@ class TrackDriverNode(Node):
           노란선이 화면 오른쪽 → 나는 좌측 차선 (-1) → 회피는 오른쪽으로
         노란선이 안 보이는 프레임은 직전 판정을 유지한다(점선이라 끊기는 구간이 있음).
         """
-        sw = self.slide_window_processor
-        centers = getattr(sw, 'yellow_centers', None)
-        if not centers or not sw.roi_w:
+        ld = self.lane_detector
+        centers = getattr(ld, 'yellow_centers', None)
+        if not centers or not ld.roi_w:
             return
         xs = [c[1] for c in centers if c is not None]
         if not xs:
             return
-        self.lane_side = 1 if (sum(xs) / len(xs)) < (sw.roi_w / 2.0) else -1
+        self.lane_side = 1 if (sum(xs) / len(xs)) < (ld.roi_w / 2.0) else -1
 
     # [2-2] 신호등
     #   입력 self.img_front
