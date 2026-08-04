@@ -37,7 +37,9 @@ from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy, Hi
 from cv_bridge import CvBridge
 from .perc_lavacon import process_lavacon
 from .hough_lane import HoughLaneDetector
-from .perc_floor import check_stopline
+from .perc_floor import check_stopline, LaneDetector as ClassicLaneDetector
+from .lane_util import CameraProcessor, SlideWindow
+from .dl_lane import DLLaneDetector
 from .traffic_signal import SignalDetector
 from .controller.obstacle_avoidance import ObstacleAvoidance, AvoidPhase
 # vehicle_overtake.py 의 구 VehicleOvertake 는 더 이상 쓰지 않는다.
@@ -100,6 +102,7 @@ BODY_MASK_ENABLED = True  # 최종 확정(2026-07-22)
 #   safe: kp=0.70, ki=0.0008, kd=0.15 / fast: kp=0.78, ki=0.0005, kd=0.405 (참고, safe값 채택)
 #   기존 0.14/0.0/1.40 대비 Kp 5배↑ Kd 9배↓ 로 큰 변화 — 실차 저속에서 오실레이션 여부 먼저 확인 후 정속 테스트 권장
 LANE_KP, LANE_KI, LANE_KD = 0.70, 0.0008, 0.15  # 차선 PID
+LANE_INTEGRAL_TERM_MAX = 10.0  # [anti-windup] 적분항이 조향에 기여할 수 있는 최대 각도(도)
 LANE_SIDE = 1               # 주행 차선: +1=노란선 오른쪽(우측차선), -1=왼쪽
 LANE_CORNER_BOOST = 1.8    # 코너(큰 offset) 조향 가중
 LANE_CORNER_REF   = 120.0  # 이 offset(px)에서 가중 최대
@@ -215,6 +218,19 @@ DEBUG_VIZ_LIDAR = True  # 라이다 BEV 장애물 감지 디버그 창
 DEBUG_VIZ_LAVACON = False  # 라바콘 트리거 좌우 클러스터 BEV 디버그 창
 DEBUG_PLANNER = False   # planner 디버그 창
 
+# ── 차선인식 백엔드 선택 ──
+#   perc_lane()은 self.lane_detector.detect(frame) -> (valid, offset, lookahead, lane_center,
+#   debug_img) 인터페이스에만 의존하는 pluggable 구조라, 아래 셋 중 하나로 자유롭게 바꿔
+#   끼울 수 있다(perc_lane()/_update_lane_side() 수정 불필요).
+#     'hough'      : hough_lane.HoughLaneDetector (현재 기본, 실차 라바콘 테스트까지 검증됨)
+#     'classic_cv' : lane_util.CameraProcessor+SlideWindow (BEV+adaptiveThreshold/HSV+moments,
+#                    perc_floor.LaneDetector로 조립. 보존용, 현재 라이브 미검증)
+#     'dl'         : dl_lane.DLLaneDetector (TwinLiteNet ONNX 세그멘테이션, 별도 스레드 추론.
+#                    실차 트랙 전체 조건에서 아직 미검증이라 기본값으로 켜지 않음)
+#   'dl' 선택 시 onnxruntime 미설치/모델파일 부재 등으로 초기화가 실패하면 __init__에서
+#   에러를 로깅하고 자동으로 'hough'로 폴백한다(조용히 무시하지 않음).
+LANE_DETECTOR_BACKEND = 'dl'  # 'hough' | 'classic_cv' | 'dl'
+
 # ── 실차 테스트 범위 제한 ──
 #   지금 단계에서 실차로 검증 가능한 건 딱 세 가지: ①신호등 인식 후 출발(S0) ②차선주행(S1)
 #   ③라바콘 주행(B1). 나머지(S2 교차로/S3 지름길, B2 고정장애물/B3 방해차량)는 아직
@@ -307,8 +323,8 @@ class TrackDriverNode(Node):
         # [2-7 장애물 위치 판단]
         self.lane_center   = 320.0           # 차선 중앙 x좌표(px) — 첫 카메라 프레임 전까지 화면 중앙 기본값
 
-        # ── 외부 차선 인식 모듈 (hough_lane.py, app_hough_drive.py의 HoughLinesP 로직 이식) 초기화 ──
-        self.lane_detector = HoughLaneDetector()
+        # ── 외부 차선 인식 모듈 초기화 (LANE_DETECTOR_BACKEND로 선택, 인터페이스는 셋 다 동일) ──
+        self.lane_detector = self._build_lane_detector(LANE_DETECTOR_BACKEND)
         self.signal_detector = SignalDetector()          # 신호등(3구/4구) Hough Circle 인식기
 
         # ── 판단/제어 상태 ──
@@ -428,6 +444,28 @@ class TrackDriverNode(Node):
             self.motor_pub.publish(self.motor_msg)
 
 
+    def _build_lane_detector(self, backend):
+        """LANE_DETECTOR_BACKEND 값에 따라 차선인식 백엔드 객체를 만든다. 셋 다
+        detect(frame) -> (valid, offset, lookahead, lane_center, debug_img) 인터페이스가
+        동일하므로 perc_lane()/_update_lane_side()는 어떤 백엔드가 골라졌는지 몰라도 된다."""
+        if backend == 'classic_cv':
+            detector = ClassicLaneDetector()
+            detector.set_processor(CameraProcessor(), SlideWindow())
+            return detector
+
+        if backend == 'dl':
+            try:
+                return DLLaneDetector(logger=self.get_logger())
+            except Exception as e:
+                # onnxruntime 미설치, models/best.onnx 부재 등으로 초기화가 실패하면
+                # 원인을 명확히 남기고 검증된 백엔드(hough)로 폴백한다 — 조용히 무시하지 않는다.
+                self.get_logger().error(
+                    f'DL 차선인식 백엔드 초기화 실패, hough로 폴백합니다: {e}'
+                )
+                return HoughLaneDetector()
+
+        return HoughLaneDetector()
+
     # #########################################################
     # [2] 인지 (Perception)
     # #########################################################
@@ -449,6 +487,11 @@ class TrackDriverNode(Node):
 
         # hough_lane.py의 HoughLaneDetector를 사용하여 차선 인식 수행
         valid, offset, lookahead, lane_center, debug_img = self.lane_detector.detect(self.img_front)
+        # DL 백엔드는 추론이 별도 스레드에서 도는데, cv2.imshow()/waitKey()는 스레드
+        # 세이프하지 않아 반드시 메인 스레드(여기, control_loop 타이머 콜백)에서만 호출해야
+        # 한다(dl_lane.DLLaneDetector.show_debug_windows() 주석 참고). hough/classic_cv
+        # 백엔드는 이 메서드가 없으므로 getattr로 조용히 건너뛴다.
+        getattr(self.lane_detector, 'show_debug_windows', lambda: None)()
 
         self.lane_center = lane_center
         self.lane_valid = valid
@@ -1213,6 +1256,12 @@ class TrackDriverNode(Node):
         if abs(offset) < deadzone:
             offset = 0.0
         self._pid_integral += offset
+        # [anti-windup] 적분항 기여를 ±LANE_INTEGRAL_TERM_MAX(도)로 제한한다.
+        #   클램프가 없으면 카메라 정렬오차·좌우 검출 신뢰도 차이 등 아주 작은 편향도
+        #   시간이 지날수록 계속 누적돼서 결국 한쪽으로 조향이 쏠리는 문제가 생긴다
+        #   (실측으로 재현됨 — "주행하다가 점점 오른쪽으로 도는" 증상의 주 원인).
+        integral_limit = (LANE_INTEGRAL_TERM_MAX / LANE_KI) if LANE_KI else 0.0
+        self._pid_integral = float(np.clip(self._pid_integral, -integral_limit, integral_limit))
         deriv = offset - self._pid_prev_error
         self._pid_prev_error = offset
         boost_ratio = min(1.0, max(0.0, abs(offset) - LANE_CORNER_MIN) / (LANE_CORNER_REF - LANE_CORNER_MIN))
@@ -1511,6 +1560,10 @@ def main(args=None):
         pass
     finally:
         try: node.drive(0.0, 0.0)
+        except Exception: pass
+        # DL 백엔드는 백그라운드 추론 스레드를 띄우므로(dl_lane.DLLaneDetector) 정상 종료시킨다.
+        # hough/classic_cv 백엔드는 stop()이 없으므로 getattr 기본값으로 조용히 건너뛴다.
+        try: getattr(node.lane_detector, 'stop', lambda: None)()
         except Exception: pass
         cv2.destroyAllWindows()
         node.destroy_node()

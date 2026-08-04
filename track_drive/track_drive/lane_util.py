@@ -309,17 +309,35 @@ class SlideWindow:
     폴리피팅이 필요 없고, 반사광으로 특정 구간이 오염돼도 다른 구간엔 영향이
     없어 커브 대응이 더 직관적이다.
     """
-    def __init__(self):
+    def __init__(self, *, n_slices=None, min_pixels=None, near_slices=None, far_slices=None,
+                 slice_outlier_max=None, slice_fit_min=None, stable_frame_min=None,
+                 stable_jump_max=None, lane_width_init=None, lane_width_min=None,
+                 lane_width_max=None):
         self.vis = None
 
         self.roi_h = 0
         self.roi_w = 0
 
+        # 튜닝 상수를 모듈 전역 대신 인스턴스 속성으로 캡처해둔다(기본값은 기존 모듈 상수와
+        # 동일 — classic 파이프라인 동작은 그대로 유지). DL 기반 서브클래스(dl_lane.py의
+        # DLSlideWindow)처럼 좌표 스케일이 다른 파생 클래스가 생성자 인자로 자기 스케일에
+        # 맞는 값을 넣을 수 있도록 파라미터화한 것뿐, 알고리즘 자체는 바뀌지 않는다.
+        self.n_slices = n_slices if n_slices is not None else MOMENT_N_SLICES
+        self.min_pixels = min_pixels if min_pixels is not None else MOMENT_MIN_PIXELS
+        self.near_slices = near_slices if near_slices is not None else MOMENT_NEAR_SLICES
+        self.far_slices = far_slices if far_slices is not None else MOMENT_FAR_SLICES
+        self.slice_outlier_max = slice_outlier_max if slice_outlier_max is not None else LANE_SLICE_OUTLIER_MAX
+        self.slice_fit_min = slice_fit_min if slice_fit_min is not None else LANE_SLICE_FIT_MIN
+        self.stable_frame_min = stable_frame_min if stable_frame_min is not None else STABLE_FRAME_MIN
+        self.stable_jump_max = stable_jump_max if stable_jump_max is not None else STABLE_JUMP_MAX
+        self.lane_width_min = lane_width_min if lane_width_min is not None else 180.0
+        self.lane_width_max = lane_width_max if lane_width_max is not None else 400.0
+
         #실시간 차선폭 (한쪽 차선만 보일 때 반대쪽 추정에 사용)
-        self.lane_width = 260.0
+        self.lane_width = lane_width_init if lane_width_init is not None else 260.0
 
         # 구간별 무게중심 저장 — calc_center()/시각화에서 재사용
-        #   각 리스트는 길이 MOMENT_N_SLICES, 인덱스 0=가장 아래(근거리) ~ 마지막=가장 위(원거리)
+        #   각 리스트는 길이 self.n_slices, 인덱스 0=가장 아래(근거리) ~ 마지막=가장 위(원거리)
         self.left_centers = []
         self.right_centers = []
         self.yellow_centers = []
@@ -338,16 +356,16 @@ class SlideWindow:
           입력 : mask     — 이진마스크(좌/우 절반 등으로 이미 열 방향이 잘려있을 수 있음)
                 x_offset — mask가 원본 ROI에서 잘려나온 경우의 x좌표 보정값(좌우 분리용)
                 color    — 디버그 사각형 색상
-          출력 : centers — 길이 MOMENT_N_SLICES 리스트. 각 원소는 (y_center, cx) 또는
-                 해당 구간 픽셀수가 MOMENT_MIN_PIXELS 미만이면 None
+          출력 : centers — 길이 self.n_slices 리스트. 각 원소는 (y_center, cx) 또는
+                 해당 구간 픽셀수가 self.min_pixels 미만이면 None
         """
-        slice_h = self.roi_h // MOMENT_N_SLICES
+        slice_h = self.roi_h // self.n_slices
         centers = []
 
-        for i in range(MOMENT_N_SLICES):
+        for i in range(self.n_slices):
             y_high = self.roi_h - i * slice_h
             # 마지막(가장 위) 구간은 정수나눗셈 나머지를 포함해 y=0까지 전부 커버
-            y_low = 0 if i == MOMENT_N_SLICES - 1 else self.roi_h - (i + 1) * slice_h
+            y_low = 0 if i == self.n_slices - 1 else self.roi_h - (i + 1) * slice_h
 
             band = mask[y_low:y_high, :]
 
@@ -360,7 +378,7 @@ class SlideWindow:
 
             M = cv2.moments(band, binaryImage=True)
 
-            if M['m00'] < MOMENT_MIN_PIXELS:
+            if M['m00'] < self.min_pixels:
                 centers.append(None)
                 continue
 
@@ -387,7 +405,7 @@ class SlideWindow:
           입력/출력 : centers — _slice_centers()와 동일한 형식(길이 불변)
         """
         valid_idx = [i for i, c in enumerate(centers) if c is not None]
-        if len(valid_idx) < LANE_SLICE_FIT_MIN:
+        if len(valid_idx) < self.slice_fit_min:
             return centers   # 점이 너무 적으면 추세 판단 자체가 불안정 → 검사 생략
 
         ys = np.array([centers[i][0] for i in valid_idx])
@@ -406,7 +424,7 @@ class SlideWindow:
             y_i, x_i = centers[i]
             residual = abs(x_i - (slope * y_i + intercept))
 
-            if residual > LANE_SLICE_OUTLIER_MAX:
+            if residual > self.slice_outlier_max:
                 result[i] = None
                 if DEBUG_VIZ_LANE:
                     cv2.drawMarker(
@@ -469,12 +487,12 @@ class SlideWindow:
             cv2.waitKey(1)
 
     def calc_center(self):
-        near_left   = self._group_mean(self.left_centers,   MOMENT_NEAR_SLICES, True)
-        far_left    = self._group_mean(self.left_centers,   MOMENT_FAR_SLICES,  False)
-        near_right  = self._group_mean(self.right_centers,  MOMENT_NEAR_SLICES, True)
-        far_right   = self._group_mean(self.right_centers,  MOMENT_FAR_SLICES,  False)
-        near_yellow = self._group_mean(self.yellow_centers, MOMENT_NEAR_SLICES, True)
-        far_yellow  = self._group_mean(self.yellow_centers, MOMENT_FAR_SLICES,  False)
+        near_left   = self._group_mean(self.left_centers,   self.near_slices, True)
+        far_left    = self._group_mean(self.left_centers,   self.far_slices,  False)
+        near_right  = self._group_mean(self.right_centers,  self.near_slices, True)
+        far_right   = self._group_mean(self.right_centers,  self.far_slices,  False)
+        near_yellow = self._group_mean(self.yellow_centers, self.near_slices, True)
+        far_yellow  = self._group_mean(self.yellow_centers, self.far_slices,  False)
 
         lane_valid = False
         offset = 0
@@ -486,7 +504,7 @@ class SlideWindow:
 
             width = near_right - near_left
 
-            if 180 < width < 400:
+            if self.lane_width_min < width < self.lane_width_max:
                 alpha = 0.1
                 self.lane_width = (
                    (1 - alpha) * self.lane_width +
@@ -545,9 +563,9 @@ class SlideWindow:
     def _debounce(self, valid, offset, lookahead, center):
         """
         프레임 간 스파이크 필터링. 이번 프레임 결과가 직전 "후보"와
-        STABLE_JUMP_MAX(px) 이내로 비슷하면 후보 연속 프레임 수를 늘리고,
+        self.stable_jump_max(px) 이내로 비슷하면 후보 연속 프레임 수를 늘리고,
         벗어나면 새 후보로 교체하며 카운트를 1로 리셋한다. 후보가
-        STABLE_FRAME_MIN 프레임 연속으로 유지돼야만 확정값으로 승격되어
+        self.stable_frame_min 프레임 연속으로 유지돼야만 확정값으로 승격되어
         실제로 반환된다 — 승격 전까지는 마지막 확정값을 그대로 반환하므로
         1~2프레임짜리 튐이 조향에 바로 반영되지 않는다.
         """
@@ -556,12 +574,12 @@ class SlideWindow:
         if self._confirmed is None:
             self._confirmed = candidate
             self._pending = candidate
-            self._pending_count = STABLE_FRAME_MIN
+            self._pending_count = self.stable_frame_min
             return candidate
 
         same_flow = (
             valid == self._pending[0] and
-            abs(offset - self._pending[1]) <= STABLE_JUMP_MAX
+            abs(offset - self._pending[1]) <= self.stable_jump_max
         )
 
         if same_flow:
@@ -570,7 +588,7 @@ class SlideWindow:
             self._pending = candidate
             self._pending_count = 1
 
-        if self._pending_count >= STABLE_FRAME_MIN:
+        if self._pending_count >= self.stable_frame_min:
             self._confirmed = self._pending
 
         return self._confirmed

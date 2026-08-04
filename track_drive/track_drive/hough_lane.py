@@ -16,25 +16,39 @@ import numpy as np
 # 원본과 동일하다.
 #=============================================
 
-# ROI(세로 구간) — app_hough_drive.py 원본의 ROI_START_ROW=300/ROI_END_ROW=380
-# (640x480 카메라 기준 절대픽셀)을 비율로 환산해 그대로 이식.
-#   ※ app_hough_drive.py는 xycar_cam, track_drive는 usb_cam(전방)으로 카메라/마운트가
-#     달라 이 ROI가 트랙 노면을 그대로 담는지는 실차에서 재확인 필요.
-HOUGH_ROI_TOP = 300 / 480
-HOUGH_ROI_BOT = 380 / 480
+# ROI(세로 구간) — 한 차례 200~400px(220px 밴드)로 넓혔던 것을, 중심(≈300px)은
+# 유지한 채 밴드 높이만 1/3(≈73px)로 되돌렸다. app_hough_drive.py 원본(300~380,
+# 80px 밴드)과 거의 같은 폭.
+#   ※ track_drive는 app_hough_drive.py(xycar_cam)와 다른 카메라(usb_cam 전방)를
+#     쓰므로 이 ROI가 실제로 노면만 담는지 실차에서 반드시 재확인·재튜닝할 것.
+HOUGH_ROI_TOP = 264 / 480
+HOUGH_ROI_BOT = 336 / 480
 
-# Canny / HoughLinesP 파라미터 — app_hough_drive.py 원본 값 그대로.
+# Canny / HoughLinesP 파라미터.
 GAUSSIAN_KSIZE = 5
 CANNY_LOW = 60
 CANNY_HIGH = 75
 HOUGH_RHO = 1
 HOUGH_THETA = math.pi / 180
-HOUGH_THRESHOLD = 50
-HOUGH_MIN_LINE_LEN = 50
+HOUGH_THRESHOLD = 40
+HOUGH_MIN_LINE_LEN = 30
 HOUGH_MAX_LINE_GAP = 20
 
 # 기울기 절대값이 이 값 이하면 수평선(차선 아님)으로 보고 제외 — 원본과 동일.
 SLOPE_MIN = 0.2
+
+# 짧은 직선(노면 이음새·반사·잡음 등으로 생기는 오검출) 제거.
+#   실제 차선은 길게 이어지는 반면 잡음은 대체로 짧게 끊어져 잡히므로, HoughLinesP가
+#   반환한 선분 중 이 길이(px) 미만은 좌/우 분류·대표직선 계산에서 아예 제외한다.
+MIN_LANE_LINE_LEN = 45
+
+# 선분 병합(그룹화) — HoughLinesP는 MAX_LINE_GAP(끊긴 구간 허용치) 때문에 실제로는
+#   하나로 이어진 차선도 여러 조각으로 쪼개서 반환하는 경우가 많다. 조각 하나하나의
+#   개별 길이만으로 평가하면 조각난 진짜 차선이 안 끊긴 짧은 잡음보다 오히려 손해를
+#   볼 수 있다. 그래서 기준행(ROI 중간)에서의 x위치가 서로 이 값(px) 이내로 가까운
+#   선분들을 하나의 그룹으로 묶고, "그룹의 총 길이"가 가장 큰 그룹만 그 쪽의 대표
+#   차선 후보로 채택한다.
+GROUP_X_TOL = 25.0
 
 # 기준행 위치 (ROI 세로비율, 0=원거리/ROI 위쪽 ~ 1=근거리/ROI 아래쪽).
 #   원본은 L_ROW=40/ROI_HEIGHT=80 로 정확히 중간(0.5) 한 지점만 썼다.
@@ -102,22 +116,40 @@ class HoughLaneDetector:
         if all_lines is None:
             return self._finish(False, 0.0, 0.0, debug_img, edge_img)
 
-        # 기울기 부호(음수=좌, 양수=우) + 화면 위치로 좌/우 선분 분류 (원본과 동일)
+        # 기울기 부호(음수=좌, 양수=우) + 화면 위치로 좌/우 선분 분류.
+        #   위치 판정은 반드시 중점(mid_x)으로 한다 — HoughLinesP는 한 선분의 두 끝점을
+        #   (x1,y1)/(x2,y2) 어느 순서로 반환할지 보장하지 않는데, 원본 app_hough_drive.py처럼
+        #   특정 한쪽 끝점(x2 또는 x1)만 검사하면 순서가 뒤집힌 프레임에서 유효한 차선이
+        #   조건을 못 넘겨 누락된다. 이게 한쪽 차선의 검출 신뢰도를 떨어뜨려 조향이 그
+        #   방향으로 쏠리는 원인이 될 수 있어(적분항과 결합 시 특히), 끝점 순서와 무관한
+        #   중점 기준으로 바꿨다.
         left_lines, right_lines = [], []
         for line in all_lines:
             x1, ly1, x2, ly2 = line[0]
+            if math.hypot(x2 - x1, ly2 - ly1) < MIN_LANE_LINE_LEN:
+                continue   # 짧은 잡음 선분 제외
             slope = 1000.0 if x2 == x1 else float(ly2 - ly1) / float(x2 - x1)
             if abs(slope) <= SLOPE_MIN:
                 continue
-            if slope < 0 and x2 < self.roi_w / 2.0:
+            mid_x = (x1 + x2) / 2.0
+            if slope < 0 and mid_x < self.roi_w / 2.0:
                 left_lines.append((x1, ly1, x2, ly2))
                 cv2.line(debug_img, (x1, ly1), (x2, ly2), RED, 2)
-            elif slope > 0 and x1 > self.roi_w / 2.0:
+            elif slope > 0 and mid_x > self.roi_w / 2.0:
                 right_lines.append((x1, ly1, x2, ly2))
                 cv2.line(debug_img, (x1, ly1), (x2, ly2), YELLOW_COL, 2)
 
         if not left_lines and not right_lines:
             return self._finish(False, 0.0, 0.0, debug_img, edge_img)
+
+        # 조각난 선분들을 병합(그룹화)해서, 총 길이가 가장 긴 그룹(=진짜 차선일
+        # 가능성이 가장 높은 쪽)만 대표직선 계산에 사용한다.
+        left_lines = self._select_main_group(left_lines)
+        right_lines = self._select_main_group(right_lines)
+        for x1, ly1, x2, ly2 in left_lines:
+            cv2.line(debug_img, (x1, ly1), (x2, ly2), GREEN, 3)
+        for x1, ly1, x2, ly2 in right_lines:
+            cv2.line(debug_img, (x1, ly1), (x2, ly2), GREEN, 3)
 
         left_fit = self._fit_line(left_lines)
         right_fit = self._fit_line(right_lines)
@@ -160,20 +192,63 @@ class HoughLaneDetector:
 
         return self._finish(True, offset, lookahead, debug_img, edge_img, lane_center)
 
+    def _select_main_group(self, lines):
+        """기준행(ROI 중간)에서의 x위치가 가까운 선분들을 그룹으로 묶고, 총 길이가
+        가장 긴 그룹만 반환한다. HoughLinesP가 하나의 실제 차선을 여러 조각으로
+        쪼개 반환해도 조각들을 다시 합쳐서 하나의 긴 차선으로 취급하기 위함이다.
+        선분이 1개뿐이면 그대로 반환."""
+        if len(lines) <= 1:
+            return lines
+
+        ref_row = self.roi_h / 2.0
+        items = []
+        for x1, y1, x2, y2 in lines:
+            if x2 == x1:
+                continue
+            m = float(y2 - y1) / float(x2 - x1)
+            if m == 0.0:
+                continue
+            b = y1 - m * x1
+            x_ref = (ref_row - b) / m
+            length = math.hypot(x2 - x1, y2 - y1)
+            items.append((x_ref, length, (x1, y1, x2, y2)))
+
+        if not items:
+            return lines
+
+        items.sort(key=lambda it: it[0])
+
+        groups = [[items[0]]]
+        for it in items[1:]:
+            if it[0] - groups[-1][-1][0] <= GROUP_X_TOL:
+                groups[-1].append(it)
+            else:
+                groups.append([it])
+
+        best_group = max(groups, key=lambda g: sum(it[1] for it in g))
+        return [it[2] for it in best_group]
+
     def _fit_line(self, lines):
-        """선분들의 기울기·양끝점 평균으로 대표직선 (m, b)를 구한다. m==0(못 찾음)이면 None."""
+        """선분들의 기울기·양끝점을 길이로 가중평균해 대표직선 (m, b)를 구한다.
+        MIN_LANE_LINE_LEN을 넘겨 일단 채택된 선분이라도, 그중 더 긴(=진짜 차선일
+        가능성이 높은) 선분이 결과에 더 크게 반영되도록 길이를 가중치로 쓴다.
+        m==0(못 찾음)이면 None."""
         if not lines:
             return None
-        x_sum = y_sum = m_sum = 0.0
+        x_sum = y_sum = m_sum = w_sum = 0.0
         for x1, y1, x2, y2 in lines:
-            x_sum += x1 + x2
-            y_sum += y1 + y2
-            m_sum += (float(y2 - y1) / float(x2 - x1)) if x2 != x1 else 0.0
-        size = len(lines)
-        m = m_sum / size
+            length = math.hypot(x2 - x1, y2 - y1)
+            slope = (float(y2 - y1) / float(x2 - x1)) if x2 != x1 else 0.0
+            w_sum += length
+            x_sum += (x1 + x2) * length
+            y_sum += (y1 + y2) * length
+            m_sum += slope * length
+        if w_sum == 0.0:
+            return None
+        m = m_sum / w_sum
         if m == 0.0:
             return None
-        x_avg, y_avg = x_sum / (size * 2), y_sum / (size * 2)
+        x_avg, y_avg = x_sum / (w_sum * 2), y_sum / (w_sum * 2)
         b = y_avg - m * x_avg
         return m, b
 
