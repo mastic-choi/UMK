@@ -118,13 +118,15 @@ VEHICLE_TRIGGER_FRAMES = 5     # 라이다 단독검출 연속 N프레임이면 
 # ── [15] 단위 환산 상수 — ★B단계 실측 후 값만 채울 것 ──
 #   지금 코드에는 '모터 단위'(drive()가 ±100으로 클립하는 값)와 '미터'가 섞여 있다.
 #   아래 값이 0.0 이면 아직 미실측 상태라는 뜻이고, 거리 기반 로직은 보수적으로 동작한다.
-METERS_PER_SPEED_UNIT    = 0.0   # ★B-2: 모터 속도단위 1 당 m/s. (SPEED_NORMAL로 5초 직진 후 거리÷5÷SPEED_NORMAL)
-LANE_WIDTH_M             = 0.0   # ★B-1: 차선 폭(m)
-PIXELS_PER_METER         = 0.0   # ★B-1: BEV 픽셀 ↔ 미터 환산
-VEHICLE_WIDTH_M          = 0.0   # ★B-3: 자차 폭(m)
+METERS_PER_SPEED_UNIT    = 0.0   # ★B-2: 모터 속도단위 1 당 m/s. (SPEED_NORMAL로 5초 직진 후 거리÷5÷SPEED_NORMAL) — 미실측
+LANE_WIDTH_M             = 0.4   # ★B-1 실측(2026-08-04): 흰선-흰선(도로 전체폭) 80cm, 노란선 정중앙 확인 → 차선 1개 폭 = 80/2 = 40cm
+PIXELS_PER_METER         = 0.0   # ★B-1: BEV 픽셀 ↔ 미터 환산 — 미실측(80cm 구간의 BEV px 대응값 필요)
+VEHICLE_WIDTH_M          = 0.31  # ★B-3 실측(2026-08-04): xycar 본체 가로 31cm (세로64cm×가로31cm×높이20cm)
 # 각폭 분류 임계 — 이 폭 이상이면 '차량', 미만이면 '고정장애물'.
-#   ★B-3(장애물 차량 실측 폭) 후 조정. 지금은 xycar급 차폭 추정치.
-OBSTACLE_VEHICLE_WIDTH_M = 0.25
+#   ★B-3 실측(2026-08-04): 고정장애물(고장난 차량) 가로 20cm × 세로 41cm × 높이 16cm,
+#   방해차량 가로 28cm × 세로 54cm × 높이 19cm → 분류 기준은 가로(=lidar obstacle_width)만 관련.
+#   두 값 중간으로 설정: (0.20+0.28)/2 = 0.24
+OBSTACLE_VEHICLE_WIDTH_M = 0.24
 
 # ── [5] 조향 변화율 제한 (openpilot 안전원칙: 액추에이터를 플래너와 분리해 구속) ──
 #   속도에는 이미 SPEED_ACCEL_STEP 이 있는데 조향축에만 없었다. drive() 가 모든 명령이
