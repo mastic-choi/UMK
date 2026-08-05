@@ -145,7 +145,7 @@ FPS_LOG_PERIOD_SEC = 5.0   # 워커 스레드 FPS/provider 로그 주기
 def _default_model_path():
     """모델 가중치 파일(best.onnx) 기본 경로.
     1순위: colcon install된 share 디렉터리(share/track_drive/models/best.onnx)
-    2순위: 소스트리에서 직접 실행 중일 때(개발 중, colcon build 전) — 이 파일 기준 상대경로
+    2순위: 소스트리에서 직접 실행 중일 때(개발 중, colcon build 전) — track_drive 패키지 디렉터리 기준 상대경로
     """
     if get_package_share_directory is not None:
         try:
@@ -155,7 +155,8 @@ def _default_model_path():
                 return candidate
         except Exception:
             pass
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models', 'best.onnx')
+    package_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(package_dir, 'models', 'best.onnx')
 
 
 class TwinLiteNetEngine:

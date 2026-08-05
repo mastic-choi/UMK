@@ -24,14 +24,14 @@ ros2 launch track_drive track_drive.launch.py
   떠 있어야 합니다 (`/xycar_motor`는 `Float32MultiArray([angle, speed])`로 브릿지됨 — 구형 `XycarMotor` 커스텀
   메시지는 `ros1_bridge`가 매핑을 못 함). 체크리스트: ①도커 컨테이너 기동 ②`ros1_bridge` 프로세스 기동 확인.
 - `DEBUG_VIZ`([track_drive.py:147](track_drive.py#L147))는 **죽은 플래그입니다.** 실제로 신호등 디버그 창을
-  켜는 스위치는 `traffic_signal.py`의 `DEBUG_VIZ_SIGNAL`입니다. 마찬가지로 `track_drive.py`의
-  `DEBUG_VIZ_LANE`도 죽은 플래그이고, 실제 차선 디버그 창 스위치는 `lane_util.py`의 `DEBUG_VIZ_LANE`
+  켜는 스위치는 `perception/traffic_signal.py`의 `DEBUG_VIZ_SIGNAL`입니다. 마찬가지로 `track_drive.py`의
+  `DEBUG_VIZ_LANE`도 죽은 플래그이고, 실제 차선 디버그 창 스위치는 `perception/lane_util.py`의 `DEBUG_VIZ_LANE`
   (별개의 변수, 이름만 같음)입니다. 헷갈리지 않게 아래 기능별 표에 실제 스위치 위치를 정리해뒀습니다.
 
 | 기능 | 디버그 창 ON/OFF 스위치 |
 |---|---|
-| 신호등 | `traffic_signal.py:23` `DEBUG_VIZ_SIGNAL` |
-| 차선 | `lane_util.py:38` `DEBUG_VIZ_LANE` |
+| 신호등 | `perception/traffic_signal.py:23` `DEBUG_VIZ_SIGNAL` |
+| 차선 | `perception/lane_util.py:38` `DEBUG_VIZ_LANE` |
 | 라이다 BEV(장애물) | `track_drive.py:149` `DEBUG_VIZ_LIDAR` (이건 정상 연결됨) |
 | 라이다 BEV(라바콘 트리거) | `track_drive.py:150` `DEBUG_VIZ_LAVACON` |
 
@@ -53,14 +53,14 @@ S1→S2 전환 경로만 막는 것이라 `START_STATE` 자체를 바꾸는 것�
 로그의 `sig=`/`[SIG-S0]` 값부터 확인하세요.
 
 **디버그 방법:**
-- 창: `traffic_signal.py:23` `DEBUG_VIZ_SIGNAL = True` → `signal_roi`(S0) / `signal4_roi`(S2) 창.
+- 창: `perception/traffic_signal.py:23` `DEBUG_VIZ_SIGNAL = True` → `signal_roi`(S0) / `signal4_roi`(S2) 창.
 - CLI 로그: S0 상태일 때 `_print_debug()`가 0.5초마다 `[SIG-S0]` 줄을 찍습니다
   (`roi=`, `circles=`, `reason=`, `bright=`, `margin=`) — 원 검출이 어느 단계(개수 부족/배치 불량/
   밝기 대비 부족)에서 막혔는지 터미널만으로 바로 보입니다.
 
 **알려진 한계(실차 미검증):**
 - `find_circles()`(Hough Circle)가 원 개수를 **정확히** 3개(S0)/4개(S2)로 요구하고, 배치 검사까지 실패하면
-  그 프레임은 무조건 인식 실패 — 디바운스/폴백 없음([traffic_signal.py:53](traffic_signal.py#L53) 주석 참고).
+  그 프레임은 무조건 인식 실패 — 디바운스/폴백 없음([perception/traffic_signal.py:53](perception/traffic_signal.py#L53) 주석 참고).
 - ROI(`SIG_ROI_*`)와 반지름 범위(`SIG_MIN/MAX_RADIUS=15~25px`)가 고정값이라, 카메라 각도·정지 위치가
   튜닝 당시와 다르면 신호등이 ROI 밖이거나 반지름 범위 밖이라 아예 못 잡을 수 있음.
 - 색상(Hue)을 직접 보지 않고 **위치(좌→우=빨강/노랑/초록) + 밝기 대비**로만 판정 — 밝은 반사광이 ROI에
@@ -78,16 +78,16 @@ TEST_FORCE_BEHAVIOR = False   # 라바콘 등 Behavior 없이 순수 차선주�
 `TEST_DISABLE_INTERSECTION = True`(기본값)면 정지선을 밟아도 S2로 안 새고 차선주행을 계속합니다.
 
 **디버그 방법:**
-- 창: `lane_util.py:38` `DEBUG_VIZ_LANE = True` → `lane_bev`(BEV 변환), `lane_white`/`lane_yellow`(색 마스크),
+- 창: `perception/lane_util.py:38` `DEBUG_VIZ_LANE = True` → `lane_bev`(BEV 변환), `lane_white`/`lane_yellow`(색 마스크),
   `lane_result`(슬라이딩윈도우 피팅 결과 + `offset` 표시).
 - CLI 로그: `[LANE] lane=편차px(검출여부) obs=... lava=...`.
 
 **알려진 한계:**
 - (2026-07-21 업데이트) 흰색 검출은 더 이상 단순 HSV 고정 임계값이 아닙니다. 지금은
-  `lane_util.py:81-145` — Gray→CLAHE(지역 대비 향상)→**Top-Hat 모폴로지**(31×31 커널, 넓은 영역에
+  `perception/lane_util.py:81-145` — Gray→CLAHE(지역 대비 향상)→**Top-Hat 모폴로지**(31×31 커널, 넓은 영역에
   걸친 균일한 반사광은 눌러주고 국소적으로 튀는 밝은 부분만 남김)→threshold(20)→세로 성분 강조
   커널(3×10)→Connected Components 면적 필터(20~1500px²)로 재구성됐습니다. 노란색도 HSV 범위를
-  좁히고(`[18,120,120]~[35,255,255]`) 면적(20~1000)·폭(<40px) 필터를 추가했습니다([lane_util.py:106-165](lane_util.py#L106)).
+  좁히고(`[18,120,120]~[35,255,255]`) 면적(20~1000)·폭(<40px) 필터를 추가했습니다([perception/lane_util.py:106-165](perception/lane_util.py#L106)).
   넓고 균일한 반사광 오검출 문제는 이 구조로 상당히 개선될 것으로 보이나, Top-Hat은 "넓은 면적"의 밝기
   변화를 누르는 방식이라 **가늘고 긴 반사(예: 금속 난간의 얇은 하이라이트 줄)**는 여전히 차선처럼 남을
   수 있습니다. Top-Hat 커널 크기·threshold(20)·면적 범위 전부 실차 미검증 값이라 실측 튜닝 필요.
