@@ -75,7 +75,7 @@ class Phase(Enum):
     DONE           = 3  # 모든 Behavior 미션 완료 — 이후 계속 B0로 일반 차선주행
 
 # ── 속도·각도 상수 ──
-SPEED_NORMAL  = 5.0   # 차선주행(S1) 기본속도
+SPEED_NORMAL  = 8.0   # 차선주행(S1) 기본속도
                        # 출처: KUAC_2024-main lane_detection/src/lane_detection.py self.motor=30(고정)
                        #   기존 20.0 → 30.0. 모터/조향 스케일이 같은 xycar 플랫폼인지 미확인, 실차 저속 테스트 우선 권장
 SPEED_LAVACON = 2.5    # KUAC_2024 라바콘 속도(12~30, fast/safe 라벨 앞뒤가 안 맞아 신뢰도 낮음) 참고만 하고 미반영
@@ -125,6 +125,11 @@ SIG_CONFIRM_FRAMES = 3   # 신호등(직진/좌회전) 판정이 연속 N프레�
 METERS_PER_SPEED_UNIT    = 0.0   # ★B-2: 모터 속도단위 1 당 m/s. (SPEED_NORMAL로 5초 직진 후 거리÷5÷SPEED_NORMAL) — 미실측
 LANE_WIDTH_M             = 0.4   # ★B-1 실측(2026-08-04): 흰선-흰선(도로 전체폭) 80cm, 노란선 정중앙 확인 → 차선 1개 폭 = 80/2 = 40cm
 PIXELS_PER_METER         = 0.0   # ★B-1: BEV 픽셀 ↔ 미터 환산 — 미실측(80cm 구간의 BEV px 대응값 필요)
+                                  #   [2026-08-05] dl_lane.py에 DL_USE_BEV(기본 False) 실험적 BEV 경로가
+                                  #   생겼고, 켜졌을 때의 스케일은 그쪽의 DL_PIXELS_PER_METER(=200, 설계값)를
+                                  #   따로 쓴다. DL_USE_BEV가 실차 검증돼 기본으로 전환되면 이 전역값도
+                                  #   그때 맞춰 채울 것 — 지금 꺼진 상태에서 이 값만 채우면 실제로는 아직
+                                  #   원근 픽셀 공간인데 미터 환산이 된 것처럼 오해할 수 있어 비워둔다.
 VEHICLE_WIDTH_M          = 0.31  # ★B-3 실측(2026-08-04): xycar 본체 가로 31cm (세로64cm×가로31cm×높이20cm)
 # 각폭 분류 임계 — 이 폭 이상이면 '차량', 미만이면 '고정장애물'.
 #   ★B-3 실측(2026-08-04): 고정장애물(고장난 차량) 가로 20cm × 세로 41cm × 높이 16cm,
@@ -389,12 +394,9 @@ class TrackDriverNode(Node):
         # 차선 세그멘테이션 경로(self.lane_path) 추종용 — _lane_pid()(PID)를 대체.
         # _lane_pid()는 B2/B3 장애물회피 behavior(apply_behavior_override())가 여전히
         # 쓰므로 그대로 남겨둔다 — 없앤 게 아니라 "일반 차선주행" 용도에서만 교체한 것.
-        # speed_lo/speed_hi를 _lane_drive()가 실제로 내는 속도 범위(SPEED_NORMAL*0.15 ~
-        # SPEED_NORMAL)에 명시적으로 맞춘다 — PurePursuitController의 기본값(0.75/5.0)과
-        # 지금은 같은 값이지만, SPEED_NORMAL을 나중에 바꿔도 여기서 같이 따라가게 하기 위함.
-        self.pure_pursuit = PurePursuitController(angle_max_deg=ANGLE_MAX,
-                                                    speed_lo=SPEED_NORMAL * 0.15,
-                                                    speed_hi=SPEED_NORMAL)
+        # lookahead_base_px/lookahead_speed_gain/lookahead_max_px 등은 클래스 기본값을
+        # 그대로 쓴다(BEV 적용 커밋에서 실차로 재확인된 값, controller/pure_pursuit.py 참고).
+        self.pure_pursuit = PurePursuitController(angle_max_deg=ANGLE_MAX)
 
         self.path = None
         self.grid = None

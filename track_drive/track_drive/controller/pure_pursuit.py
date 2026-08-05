@@ -29,20 +29,46 @@ class PurePursuitController:
     반환한다. path가 비어있으면(첫 프레임 등) 직전 조향각을 그대로 유지한다 —
     lane_util._debounce()가 무효 프레임에 직전 확정값을 유지하는 것과 같은 원칙."""
 
-    def __init__(self, lookahead_px=90.0, wheelbase_px=50.0, angle_max_deg=100.0, alpha=0.5,
-                 min_lookahead_px=65.0, lookahead_gain_px=45.0, speed_lo=0.75, speed_hi=5.0):
-        # 목표점을 찾는 전방주시거리(px). speed<=speed_lo(정지에 가까운 저속/급코너)일 때
-        # 쓰는 하한값이다. ROI가 짧은 백엔드(hough_lane은 ROI 높이가 ~70px로 매우 짧다)
-        # 에서는 경로 전체 길이가 lookahead_px보다 짧아져 자동으로 path의 가장 먼 점이
-        # 목표점이 된다(_target_point() 참고) — 그 자체로는 안전한 폴백이지만 반응이
-        # 둔해지니, 그런 백엔드에서 체감 반응이 느리면 값을 줄일 것. 실차 미검증 튜닝값.
-        self.lookahead_px = lookahead_px
+    def __init__(self, lookahead_base_px=90.0, lookahead_speed_gain=4.0, lookahead_max_px=150.0,
+                 wheelbase_px=80.0, angle_max_deg=100.0, alpha=0.5,
+                 min_lookahead_px=90.0, dx_deadzone_px=6.0):
+        # [2026-08-05, 속도 적응형 lookahead — 1차 시도 후 수정]
+        #   curvature ≈ 2*dx/ld^2 (작은각 근사)라서 ld가 짧을수록 같은 dx도 1/ld^2로
+        #   증폭된다. 처음엔 PythonRobotics/Autoware 관례(Ld=k*v+Lfc, 저속일수록 lookahead도
+        #   짧게)를 그대로 따라 lookahead_base_px를 65(=기존 min_lookahead_px 가드값과 동일)로
+        #   낮췄는데, 실차에서 "waypoint가 살짝만 틀어져도(dx≈50px) ang=50도 가까이 찍힌다"는
+        #   증상으로 재현됨 — ld=65, dx=50이면 steer≈50°(계산 확인됨), ld=90(구 고정값)이면
+        #   같은 dx에도 steer≈32°로 훨씬 덜 민감하다. 즉 "저속=깨끗한 경로를 촘촘히 추종"을
+        #   가정하는 PythonRobotics류 관례가, 매 프레임 픽셀 노이즈가 있는 비전 기반 경로에는
+        #   그대로 안 맞았다(짧은 lookahead가 노이즈까지 증폭). 게다가 base와 min_lookahead_px
+        #   가드가 같은 값(65)이라 이 위험구간에서 가드도 사실상 작동을 안 했다.
+        #   → 하한을 기존에 검증된 고정값(90)으로 되돌리고, 속도가 오르면 그 "위로만" 늘어나게
+        #   바꿨다(절대 90 밑으로는 안 내려감). 여전히 저속에서 tight-tracking 이점은 없지만,
+        #   노이즈 증폭 문제가 없는 쪽을 우선했다 — 실차에서 저속 코너 추종이 둔하게 느껴지면
+        #   base를 낮추기보다 wheelbase_px를 낮추는 쪽으로 대응할 것(하단 주석 참고).
+        #   gain=4.0: SPEED_NORMAL(5.0)에서 90+4*5=110, 향후 최고속도를 올려도 max_px(150)
+        #   여유 안에 들어오도록 잡은 것. 전부 실차 미검증 튜닝값.
+        self.lookahead_base_px = lookahead_base_px
+        self.lookahead_speed_gain = lookahead_speed_gain
+        self.lookahead_max_px = lookahead_max_px
+
+        # [2026-08-05] dx(waypoint-차량중앙 픽셀오차)가 이 값 미만이면 0으로 죽인다 —
+        #   차량이 차선 중앙에 사실상 있는데도(카메라/세그멘테이션의 서브픽셀 단위 흔들림) 매
+        #   프레임 미세하게 다른 조향이 나가 중앙 부근에서 계속 잔떨림하는 것을 막는다.
+        #   _lane_pid()의 LANE_DEADZONE(40px, PID 입력용)과 같은 철학이지만, 여긴 훨씬 작은
+        #   값을 쓴다 — Pure Pursuit은 목표점 자체가 이미 lookahead 앞의 실제 경로점이라
+        #   LANE_DEADZONE만큼 크게 죽이면 완만한 커브 진입까지 무시하게 된다. 실차 미검증.
+        self.dx_deadzone_px = dx_deadzone_px
 
         # 실제 차축거리(m) 대신 쓰는 "곡률→조향각" 게인. 표준 Pure Pursuit 공식
         # steer = atan(2*L*sin(alpha)/Ld)에서 L 자리에 들어간다 — 크게 잡을수록 같은
         # 곡률에도 조향각이 커진다(더 공격적). PIXELS_PER_METER 실측 전까지는 물리적
         # 의미가 없는 순수 튜닝 게인이므로, 실차에서 직진 안정성/코너 추종성을 보고
         # 맞출 것. 실차 미검증 튜닝값.
+        #   [2026-08-05] lookahead 하한(90) 복원 후에도 여전히 작은 dx에 조향이 과민하면,
+        #   lookahead보다 이 값을 낮추는 쪽이 더 직접적인 레버다 — curvature*wheelbase_px에
+        #   그대로 곱해지므로 ld 범위 전체에서 균일하게 민감도를 낮춘다(단, 실제 코너에서도
+        #   반응이 약해지니 함께 재확인할 것).
         self.wheelbase_px = wheelbase_px
 
         self.angle_max_deg = angle_max_deg
@@ -58,21 +84,6 @@ class PurePursuitController:
         # 원칙을 짧은 ld에도 동일하게 적용한다. 실차 미검증 튜닝값.
         self.min_lookahead_px = min_lookahead_px
 
-        # ── 속도 적응형 lookahead ──
-        # 저속(제자리에 가까운 급코너)에서 lookahead가 너무 길면 코너 안쪽을 크게 잘라
-        # 타이트하게 못 붙고, 반대로 고속(직선/완만한 구간)에서 lookahead가 너무 짧으면
-        # 한 프레임(0.05s)에 차가 이동하는 거리에 비해 목표점이 코앞이라 dx의 픽셀
-        # 노이즈가 조향각으로 그대로 증폭돼 좌우로 흔들리다가(오실레이션) 그 편차가
-        # 누적돼 차선을 이탈한다 — 실차에서 재현된 증상. 그래서 speed<=speed_lo에서는
-        # lookahead_px(하한)를, speed>=speed_hi에서는 lookahead_px+lookahead_gain_px
-        # (상한)를 쓰고 그 사이는 선형보간한다(_effective_lookahead() 참고).
-        # speed_lo/speed_hi 기본값은 _lane_drive()의 실제 속도 하한(SPEED_NORMAL*0.15)과
-        # 기본 순항속도(SPEED_NORMAL)에 맞춘 것 — track_drive.py가 다른 값을 쓰면 생성자
-        # 호출부에서 명시적으로 override할 것. 실차 미검증 튜닝값.
-        self.lookahead_gain_px = lookahead_gain_px
-        self.speed_lo = speed_lo
-        self.speed_hi = speed_hi
-
         # 프레임 간 조향각 스파이크 저역통과 — controller/stanley.py의 self.alpha와
         # 동일한 패턴(1프레임짜리 경로 튐이 조향에 그대로 실리지 않도록).
         self.alpha = alpha
@@ -80,16 +91,6 @@ class PurePursuitController:
 
     def reset(self):
         self.prev_steer_deg = 0.0
-
-    def _effective_lookahead(self, speed):
-        """speed_lo 이하는 lookahead_px(하한), speed_hi 이상은 lookahead_px+lookahead_gain_px
-        (상한)를 쓰고 그 사이는 선형보간한다. speed_hi<=speed_lo면(설정 오류 방지) 상한을
-        그대로 반환한다."""
-        if self.speed_hi <= self.speed_lo:
-            return self.lookahead_px + self.lookahead_gain_px
-        t = (speed - self.speed_lo) / (self.speed_hi - self.speed_lo)
-        t = max(0.0, min(1.0, t))
-        return self.lookahead_px + t * self.lookahead_gain_px
 
     def _target_point(self, path, vehicle_xy, lookahead_px):
         """path를 따라 vehicle_xy로부터 누적 호길이가 lookahead_px를 넘는 첫 지점을
@@ -110,15 +111,21 @@ class PurePursuitController:
     def control(self, path, vehicle_xy, speed=0.0):
         """path : [(x,y), ...] ROI 픽셀좌표, 가까운점(차량 근처)→먼점 순
            vehicle_xy : (x,y) 차량 기준점(관례상 ROI 하단 중앙 == path[0] 근방)
-           speed : 이번 프레임에 근사로 쓸 속도(직전 프레임 출력속도) — _effective_lookahead()가
-                   저속/고속 lookahead를 선형보간하는 데만 쓴다.
+           speed : 직전 프레임 명령속도(track_drive.py의 _prev_speed, 모터 단위) 근사치 —
+                   lookahead를 속도에 맞춰 늘이고 줄이는 데만 쓰는 순간값이라 누적하지
+                   않는다(위치를 적분하는 dead-reckoning과는 다름, 드리프트 없음).
            반환 : 조향각(도), ±angle_max_deg로 클램프."""
         if not path:
             return self.prev_steer_deg
 
-        lookahead_px = self._effective_lookahead(speed)
+        lookahead_px = float(np.clip(
+            self.lookahead_base_px + self.lookahead_speed_gain * max(speed, 0.0),
+            self.lookahead_base_px, self.lookahead_max_px
+        ))
         tx, ty = self._target_point(path, vehicle_xy, lookahead_px)
         dx = tx - vehicle_xy[0]
+        if abs(dx) < self.dx_deadzone_px:
+            dx = 0.0
         # 이미지 y는 아래로 증가하므로 "전방으로 이만큼"은 vehicle_xy[1]-ty(위로 갈수록 +).
         # 목표점이 차량과 같은 행(dy<=0)에 있는 뒤틀린 경로라도 나눗셈이 죽지 않도록
         # 최소값을 준다.

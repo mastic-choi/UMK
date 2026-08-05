@@ -94,6 +94,61 @@ DL_FG_THRESHOLD = 0.5   # 이진화 임계값(요구사항에 명시된 값)
 DL_ROI_Y0 = 250
 DL_ROI_Y1 = 390
 
+# ── BEV(원근변환) — 2026-08-05 bev_point_picker.py로 실측 캘리브레이션 ──
+#   DL 백엔드는 원래 원근(perspective) 픽셀 스케일 그대로 da/ll 중심선을 뽑았다(위
+#   "SlideWindow moments" 섹션 주석 참고) — 카메라에 가까운 픽셀과 먼 픽셀이 나타내는
+#   실제 거리(m/px)가 달라서(원근 압축), 같은 실제 곡률도 화면 위치마다 다른 곡률로
+#   보이고 PIXELS_PER_METER(track_drive.py)도 애초에 상수로 정의가 안 되는 문제가 있었다.
+#   좌/우 백선을 근거리(BL/BR)~1m지점(TL/TR)에서 직접 찍어(bev_point_picker.py) 얻은
+#   4점으로 이 왜곡을 제거한다.
+#     실측: 폭 W=0.8m(LANE_WIDTH_M*2, track_drive.py 기존 실측 — 두 지점 모두 같은 두
+#           백선이므로 폭은 근거리/원거리 공통), 길이 L=1.0m(TL~BL 직접 실측, 2026-08-05)
+#     좌표: 아래 4점은 DL_ROI_Y0:Y1로 자른 ROI 기준(원본 y - DL_ROI_Y0). x는 원본 그대로
+#           (ROI가 가로는 안 자름). 순서는 TL(좌상/먼왼쪽)→TR(우상/먼오른쪽)→
+#           BR(우하/가까운오른쪽)→BL(좌하/가까운왼쪽).
+DL_USE_BEV = True  # 실차 검증 중(2026-08-05). 검증 전까지는 기본 False로 되돌릴 것 —
+#   LANE_DETECTOR_BACKEND='dl'(track_drive.py 기본값) 자체가 "실차 트랙 전체 조건에서
+#   아직 미검증" 상태고, BEV로 좌표계를 바꾸면 DL_DA_MIN_COMPONENT_AREA/DL_SLICE_OUTLIER_MAX/
+#   DL_STABLE_JUMP_MAX 등 원근 픽셀 스케일 기준으로 잡힌 튜닝값들의 "픽셀당 의미"가 전부
+#   바뀐다(아래 캔버스 자동계산 결과 면적이 원래 ROI의 약 1.95배).
+DL_BEV_SRC_PX = np.float32([
+    [246, 257 - DL_ROI_Y0],   # TL: 원본 프레임 좌표 (246, 257)
+    [455, 257 - DL_ROI_Y0],   # TR: 원본 프레임 좌표 (455, 257)
+    [635, 333 - DL_ROI_Y0],   # BR: 원본 프레임 좌표 (635, 333)
+    [ 60, 333 - DL_ROI_Y0],   # BL: 원본 프레임 좌표 ( 60, 333)
+])
+DL_PIXELS_PER_METER = 200.0   # 설계값(실측 아님) — 목적 캔버스를 1m=200px 스케일로 만든다.
+
+# ── [2026-08-05] 캔버스 크기를 손으로 정하지 않고 "ROI 전체가 어디까지 매핑되는지"
+#   역산해서 자동으로 딱 맞춘다. 처음엔 640x400을 임의로 잡았는데, 실측 4점(근거리~1m)이
+#   ROI 전체(DL_ROI_Y0:Y1, 640px 폭) 중 일부만 커버하다 보니 그 바깥으로 워프되는 영역이
+#   생각보다 넓어서 위/아래/양옆에 안 쓰는 검은 여백이 크게 남았다(디버그 창에서 실측 확인).
+#   방법: ①실측 4점→목적 사각형(W=0.8m*스케일, H=1.0m*스케일)으로 1차 M을 구하고,
+#   ②그 M으로 ROI 네 모서리가 어디로 매핑되는지 계산해서 바운딩박스를 구한 뒤,
+#   ③목적점 전체를 그 바운딩박스의 좌상단이 (0,0)에 오도록 평행이동 — 이러면 ROI 전체가
+#   여백 없이 캔버스에 꽉 찬다.
+#   단, 이렇게 해도 위(원거리)/아래(근거리) 폭이 서로 다른 "사다리꼴" 모양 자체는 없어지지
+#   않는다 — 카메라 화각이 고정이라 원거리일수록 같은 화면폭이 더 넓은 실제거리를 담기
+#   때문에(원근투영의 기본 성질), 사다리꼴 아래쪽 양 모서리에 남는 검은 삼각형은 "잘못
+#   잡은 여백"이 아니라 "그 위치엔 애초에 대응하는 도로 데이터가 없다"는 뜻이다.
+DL_ROI_W_PX = 640  # 원본 카메라 프레임 폭(TwinLiteNetEngine.infer_raw()가 업샘플링하는 크기)
+_dl_roi_h_px = DL_ROI_Y1 - DL_ROI_Y0
+_dl_block_w = 0.8 * DL_PIXELS_PER_METER
+_dl_block_h = 1.0 * DL_PIXELS_PER_METER
+_dl_block_dst = np.float32([[0, 0], [_dl_block_w, 0], [_dl_block_w, _dl_block_h], [0, _dl_block_h]])
+_dl_M0 = cv2.getPerspectiveTransform(DL_BEV_SRC_PX, _dl_block_dst)
+
+_dl_roi_corners = np.float32([
+    [0, 0], [DL_ROI_W_PX - 1, 0], [DL_ROI_W_PX - 1, _dl_roi_h_px - 1], [0, _dl_roi_h_px - 1]
+]).reshape(-1, 1, 2)
+_dl_mapped_corners = cv2.perspectiveTransform(_dl_roi_corners, _dl_M0).reshape(-1, 2)
+_dl_min_xy = _dl_mapped_corners.min(axis=0)
+_dl_max_xy = _dl_mapped_corners.max(axis=0)
+
+DL_BEV_CANVAS_W = int(np.ceil(_dl_max_xy[0] - _dl_min_xy[0])) + 1
+DL_BEV_CANVAS_H = int(np.ceil(_dl_max_xy[1] - _dl_min_xy[1])) + 1
+DL_BEV_DST_PX = _dl_block_dst - _dl_min_xy  # 목적점을 캔버스 원점 기준으로 평행이동
+
 # ── SlideWindow moments 로직 재사용을 위한 DL 전용 튜닝값 ──
 #   classic 파이프라인은 BEV로 워프된 ROI px 스케일이고, DL은 원본 카메라 프레임 px
 #   스케일(BEV 없음, 위 DL_ROI_Y0:Y1로 자른 640폭 대역)이라 픽셀당 의미가 달라 값을 따로
@@ -298,6 +353,28 @@ class DLSlideWindow(SlideWindow):
         self.ll_mask_roi = None    # 시각화용
         self.centerline = []       # da 밴드별 중심점(원본 관측점, 길이 self.n_slices)
 
+        # DL_USE_BEV=True일 때만 쓰는 워프 행렬. 상수라 매 프레임 다시 안 만들고 한 번만 계산.
+        self._bev_M = (
+            cv2.getPerspectiveTransform(DL_BEV_SRC_PX, DL_BEV_DST_PX)
+            if DL_USE_BEV else None
+        )
+
+    def _bev_warp(self, roi_img, nearest=False):
+        """cropped ROI(da/ll 확률맵 float32, yellow 이진마스크, 디버그용 raw_bgr) 하나를
+        DL_BEV_CANVAS 크기로 원근변환한다. da/ll은 이진화 전(float 확률맵) 상태로 넣어야
+        경계가 계단처럼 뭉개지지 않는다(INTER_LINEAR로 워프 후 detect()에서 이진화).
+        이미 이진값인 마스크(yellow)는 중간값이 생기지 않도록 nearest=True로 호출한다.
+        classic_cv(CameraProcessor)와 달리 워프 전 소스를 사다리꼴 밖으로 미리 마스킹하지
+        않는다 — da/ll은 이미 세그멘테이션으로 배경이 지워진 깨끗한 마스크라 classic_cv가
+        겪은 "배경 텍스처가 대각선으로 늘어붙는" 문제(원본 컬러/엣지 기반이라 생김)가 원천적으로
+        없고, 오히려 사다리꼴(두 백선 사이)만 남기면 백선 바깥 도로까지 포함해야 하는
+        da/ll 정보를 불필요하게 잘라내게 된다."""
+        flags = cv2.INTER_NEAREST if nearest else cv2.INTER_LINEAR
+        return cv2.warpPerspective(
+            roi_img, self._bev_M, (DL_BEV_CANVAS_W, DL_BEV_CANVAS_H),
+            flags=flags, borderValue=0
+        )
+
     def _largest_da_component(self, da_mask):
         """da 마스크에서 가장 큰 연결 덩어리 하나만 남기고 나머지(급커브 등에서 생기는
         파편)는 지운다. 덩어리가 DL_DA_MIN_COMPONENT_AREA보다 작으면(사실상 안 보임)
@@ -376,10 +453,24 @@ class DLSlideWindow(SlideWindow):
         y1 = max(y0, min(DL_ROI_Y1, h))
 
         ll_roi = ll_prob[y0:y1]
+        da_roi = da_prob[y0:y1]
+        yellow_roi = yellow_mask[y0:y1]
+        vis_roi = raw_bgr[y0:y1]
+
+        # [2026-08-05] DL_USE_BEV=True면 여기서 원근왜곡을 제거한다 — da/ll은 이진화 전
+        # (float 확률맵) 상태로 워프해야 경계가 계단처럼 뭉개지지 않는다. 이후의 이진화/
+        # largest_component/clip_by_ll/slice_centers는 전부 마스크 shape만 보는 범용
+        # 로직이라 좌표계가 원근이든 BEV든 그대로 재사용된다(self.roi_h/roi_w가 da_mask.shape
+        # 를 따라가므로 자동으로 캔버스 크기로 바뀐다).
+        if DL_USE_BEV:
+            ll_roi = self._bev_warp(ll_roi)
+            da_roi = self._bev_warp(da_roi)
+            yellow_roi = self._bev_warp(yellow_roi, nearest=True)
+            vis_roi = self._bev_warp(vis_roi)
+
         ll_mask = (ll_roi >= DL_FG_THRESHOLD).astype(np.uint8) * 255
         self.ll_coverage = float(np.count_nonzero(ll_mask)) / ll_mask.size if ll_mask.size else 0.0
 
-        da_roi = da_prob[y0:y1]
         da_mask = (da_roi >= DL_FG_THRESHOLD).astype(np.uint8) * 255
         # 급커브 파편화 대응: 가장 큰 덩어리만 남긴다(모듈 상단 주석 참고). ll 클리핑보다
         # 먼저 해야 한다 — 이 시점엔 da가 아직 하나의 연결된 덩어리라 "가장 큰 덩어리"가
@@ -397,12 +488,10 @@ class DLSlideWindow(SlideWindow):
         ref_x = self._confirmed[3] if self._confirmed is not None else da_mask.shape[1] / 2.0
         da_mask = self._clip_da_by_ll(da_mask, ll_mask, ref_x)
 
-        yellow_roi = yellow_mask[y0:y1]
-
         self.da_mask_roi = da_mask
         self.ll_mask_roi = ll_mask
         self.roi_h, self.roi_w = da_mask.shape
-        self.vis = raw_bgr[y0:y1].copy()
+        self.vis = vis_roi.copy()
 
         # da 중심선 — 밴드별 무게중심(_slice_centers는 색상/의미에 상관없이 "임의의
         # 이진마스크를 세로로 N등분해 구간별 moments 중심을 구하는" 범용 로직이라
