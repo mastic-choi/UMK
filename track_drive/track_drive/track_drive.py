@@ -389,7 +389,12 @@ class TrackDriverNode(Node):
         # 차선 세그멘테이션 경로(self.lane_path) 추종용 — _lane_pid()(PID)를 대체.
         # _lane_pid()는 B2/B3 장애물회피 behavior(apply_behavior_override())가 여전히
         # 쓰므로 그대로 남겨둔다 — 없앤 게 아니라 "일반 차선주행" 용도에서만 교체한 것.
-        self.pure_pursuit = PurePursuitController(angle_max_deg=ANGLE_MAX)
+        # speed_lo/speed_hi를 _lane_drive()가 실제로 내는 속도 범위(SPEED_NORMAL*0.15 ~
+        # SPEED_NORMAL)에 명시적으로 맞춘다 — PurePursuitController의 기본값(0.75/5.0)과
+        # 지금은 같은 값이지만, SPEED_NORMAL을 나중에 바꿔도 여기서 같이 따라가게 하기 위함.
+        self.pure_pursuit = PurePursuitController(angle_max_deg=ANGLE_MAX,
+                                                    speed_lo=SPEED_NORMAL * 0.15,
+                                                    speed_hi=SPEED_NORMAL)
 
         self.path = None
         self.grid = None

@@ -30,11 +30,12 @@ class PurePursuitController:
     lane_util._debounce()가 무효 프레임에 직전 확정값을 유지하는 것과 같은 원칙."""
 
     def __init__(self, lookahead_px=90.0, wheelbase_px=50.0, angle_max_deg=100.0, alpha=0.5,
-        # 목표점을 찾는 전방주시거리(px). ROI가 짧은 백엔드(hough_lane은 ROI 높이가
-        # ~70px로 매우 짧다)에서는 경로 전체 길이가 lookahead_px보다 짧아져 자동으로
-        # path의 가장 먼 점이 목표점이 된다(_target_point() 참고) — 그 자체로는 안전한
-        # 폴백이지만 반응이 둔해지니, 그런 백엔드에서 체감 반응이 느리면 값을 줄일 것.
-        # 실차 미검증 튜닝값.
+                 min_lookahead_px=65.0, lookahead_gain_px=45.0, speed_lo=0.75, speed_hi=5.0):
+        # 목표점을 찾는 전방주시거리(px). speed<=speed_lo(정지에 가까운 저속/급코너)일 때
+        # 쓰는 하한값이다. ROI가 짧은 백엔드(hough_lane은 ROI 높이가 ~70px로 매우 짧다)
+        # 에서는 경로 전체 길이가 lookahead_px보다 짧아져 자동으로 path의 가장 먼 점이
+        # 목표점이 된다(_target_point() 참고) — 그 자체로는 안전한 폴백이지만 반응이
+        # 둔해지니, 그런 백엔드에서 체감 반응이 느리면 값을 줄일 것. 실차 미검증 튜닝값.
         self.lookahead_px = lookahead_px
 
         # 실제 차축거리(m) 대신 쓰는 "곡률→조향각" 게인. 표준 Pure Pursuit 공식
@@ -48,7 +49,7 @@ class PurePursuitController:
 
         # 목표점까지 남은 실제거리(ld)가 이보다 짧으면 곡률 계산을 하지 않고 직전 조향각을
         # 유지한다 — 유효 슬라이스가 적어 path가 짧게 잘린 프레임(부분 가림, 순간 노이즈
-        # 등)에서 _target_point()가 lookahead_px에 못 미쳐 path[-1](아주 가까운 점)을
+        # 등)에서 _target_point()가 (가변)lookahead에 못 미쳐 path[-1](아주 가까운 점)을
         # 목표점으로 쓰게 되는데, curvature = 2*sin(alpha)/ld 는 ld가 작을수록 같은 dx도
         # 훨씬 큰 곡률로 증폭시킨다. 실측 예: ld=42px, dx=3px(육안으론 거의 직진)여도
         # alpha≈4.1°, curvature≈0.0034 → atan(curvature*wheelbase_px=220)≈37° — 픽셀
@@ -56,6 +57,21 @@ class PurePursuitController:
         # 비었을 때(위 return self.prev_steer_deg)와 같은 "못 믿을 프레임은 직전 값 유지"
         # 원칙을 짧은 ld에도 동일하게 적용한다. 실차 미검증 튜닝값.
         self.min_lookahead_px = min_lookahead_px
+
+        # ── 속도 적응형 lookahead ──
+        # 저속(제자리에 가까운 급코너)에서 lookahead가 너무 길면 코너 안쪽을 크게 잘라
+        # 타이트하게 못 붙고, 반대로 고속(직선/완만한 구간)에서 lookahead가 너무 짧으면
+        # 한 프레임(0.05s)에 차가 이동하는 거리에 비해 목표점이 코앞이라 dx의 픽셀
+        # 노이즈가 조향각으로 그대로 증폭돼 좌우로 흔들리다가(오실레이션) 그 편차가
+        # 누적돼 차선을 이탈한다 — 실차에서 재현된 증상. 그래서 speed<=speed_lo에서는
+        # lookahead_px(하한)를, speed>=speed_hi에서는 lookahead_px+lookahead_gain_px
+        # (상한)를 쓰고 그 사이는 선형보간한다(_effective_lookahead() 참고).
+        # speed_lo/speed_hi 기본값은 _lane_drive()의 실제 속도 하한(SPEED_NORMAL*0.15)과
+        # 기본 순항속도(SPEED_NORMAL)에 맞춘 것 — track_drive.py가 다른 값을 쓰면 생성자
+        # 호출부에서 명시적으로 override할 것. 실차 미검증 튜닝값.
+        self.lookahead_gain_px = lookahead_gain_px
+        self.speed_lo = speed_lo
+        self.speed_hi = speed_hi
 
         # 프레임 간 조향각 스파이크 저역통과 — controller/stanley.py의 self.alpha와
         # 동일한 패턴(1프레임짜리 경로 튐이 조향에 그대로 실리지 않도록).
@@ -65,7 +81,17 @@ class PurePursuitController:
     def reset(self):
         self.prev_steer_deg = 0.0
 
-    def _target_point(self, path, vehicle_xy):
+    def _effective_lookahead(self, speed):
+        """speed_lo 이하는 lookahead_px(하한), speed_hi 이상은 lookahead_px+lookahead_gain_px
+        (상한)를 쓰고 그 사이는 선형보간한다. speed_hi<=speed_lo면(설정 오류 방지) 상한을
+        그대로 반환한다."""
+        if self.speed_hi <= self.speed_lo:
+            return self.lookahead_px + self.lookahead_gain_px
+        t = (speed - self.speed_lo) / (self.speed_hi - self.speed_lo)
+        t = max(0.0, min(1.0, t))
+        return self.lookahead_px + t * self.lookahead_gain_px
+
+    def _target_point(self, path, vehicle_xy, lookahead_px):
         """path를 따라 vehicle_xy로부터 누적 호길이가 lookahead_px를 넘는 첫 지점을
         찾아 그 직전 구간 위에서 선형보간한다. 경로 전체 길이가 lookahead_px보다
         짧으면(짧은 ROI, 혹은 유효 슬라이스가 적어 path가 짧게 잘린 경우) 경로의
@@ -74,21 +100,24 @@ class PurePursuitController:
         prev = vehicle_xy
         for x, y in path:
             seg = math.hypot(x - prev[0], y - prev[1])
-            if seg > 1e-6 and acc + seg >= self.lookahead_px:
-                t = (self.lookahead_px - acc) / seg
+            if seg > 1e-6 and acc + seg >= lookahead_px:
+                t = (lookahead_px - acc) / seg
                 return (prev[0] + t * (x - prev[0]), prev[1] + t * (y - prev[1]))
             acc += seg
             prev = (x, y)
         return path[-1]
 
-    def control(self, path, vehicle_xy):
+    def control(self, path, vehicle_xy, speed=0.0):
         """path : [(x,y), ...] ROI 픽셀좌표, 가까운점(차량 근처)→먼점 순
            vehicle_xy : (x,y) 차량 기준점(관례상 ROI 하단 중앙 == path[0] 근방)
+           speed : 이번 프레임에 근사로 쓸 속도(직전 프레임 출력속도) — _effective_lookahead()가
+                   저속/고속 lookahead를 선형보간하는 데만 쓴다.
            반환 : 조향각(도), ±angle_max_deg로 클램프."""
         if not path:
             return self.prev_steer_deg
 
-        tx, ty = self._target_point(path, vehicle_xy)
+        lookahead_px = self._effective_lookahead(speed)
+        tx, ty = self._target_point(path, vehicle_xy, lookahead_px)
         dx = tx - vehicle_xy[0]
         # 이미지 y는 아래로 증가하므로 "전방으로 이만큼"은 vehicle_xy[1]-ty(위로 갈수록 +).
         # 목표점이 차량과 같은 행(dy<=0)에 있는 뒤틀린 경로라도 나눗셈이 죽지 않도록
