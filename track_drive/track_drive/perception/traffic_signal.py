@@ -8,17 +8,18 @@ import cv2
 #     S0: 초록(직진 위치)만 점등 → 출발
 #     S2: 초록만 점등 → 직진 / 초록+빨강 동시 점등 → 좌회전
 #   S0/S2 물리적 카메라-신호등 거리가 같아 ROI/반지름도 공유한다(실측 확인됨).
-SIG4_ROI_T, SIG4_ROI_B = 0.08, 0.28
-SIG4_ROI_L, SIG4_ROI_R = 0.04, 0.78
-SIG4_MIN_RADIUS, SIG4_MAX_RADIUS = 15, 25
+#   기본 튜닝값(SIG4_ROI_*/MIN_RADIUS/MAX_RADIUS/BRIGHT_MARGIN/MAX_CANDIDATES,
+#   DEBUG_VIZ_SIGNAL)은 config.py에 있다 — 실차 테스트 중 값을 바꾸려면 이 파일이
+#   아니라 config.py를 고칠 것. 아래 셋(VERT/HORIZ_DIFF_MAX, MIN_DIST)은
+#   MIN/MAX_RADIUS에서 파생되는 값이라 "N배" 관계를 그대로 보여주려고 여기 둔다.
+from ..config import (
+    SIG4_ROI_T, SIG4_ROI_B, SIG4_ROI_L, SIG4_ROI_R,
+    SIG4_MIN_RADIUS, SIG4_MAX_RADIUS, SIG4_BRIGHT_MARGIN, SIG4_MAX_CANDIDATES,
+    DEBUG_VIZ_SIGNAL,
+)
 SIG4_VERT_DIFF_MAX  = SIG4_MAX_RADIUS * 2
 SIG4_HORIZ_DIFF_MAX = SIG4_MAX_RADIUS * 11
 SIG4_MIN_DIST       = SIG4_MIN_RADIUS * 3
-SIG4_BRIGHT_MARGIN  = 15
-SIG4_MAX_CANDIDATES = 10  # 원이 이보다 많이 잡히면 조합 탐색 없이 바로 실패 처리(ROI 자체가 노이즈로 판단)
-
-#Debug
-DEBUG_VIZ_SIGNAL = False
 
 
 class SignalDetector:

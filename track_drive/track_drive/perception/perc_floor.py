@@ -6,11 +6,12 @@ from .lane_util import CameraProcessor, SlideWindow
 #   프로젝트 전체가 640x480 한 대의 카메라를 전제로 캘리브레이션돼 있어(BEV_SRC/DST, SIG_ROI 등)
 #   해상도가 달라지면 이 값들 전부 재보정 대상이므로, 비율 변환 없이 절대픽셀 그대로 사용.
 #   튜닝도 디버그 창에서 눈으로 사각형 맞추는 방식이라 절대픽셀이 더 직관적.
+#   ROI 크롭 좌표는 이 640x480 가정에 강하게 묶여있어 여기 그대로 두고, 임계값/디버그
+#   플래그만 config.py로 옮겼다(STOPLINE_TH는 track_drive.py에 있던 동명의 죽은 상수와
+#   헷갈리지 않게 STOPLINE_WHITE_RATIO_TH로 이름을 바꿨다).
 STOPLINE_ROI_Y0, STOPLINE_ROI_Y1 = 270, 320   # 세로 밴드
 STOPLINE_ROI_X0, STOPLINE_ROI_X1 = 150, 480   # 가로 중앙 크롭
-STOPLINE_WHITE_LOW = 180                      # 그레이스케일 흰색 임계
-STOPLINE_TH = 0.06                            # ROI 내 흰 픽셀 비율 임계 (실측: 1000/16500 ≈ 6%)
-DEBUG_VIZ_STOPLINE = False
+from ..config import STOPLINE_WHITE_LOW, STOPLINE_WHITE_RATIO_TH, DEBUG_VIZ_STOPLINE
 
 
 def check_stopline(image):
@@ -28,11 +29,11 @@ def check_stopline(image):
     _, binary = cv2.threshold(gray, STOPLINE_WHITE_LOW, 255, cv2.THRESH_BINARY)
 
     white_ratio = float(np.count_nonzero(binary)) / binary.size
-    detected = white_ratio > STOPLINE_TH
+    detected = white_ratio > STOPLINE_WHITE_RATIO_TH
 
     if DEBUG_VIZ_STOPLINE:
         vis = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
-        cv2.putText(vis, f'ratio={white_ratio:.3f} th={STOPLINE_TH:.2f}',
+        cv2.putText(vis, f'ratio={white_ratio:.3f} th={STOPLINE_WHITE_RATIO_TH:.2f}',
                     (4, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
         cv2.putText(vis, 'DETECTED' if detected else 'none',
                     (4, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.5,

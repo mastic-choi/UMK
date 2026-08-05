@@ -26,24 +26,17 @@
 '''
 from enum import Enum
 
-
-# 반대 차선으로 이동할 목표 횡편차(px). ★B-1(차선 폭 실측) 후 실제 차선 폭으로 대체
-PASS_OFFSET = 100.0
-
-# 타겟 횡중심이 이 값(m) 이내면 '정면'으로 보고 방향을 다른 근거로 정한다
-CENTER_DEADZONE_M = 0.12
-
-# 진입/이탈 히스테리시스 (Apollo lane_borrow: 진입/이탈 비대칭 카운터)
-CLEAR_FRAMES_TO_RETURN = 6     # 타겟이 안 보이는 상태가 이만큼 연속되면 복귀 시작
-SWITCH_FRAMES = 8              # 주행 타겟이 내 진행쪽으로 넘어온 상태가 이만큼 지속되면 방향 전환
-
-# 횡이동 수렴 (★3단계에서 5차 다항식·거리 매개변수로 교체 예정)
-LATERAL_ALPHA_OUT = 0.12
-LATERAL_ALPHA_BACK = 0.16      # 복귀는 더 빠르게 — 90cm 규정 때문에 늑장 부리면 차선이탈
-LATERAL_DONE_PX = 8.0
-
-# 추돌 방지 종방향 간격(m). 이보다 가까우면 횡이동이 끝날 때까지 속도를 죽인다
-MIN_GAP_M = 0.6
+# 튜닝값은 전부 config.py에 있다 — 실차 테스트 중 값을 바꿔야 하면 이 파일이
+# 아니라 config.py를 고칠 것.
+#   PASS_OFFSET: 반대 차선으로 이동할 목표 횡편차(px). ★B-1(차선 폭 실측) 후 실제 차선 폭으로 대체
+#   CENTER_DEADZONE_M: 타겟 횡중심이 이 값(m) 이내면 '정면'으로 보고 방향을 다른 근거로 정한다
+#   CLEAR_FRAMES_TO_RETURN/SWITCH_FRAMES: 진입/이탈 히스테리시스 (Apollo lane_borrow 패턴)
+#   LATERAL_ALPHA_OUT/BACK/DONE_PX: 횡이동 수렴 (★3단계에서 5차 다항식·거리 매개변수로 교체 예정)
+#   MIN_GAP_M: 추돌 방지 종방향 간격(m). 이보다 가까우면 횡이동이 끝날 때까지 속도를 죽인다
+from ..config import (
+    PASS_OFFSET, CENTER_DEADZONE_M, CLEAR_FRAMES_TO_RETURN, SWITCH_FRAMES,
+    LATERAL_ALPHA_OUT, LATERAL_ALPHA_BACK, LATERAL_DONE_PX, MIN_GAP_M,
+)
 
 
 class PassPhase(Enum):

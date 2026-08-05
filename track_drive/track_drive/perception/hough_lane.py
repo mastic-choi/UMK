@@ -74,15 +74,15 @@ LANE_WIDTH_EMA_ALPHA = 0.1
 # 노란 중앙선 위치 추정용 색상 마스크 — Hough 로직 자체는 색상을 쓰지 않지만,
 # obstacle_avoidance의 회피방향 판단(choose_side)이 lane_side(내가 어느 차선에
 # 있는지)에 의존하므로, 그 판정에 필요한 최소한의 정보만 별도로 뽑아 제공한다.
-YELLOW_LOWER = np.array([15, 80, 80])
-YELLOW_UPPER = np.array([40, 255, 255])
+# dl_lane.py와 값을 공유하므로 config.py에서 가져온다.
+# DEBUG_VIZ_HOUGH_LANE도 config.py에 있다 — 실차 테스트 중 값을 바꾸려면
+# 이 파일이 아니라 config.py를 고칠 것.
+from ..config import YELLOW_LOWER, YELLOW_UPPER, DEBUG_VIZ_HOUGH_LANE
 
 RED = (0, 0, 255)
 YELLOW_COL = (0, 255, 255)
 BLUE = (255, 0, 0)
 GREEN = (0, 255, 0)
-
-DEBUG_VIZ_HOUGH_LANE = True
 
 
 class HoughLaneDetector:

@@ -77,47 +77,36 @@ DL_INPUT_H = 360
 DL_INPUT_NAME = 'images'
 DL_OUTPUT_NAMES = ('da', 'll')
 
-# da/ll 둘 다 (1,2,360,640) raw logit. 채널축 softmax 후 채널1이 foreground 확률.
-DL_FG_THRESHOLD = 0.5   # 이진화 임계값(요구사항에 명시된 값)
-
 # ── 세그멘테이션 입력은 절대 자르지 않는다 ──
 #   원본 리포(blobFromImage)와 동일하게 raw 프레임 전체를 그대로 640x360으로 리사이즈해서
 #   모델에 넣는다(추가 크롭 없음). 관심영역은 "모델에 들어가기 전"이 아니라 "모델에서 나온
 #   세그멘테이션 결과(da/ll)를 원본 프레임 크기로 되돌린 뒤" 잘라서 쓴다 — 아래
 #   DL_ROI_Y0/Y1 참고.
-
-# ── 세그멘테이션 결과에서 좌/우 차선 중심을 뽑을 관심영역 ──
-#   da/ll은 모델 고정 해상도(360행)로 나오지만, TwinLiteNetEngine.infer_raw()가 이걸
-#   원본 카메라 프레임 크기(640x480)로 다시 업샘플링해서 돌려주므로, 여기 Y0/Y1은
-#   (STOPLINE_ROI 등 프로젝트의 다른 ROI들과 동일하게) 원본 480행 기준 절대 픽셀값이다.
-#   실차 실측값.
-DL_ROI_Y0 = 250
-DL_ROI_Y1 = 390
+#
+# da/ll 둘 다 (1,2,360,640) raw logit. 채널축 softmax 후 채널1이 foreground 확률.
+# DL_FG_THRESHOLD(이진화 임계값), DL_ROI_Y0/Y1(원본 480행 기준 절대 픽셀, 실차 실측값)는
+# config.py에 있다 — 실차 테스트 중 값을 바꾸려면 이 파일이 아니라 config.py를 고칠 것.
+from ..config import DL_FG_THRESHOLD, DL_ROI_Y0, DL_ROI_Y1
 
 # ── BEV(원근변환) — 2026-08-05 bev_point_picker.py로 실측 캘리브레이션 ──
 #   DL 백엔드는 원래 원근(perspective) 픽셀 스케일 그대로 da/ll 중심선을 뽑았다(위
 #   "SlideWindow moments" 섹션 주석 참고) — 카메라에 가까운 픽셀과 먼 픽셀이 나타내는
 #   실제 거리(m/px)가 달라서(원근 압축), 같은 실제 곡률도 화면 위치마다 다른 곡률로
-#   보이고 PIXELS_PER_METER(track_drive.py)도 애초에 상수로 정의가 안 되는 문제가 있었다.
+#   보이고 PIXELS_PER_METER(config.py)도 애초에 상수로 정의가 안 되는 문제가 있었다.
 #   좌/우 백선을 근거리(BL/BR)~1m지점(TL/TR)에서 직접 찍어(bev_point_picker.py) 얻은
 #   4점으로 이 왜곡을 제거한다.
-#     실측: 폭 W=0.8m(LANE_WIDTH_M*2, track_drive.py 기존 실측 — 두 지점 모두 같은 두
+#     실측: 폭 W=0.8m(LANE_WIDTH_M*2, config.py 기존 실측 — 두 지점 모두 같은 두
 #           백선이므로 폭은 근거리/원거리 공통), 길이 L=1.0m(TL~BL 직접 실측, 2026-08-05)
-#     좌표: 아래 4점은 DL_ROI_Y0:Y1로 자른 ROI 기준(원본 y - DL_ROI_Y0). x는 원본 그대로
-#           (ROI가 가로는 안 자름). 순서는 TL(좌상/먼왼쪽)→TR(우상/먼오른쪽)→
-#           BR(우하/가까운오른쪽)→BL(좌하/가까운왼쪽).
-DL_USE_BEV = True  # 실차 검증 중(2026-08-05). 검증 전까지는 기본 False로 되돌릴 것 —
-#   LANE_DETECTOR_BACKEND='dl'(track_drive.py 기본값) 자체가 "실차 트랙 전체 조건에서
+#   DL_USE_BEV/DL_PIXELS_PER_METER와 실측 원점(DL_BEV_SRC_PX_RAW, 원본 프레임 절대좌표)은
+#   config.py에 있다 — 여기서는 그 절대좌표를 ROI 기준 상대좌표로만 변환한다(DL_ROI_Y0만큼
+#   빼기. x는 원본 그대로 — ROI가 가로는 안 자름). 순서는 TL(좌상/먼왼쪽)→TR(우상/먼오른쪽)→
+#   BR(우하/가까운오른쪽)→BL(좌하/가까운왼쪽).
+#   [주의] LANE_DETECTOR_BACKEND='dl'(config.py 기본값) 자체가 "실차 트랙 전체 조건에서
 #   아직 미검증" 상태고, BEV로 좌표계를 바꾸면 DL_DA_MIN_COMPONENT_AREA/DL_SLICE_OUTLIER_MAX/
 #   DL_STABLE_JUMP_MAX 등 원근 픽셀 스케일 기준으로 잡힌 튜닝값들의 "픽셀당 의미"가 전부
 #   바뀐다(아래 캔버스 자동계산 결과 면적이 원래 ROI의 약 1.95배).
-DL_BEV_SRC_PX = np.float32([
-    [246, 257 - DL_ROI_Y0],   # TL: 원본 프레임 좌표 (246, 257)
-    [455, 257 - DL_ROI_Y0],   # TR: 원본 프레임 좌표 (455, 257)
-    [635, 333 - DL_ROI_Y0],   # BR: 원본 프레임 좌표 (635, 333)
-    [ 60, 333 - DL_ROI_Y0],   # BL: 원본 프레임 좌표 ( 60, 333)
-])
-DL_PIXELS_PER_METER = 200.0   # 설계값(실측 아님) — 목적 캔버스를 1m=200px 스케일로 만든다.
+from ..config import DL_USE_BEV, DL_BEV_SRC_PX_RAW, DL_PIXELS_PER_METER
+DL_BEV_SRC_PX = DL_BEV_SRC_PX_RAW - np.float32([0, DL_ROI_Y0])
 
 # ── [2026-08-05] 캔버스 크기를 손으로 정하지 않고 "ROI 전체가 어디까지 매핑되는지"
 #   역산해서 자동으로 딱 맞춘다. 처음엔 640x400을 임의로 잡았는데, 실측 4점(근거리~1m)이
@@ -154,47 +143,17 @@ DL_BEV_DST_PX = _dl_block_dst - _dl_min_xy  # 목적점을 캔버스 원점 기�
 #   스케일(BEV 없음, 위 DL_ROI_Y0:Y1로 자른 640폭 대역)이라 픽셀당 의미가 달라 값을 따로
 #   둔다 — 알고리즘 자체는 lane_util.py의 MOMENT_*/LANE_SLICE_*/STABLE_* 와 동일(이름만
 #   DL_ 접두어). 이제 좌/우 두 갈래가 아니라 da 중심선 "한 갈래"에만 적용된다.
-#   실차 미검증 튜닝값.
-DL_N_SLICES = 8              # da는 좌/우로 안 나누고 한 줄만 뽑으므로, 예전(5)보다 밴드를
-                              # 더 세분화해도 밴드당 픽셀수가 충분하다(da가 ll보다 훨씬 넓은 영역).
-DL_MIN_PIXELS = 40           # da 덩어리 기준이라 ll 기준(25)보다 높임 — 밴드 하나가 대부분
-                              # 비어있으면 그 밴드는 신뢰하지 않는다.
-DL_NEAR_SLICES = 2
-DL_FAR_SLICES = 2
-DL_SLICE_OUTLIER_MAX = 60    # 640px 스케일(≈classic BEV ROI 폭의 2배)이라 허용폭도 비례해서 키움
-DL_SLICE_FIT_MIN = 3
-
-DL_STABLE_FRAME_MIN = 3      # "새 추론이 끝난 시점" 기준 연속 횟수(제어루프 틱 아님)
-DL_STABLE_JUMP_MAX = 30      # 640px 스케일에 맞춰 classic(15px)의 약 2배
-
-# da 파편화 대응 — ConnectedComponents로 가장 큰 덩어리만 남기고, 그 덩어리 면적이
-# 이 값(px) 미만이면 "사실상 da가 안 보인다"고 보고 이번 프레임을 무효 처리한다.
-# ROI가 640x140(≈89,600px)이라 도로 폭 대부분을 차지하는 정상적인 da는 훨씬 크므로,
-# 이 값은 "노이즈 파편 vs 진짜 도로" 정도만 가르는 낮은 문턱이다. 실차 미검증 튜닝값.
-DL_DA_MIN_COMPONENT_AREA = 800
-
-# ll sanity check 임계값 — ROI 내 ll(차선) foreground 비율이 이 미만이면 da 결과와
-# 무관하게 이번 프레임을 무효 처리한다(모션블러 등으로 세그멘테이션이 통째로 깨진 경우
-# da만으로는 못 거르는 실패모드를 ll로 보강). 가는 선 두 줄이 640x140 ROI에서 차지하는
-# 넓이 자체가 원래 작아서(정상 상태에서도 대략 1%대) 문턱을 낮게 잡았다 — 이보다 높이면
-# 차선이 정상적으로 보이는 프레임까지 무효 처리될 수 있다. 실차 미검증 튜닝값.
-DL_LL_SANITY_MIN_RATIO = 0.005
-
-# da가 점선 틈으로 옆 차선 da와 하나의 덩어리로 이어붙었을 때, ll(차선 마킹) 라인을
-# 경계로 그 바깥(옆 차선 쪽) 픽셀을 잘라내는 여유폭(px) — DLSlideWindow._clip_da_by_ll()
-# 참고. ll 선 자체의 두께 + 약간의 여유를 더한 값. 실차 미검증 튜닝값.
-DL_LL_CLIP_MARGIN_PX = 15
-
-DEBUG_VIZ_DL_LANE = True   # lane_util.DEBUG_VIZ_LANE과 동일한 패턴의 디버그 창 on/off 스위치
-
-# ── 색상기반 노란 중앙선 보조 검출 (lane_side 판정용) ──
-#   TwinLiteNet의 ll 출력은 흰/노랑을 구분하지 않는다. track_drive.py의 _update_lane_side()가
-#   yellow_centers에 의존하므로, hough_lane.py와 동일한 HSV 임계값으로 별도 계산해 채워준다.
-#   ※ 이건 DL 모델의 출력이 아니라 명시적으로 추가하는 classic-CV 보조 컴포넌트다.
-YELLOW_LOWER = np.array([15, 80, 80])
-YELLOW_UPPER = np.array([40, 255, 255])
-
-FPS_LOG_PERIOD_SEC = 5.0   # 워커 스레드 FPS/provider 로그 주기
+#   전부 config.py에 있다(DL_N_SLICES/MIN_PIXELS/NEAR_SLICES/FAR_SLICES/SLICE_OUTLIER_MAX/
+#   SLICE_FIT_MIN/STABLE_FRAME_MIN/STABLE_JUMP_MAX/DA_MIN_COMPONENT_AREA/
+#   LL_SANITY_MIN_RATIO/LL_CLIP_MARGIN_PX, DEBUG_VIZ_DL_LANE, YELLOW_LOWER/UPPER,
+#   FPS_LOG_PERIOD_SEC) — 실차 테스트 중 값을 바꾸려면 이 파일이 아니라 config.py를 고칠 것.
+from ..config import (
+    DL_N_SLICES, DL_MIN_PIXELS, DL_NEAR_SLICES, DL_FAR_SLICES,
+    DL_SLICE_OUTLIER_MAX, DL_SLICE_FIT_MIN,
+    DL_STABLE_FRAME_MIN, DL_STABLE_JUMP_MAX,
+    DL_DA_MIN_COMPONENT_AREA, DL_LL_SANITY_MIN_RATIO, DL_LL_CLIP_MARGIN_PX,
+    DEBUG_VIZ_DL_LANE, YELLOW_LOWER, YELLOW_UPPER, FPS_LOG_PERIOD_SEC,
+)
 
 
 def _default_model_path():

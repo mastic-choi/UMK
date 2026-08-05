@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+#=============================================
+# config.py — 실차 테스트용 파라미터 통합 파일.
+#
+# 이 프로젝트의 거의 모든 모듈(track_drive.py, perception/*, controller/*)이
+# 튜닝 파라미터를 여기서 가져다 씁니다(`from .config import *` 또는
+# `from ..config import ...`). 즉 실차 테스트 중 값을 바꿔야 할 때 이 파일
+# 하나만 고치면 됩니다 — 개별 모듈 파일을 헤집을 필요가 없습니다.
+#
+# ── 이 파일에 없는 값들 ──
+#   전부 다 여기 모은 건 아닙니다. OpenCV 알고리즘 내부값(Canny/Hough 임계값,
+#   블러 커널 크기 등)처럼 "행동을 튜닝한다"기보다 "그 함수 내부 구현"에 가까운
+#   상수, 그리고 현재 기본값이 아닌 백엔드(hough/classic_cv 차선인식, Hybrid A*
+#   B2 대안)의 세부 알고리즘 상수는 원래 파일에 그대로 남아있습니다. 각 절의
+#   "관련 지식" 표를 보고 원래 위치를 찾으세요.
+#
+# ── 이번 정리에서 같이 치운 죽은 상수 ──
+#   track_drive.py에 있던 DEBUG_VIZ, DEBUG_VIZ_LANE(자기 것), STOPLINE_TH,
+#   RETURN_THRESHOLD는 정의만 있고 어디서도 참조되지 않는 죽은 상수라 이관하지
+#   않고 삭제했습니다(README에 이미 죽은 플래그로 문서화돼 있던 것들 포함).
+#=============================================
+import math
+from enum import Enum
+
+import numpy as np
+
+
+# #############################################################
+# 미션 상태 Enum — START_STATE가 여기 값을 쓰므로 config.py에 둔다
+# (track_drive.py가 여기서 import해서 그대로 쓴다. 순환 import 방지 목적).
+# #############################################################
+
+class MissionState(Enum):
+    S0_WAIT_GREEN   = 0  # 3구 신호등 초록불 대기 후 출발
+    S1_LANE_FOLLOW  = 1  # 차선인식 주행 (라바콘·고정장애물·추월 Behavior를 이 상태 안에서 처리)
+    S2_INTERSECTION = 2  # 4구 신호등 교차로 (정지→라이다 경로판단→직진/좌회전)
+    S3_SHORTCUT     = 3  # 지름길 (직진, 끝에서 좌회전)
+    S4_FINISH       = 4  # 종료
+
+class BehaviorState(Enum):
+    B0_NORMAL   = 0  # Mission(차선주행) 출력 그대로
+    B1_LAVACON  = 1  # 라바콘 구간 주행 (Phase.LAVACON일 때, 좌우 라이다 클러스터 동시검출 트리거로 활성)
+    B2_OBSTACLE = 2  # 고정장애물 회피 (Phase.FIXED_OBSTACLE일 때, 감지 시 활성)
+    B3_VEHICLE  = 3  # 방해차량 추월   (Phase.VEHICLE일 때, 감지 시 활성)
+
+# S1(차선주행) 내부 진행 순서 — 순서 고정(라바콘→고정장애물→방해차량→완료), 순차 전용(우선순위 판단 불필요)
+class Phase(Enum):
+    LAVACON        = 0
+    FIXED_OBSTACLE = 1
+    VEHICLE        = 2
+    DONE           = 3  # 모든 Behavior 미션 완료 — 이후 계속 B0로 일반 차선주행
+
+
+# #############################################################
+# 1. 차선인식 백엔드 선택
+# #############################################################
+#   track_drive.py의 perc_lane()은 self.lane_detector.detect(frame) ->
+#   (valid, offset, lookahead, lane_center, path, debug_img) 인터페이스에만
+#   의존하는 pluggable 구조라, 아래 셋 중 하나로 자유롭게 바꿔 끼울 수 있다.
+#     'dl'         : perception/dl_lane.py의 DLLaneDetector (TwinLiteNet ONNX
+#                    세그멘테이션, 별도 스레드 추론). **현재 기본값**.
+#     'hough'      : perception/hough_lane.py의 HoughLaneDetector. 대안,
+#                    실차 라바콘 테스트까지 검증됨. 'dl' 초기화 실패 시 자동 폴백.
+#     'classic_cv' : perception/lane_util.py+perc_floor.py 조립. 보존용,
+#                    현재 라이브 미검증.
+LANE_DETECTOR_BACKEND = 'dl'  # 'hough' | 'classic_cv' | 'dl'
+
+
+# #############################################################
+# 2. 차량 속도 / 조향 기본값
+# #############################################################
+SPEED_NORMAL  = 8.0    # 차선주행(S1) 기본속도. 0.0으로 두지 말 것 — _lane_drive()에서 나눗셈 분모로도 쓰여 ZeroDivisionError.
+SPEED_LAVACON = 2.5    # 라바콘 구간 속도
+SPEED_STOP    = 0.0
+ANGLE_MAX     = 100.0  # 조향각 클램프(도)
+ANGLE_RATE_MAX = 12.0  # 조향 변화율 제한(도/주기, 20Hz 기준 12도/주기=240도/초) — drive()에서 모든 명령에 일괄 적용
+SPEED_ACCEL_STEP = 0.85  # 가속 속도제한(주기당 최대 증가량)
+CORNER_HOLD_DECAY_LO = 0.92  # 저속 시 코너 hold 감쇠 (빠른 회복)
+CORNER_HOLD_DECAY_HI = 0.97  # 고속 시 코너 hold 감쇠 (느린 회복, 연속코너 대응)
+LANE_LOOKAHEAD_REF = 220.0   # 예측감속 최대가 되는 lookahead 편차(px) — _lane_drive() 속도계획용
+LAVACON_KP = 210.0           # 라바콘 조향 게인
+
+# ── 코너 진입 시 회전반경 기반 감속 (ROS2 Nav2 Regulated Pure Pursuit 방식) ──
+#   회전반경(1/curvature)이 CORNER_MIN_RADIUS_PX보다 작아지면 그 비율만큼 목표속도를
+#   깎는다. PIXELS_PER_METER 미실측이라 반경은 픽셀 단위 — 실차 미검증 추정치.
+CORNER_MIN_RADIUS_PX = 250.0
+CORNER_MIN_SPEED_SCALE = 0.35  # 반경이 0에 가까워져도 속도가 0으로 죽지 않게 하는 하한 배율
+
+# ── 좌회전 공통 (S2→S3 진입, S3→S1 진출) — 전부 실차 튜닝 필요한 임시값 ──
+TURN_ANGLE       = -60.0   # [진입] S2 교차로 → S3 지름길 좌회전 조향각
+TURN_SPEED       = 15.0    # [진입] 좌회전 속도
+TURN_FRAMES      = 40      # [진입] 좌회전 유지 프레임 수 (20Hz 기준)
+TURN_EXIT_ANGLE  = -60.0   # [진출] S3 지름길 → S1 차선주행 좌회전 조향각
+TURN_EXIT_SPEED  = 15.0    # [진출] 좌회전 속도
+TURN_EXIT_FRAMES = 40      # [진출] 좌회전 유지 프레임 수
+
+# ── 정지선 접근 감속 (S1→S2 진입, S3→S1 진출) ──
+APPROACH_SPEED      = 2.0  # [진입] 정지선 감지 후 S2 진입 전 감속 속도
+APPROACH_TIME       = 1.0  # [진입] 감속 유지 시간(s)
+APPROACH_EXIT_SPEED = 2.0  # [진출] S3 탈출 정지선 감지 후 감속 속도
+APPROACH_EXIT_TIME  = 1.0  # [진출] 감속 유지 시간(s)
+
+
+# #############################################################
+# 3. 차선인식(dl_lane.py) 세부 튜닝 — BEV 적용여부 포함
+# #############################################################
+#   perception/dl_lane.py(현재 기본 백엔드)의 세그멘테이션 후처리 튜닝값 모음.
+#   모델 자체의 입출력 스펙(DL_INPUT_W/H, DL_OUTPUT_NAMES 등)은 "이미 검증된
+#   고정값"이라 dl_lane.py에 그대로 남아있다 — 여긴 실차 조건에 따라 실제로
+#   바꿀 만한 값들만 모았다.
+
+# ── BEV(원근변환) 적용 여부 ──
+#   True면 da/ll 확률맵을 원근변환(BEV)한 뒤 중심선을 뽑는다 — 실차 검증 중.
+#   DL_BEV_SRC_PX(원본 프레임 픽셀 4점)와 DL_PIXELS_PER_METER(설계값, 실측
+#   아님)가 이 변환의 캘리브레이션 입력이다. 재측정 방법/실측값 근거는
+#   track_drive/README.md "6.3 DL 백엔드 BEV 캘리브레이션" 절 참고. 카메라
+#   마운트가 바뀌면(재장착, 진동 등) 아래 4점은 무효가 되므로 재측정 필요.
+DL_USE_BEV = True  # 실차 검증 중(2026-08-05). 검증 전까지는 기본 False로 되돌릴 것
+
+# 실측 픽셀좌표(원본 640×480 프레임 기준, ROI 자르기 전 절대좌표) — TL/TR/BR/BL 순.
+# dl_lane.py가 여기서 DL_ROI_Y0만큼 뺀 ROI-상대좌표로 변환해서 쓴다.
+DL_BEV_SRC_PX_RAW = np.float32([
+    [246, 257],  # TL(좌상/먼왼쪽)
+    [455, 257],  # TR(우상/먼오른쪽)
+    [635, 333],  # BR(우하/가까운오른쪽)
+    [60,  333],  # BL(좌하/가까운왼쪽)
+])
+DL_PIXELS_PER_METER = 200.0   # 설계값(실측 아님) — 목적 캔버스를 1m=200px 스케일로 만든다.
+
+# ── 세그멘테이션 결과에서 좌/우 차선 중심을 뽑을 관심영역 (원본 480행 기준 절대 픽셀, 실차 실측값) ──
+DL_ROI_Y0 = 250
+DL_ROI_Y1 = 390
+
+DL_FG_THRESHOLD = 0.5   # da/ll 확률맵 이진화 임계값(요구사항에 명시된 값)
+
+# ── SlideWindow moments 재사용 DL 전용 튜닝값 (알고리즘은 lane_util.py의
+#   MOMENT_*/LANE_SLICE_*/STABLE_*와 동일, DL은 원본 카메라 프레임 px 스케일이라
+#   값만 따로 둔다) — 전부 실차 미검증 튜닝값 ──
+DL_N_SLICES = 8               # da 중심선을 세로로 나눌 밴드 수
+DL_MIN_PIXELS = 40            # 밴드 내 da 픽셀수가 이 미만이면 그 밴드는 "차선 없음" 처리
+DL_NEAR_SLICES = 2            # 근거리(조향용) 편차 계산에 쓸 아래쪽 밴드 수
+DL_FAR_SLICES = 2             # 원거리(코너 예측용) 편차 계산에 쓸 위쪽 밴드 수
+DL_SLICE_OUTLIER_MAX = 60     # 추세선에서 이 이상(px) 벗어난 밴드는 이상치로 제외
+DL_SLICE_FIT_MIN = 3          # 유효 밴드가 이 미만이면 추세 판단 생략
+DL_STABLE_FRAME_MIN = 3       # "새 추론이 끝난 시점" 기준 연속 안정 프레임 수(디바운스)
+DL_STABLE_JUMP_MAX = 30       # 이 이상(px) 차이나면 새 후보로 취급
+
+# da 파편화 대응 — ConnectedComponents 최대 덩어리 면적이 이 미만이면 "da 안 보임" 처리
+DL_DA_MIN_COMPONENT_AREA = 800
+# ll sanity check — ROI 내 ll(차선) foreground 비율이 이 미만이면 da 결과와 무관하게 무효 처리
+DL_LL_SANITY_MIN_RATIO = 0.005
+# da가 옆 차선과 이어붙었을 때 ll 라인 바깥(옆 차선 쪽) 픽셀을 잘라내는 여유폭(px)
+DL_LL_CLIP_MARGIN_PX = 15
+
+# ── 색상기반 노란 중앙선 보조 검출 (lane_side 판정용, hough_lane.py와 공유) ──
+#   TwinLiteNet의 ll 출력은 흰/노랑을 구분하지 않아 HSV로 별도 검출한다.
+YELLOW_LOWER = np.array([15, 80, 80])
+YELLOW_UPPER = np.array([40, 255, 255])
+
+FPS_LOG_PERIOD_SEC = 5.0   # dl_lane.py 워커 스레드 FPS/provider 로그 주기(s)
+
+
+# #############################################################
+# 4. 조향 컨트롤러 선택 (Pure Pursuit / LQR)
+# #############################################################
+#   track_drive.py의 _lane_steer()가 self.lane_path를 받아 조향각(도)을
+#   계산하는데, 아래 값으로 어떤 컨트롤러를 쓸지 고른다. 둘 다
+#   control(path, vehicle_xy)->조향각(도) 계약이 동일해 전환에 다른 코드
+#   수정이 필요 없다.
+#     'pure_pursuit' : controller/pure_pursuit.py (기하학적, 속도/커브 적응형
+#                      lookahead). **현재 기본값**.
+#     'lqr'          : controller/lqr.py (2-state 운동학 오차모델 LQR, 신규·
+#                      실차 미검증). 처음 켤 때는 저속에서, 언제든 사람이
+#                      개입할 수 있는 상태로 테스트할 것.
+STEERING_CONTROLLER = 'pure_pursuit'  # 'pure_pursuit' | 'lqr'
+
+# ── Pure Pursuit 튜닝값 (controller/pure_pursuit.py PurePursuitController) ──
+#   전부 실차 미검증 튜닝값. 각 값의 설계 배경은 pure_pursuit.py __init__ 상단
+#   주석 참고 — 여기는 "현재 적용값"만 모아둔다.
+PP_LOOKAHEAD_BASE_PX = 90.0        # lookahead 하한(직진/저속 기준값)
+PP_LOOKAHEAD_SPEED_GAIN = 4.0      # 속도가 오를수록 lookahead를 늘리는 게인
+PP_LOOKAHEAD_MAX_PX = 150.0        # lookahead 상한
+PP_LOOKAHEAD_CURVATURE_GAIN = 100.0  # 직전 프레임 curvature가 클수록(코너) lookahead를 줄이는 게인
+PP_LOOKAHEAD_MIN_PX = 40.0         # 코너에서 lookahead가 줄어들 수 있는 하한
+PP_WHEELBASE_PX = 80.0             # "곡률→조향각" 게인(실제 축거리 대신 쓰는 튜닝값)
+PP_ALPHA = 0.5                     # 프레임간 조향각 저역통과 필터(1=필터없음, 0=반응없음)
+PP_MIN_LOOKAHEAD_PX = 90.0         # curvature 분모(ld) 바닥값 — 노이즈 증폭 방지용. PP_LOOKAHEAD_MIN_PX와 다른 값이니 헷갈리지 말 것
+PP_DX_DEADZONE_PX = 6.0            # 이 이하 픽셀오차는 0으로 죽여 중앙 부근 잔떨림 제거
+
+# ── LQR 튜닝값 (controller/lqr.py LQRController) — 전부 실차 미검증 ──
+#   speed_gain: 클수록 반응 커짐. r_steer: 올릴수록 조향 억제(지그재그 완화,
+#   q_lateral/q_heading 건드리기 전에 먼저 조정). q_lateral/q_heading: lateral
+#   비중↑→중앙복귀 서두름(오버슈트 위험), heading 비중↑→각도부터 맞추고 천천히
+#   복귀. wheelbase_gain: 조향 강도. alpha: 저역통과(반응 느리면 올리고 잔떨림
+#   있으면 낮출 것). heading_probe_px/min_path_px: 노이즈 방지 안전장치(조향이
+#   자꾸 직전값 유지로 빠지면 낮출 것).
+LQR_WHEELBASE_GAIN = 50.0
+LQR_SPEED_GAIN = 120.0
+LQR_Q_LATERAL = 1.0
+LQR_Q_HEADING = 1.0
+LQR_R_STEER = 1.0
+LQR_DT = 0.05               # control_loop 타이머 주기(20Hz)와 반드시 일치 — 튜닝값 아닌 시스템 상수
+LQR_HEADING_PROBE_PX = 65.0
+LQR_ALPHA = 0.5
+LQR_MIN_PATH_PX = 65.0
+
+
+# #############################################################
+# 5. 디버깅 ON/OFF
+# #############################################################
+DEBUG_LOG    = True   # 0.5초마다 CLI에 [LAP]/[SENS]/[LANE]/[TRIG]/[SIG]/[LAVA-ROI] 로그
+DEBUG_PERIOD = 0.5     # 위 로그 주기(s)
+
+DEBUG_VIZ_LIDAR    = True   # 라이다 BEV 장애물 감지 디버그 창 (track_drive.py)
+DEBUG_VIZ_LAVACON  = False  # 라바콘 트리거 좌우 클러스터 BEV 디버그 창 (track_drive.py)
+DEBUG_PLANNER      = False  # Hybrid A* OccupancyGrid 디버그 창 (track_drive.py, USE_HYBRID_ASTAR_FOR_B2=True일 때만 의미있음)
+DEBUG_VIZ_STEER    = True   # 조향 컨트롤러(직전값유지/현재값반영) 한글 디버그 창 (track_drive.py)
+
+DEBUG_VIZ_DL_LANE    = True   # 차선 — 기본 백엔드('dl') 디버그 창 (perception/dl_lane.py)
+DEBUG_VIZ_HOUGH_LANE = True   # 차선 — 대안 백엔드('hough') 디버그 창 (perception/hough_lane.py)
+DEBUG_VIZ_LANE       = True   # 차선 — 대안 백엔드('classic_cv') 디버그 창 (perception/lane_util.py)
+DEBUG_VIZ_STOPLINE   = False  # 정지선 디버그 창, 백엔드 무관 항상 동작 (perception/perc_floor.py)
+DEBUG_VIZ_SIGNAL     = False  # 신호등(S0/S2 공용) 디버그 창 (perception/traffic_signal.py)
+
+
+# #############################################################
+# 6. 미션 State / 실차 테스트 범위 제한
+# #############################################################
+START_STATE     = MissionState.S1_LANE_FOLLOW
+ENABLE_BEHAVIOR = False   # S1에서 라바콘/장애물/추월 Behavior를 켤지 여부(최상위 스위치)
+
+# ── 실차 테스트 범위 제한 ──
+#   지금 단계에서 실차로 검증 가능한 건 딱 세 가지: ①신호등 인식 후 출발(S0)
+#   ②차선주행(S1) ③라바콘 주행(B1). 나머지(S2 교차로/S3 지름길, B2 고정장애물/
+#   B3 방해차량)는 아직 실차 미검증(좌회전 각도·속도 placeholder)이라 테스트 중
+#   의도치 않게 발동하면 위험할 수 있어 아래 두 플래그로 강제로 꺼둔다.
+#   → 전체 미션을 테스트할 준비가 되면(좌회전 튜닝 끝) 둘 다 False로 되돌릴 것.
+TEST_DISABLE_INTERSECTION = True
+#   True: 정지선을 감지해도 감속→S2_INTERSECTION 전환을 아예 안 함(차선주행만 계속).
+#   False: 원래대로 정지선 감지 시 감속 후 S2로 정상 전환.
+TEST_DISABLE_B2_B3 = True
+#   True: Phase가 FIXED_OBSTACLE/VEHICLE로 넘어가도 트리거 검사를 건너뛰고
+#         B0_NORMAL로 고정(B1 끝난 뒤 계속 일반 차선주행만 함).
+#   False: 원래대로 SAFETY_DIST/OVERTAKE_TRIGGER 트리거 검사해서 B2/B3 정상 발동.
+TEST_FORCE_BEHAVIOR = True
+#   True: _behavior_enabled를 시작부터 강제 True로 켜서, 교차로를 끈 채로도
+#         라바콘(B1)만 독립적으로 실차 검증할 수 있게 한다.
+#   False: 원래대로 S2 교차로 직진 신호를 받아야만 Behavior가 켜짐.
+#   → 전체 미션 테스트로 넘어갈 때는 TEST_DISABLE_INTERSECTION=False와 함께
+#     이것도 False로 되돌릴 것(둘 다 켜두면 시나리오 순서가 어긋난다).
+
+# ── B2 회피 방식 선택 ──
+#   False = ObstacleAvoidance(차선 기반 횡이동, 기본값)
+#   True  = Hybrid A* + OccupancyGrid + Stanley (비교/보존용) — planner/ 참고
+USE_HYBRID_ASTAR_FOR_B2 = False
+
+# ── 바퀴(Lap) 카운트 — 트랙은 닫힌 곡선이라 한 바퀴 돌면 누적 yaw가 정확히 360도 ──
+TOTAL_LAPS = 3
+LAP_YAW_FULL   = math.radians(330.0)  # 이만큼 돌면 한 바퀴 완주로 확정(360도에 여유)
+LAP_YAW_MIN    = math.radians(270.0)  # 정지선으로 조기 확정하려면 최소 이만큼은 돌아야 함
+LAP_MIN_T      = 20.0   # 한 바퀴 최소 소요시간(s) — 연속 오검출 차단
+LAP_YAW_CONFIRM_FRAMES = 10  # 누적 임계를 넘은 상태가 이 프레임(20Hz→0.5초) 연속 유지돼야 확정
+RESET_PHASE_EACH_LAP = True
+#   True : 새 바퀴가 시작되면 Phase를 LAVACON으로 되돌린다(라바콘 등은 매 바퀴 다시 만남).
+#   False: Phase를 유지한다(1바퀴만 미션 수행하고 이후 순수 차선주행).
+
+
+# #############################################################
+# 7. 기타 튜닝 파라미터 (PID, 트리거, 회피, 신호등, 정지선, 단위환산 등)
+# #############################################################
+
+# ── 라이다 장착 각도 보정 (재실측 2026-07-22) ──
+#   perc_obstacle()/perc_lavacon_trigger()에서 극좌표→직교좌표 변환 시
+#   "deg = 인덱스(도) - LIDAR_ANGLE_OFFSET_DEG"로 이 오프셋을 뺀다.
+#   보정 후 각도 약속: 0=정면, 90=좌측, 180=후방, 270(-90)=우측(반시계 방향).
+LIDAR_ANGLE_OFFSET_DEG = 80.0
+BODY_MASK_ENABLED = True  # 차체 자기가림 마스킹(BODY_LO~BODY_HI) 전체 스위치. 최종 확정(2026-07-22)
+
+# ── 차선 PID (_lane_pid(), B2/B3 behavior가 여전히 사용) ──
+LANE_KP, LANE_KI, LANE_KD = 0.70, 0.0008, 0.15
+LANE_INTEGRAL_TERM_MAX = 10.0  # [anti-windup] 적분항이 조향에 기여할 수 있는 최대 각도(도)
+LANE_SIDE = 1               # 주행 차선: +1=노란선 오른쪽(우측차선), -1=왼쪽
+LANE_CORNER_BOOST = 1.8     # 코너(큰 offset) 조향 가중
+LANE_CORNER_REF   = 120.0   # 이 offset(px)에서 가중 최대
+LANE_CORNER_MIN   = 40.0    # 코너 가중 시작 임계(px)
+LANE_DEADZONE     = 40.0    # 중앙 데드존(px)
+
+# ── 차선 인식 안정화 (perception/lane_util.py — dl/classic_cv 백엔드 공용) ──
+# 프레임 간 스파이크 필터링(디바운스): 새로 들어온 (lane_valid, offset)이 직전
+#   "후보"와 STABLE_JUMP_MAX(px) 이내로 비슷하면 후보 연속 프레임 수를 늘리고,
+#   벗어나면 새 후보로 교체하며 카운트를 1로 리셋한다. 후보가 STABLE_FRAME_MIN
+#   프레임 연속 유지돼야만 확정값으로 승격돼 실제 출력에 반영된다 — 1~2프레임짜리
+#   튐이 조향에 바로 반영되지 않게 막는다. 실차 미검증 튜닝값.
+STABLE_FRAME_MIN = 3   # 후보를 확정값으로 승격시키기 위해 필요한 연속 프레임 수
+STABLE_JUMP_MAX = 15   # 이 이상(px) 차이나면 "같은 흐름"이 아닌 새 후보로 취급
+
+# 경로(웨이포인트) 프레임 간 EMA 스무딩 — pure_pursuit이 실제로 추종하는 self.path는
+#   매 프레임 그 프레임의 관측점만으로 처음부터 다시 피팅돼 대입되므로(dl_lane.py
+#   detect(), lane_util.calc_center() 공통) 별도 필터가 없으면 프레임간 흔들림이
+#   그대로 조향에 실린다. 웨이포인트 인덱스별로 새 값과 직전 값을 블렌딩(x,y 둘 다 —
+#   y_far가 프레임마다 달라지므로 x만 블렌딩하면 인덱스가 가리키는 실제 지점이 어긋남).
+#   값을 낮추면(더 스무딩) 저킹은 줄지만 코너 진입 반응이 늦어짐. 실차 미검증 튜닝값.
+#   [2026-08-05] 실차 조향 오실레이션("와리가리") 대응으로 0.3→0.2 하향(pure_pursuit.py의
+#   속도 적응형 lookahead와 같은 목적 — 입력 신호 자체의 프레임간 흔들림을 줄임).
+#   [2026-08-06] 0.2→0.4로 재상향. pure_pursuit.py 쪽 lookahead 얼어붙음 버그 수정 +
+#   curvature 기반 lookahead 축소로 "중심선이 waypoint에서 벗어나면 되돌아오는 반응이
+#   한 박자 늦다"는 문제를 제어 단계에서 어느 정도 잡았으니, 인지 단계 경로 스무딩도
+#   새 프레임 비중을 높여 지연 자체를 줄여본다. 오실레이션 재발 시 0.2~0.3으로 낮출 것.
+PATH_EMA_ALPHA = 0.4   # 새 프레임에 줄 가중치(작을수록 더 부드럽고, 더 느리게 반응)
+
+# ── 라바콘/장애물/방해차량/신호등 트리거 ──
+LAVACON_DONE_FRAMES = 80      # 우측콘 미검출이 연속 N프레임(20Hz→약 4초) 쌓이면 Phase 전환(디바운스)
+LAVACON_TRIGGER_FRAMES = 5    # 좌우 클러스터 동시검출이 연속 N프레임 쌓이면 B1_LAVACON 진입 확정
+SAFETY_DIST      = 5.0        # B2(고정장애물) 발동 거리(m)
+OVERTAKE_TRIGGER = 6.5        # B3(방해차량) 발동 거리(m)
+VEHICLE_TRIGGER_FRAMES = 5    # 라이다 단독검출 연속 N프레임이면 B3_VEHICLE 진입 확정
+SIG_CONFIRM_FRAMES = 3        # 신호등(직진/좌회전) 판정이 연속 N프레임 유지돼야 확정(20Hz→0.15s)
+
+# ── 장애물회피(TargetPassing, controller/obstacle_avoidance.py) ──
+PASS_OFFSET = 100.0          # 반대 차선으로 이동할 목표 횡편차(px)
+CENTER_DEADZONE_M = 0.12     # 타겟 횡중심이 이 값(m) 이내면 '정면'으로 보고 방향을 다른 근거로 정함
+CLEAR_FRAMES_TO_RETURN = 6   # 타겟이 안 보이는 상태가 이만큼 연속되면 복귀 시작
+SWITCH_FRAMES = 8            # 주행 타겟이 내 진행쪽으로 넘어온 상태가 이만큼 지속되면 방향 전환
+LATERAL_ALPHA_OUT = 0.12     # 옆차선 이동 수렴 속도
+LATERAL_ALPHA_BACK = 0.16    # 복귀 수렴 속도 — 90cm 규정 때문에 늑장 부리면 차선이탈, OUT보다 빠르게
+LATERAL_DONE_PX = 8.0        # 이 이하로 좁혀지면 이동 완료로 판정
+MIN_GAP_M = 0.6              # 추돌 방지 종방향 간격(m) — 이보다 가까우면 횡이동 끝날 때까지 속도를 죽임
+
+# ── 신호등(S0/S2 공용 4구, perception/traffic_signal.py) ──
+SIG4_ROI_T, SIG4_ROI_B = 0.08, 0.28
+SIG4_ROI_L, SIG4_ROI_R = 0.04, 0.78
+SIG4_MIN_RADIUS, SIG4_MAX_RADIUS = 15, 25
+SIG4_BRIGHT_MARGIN  = 15
+SIG4_MAX_CANDIDATES = 10  # 원이 이보다 많이 잡히면 조합 탐색 없이 바로 실패 처리(ROI 자체가 노이즈로 판단)
+
+# ── 정지선(perception/perc_floor.py check_stopline(), 백엔드 무관 항상 사용) ──
+STOPLINE_WHITE_LOW = 180        # 그레이스케일 흰색 임계
+STOPLINE_WHITE_RATIO_TH = 0.06  # ROI 내 흰 픽셀 비율 임계 (실측: 1000/16500 ≈ 6%)
+
+# ── 정지선 접근/이탈 판정 (track_drive.py) ──
+SHORTCUT_MIN_T = 3.0     # 지름길 진입 후 끝감지 활성화까지 최소 주행시간(s, 오판 방지)
+SHORTCUT_MAX_T = 15.0    # 지름길 최대 주행시간(s, 끝 못 찾을 때 강제 탈출 백업)
+STOPLINE_COOLDOWN = 3.0  # 상태 복귀 후 이 시간(s)간 정지선 재감지 무시(따다닥 전환 방지)
+
+# ── 인식 끊김 보상 / 교차로 근처 기동 금지 ──
+OBSTACLE_HOLD_T = 0.6                   # 마지막 관측 후 이 시간(s)까지는 장애물이 있다고 본다
+MANEUVER_BLOCK_AFTER_STOPLINE_T = 2.0   # 정지선을 최근에 봤으면 이 시간(s) 동안 회피/추월 기동 금지
+
+# ── 단위 환산 상수 — 실측 후 값만 채울 것 ──
+#   지금 코드에는 '모터 단위'(drive()가 ±100으로 클립하는 값)와 '미터'가 섞여
+#   있다. 아래 값이 0.0이면 아직 미실측 상태라는 뜻이고, 거리 기반 로직은
+#   보수적으로 동작한다.
+METERS_PER_SPEED_UNIT = 0.0   # 모터 속도단위 1당 m/s. (SPEED_NORMAL로 5초 직진 후 거리÷5÷SPEED_NORMAL) — 미실측
+LANE_WIDTH_M          = 0.4   # 실측(2026-08-04): 흰선-흰선(도로 전체폭) 80cm, 노란선 정중앙 확인 → 차선 1개 폭 = 40cm
+PIXELS_PER_METER      = 0.0   # BEV 픽셀 ↔ 미터 환산(전역) — 미실측. DL_USE_BEV가 검증돼 기본 전환되면 DL_PIXELS_PER_METER로 채울 것
+VEHICLE_WIDTH_M       = 0.31  # 실측(2026-08-04): xycar 본체 가로 31cm (세로64cm×가로31cm×높이20cm)
+# 각폭 분류 임계 — 이 폭 이상이면 '차량', 미만이면 '고정장애물'.
+#   실측(2026-08-04): 고정장애물(고장난 차량) 가로20cm×세로41cm×높이16cm,
+#   방해차량 가로28cm×세로54cm×높이19cm → (0.20+0.28)/2 = 0.24
+OBSTACLE_VEHICLE_WIDTH_M = 0.24

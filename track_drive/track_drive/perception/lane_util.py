@@ -27,8 +27,8 @@ BEV_DST = np.float32([
 # TOP을 더 낮은 비율로 내려서(화면 위쪽=먼 거리) ROI를 더 멀리까지 보도록 확장.
 LANE_ROI_TOP = 0.35
 LANE_ROI_BOT = 0.825
-#Debug
-DEBUG_VIZ_LANE = True
+#Debug — config.py에서 가져온다(실차 테스트 중 값을 바꾸려면 config.py를 고칠 것)
+from ..config import DEBUG_VIZ_LANE
 
 # Adaptive Thresholding — 흰 차선 마스킹
 #   기존 CLAHE+Top-Hat(21x21 국소대비)+고정 임계값(10)+HSV 조합 대신, CLAHE 다음
@@ -110,19 +110,11 @@ LANE_SLICE_FIT_MIN = 3        # 유효 슬라이스가 이 개수 미만이면 �
 #   통과했다. MOMENT_MIN_PIXELS와 같은 기준으로 맞춰 실질적으로 걸러지게 한다.
 WHITE_CCA_MIN_AREA = 15
 
-# 프레임 간 스파이크 필터링 (디바운스)
-#   문제 : 반사/워프 왜곡 등으로 특정 프레임 하나만 offset이 크게 튀는 경우가
-#         있다. 이런 튐은 한두 프레임만 반짝 나타나고 사라지는 반면, 실제 차선
-#         변화(코너 진입 등)는 여러 프레임에 걸쳐 연속적으로 이어진다는 차이가 있다.
-#   방법 : 새로 들어온 (lane_valid, offset)이 직전 "후보"와 STABLE_JUMP_MAX(px)
-#         이내로 비슷하면 후보 연속 프레임 수를 늘리고, 벗어나면 그 값을 새
-#         후보로 교체하며 카운트를 1로 리셋한다. 후보가 STABLE_FRAME_MIN 프레임
-#         연속으로 유지돼야만 "확정값"으로 승격해서 실제 출력에 반영한다 —
-#         승격 전까지는 마지막 확정값을 그대로 유지해서, 1~2프레임짜리 튐이
-#         조향에 바로 반영되지 않게 막는다.
-#   실차 미검증 튜닝값.
-STABLE_FRAME_MIN = 3   # 후보를 확정값으로 승격시키기 위해 필요한 연속 프레임 수
-STABLE_JUMP_MAX = 15   # 이 이상(px) 차이나면 "같은 흐름"이 아닌 새 후보로 취급
+# 프레임 간 스파이크 필터링(디바운스) — STABLE_FRAME_MIN/STABLE_JUMP_MAX는
+# config.py에 있다(설계 배경 주석도 그쪽에). 반사/워프 왜곡 등으로 특정 프레임
+# 하나만 offset이 크게 튀는 걸 걸러내는 용도 — 실차 테스트 중 값을 바꾸려면
+# config.py를 고칠 것.
+from ..config import STABLE_FRAME_MIN, STABLE_JUMP_MAX
 
 # 명시적 경로(곡선/웨이포인트) 생성 — controller/pure_pursuit.py가 소비
 #   기존 offset/lookahead(근거리·원거리 두 그룹의 평균 스칼라)만으로는 Pure Pursuit이
@@ -133,28 +125,10 @@ STABLE_JUMP_MAX = 15   # 이 이상(px) 차이나면 "같은 흐름"이 아닌 �
 PATH_N_WAYPOINTS = 12       # 피팅한 곡선에서 뽑아낼 웨이포인트 수
 PATH_EXTRAPOLATE_MARGIN = 1.5  # 다항식 외삽이 튀는 걸 막는 안전클램프(roi_w의 배수)
 
-# 경로(웨이포인트) 프레임 간 EMA 스무딩 — offset/lookahead(_debounce(), perc_lane()의
-#   0.7/0.3 EMA)는 이미 두 겹으로 걸러지는데, pure_pursuit이 실제로 추종하는 self.path는
-#   매 프레임 그 프레임의 관측점만으로 처음부터 다시 피팅돼 대입되고 있어(계보: dl_lane.py
-#   detect(), lane_util.calc_center() 모두 "fitted_path 있으면 그대로 self.path에 대입") 아무
-#   필터도 안 거친다. pure_pursuit.py의 조향각 1탭 EMA(alpha=0.5)만으로는 입력 경로 자체의
-#   프레임간 흔들림(특히 밴드 8개뿐인 DL 쪽에서 두드러짐)을 못 죽여서 조향이 실제 운전보다
-#   과민하게 자주 바뀌는 원인이 된다. 그래서 offset과 같은 패턴(가중 EMA)을 경로에도 적용한다
-#   — 웨이포인트 인덱스별로 새 값과 직전 값을 블렌딩(y도 함께 블렌딩 — y_far가 프레임마다
-#   조금씩 달라지므로 x만 블렌딩하면 인덱스가 가리키는 실제 지점이 어긋난다).
-#   PATH_N_WAYPOINTS가 고정값이라 fitted_path 길이는 항상 self.path와 같다(첫 프레임 등
-#   길이가 다르면 스무딩을 생략하고 그대로 대입).
-#   실차 미검증 튜닝값 — 값을 낮추면(더 스무딩) 저킹은 줄지만 실제 코너 진입 반응이 늦어짐.
-#   [2026-08-05] 실차 조향 오실레이션("와리가리") 대응으로 0.3→0.2 하향. pure_pursuit.py의
-#   속도 적응형 lookahead와 같은 목적(입력 신호 자체의 프레임간 흔들림을 줄임)이라 함께
-#   적용해 효과를 겹쳐본다. 코너 반응이 너무 늦어지면(라바콘 등 급한 커브에서 밀림) 다시
-#   0.3 쪽으로 올릴 것 — 실차 재검증 필요.
-#   [2026-08-06] 0.2→0.4로 재상향. pure_pursuit.py 쪽에서 짧은 ld 얼어붙음 버그 수정 +
-#   curvature 기반 lookahead 축소를 추가하면서 "중심선이 waypoint에서 벗어나면 되돌아오는
-#   반응이 한 박자 늦다"는 문제를 제어 단계에서 어느 정도 잡았으니, 인지 단계의 경로
-#   스무딩은 새 프레임 비중을 높여 그 지연 자체를 줄여본다. 다시 오실레이션이 심해지면
-#   0.2~0.3 쪽으로 낮출 것 — 실차 재검증 필요.
-PATH_EMA_ALPHA = 0.4   # 새 프레임에 줄 가중치(작을수록 더 부드럽고, 더 느리게 반응)
+# 경로(웨이포인트) 프레임 간 EMA 스무딩 — PATH_EMA_ALPHA는 config.py에 있다
+# (설계 배경/변경 이력 주석도 그쪽에 있음). 실차 테스트 중 값을 바꾸려면
+# config.py를 고칠 것.
+from ..config import PATH_EMA_ALPHA
 
 
 #def Debugging(flag):
