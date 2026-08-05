@@ -73,15 +73,24 @@ class PurePursuitController:
 
         self.angle_max_deg = angle_max_deg
 
-        # 목표점까지 남은 실제거리(ld)가 이보다 짧으면 곡률 계산을 하지 않고 직전 조향각을
-        # 유지한다 — 유효 슬라이스가 적어 path가 짧게 잘린 프레임(부분 가림, 순간 노이즈
-        # 등)에서 _target_point()가 (가변)lookahead에 못 미쳐 path[-1](아주 가까운 점)을
-        # 목표점으로 쓰게 되는데, curvature = 2*sin(alpha)/ld 는 ld가 작을수록 같은 dx도
-        # 훨씬 큰 곡률로 증폭시킨다. 실측 예: ld=42px, dx=3px(육안으론 거의 직진)여도
-        # alpha≈4.1°, curvature≈0.0034 → atan(curvature*wheelbase_px=220)≈37° — 픽셀
-        # 몇 개짜리 잡음이 30도대 조향 스파이크로 증폭되는 걸 실제로 재현 가능. path가
-        # 비었을 때(위 return self.prev_steer_deg)와 같은 "못 믿을 프레임은 직전 값 유지"
-        # 원칙을 짧은 ld에도 동일하게 적용한다. 실차 미검증 튜닝값.
+        # 목표점까지 남은 실제거리(ld)가 이보다 짧으면 curvature = 2*sin(alpha)/ld 계산의
+        # 분모(ld)를 이 값으로 바닥을 깐다 — 유효 슬라이스가 적어 path가 짧게 잘린 프레임
+        # (부분 가림, 순간 노이즈 등)에서 _target_point()가 (가변)lookahead에 못 미쳐
+        # path[-1](아주 가까운 점)을 목표점으로 쓰게 되면, ld가 작을수록 같은 dx도 훨씬
+        # 큰 곡률로 증폭된다. 실측 예: ld=42px, dx=3px(육안으론 거의 직진)여도 alpha≈4.1°,
+        # curvature≈0.0034 → atan(curvature*wheelbase_px=220)≈37° — 픽셀 몇 개짜리 잡음이
+        # 30도대 조향 스파이크로 증폭되는 걸 실제로 재현 가능.
+        #   [2026-08-06] 예전엔 ld<min_lookahead_px일 때 계산 자체를 건너뛰고 직전 조향각을
+        #   그대로 반환했는데(freeze), 이러면 "ld가 짧은 상태"(주로 dx 자체가 작을 때 걸림,
+        #   ld≥|dx|라서)가 진동 중 우연히 한 번 걸리는 순간 그때의 조향각에 영원히 고정돼
+        #   버렸다 — 그 뒤로는 실제 편차가 계속 커져도 재계산을 아예 안 해서 차가 한쪽으로
+        #   계속 밀리는데도 못 돌아오는 문제가 실차에서 재현됨(진동하다 갑자기 한쪽으로
+        #   빠져서 그대로 직진하는 증상). 분모만 바닥을 깔면 노이즈 증폭은 여전히 막으면서도
+        #   매 프레임 계속 살아있는 보정을 하므로 이 "얼어붙음"이 없어진다. 대신 짧은
+        #   ld 구간에서 완전히 무시되던 미세한 잔떨림이 약하게나마 계속 반영될 수 있고,
+        #   목표점이 아주 가까우면서 옆으로도 벌어져 있는 극단적인 경우엔(alpha 자체가
+        #   크면) 여전히 큰 조향각이 나올 수 있다 — alpha는 이 바닥값의 영향을 안 받기
+        #   때문. 실차 미검증 튜닝값, 저속·개입 가능 상태로 재검증할 것.
         self.min_lookahead_px = min_lookahead_px
 
         # 프레임 간 조향각 스파이크 저역통과 — controller/stanley.py의 self.alpha와
@@ -137,13 +146,10 @@ class PurePursuitController:
         # 목표점이 차량과 같은 행(dy<=0)에 있는 뒤틀린 경로라도 나눗셈이 죽지 않도록
         # 최소값을 준다.
         dy = max(vehicle_xy[1] - ty, 1e-3)
-        ld = math.hypot(dx, dy)
-
-        # ld가 너무 짧으면(위 min_lookahead_px 주석 참고) 곡률 계산 자체를 건너뛰고
-        # 직전 조향각을 유지한다 — 짧은 ld에서는 픽셀 노이즈가 조향각으로 크게 증폭된다.
-        if ld < self.min_lookahead_px:
-            self.held = True
-            return self.prev_steer_deg
+        # ld가 너무 짧으면(위 min_lookahead_px 주석 참고) 분모만 바닥을 깐다 — 계산 자체를
+        # 건너뛰지 않는다. 짧은 ld에서 픽셀 노이즈가 조향각으로 증폭되는 건 막으면서도,
+        # 매 프레임 계속 보정하므로 "얼어붙어서 못 돌아오는" 문제가 없다.
+        ld = max(math.hypot(dx, dy), self.min_lookahead_px)
 
         alpha = math.atan2(dx, dy)
         curvature = 2.0 * math.sin(alpha) / ld
