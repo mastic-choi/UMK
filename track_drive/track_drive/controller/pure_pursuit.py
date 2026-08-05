@@ -88,9 +88,13 @@ class PurePursuitController:
         # 동일한 패턴(1프레임짜리 경로 튐이 조향에 그대로 실리지 않도록).
         self.alpha = alpha
         self.prev_steer_deg = 0.0
+        # 직전 control() 호출이 "새로 계산"했는지 "직전값을 그대로 유지"했는지 표시.
+        # track_drive.py의 DEBUG_VIZ_STEER 디버그 창이 이 값을 읽어서 보여준다.
+        self.held = False
 
     def reset(self):
         self.prev_steer_deg = 0.0
+        self.held = False
 
     def _target_point(self, path, vehicle_xy, lookahead_px):
         """path를 따라 vehicle_xy로부터 누적 호길이가 lookahead_px를 넘는 첫 지점을
@@ -114,8 +118,11 @@ class PurePursuitController:
            speed : 직전 프레임 명령속도(track_drive.py의 _prev_speed, 모터 단위) 근사치 —
                    lookahead를 속도에 맞춰 늘이고 줄이는 데만 쓰는 순간값이라 누적하지
                    않는다(위치를 적분하는 dead-reckoning과는 다름, 드리프트 없음).
-           반환 : 조향각(도), ±angle_max_deg로 클램프."""
+           반환 : 조향각(도), ±angle_max_deg로 클램프.
+           호출 후 self.held로 이번 호출이 "새로 계산"(False)했는지 "직전값 유지"(True)
+           했는지 확인할 수 있다(디버그 창용)."""
         if not path:
+            self.held = True
             return self.prev_steer_deg
 
         lookahead_px = float(np.clip(
@@ -135,6 +142,7 @@ class PurePursuitController:
         # ld가 너무 짧으면(위 min_lookahead_px 주석 참고) 곡률 계산 자체를 건너뛰고
         # 직전 조향각을 유지한다 — 짧은 ld에서는 픽셀 노이즈가 조향각으로 크게 증폭된다.
         if ld < self.min_lookahead_px:
+            self.held = True
             return self.prev_steer_deg
 
         alpha = math.atan2(dx, dy)
@@ -144,4 +152,5 @@ class PurePursuitController:
         steer_deg = self.alpha * steer_deg + (1.0 - self.alpha) * self.prev_steer_deg
         steer_deg = float(np.clip(steer_deg, -self.angle_max_deg, self.angle_max_deg))
         self.prev_steer_deg = steer_deg
+        self.held = False
         return steer_deg

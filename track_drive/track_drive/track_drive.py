@@ -49,7 +49,10 @@ from .planner.hybrid_astar import HybridAStar
 from .planner.occupancy import OccupancyGrid
 from .controller.stanley import StanleyController
 from .controller.pure_pursuit import PurePursuitController
+from .controller.lqr import LQRController
 from .planner.node import Node as PlannerNode
+from .localization.pose_estimator import EncoderPoseEstimator
+from .kr_text import put_text_kr_multi
 # #############################################################
 # [0] 설정 (Config)
 # #############################################################
@@ -223,12 +226,13 @@ DEBUG_VIZ_LANE  = True  # 차선 슬라이딩윈도우 디버그 창
 DEBUG_VIZ_LIDAR = True  # 라이다 BEV 장애물 감지 디버그 창
 DEBUG_VIZ_LAVACON = False  # 라바콘 트리거 좌우 클러스터 BEV 디버그 창
 DEBUG_PLANNER = False   # planner 디버그 창
+DEBUG_VIZ_STEER = True  # 조향 컨트롤러(직전값유지/현재값반영) 한글 디버그 창
 
 # ── 차선인식 백엔드 선택 ──
 #   perc_lane()은 self.lane_detector.detect(frame) -> (valid, offset, lookahead, lane_center,
 #   path, debug_img) 인터페이스에만 의존하는 pluggable 구조라, 아래 셋 중 하나로 자유롭게 바꿔
 #   끼울 수 있다(perc_lane()/_update_lane_side() 수정 불필요). path(ROI 픽셀좌표 웨이포인트)는
-#   _pure_pursuit_steer()가 조향각 계산에 쓴다.
+#   _lane_steer()가 조향각 계산에 쓴다.
 #     'hough'      : hough_lane.HoughLaneDetector (현재 기본, 실차 라바콘 테스트까지 검증됨)
 #     'classic_cv' : lane_util.CameraProcessor+SlideWindow (BEV+adaptiveThreshold/HSV+moments,
 #                    perc_floor.LaneDetector로 조립. 보존용, 현재 라이브 미검증)
@@ -237,6 +241,17 @@ DEBUG_PLANNER = False   # planner 디버그 창
 #   'dl' 선택 시 onnxruntime 미설치/모델파일 부재 등으로 초기화가 실패하면 __init__에서
 #   에러를 로깅하고 자동으로 'hough'로 폴백한다(조용히 무시하지 않음).
 LANE_DETECTOR_BACKEND = 'dl'  # 'hough' | 'classic_cv' | 'dl'
+
+# ── 조향 컨트롤러 선택 ──
+#   _lane_steer()가 self.lane_path를 받아 조향각(도)을 계산하는데, 아래 값으로 어떤
+#   컨트롤러를 쓸지 고른다. 둘 다 control(path, vehicle_xy)->조향각(도) 계약이 동일해
+#   전환에 다른 코드 수정이 필요 없다.
+#     'pure_pursuit' : controller/pure_pursuit.py (기하학적, 기존 기본값)
+#     'lqr'          : controller/lqr.py (2-state 운동학 오차모델 LQR, 신규·실차 미검증)
+#   'lqr'은 아직 실차 튜닝 전이므로(controller/lqr.py 상단 주석 참고 — wheelbase_gain/
+#   speed_gain 둘 다 튜닝값) 처음 켤 때는 저속에서, 그리고 사람이 언제든 개입할 수
+#   있는 상태로 테스트할 것.
+STEERING_CONTROLLER = 'pure_pursuit'  # 'pure_pursuit' | 'lqr'
 
 # ── 실차 테스트 범위 제한 ──
 #   지금 단계에서 실차로 검증 가능한 건 딱 세 가지: ①신호등 인식 후 출발(S0) ②차선주행(S1)
@@ -287,7 +302,7 @@ class TrackDriverNode(Node):
         self.lane_valid  = False    # 차선 검출 여부
         self.lane_lookahead = 0.0   # 원거리(앞쪽) 편차 → 코너 진입 전 예측감속용
         self.lane_path = []         # 명시적 경로(ROI 픽셀좌표 웨이포인트, 가까운점→먼점)
-                                     #   perc_lane()이 갱신, _pure_pursuit_steer()가 조향각 계산에 사용
+                                     #   perc_lane()이 갱신, _lane_steer()가 조향각 계산에 사용
         self._lane_prev_width = 448.0  # 도로폭 직전값(px, EMA)
         self.lane_side   = LANE_SIDE   # 현재 주행 차선: +1=우측차선(노란선이 왼쪽) / -1=좌측차선
                                         #   노란 중앙선 위치로 매 프레임 갱신(_update_lane_side)
@@ -396,7 +411,9 @@ class TrackDriverNode(Node):
         # 쓰므로 그대로 남겨둔다 — 없앤 게 아니라 "일반 차선주행" 용도에서만 교체한 것.
         # lookahead_base_px/lookahead_speed_gain/lookahead_max_px 등은 클래스 기본값을
         # 그대로 쓴다(BEV 적용 커밋에서 실차로 재확인된 값, controller/pure_pursuit.py 참고).
+        # STEERING_CONTROLLER로 아래 둘 중 _lane_steer()가 실제로 호출할 것을 고른다.
         self.pure_pursuit = PurePursuitController(angle_max_deg=ANGLE_MAX)
+        self.lqr = LQRController(angle_max_deg=ANGLE_MAX)
 
         self.path = None
         self.grid = None
@@ -412,6 +429,19 @@ class TrackDriverNode(Node):
         self.vehicle_speed = 0.0
         self._plan_ref_yaw = 0.0
         self._plan_last_t = 0.0
+
+        # ── 엔코더 기반 pose 추정기 (localization/pose_estimator.py) ──
+        #   위 self.vehicle_x/y/yaw(플래너용, 명령속도 적분 근사)와는 별개로 준비해둔
+        #   컴포넌트. 2026-08-05 기준 이 로봇에 실제 엔코더 ROS 토픽이 있는지/이름이
+        #   뭔지 아직 확인 전이라 지금은 아무 콜백도 이걸 갱신하지 않는다(가짜 값을
+        #   넣지 않기 위해 의도적으로 미배선 상태로 둠). 실제 토픽을 확인하면:
+        #     1) cb_encoder(msg) 콜백 추가 → v_mps 계산
+        #     2) control_loop()에서 매 주기
+        #        self.pose_estimator.update(v_mps, math.radians(self.ctrl_angle), 0.05)
+        #        (혹은 IMU 쓸 수 있게 되면 set_yaw_source('imu') 후
+        #         update(..., imu_yaw=self.imu_yaw))
+        #   wheelbase_m은 줄자로 축간거리 실측 후 대입(픽셀 환산과 무관, 바로 잴 수 있음).
+        self.pose_estimator = EncoderPoseEstimator(wheelbase_m=None)
 
 
         # ── ROS 통신 ──
@@ -1091,7 +1121,7 @@ class TrackDriverNode(Node):
         if self._approach_t0 is not None:
             # 감속 구간: 차선 조향 유지 + 극저속 → 거의 정지 상태로 S2 진입
             elapsed = time.time() - self._approach_t0
-            self.ctrl_angle = self._pure_pursuit_steer()
+            self.ctrl_angle = self._lane_steer()
             self.ctrl_speed = APPROACH_SPEED
             self._prev_speed = APPROACH_SPEED
             if elapsed >= APPROACH_TIME:
@@ -1268,7 +1298,7 @@ class TrackDriverNode(Node):
     # #########################################################
     def _lane_drive(self):
         """S1/S3 공통 차선 조향+감속 로직. ctrl_angle·ctrl_speed·_prev_speed·_corner_hold 갱신."""
-        self.ctrl_angle = self._pure_pursuit_steer()
+        self.ctrl_angle = self._lane_steer()
         turn_now     = min(1.0, abs(self.ctrl_angle) / ANGLE_MAX)
         turn_preview = min(1.0, abs(self.lane_lookahead) / LANE_LOOKAHEAD_REF)
         turn_for_speed = max(turn_now, turn_preview * 0.3)
@@ -1283,21 +1313,69 @@ class TrackDriverNode(Node):
         self.ctrl_speed = target_speed
         self._prev_speed = target_speed
 
-    def _pure_pursuit_steer(self):
+    def _lane_steer(self):
         """self.lane_path(DL/classic_cv/hough 백엔드가 만든 ROI 픽셀좌표 경로, 가까운점→
-        먼점)를 Pure Pursuit으로 추종해 조향각(도)을 계산한다. 차량 기준점은 항상
-        ROI 하단 중앙(roi_w/2, path의 가장 가까운 점의 y좌표)으로 둔다 — path[0].y는
-        lane_util._fit_and_sample_path()가 self.roi_h로 샘플링해둔 값이라 별도로
-        백엔드별 roi_h를 조회할 필요가 없다.
+        먼점)를 STEERING_CONTROLLER로 고른 컨트롤러(pure_pursuit.py 또는 lqr.py)로
+        추종해 조향각(도)을 계산한다. 차량 기준점은 항상 ROI 하단 중앙(roi_w/2, path의
+        가장 가까운 점의 y좌표)으로 둔다 — path[0].y는 lane_util._fit_and_sample_path()가
+        self.roi_h로 샘플링해둔 값이라 별도로 백엔드별 roi_h를 조회할 필요가 없다.
         경로가 비어있으면(첫 프레임, 혹은 roi_w를 아직 모르는 백엔드) 직전 조향각을
-        그대로 유지한다 — PurePursuitController.control()이 내부적으로 처리.
-        속도는 _prev_speed(직전 프레임 출력속도)를 근사치로 넘긴다 — 이번 프레임 ctrl_speed는
-        이 조향각 계산 이후에나 정해지므로(아래 _lane_drive() 참고) 아직 알 수 없다."""
+        그대로 유지한다 — 두 컨트롤러의 control()이 내부적으로 동일하게 처리.
+        (구 이름 _pure_pursuit_steer — STEERING_CONTROLLER로 lqr도 고를 수 있게 되며
+        컨트롤러 중립적인 이름으로 변경)
+        pure_pursuit은 속도 적응형 lookahead 때문에 speed(_prev_speed 근사치)를 받지만,
+        lqr은 자체 speed_gain 튜닝값을 쓰고 control()에 speed 인자가 없다(controller/lqr.py
+        참고) — 그래서 여기서 컨트롤러별로 분기해서 호출한다(공통 kwarg로 합칠 수 없음)."""
+        controller = self.lqr if STEERING_CONTROLLER == 'lqr' else self.pure_pursuit
         roi_w = getattr(self.lane_detector, 'roi_w', 0) or 0
         if not self.lane_path or not roi_w:
-            return self.pure_pursuit.prev_steer_deg
+            return controller.prev_steer_deg
         vehicle_xy = (roi_w / 2.0, self.lane_path[0][1])
+        if STEERING_CONTROLLER == 'lqr':
+            return self.lqr.control(self.lane_path, vehicle_xy)
         return self.pure_pursuit.control(self.lane_path, vehicle_xy, speed=self._prev_speed)
+
+    # [DEBUG_VIZ_STEER] 조향 컨트롤러가 이번 주기에 "새로 계산"했는지(초록/현재값 반영)
+    # "직전 조향각을 그대로 유지"했는지(주황/직전값 유지)를 별도 창으로 바로 확인.
+    # cv2 기본폰트는 한글을 못 그려서 kr_text.put_text_kr_multi(PIL 기반)로 그린다
+    # (kr_text.py 상단 주석 참고). control_loop()에서 매 주기 호출 — 이 함수를 부르는
+    # 시점(run_mission_fsm 직후, behavior override 이전)이 중요: 표시값은 self.ctrl_angle이
+    # 아니라 controller.prev_steer_deg를 쓴다 — B1/B2/B3 behavior가 나중에 self.ctrl_angle을
+    # 덮어써도(apply_behavior_override) 이 창은 항상 "차선 조향 컨트롤러 자체"의 상태를
+    # 보여주기 위함이다.
+    def _debug_viz_steer(self):
+        controller = self.lqr if STEERING_CONTROLLER == 'lqr' else self.pure_pursuit
+        held = getattr(controller, 'held', False)
+
+        canvas = np.full((200, 380, 3), 30, dtype=np.uint8)
+        # 주황 = 직전값 유지(경로 부족/노이즈로 신뢰 못 함), 초록 = 현재값 반영(정상 계산됨)
+        status_color = (0, 140, 255) if held else (0, 200, 0)
+        status_text = '직전값 유지 (경로 부족/노이즈)' if held else '현재값 반영'
+        controller_name = 'LQR' if STEERING_CONTROLLER == 'lqr' else 'Pure Pursuit'
+
+        lines = [
+            (f'컨트롤러: {controller_name}', (10, 8), (255, 255, 255), 20, f'Controller: {controller_name}'),
+            (f'상태: {status_text}', (10, 40), status_color, 20,
+             f'Status: {"HOLD (prev)" if held else "LIVE (fresh)"}'),
+            (f'조향각: {controller.prev_steer_deg:+.1f}도', (10, 72), (255, 255, 255), 20,
+             f'Steer: {controller.prev_steer_deg:+.1f}deg'),
+        ]
+        if STEERING_CONTROLLER == 'lqr':
+            e_y = getattr(controller, 'last_e_y', None)
+            e_psi = getattr(controller, 'last_e_psi', None)
+            if e_y is not None:
+                lines.append((f'횡오차 e_y: {e_y:+.1f}px', (10, 104), (255, 255, 255), 20,
+                               f'e_y: {e_y:+.1f}px'))
+            if e_psi is not None:
+                lines.append((f'헤딩오차 e_psi: {math.degrees(e_psi):+.1f}도', (10, 136), (255, 255, 255), 20,
+                               f'e_psi: {math.degrees(e_psi):+.1f}deg'))
+
+        put_text_kr_multi(canvas, lines)
+        # 한글 폰트가 없어 fallback(영문)만 그려진 경우에도 색 테두리만으로 상태 구분 가능하게.
+        cv2.rectangle(canvas, (0, 0), (canvas.shape[1] - 1, canvas.shape[0] - 1), status_color, 3)
+
+        cv2.imshow('steer_debug', canvas)
+        cv2.waitKey(1)
 
     def _lane_pid(self, offset, deadzone=LANE_DEADZONE):
         """차선 중앙편차(offset)를 PID 제어로 조향각(angle)으로 변환한다."""
@@ -1507,6 +1585,11 @@ class TrackDriverNode(Node):
         self.perceive_all()                 # 1. 인지
         self._update_lap()                  #    바퀴 카운트(누적 yaw + 정지선)
         self.run_mission_fsm()              # 2. 판단(Mission)
+
+        if DEBUG_VIZ_STEER:
+            # behavior override 이전 시점 — 차선 조향 컨트롤러 자체의 상태를 보여준다
+            # (_debug_viz_steer() 상단 주석 참고).
+            self._debug_viz_steer()
 
         if ENABLE_BEHAVIOR and self.mission_state == MissionState.S1_LANE_FOLLOW and self._behavior_enabled:
             self.run_behavior_fsm()         #    Behavior 상태 결정
