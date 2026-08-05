@@ -68,6 +68,53 @@ ros2 launch track_drive track_drive.launch.py
 
 ---
 
+## 0.5 조향 컨트롤러 선택 (Pure Pursuit / LQR)
+
+차선 추종(`_lane_steer()`, [track_drive.py:1316](track_drive.py#L1316))도 백엔드처럼 pluggable합니다.
+`self.pure_pursuit`과 `self.lqr` 둘 다 미리 생성해두고([track_drive.py:414-416](track_drive.py#L414)),
+`STEERING_CONTROLLER`([track_drive.py:254](track_drive.py#L254)) 값에 따라 어느 쪽을 쓸지 고릅니다.
+`_lane_drive()`(S1/S3 차선주행)와 S2 진입 전 감속 구간이 전부 이 하나를 거치므로, 플래그만 바꾸면
+차선 추종 전체가 전환됩니다.
+
+```python
+STEERING_CONTROLLER = 'pure_pursuit'  # 'pure_pursuit' | 'lqr'
+```
+
+| 값 | 구현 | 상태 |
+|---|---|---|
+| `'pure_pursuit'` | `controller/pure_pursuit.py`의 `PurePursuitController` (기하학적, 속도적응형 lookahead) | **현재 기본값** |
+| `'lqr'` | `controller/lqr.py`의 `LQRController` (횡오차/헤딩오차 2-state 운동학 LQR) | 신규, 실차 미검증 |
+
+**주의:** `pure_pursuit.control()`은 속도적응형 lookahead 때문에 `speed=` 인자를 받지만, `lqr.control()`은
+자체 `speed_gain` 튜닝값을 쓰고 그 인자가 없습니다 — 그래서 `_lane_steer()`가 컨트롤러별로 분기해서
+호출합니다([track_drive.py:1334-1336](track_drive.py#L1334)). 두 컨트롤러를 직접 갖다 붙일 일이 있으면
+이 시그니처 차이를 꼭 확인하세요.
+
+**LQR 튜닝 파라미터** (`controller/lqr.py:87` `__init__`, 전부 실차 미검증):
+| 파라미터 | 의미 | 비고 |
+|---|---|---|
+| `speed_gain=120.0` | 속도 대응값(클수록 반응 커짐) | pure_pursuit에 대응 없는 신규 튜닝값 — 실차에서 최우선으로 건드릴 값 |
+| `r_steer=1.0` | 조향각 가중치(올릴수록 조향 억제, 지그재그 완화) | `q_lateral`/`q_heading` 건드리기 전에 먼저 조정 |
+| `q_lateral=1.0` / `q_heading=1.0` | 횡오차/헤딩오차 비중 | lateral 비중↑ → 중앙복귀 서두름(오버슈트 위험), heading 비중↑ → 각도부터 맞추고 천천히 복귀 |
+| `wheelbase_gain=50.0` | 조향 강도 | pure_pursuit의 `wheelbase_px`와 같은 역할의 튜닝 게인 |
+| `alpha=0.5` | 프레임간 저역통과 필터 | 반응이 느리면 올리고, 잔떨림이 있으면 낮출 것 |
+| `heading_probe_px`/`min_path_px=65.0` | 노이즈 방지 안전장치 | 조향이 자꾸 직전값 유지로 빠지면 낮출 것 |
+
+**디버그 방법:**
+- 창: `DEBUG_VIZ_STEER = True`(기본값, [track_drive.py:229](track_drive.py#L229)) → `steer_debug` 창에서
+  지금 어느 컨트롤러가 쓰이는지, 이번 프레임이 "직전값 유지"(주황)인지 "현재값 반영"(초록)인지, 조향각과
+  (`lqr`일 때) 횡오차 `e_y`/헤딩오차 `e_psi`까지 한글로 보여줍니다. cv2 기본폰트가 한글을 못 그려서
+  `kr_text.py`의 PIL 기반 렌더러를 씁니다 — 한글 폰트가 없는 환경이면 영문 fallback으로 표시됩니다.
+
+**알려진 한계:**
+- LQR은 아직 실차 튜닝 전입니다. 처음 켤 때는 저속에서, 언제든 사람이 개입할 수 있는 상태로 테스트하세요.
+- `localization/pose_estimator.py`의 `EncoderPoseEstimator`가 `self.pose_estimator`로 준비돼 있지만
+  ([track_drive.py:444](track_drive.py#L444)), 실제 엔코더 ROS 토픽이 아직 확인 전이라 **어떤 콜백도
+  갱신하지 않는 미배선 상태**입니다. LQR은 지금 이 pose 추정기를 쓰지 않고 `speed_gain`(튜닝 게인)으로
+  대신합니다 — 엔코더 토픽이 확인되면 실제 m/s를 `set_speed_gain()`에 매 프레임 넣어주는 식으로 전환할 것.
+
+---
+
 ## 1. 신호등 (S0 출발 / S2 교차로) — 통합 4구 신호등
 
 **(2026-08 규정 변경)** S0(출발)도 더 이상 3구 신호가 아니라 S2(교차로)와 동일한 4구 신호등을 재사용합니다.
