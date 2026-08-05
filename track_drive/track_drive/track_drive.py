@@ -117,6 +117,7 @@ LAVACON_TRIGGER_FRAMES = 5   # 좌우 클러스터 동시검출이 연속 N프�
 SAFETY_DIST      = 5.0    # B2(고정장애물) 발동 거리(m) — ★재설계 시 재검토
 OVERTAKE_TRIGGER = 6.5    # B3(방해차량) 발동 거리(m)   — ★재설계 시 재검토
 VEHICLE_TRIGGER_FRAMES = 5     # 라이다 단독검출 연속 N프레임이면 B3_VEHICLE 진입 확정(디바운스)
+SIG_CONFIRM_FRAMES = 3   # 신호등(직진/좌회전) 판정이 연속 N프레임 유지돼야 확정(20Hz→0.15s, 단일 프레임 오검출 방지)
 
 # ── [15] 단위 환산 상수 — ★B단계 실측 후 값만 채울 것 ──
 #   지금 코드에는 '모터 단위'(drive()가 ±100으로 클립하는 값)와 '미터'가 섞여 있다.
@@ -285,11 +286,16 @@ class TrackDriverNode(Node):
         self._lane_prev_width = 448.0  # 도로폭 직전값(px, EMA)
         self.lane_side   = LANE_SIDE   # 현재 주행 차선: +1=우측차선(노란선이 왼쪽) / -1=좌측차선
                                         #   노란 중앙선 위치로 매 프레임 갱신(_update_lane_side)
-        # [2-2 신호등]
-        self.signal_color   = 'unknown'  # [S0] 'red'/'yellow'/'blue'/'unknown'
-        self.signal_red_on      = False  # [S2] 빨강
-        self.signal_straight_on = False  # [S2] 직진(점등 위치)
-        self.signal_left_on     = False  # [S2] 좌회전(점등 위치)
+        # [2-2 신호등] S0(출발)/S2(교차로) 공통 — 둘 다 같은 4구 신호등을 본다(대회 규정 변경)
+        self.signal_red_on      = False  # 빨강 (단일 프레임 순간값, 디바운스 안 됨)
+        self.signal_straight_on = False  # 직진(=초록만 점등) 순간값
+        self.signal_left_on     = False  # 좌회전(=초록+빨강 동시 점등) 순간값
+        # FSM은 반드시 아래 confirmed 값만 봐야 한다(디바운스 통과분) — 순간값은 빛반사·블러로
+        # 한 프레임만 튈 수 있어 그대로 쓰면 오출발/오좌회전 위험이 있다.
+        self.signal_straight_confirmed = False
+        self.signal_left_confirmed     = False
+        self._sig_straight_cnt = 0   # signal_straight_on 연속 유지 프레임 수
+        self._sig_left_cnt     = 0   # signal_left_on 연속 유지 프레임 수
         self.stopline = False            # 굵은 가로 흰선(정지선/지름길 끝 단서)
         self._stopline_cooldown_t = 0.0  # 이 시각까지 정지선 재감지 무시
         self._last_stopline_t = 0.0      # [10] 정지선을 마지막으로 본 시각(교차로 근처 기동 금지용)
@@ -535,23 +541,28 @@ class TrackDriverNode(Node):
 
     # [2-2] 신호등
     #   입력 self.img_front
-    #   출력 [S0] signal_color / [S2] signal_red/straight/left_on
+    #   출력 signal_red/straight/left_on (S0/S2 공통)
     #   주의 4구는 직진·좌회전 모두 초록 → 점등 '위치'로 구분
     def perc_signal(self):
-        """신호등 판별 (상태별) — traffic_signal.py의 SignalDetector(Hough Circle)에 위임:
-          S0 → 3구 색 판별 → signal_color('blue'=초록=출발)
-          S2 → 4구 직진/좌회전 → 빨강 동반 여부로 구분(좌회전=초록+빨강 동시, 직진=초록만)
-        ★TODO(실차 테스트시 체크): 원 3개/4개 정확히 안 잡히면 그 프레임은 인식 실패 처리됨
-          (디바운스/폴백 없음, 자세한 내용은 traffic_signal.py의 shape_ok 주석 참고)"""
+        """신호등 판별 — traffic_signal.py의 SignalDetector.detect_s2()(4구 Hough Circle)에 위임.
+          대회 규정 변경으로 S0(출발)도 S2(교차로)와 동일한 4구 신호등을 재사용한다:
+            S0 → signal_straight_confirmed(초록만 점등) = 출발
+            S2 → signal_straight_confirmed = 직진, signal_left_confirmed(초록+빨강 동시) = 좌회전
+        detect_s2()는 원 4개가 정확히 안 잡히면(초과분은 pick_best_4()로 어느 정도 흡수하지만,
+        미달은 흡수 불가) 그 프레임은 인식 실패로 순간값이 False가 될 수 있다. 여기서
+        SIG_CONFIRM_FRAMES 연속 유지를 확인해 confirmed로 승격시켜, 단발성 오검출/오검출실패가
+        바로 FSM 전환(출발/좌회전)으로 새는 걸 막는다(라바콘/차량 트리거와 동일한 패턴)."""
         if self.img_front is None:
             return
 
-        if self.mission_state == MissionState.S0_WAIT_GREEN:
-            self.signal_color = self.signal_detector.detect_s0(self.img_front)
-
-        elif self.mission_state == MissionState.S2_INTERSECTION:
+        if self.mission_state in (MissionState.S0_WAIT_GREEN, MissionState.S2_INTERSECTION):
             self.signal_red_on, self.signal_straight_on, self.signal_left_on = \
                 self.signal_detector.detect_s2(self.img_front)
+
+            self._sig_straight_cnt = self._sig_straight_cnt + 1 if self.signal_straight_on else 0
+            self._sig_left_cnt     = self._sig_left_cnt + 1 if self.signal_left_on else 0
+            self.signal_straight_confirmed = self._sig_straight_cnt >= SIG_CONFIRM_FRAMES
+            self.signal_left_confirmed     = self._sig_left_cnt >= SIG_CONFIRM_FRAMES
 
     # [2-3] 장애물(전방+측면)
     #   입력 self.lidar_ranges
@@ -1022,6 +1033,10 @@ class TrackDriverNode(Node):
             self.signal_red_on      = False
             self.signal_straight_on = False
             self.signal_left_on     = False
+            self.signal_straight_confirmed = False
+            self.signal_left_confirmed     = False
+            self._sig_straight_cnt = 0
+            self._sig_left_cnt     = 0
         # S1 진입 시 감속 플래그 초기화
         if new_state == MissionState.S1_LANE_FOLLOW:
             self._approach_t0 = None
@@ -1041,12 +1056,12 @@ class TrackDriverNode(Node):
     # ── S0: 출발 (신호등 인식) ──
     def _s0_wait_green(self):
         """
-        출발선에서 정지한 채 3구 신호등을 본다.
-          - 파란불 전: 완전 정지 (신호위반 감점 방지)
-          - 파란불 감지: S1(차선주행)로 전환하여 출발
+        출발선에서 정지한 채 4구 신호등을 본다(대회 규정 변경: S2와 동일한 신호등 재사용).
+          - 초록불 켜지기 전: 완전 정지 (신호위반 감점 방지)
+          - 초록불(직진 위치만 점등) 감지: S1(차선주행)로 전환하여 출발
         """
         self.ctrl_angle, self.ctrl_speed = 0.0, SPEED_STOP
-        if self.signal_color == 'blue':
+        if self.signal_straight_confirmed:
             self._change_state(MissionState.S1_LANE_FOLLOW)
 
     # ── S1: 차선인식 주행 (라바콘·고정장애물·추월 Behavior를 이 상태 안에서 처리) ──
@@ -1088,8 +1103,8 @@ class TrackDriverNode(Node):
         """
         4구 신호등 교차로 진입 후 흐름 (순수 신호 인식만으로 경로 선택):
           1. 진입 즉시 정지 (기본값 STOP, 명시적 신호만 출발)
-          2. 직진 초록(signal_straight_on) → S1 복귀 + Behavior 활성화(라바콘부터 진행)
-             좌회전 신호(초록+빨강 동시, signal_left_on) → 좌회전 후 S3(지름길)
+          2. 직진 초록(signal_straight_confirmed) → S1 복귀 + Behavior 활성화(라바콘부터 진행)
+             좌회전 신호(초록+빨강 동시, signal_left_confirmed) → 좌회전 후 S3(지름길)
           3. 좌회전 진행 중이면 신호와 무관하게 완료 우선
         """
         if self._turn_yaw_start is not None:
@@ -1098,12 +1113,12 @@ class TrackDriverNode(Node):
 
         self.ctrl_angle, self.ctrl_speed = 0.0, SPEED_STOP
 
-        if self.signal_straight_on:
+        if self.signal_straight_confirmed:
             # 직진 신호 → S1 복귀, 이때부터 Behavior 시작
             self._behavior_enabled = True
             self._stopline_cooldown_t = time.time() + STOPLINE_COOLDOWN
             self._change_state(MissionState.S1_LANE_FOLLOW)
-        elif self.signal_left_on:
+        elif self.signal_left_confirmed:
             # 좌회전 신호 → 지름길로 (Behavior 안 켬)
             self._begin_left_turn()
 
@@ -1504,7 +1519,9 @@ class TrackDriverNode(Node):
         """0.5초마다 여러 줄로 상태 덤프. 별도 터미널(rqt/topic echo) 없이 이 로그만으로
         센서 원시상태(카메라 살아있는지·신호색·라이다 포인트수)부터 트리거 카운터까지 확인 가능하게 함.
         80컬럼 좁은 터미널에서도 안 잘리게 줄당 길이를 짧게 나눴다.
-          [SENS] cam = 카메라 나이(s, 값이 계속 커지면 미수신) / sig = 신호등 색(S0: unknown이면 원 검출 실패)
+          [SENS] cam = 카메라 나이(s, 값이 계속 커지면 미수신)
+                 sig = 신호등 상태. 앞 R/L/S(0/1)는 이번 프레임 순간값, confirmS/L는 디바운스
+                       통과 후 FSM이 실제로 보는 확정값(카운터/기준 SIG_CONFIRM_FRAMES 같이 표시)
                  lidar = 유효포인트수(min거리m, 나이s)
           [LANE] 차선편차px(검출여부) / obs = 라이다 전방장애물(거리m,좌우,타입)
           lava   = 라바콘 보로노이 편차(구간종료 판정)
@@ -1520,13 +1537,12 @@ class TrackDriverNode(Node):
                      지워버리기 전, 원본(raw) 라이다 값 기준 그 구간 안의 점 개수/최소거리.
                      이 값이 크고 거리도 콘 간격과 비슷하면, 그 마스크가 진짜 콘 반사까지
                      같이 지우고 있다는 뜻 — BODY_LO/BODY_HI 구간 재보정이 필요할 수 있음.
-          [SIG-S0](S0 상태에서만 출력) 신호등 원 검출이 어느 단계에서 막혔는지 진단:
+          [SIG](S0/S2 상태에서만 출력) 4구 신호등 원 검출이 어느 단계에서 막혔는지 진단:
             roi     = ROI 픽셀 좌표(t,b,l,r) — 신호등이 이 영역 안에 실제로 들어오는지 확인용
-            circles = HoughCircles가 찾은 원 개수(0=원 자체를 못 찾음, 3이 아니면 배치/블러 의심)
+            circles = HoughCircles가 찾은 원 개수(0=원 자체를 못 찾음, 4가 아니면 배치/블러 의심)
             reason  = 실패 사유(OK=성공) — circle_count=N / vert_spread.../horiz_spread.../
-                      gap[i]=... (배치 불량) / bright_margin=... (밝기 대비 부족)
-            bright  = 성공적으로 3개+배치 통과 시 좌→우(빨강,노랑,초록) 밝기값
-            margin  = 최댓값-평균 (SIG_BRIGHT_MARGIN=15와 비교되는 실측값)
+                      gap[i]=... (배치 불량)
+            bright  = 성공적으로 4개+배치 통과 시 좌→우(빨강,노랑,좌회전,직진) 밝기값
         """
         now = time.time()
         if now - self._last_debug_t < DEBUG_PERIOD: return
@@ -1545,22 +1561,25 @@ class TrackDriverNode(Node):
         masked_pts, masked_min = self._lavacon_mask_dbg
         masked_min_s = f'{masked_min:.2f}m' if masked_min >= 0 else 'N/A'
 
-        sig_s0_line = ''
-        if self.mission_state == MissionState.S0_WAIT_GREEN:
+        sig_line = ''
+        if self.mission_state in (MissionState.S0_WAIT_GREEN, MissionState.S2_INTERSECTION):
             sd = self.signal_detector
-            reason = sd.s0_reject_reason or 'OK'
-            sig_s0_line = (
-                f'\n  [SIG-S0] roi={sd.s0_roi_px} circles={sd.s0_circle_count} '
-                f'reason={reason} bright={sd.s0_brightness} margin={sd.s0_bright_margin:+.1f}'
+            reason = sd.s2_reject_reason or 'OK'
+            sig_line = (
+                f'\n  [SIG] roi={sd.s2_roi_px} circles={sd.s2_circle_count} '
+                f'reason={reason} bright={sd.s2_brightness}'
             )
 
+        sig_flags = (f'R{int(self.signal_red_on)}L{int(self.signal_left_on)}S{int(self.signal_straight_on)} '
+                     f'confirmS{int(self.signal_straight_confirmed)}({self._sig_straight_cnt}/{SIG_CONFIRM_FRAMES})'
+                     f'L{int(self.signal_left_confirmed)}({self._sig_left_cnt}/{SIG_CONFIRM_FRAMES})')
         self.get_logger().info(
             f'[{self.mission_state.name}|{self.behavior_state.name}|{self.phase.name}] '
             f'ang={self.ctrl_angle:+.1f} spd={self.ctrl_speed:.1f}\n'
             f'  [LAP] {self.lap}/{TOTAL_LAPS} 바퀴 '
             f'누적={math.degrees(self._yaw_accum):+.0f}도/{math.degrees(LAP_YAW_FULL):.0f} '
             f'경과={time.time() - self._lap_t0:.0f}s\n'
-            f'  [SENS] cam={cam_age:.1f}s sig={self.signal_color} lidar={lidar_desc}\n'
+            f'  [SENS] cam={cam_age:.1f}s sig={sig_flags} lidar={lidar_desc}\n'
             f'  [LANE] lane={self.lane_offset:+.1f}({int(self.lane_valid)}) '
             f'side={"R" if self.lane_side >= 0 else "L"}차선 '
             f'obs={self.obstacle_front}({self.obstacle_dist:.1f}m,w={self.obstacle_width:.2f}m,{self.obstacle_type}) '
@@ -1571,7 +1590,7 @@ class TrackDriverNode(Node):
             f'  [LAVA-ROI] L pts={lava_lp} run={lava_lrun}(need>=2) '
             f'R pts={lava_rp} run={lava_rrun}(need>=2) '
             f'masked_raw_pts={masked_pts} masked_min={masked_min_s}'
-            f'{sig_s0_line}')
+            f'{sig_line}')
 
 
 # #############################################################
