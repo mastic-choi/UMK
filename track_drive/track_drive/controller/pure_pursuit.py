@@ -29,8 +29,7 @@ class PurePursuitController:
     반환한다. path가 비어있으면(첫 프레임 등) 직전 조향각을 그대로 유지한다 —
     lane_util._debounce()가 무효 프레임에 직전 확정값을 유지하는 것과 같은 원칙."""
 
-    def __init__(self, lookahead_px=90.0, wheelbase_px=220.0, angle_max_deg=100.0, alpha=0.5,
-                 min_lookahead_px=40.0):
+    def __init__(self, lookahead_px=90.0, wheelbase_px=50.0, angle_max_deg=100.0, alpha=0.5,
         # 목표점을 찾는 전방주시거리(px). ROI가 짧은 백엔드(hough_lane은 ROI 높이가
         # ~70px로 매우 짧다)에서는 경로 전체 길이가 lookahead_px보다 짧아져 자동으로
         # path의 가장 먼 점이 목표점이 된다(_target_point() 참고) — 그 자체로는 안전한

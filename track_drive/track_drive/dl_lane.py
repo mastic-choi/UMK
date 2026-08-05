@@ -322,6 +322,15 @@ class DLSlideWindow(SlideWindow):
         ll이 한쪽만 보이면 그쪽만 자르고, 양쪽 다 안 보이면(가려짐/마모 등) 이번 밴드는 자르지
         않고 da를 그대로 둔다 — ll이 확실할 때만 개입한다("da를 경로의 주 신호로, ll은 보강" —
         모듈 상단 주석 참고).
+          ★ cur_ref는 반드시 "이번 밴드에서 ll이 실제로 보여서 클리핑 근거가 있었을 때만"
+          갱신한다(아래 if ll_cols.size 안에서만 재계산) ★ — ll이 안 보이는 밴드(점선 틈 등)는
+          da가 옆 차선까지 안 잘린 채 그대로 남아있을 수 있는데, 그 밴드의 컬럼 평균을 그대로
+          다음(더 먼) 밴드의 기준점으로 넘기면 오염된 기준이 근거리→원거리로 계속 누적(cascade)
+          된다 — 한 프레임 안에서 점선 틈 하나가 그 위 모든 밴드의 좌/우 판정을 연쇄적으로
+          틀어지게 만드는 실패모드가 실측으로 확인됨(여러 밴드가 "같은 방향으로" 같이 밀리면
+          _reject_outliers()의 leave-one-out 추세 검사도 못 잡아낸다 — 이상치 하나가 아니라
+          추세 자체가 휜 것처럼 보이기 때문). ll이 안 보인 밴드는 기준점을 갱신하지 않고 직전
+          확정 기준을 그대로 들고 다음 밴드로 넘어가서 오염 전파를 그 밴드 하나로 막는다.
           입력 : da_mask, ll_mask — 동일 shape의 (roi_h, roi_w) uint8 이진마스크
                  ref_x           — 첫(근거리) 밴드의 기준 x좌표. 보통 직전 프레임 lane_center.
           출력 : da_mask에서 ll 경계 밖 픽셀만 0으로 지운 복사본(shape 동일).
@@ -346,9 +355,9 @@ class DLSlideWindow(SlideWindow):
                     cut = max(0, int(right_cols.min()) - DL_LL_CLIP_MARGIN_PX)
                     clipped[y_low:y_high, cut:] = 0
 
-            band_da_cols = np.nonzero(np.any(clipped[y_low:y_high, :] > 0, axis=0))[0]
-            if band_da_cols.size:
-                cur_ref = float(np.mean(band_da_cols))
+                band_da_cols = np.nonzero(np.any(clipped[y_low:y_high, :] > 0, axis=0))[0]
+                if band_da_cols.size:
+                    cur_ref = float(np.mean(band_da_cols))
 
         return clipped
 
