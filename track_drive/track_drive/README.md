@@ -106,6 +106,13 @@ STEERING_CONTROLLER = 'pure_pursuit'  # 'pure_pursuit' | 'lqr'
   (`lqr`일 때) 횡오차 `e_y`/헤딩오차 `e_psi`까지 한글로 보여줍니다. cv2 기본폰트가 한글을 못 그려서
   `kr_text.py`의 PIL 기반 렌더러를 씁니다 — 한글 폰트가 없는 환경이면 영문 fallback으로 표시됩니다.
 
+**알려진 한계:**
+- LQR은 아직 실차 튜닝 전입니다. 처음 켤 때는 저속에서, 언제든 사람이 개입할 수 있는 상태로 테스트하세요.
+- `localization/pose_estimator.py`의 `EncoderPoseEstimator`가 `self.pose_estimator`로 준비돼 있지만
+  ([track_drive.py:444](track_drive.py#L444)), 실제 엔코더 ROS 토픽이 아직 확인 전이라 **어떤 콜백도
+  갱신하지 않는 미배선 상태**입니다. LQR은 지금 이 pose 추정기를 쓰지 않고 `speed_gain`(튜닝 게인)으로
+  대신합니다 — 엔코더 토픽이 확인되면 실제 m/s를 `set_speed_gain()`에 매 프레임 넣어주는 식으로 전환할 것.
+
 ### 0.5.1 코너 진입 시 회전반경 기반 감속 (`pure_pursuit` 전용)
 
 `_lane_drive()`([track_drive.py:1329](track_drive.py#L1329))는 조향각 크기(`turn_now`)와 lookahead
@@ -131,12 +138,30 @@ STEERING_CONTROLLER = 'pure_pursuit'  # 'pure_pursuit' | 'lqr'
 각도 오차라도 프레임당 실제로 밀리는 거리가 줄고 인지/제어 루프가 반응할 시간을 더 벌 수 있어
 진동 억제에도 도움이 됩니다.
 
+### 0.5.2 코너 진입 시 lookahead 축소 (curvature 기반, `pure_pursuit` 전용)
+
+Lee, Lee & Moon, *"Frequency Shaping-Based Control Framework for Reducing Motion Sickness in
+Autonomous Vehicles"* (Sensors 2025, 25, 819)의 "가변 LAD(Look-Ahead Distance)" 아이디어를
+반영했습니다. 그 논문은 GPS+사전 지도로 "지금 위치에서 LAD만큼 앞의 실제 커브 반경"을 미리 조회해
+LAD를 정하는데, 이 프로젝트는 그런 전역 지도/위치추정이 없어 그대로는 못 씁니다. 대신 **직전 프레임에
+이미 계산해둔 `self.last_curvature`**로 반응형 버전을 구현했습니다([controller/pure_pursuit.py:32](controller/pure_pursuit.py#L32)
+`lookahead_curvature_gain`/`lookahead_min_px`, [153](controller/pure_pursuit.py#L153) `control()`) —
+직전 프레임이 타이트한 코너였으면 이번 프레임 lookahead를 속도 기반 값보다 낮춰서(최소
+`lookahead_min_px=40px`까지) 더 촘촘하게 추종하고, 직진이면(curvature≈0) 원래 속도 기반 값을 그대로
+씁니다. 한 프레임 지연된 반응이라 논문만큼 정교하진 않습니다.
+
+**주의 — `min_lookahead_px`와 별개입니다:** lookahead를 줄이는 하한(`lookahead_min_px=40`)과, curvature
+분모를 바닥까는 하한(`min_lookahead_px=90`, 짧은 lookahead 얼어붙음 버그 수정에서 쓰인 값)은 이름이
+비슷하지만 완전히 다른 역할입니다. 후자를 코너에서도 고정 90으로 두면 curvature
+계산의 ld가 거의 항상 90으로 다시 눌려서 lookahead 축소 효과가 무효화되므로,
+`ld = max(hypot(dx,dy), min(min_lookahead_px, lookahead_px))`로 — lookahead가 의도적으로 줄어든
+프레임에는 그 줄어든 값 자체를 바닥으로 쓰도록 함께 수정했습니다([controller/pure_pursuit.py:195](controller/pure_pursuit.py#L195)).
+
 **알려진 한계:**
-- LQR은 아직 실차 튜닝 전입니다. 처음 켤 때는 저속에서, 언제든 사람이 개입할 수 있는 상태로 테스트하세요.
-- `localization/pose_estimator.py`의 `EncoderPoseEstimator`가 `self.pose_estimator`로 준비돼 있지만
-  ([track_drive.py:444](track_drive.py#L444)), 실제 엔코더 ROS 토픽이 아직 확인 전이라 **어떤 콜백도
-  갱신하지 않는 미배선 상태**입니다. LQR은 지금 이 pose 추정기를 쓰지 않고 `speed_gain`(튜닝 게인)으로
-  대신합니다 — 엔코더 토픽이 확인되면 실제 m/s를 `set_speed_gain()`에 매 프레임 넣어주는 식으로 전환할 것.
+- `lookahead_curvature_gain=100.0`, `lookahead_min_px=40px` 둘 다 추정치입니다(`curvature=0.01`,
+  반경≈100px짜리 중간 코너에서 배율 0.5가 되도록 잡음). `steer_debug` 창이나 CLI 로그로 관찰하며
+  튜닝이 필요합니다.
+- `STEERING_CONTROLLER='lqr'`일 때는 적용되지 않습니다 — `lqr.py`는 curvature 개념 자체가 없습니다.
 
 ---
 

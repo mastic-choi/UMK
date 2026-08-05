@@ -31,7 +31,8 @@ class PurePursuitController:
 
     def __init__(self, lookahead_base_px=90.0, lookahead_speed_gain=4.0, lookahead_max_px=150.0,
                  wheelbase_px=80.0, angle_max_deg=100.0, alpha=0.5,
-                 min_lookahead_px=90.0, dx_deadzone_px=6.0):
+                 min_lookahead_px=90.0, dx_deadzone_px=6.0, lookahead_curvature_gain=100.0,
+                 lookahead_min_px=40.0):
         # [2026-08-05, 속도 적응형 lookahead — 1차 시도 후 수정]
         #   curvature ≈ 2*dx/ld^2 (작은각 근사)라서 ld가 짧을수록 같은 dx도 1/ld^2로
         #   증폭된다. 처음엔 PythonRobotics/Autoware 관례(Ld=k*v+Lfc, 저속일수록 lookahead도
@@ -51,6 +52,26 @@ class PurePursuitController:
         self.lookahead_base_px = lookahead_base_px
         self.lookahead_speed_gain = lookahead_speed_gain
         self.lookahead_max_px = lookahead_max_px
+
+        # [2026-08-06] curvature 기반 lookahead 감쇠 — Lee, Lee & Moon, "Frequency
+        #   Shaping-Based Control Framework for Reducing Motion Sickness in Autonomous
+        #   Vehicles" (Sensors 2025, 25, 819)의 "가변 LAD" 아이디어를 반영. 그 논문은
+        #   GPS+사전 지도로 "지금 위치에서 LAD만큼 앞의 실제 커브 반경"을 미리 조회해
+        #   LAD를 정하는데, 여긴 그럴 전역 지도/위치추정이 없어 그 방식을 그대로 못 쓴다.
+        #   대신 우리가 가진 정보(직전 프레임에 이미 계산한 self.last_curvature)로 반응형
+        #   버전을 만든다 — 직전 프레임이 타이트한 코너였으면(curvature 큼) 이번 프레임
+        #   lookahead를 속도가 밀어올린 값보다 낮춰서(=lookahead_min_px 쪽으로 당겨서)
+        #   더 촘촘하게 추종하고, 직진이면(curvature≈0) 원래 속도 기반 값을 그대로 쓴다.
+        #   한 프레임 지연된 반응이라 논문만큼 정교하진 않다.
+        #   gain=100.0: curvature=0.01(반경≈100px, 중간 정도 코너)에서 배율이 0.5로
+        #   떨어지도록 잡은 추정치 — 실차 미검증, steer_debug로 관찰하며 조정할 것.
+        self.lookahead_curvature_gain = lookahead_curvature_gain
+        # 위 감쇠가 당길 수 있는 하한 — min_lookahead_px(curvature 계산의 ld 분모 바닥값,
+        # 완전히 다른 용도)와 절대 헷갈리지 말 것. 둘 다 90.0이면 damp가 아무리 작아져도
+        # lookahead_px가 base(90)로 다시 clip돼서 이 기능 자체가 무효화된다 — 그래서
+        # 반드시 lookahead_base_px보다 뚜렷이 작은 값으로 따로 둔다. 40px은 추정치,
+        # 실차에서 코너 추종이 여전히 둔하면 더 낮출 것.
+        self.lookahead_min_px = lookahead_min_px
 
         # [2026-08-05] dx(waypoint-차량중앙 픽셀오차)가 이 값 미만이면 0으로 죽인다 —
         #   차량이 차선 중앙에 사실상 있는데도(카메라/세그멘테이션의 서브픽셀 단위 흔들림) 매
@@ -143,9 +164,13 @@ class PurePursuitController:
             self.held = True
             return self.prev_steer_deg
 
+        speed_lookahead_px = self.lookahead_base_px + self.lookahead_speed_gain * max(speed, 0.0)
+        # 직전 프레임 curvature가 컸으면(코너였으면) 위 속도 기반 값을 낮춘다 — 직진이면
+        # (curvature≈0) damp≈1이라 기존과 동일하게 동작한다(클래스 상단 주석 참고).
+        curvature_damp = 1.0 / (1.0 + self.lookahead_curvature_gain * abs(self.last_curvature))
         lookahead_px = float(np.clip(
-            self.lookahead_base_px + self.lookahead_speed_gain * max(speed, 0.0),
-            self.lookahead_base_px, self.lookahead_max_px
+            speed_lookahead_px * curvature_damp,
+            self.lookahead_min_px, self.lookahead_max_px
         ))
         tx, ty = self._target_point(path, vehicle_xy, lookahead_px)
         dx = tx - vehicle_xy[0]
@@ -158,7 +183,16 @@ class PurePursuitController:
         # ld가 너무 짧으면(위 min_lookahead_px 주석 참고) 분모만 바닥을 깐다 — 계산 자체를
         # 건너뛰지 않는다. 짧은 ld에서 픽셀 노이즈가 조향각으로 증폭되는 건 막으면서도,
         # 매 프레임 계속 보정하므로 "얼어붙어서 못 돌아오는" 문제가 없다.
-        ld = max(math.hypot(dx, dy), self.min_lookahead_px)
+        #   [2026-08-06] 바닥값을 min_lookahead_px로 고정하면 안 된다 — _target_point()가
+        #   찾는 ld는 항상 lookahead_px 이하다(호길이 ≥ 직선거리라서). curvature 기반
+        #   감쇠(위 lookahead_curvature_gain 주석 참고)로 이번 프레임 lookahead_px가
+        #   min_lookahead_px(90)보다 작게(코너에서 의도적으로) 정해졌는데 바닥을 그대로
+        #   90으로 두면, ld가 거의 항상 그 90으로 다시 눌려서 "코너에서 더 촘촘히
+        #   추종한다"는 효과가 없어진다. 그래서 바닥을 min(min_lookahead_px, lookahead_px)로
+        #   잡는다 — 직진처럼 lookahead_px가 min_lookahead_px 이상이면 기존과 동일하게
+        #   90이 바닥이고, 코너처럼 lookahead_px를 일부러 줄였으면 그 줄어든 값 자체가
+        #   바닥이 된다(더 줄어들진 않되, 의도한 값 밑으로 인위적으로 다시 늘어나지도 않음).
+        ld = max(math.hypot(dx, dy), min(self.min_lookahead_px, lookahead_px))
 
         alpha = math.atan2(dx, dy)
         curvature = 2.0 * math.sin(alpha) / ld
