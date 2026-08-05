@@ -30,8 +30,8 @@ class PurePursuitController:
     lane_util._debounce()가 무효 프레임에 직전 확정값을 유지하는 것과 같은 원칙."""
 
     def __init__(self, lookahead_base_px=90.0, lookahead_speed_gain=4.0, lookahead_max_px=150.0,
-                 wheelbase_px=50.0, angle_max_deg=100.0, alpha=0.5,
-                 min_lookahead_px=65.0, dx_deadzone_px=6.0):
+                 wheelbase_px=80.0, angle_max_deg=100.0, alpha=0.5,
+                 min_lookahead_px=90.0, dx_deadzone_px=6.0):
         # [2026-08-05, 속도 적응형 lookahead — 1차 시도 후 수정]
         #   curvature ≈ 2*dx/ld^2 (작은각 근사)라서 ld가 짧을수록 같은 dx도 1/ld^2로
         #   증폭된다. 처음엔 PythonRobotics/Autoware 관례(Ld=k*v+Lfc, 저속일수록 lookahead도

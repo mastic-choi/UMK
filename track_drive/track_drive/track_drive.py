@@ -75,7 +75,7 @@ class Phase(Enum):
     DONE           = 3  # 모든 Behavior 미션 완료 — 이후 계속 B0로 일반 차선주행
 
 # ── 속도·각도 상수 ──
-SPEED_NORMAL  = 5.0   # 차선주행(S1) 기본속도
+SPEED_NORMAL  = 8.0   # 차선주행(S1) 기본속도
                        # 출처: KUAC_2024-main lane_detection/src/lane_detection.py self.motor=30(고정)
                        #   기존 20.0 → 30.0. 모터/조향 스케일이 같은 xycar 플랫폼인지 미확인, 실차 저속 테스트 우선 권장
 SPEED_LAVACON = 2.5    # KUAC_2024 라바콘 속도(12~30, fast/safe 라벨 앞뒤가 안 맞아 신뢰도 낮음) 참고만 하고 미반영
@@ -124,6 +124,11 @@ VEHICLE_TRIGGER_FRAMES = 5     # 라이다 단독검출 연속 N프레임이면 
 METERS_PER_SPEED_UNIT    = 0.0   # ★B-2: 모터 속도단위 1 당 m/s. (SPEED_NORMAL로 5초 직진 후 거리÷5÷SPEED_NORMAL) — 미실측
 LANE_WIDTH_M             = 0.4   # ★B-1 실측(2026-08-04): 흰선-흰선(도로 전체폭) 80cm, 노란선 정중앙 확인 → 차선 1개 폭 = 80/2 = 40cm
 PIXELS_PER_METER         = 0.0   # ★B-1: BEV 픽셀 ↔ 미터 환산 — 미실측(80cm 구간의 BEV px 대응값 필요)
+                                  #   [2026-08-05] dl_lane.py에 DL_USE_BEV(기본 False) 실험적 BEV 경로가
+                                  #   생겼고, 켜졌을 때의 스케일은 그쪽의 DL_PIXELS_PER_METER(=200, 설계값)를
+                                  #   따로 쓴다. DL_USE_BEV가 실차 검증돼 기본으로 전환되면 이 전역값도
+                                  #   그때 맞춰 채울 것 — 지금 꺼진 상태에서 이 값만 채우면 실제로는 아직
+                                  #   원근 픽셀 공간인데 미터 환산이 된 것처럼 오해할 수 있어 비워둔다.
 VEHICLE_WIDTH_M          = 0.31  # ★B-3 실측(2026-08-04): xycar 본체 가로 31cm (세로64cm×가로31cm×높이20cm)
 # 각폭 분류 임계 — 이 폭 이상이면 '차량', 미만이면 '고정장애물'.
 #   ★B-3 실측(2026-08-04): 고정장애물(고장난 차량) 가로 20cm × 세로 41cm × 높이 16cm,
