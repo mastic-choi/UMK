@@ -114,6 +114,19 @@ LANE_CORNER_MIN   = 40.0   # 코너 가중 시작 임계(px)
 LANE_DEADZONE     = 40.0   # 중앙 데드존(px) — _lane_pid()(B2/B3 behavior가 여전히 사용)용
 LANE_LOOKAHEAD_REF = 220.0  # 예측감속 최대가 되는 lookahead 편차(px) — _lane_drive() 속도계획용
 
+# ── 코너 진입 시 회전반경 기반 감속 (ROS2 Nav2 Regulated Pure Pursuit 방식) ──
+#   pure_pursuit.py가 조향각을 계산하며 이미 curvature(=2*sin(alpha)/ld)를 구하는데,
+#   여기서 회전반경(1/curvature)이 CORNER_MIN_RADIUS_PX보다 작아지면(=코너가 타이트해지면)
+#   목표속도를 "반경/CORNER_MIN_RADIUS_PX" 비율만큼 깎는다(Nav2의 curvatureConstraint()와
+#   동일 공식). turn_now/turn_preview 기반 기존 감속과는 독립적으로 계산해서 더 낮은 쪽을
+#   쓴다 — 기존 로직을 대체하는 게 아니라 추가 안전판.
+#   PIXELS_PER_METER가 아직 미실측이라 반경도 미터가 아니라 픽셀 단위다. 시작값(250px)은
+#   lookahead_base_px(90)~lookahead_max_px(150) 범위에서 alpha가 20~30도 정도 나오는
+#   코너의 반경(대략 ld/(2*sin(alpha)) ≈ 90~300px)을 역산해 다소 이르게(=보수적으로)
+#   개입하도록 잡은 추정치다 — pure_pursuit.py의 다른 값들과 마찬가지로 실차 미검증.
+CORNER_MIN_RADIUS_PX = 250.0
+CORNER_MIN_SPEED_SCALE = 0.35  # 반경이 0에 가까워져도 속도가 0으로 죽지 않게 하는 하한 배율
+
 LAVACON_KP   = 210.0
 LAVACON_DONE_FRAMES = 80   # 우측콘 미검출이 연속 N프레임(20Hz→약 4초) 쌓이면 Phase 전환(순간누락 디바운스)
 LAVACON_TRIGGER_FRAMES = 5   # 좌우 클러스터 동시검출이 연속 N프레임 쌓이면 B1_LAVACON 진입 확정(디바운스)
@@ -1296,6 +1309,23 @@ class TrackDriverNode(Node):
     # #########################################################
     # [4] 제어 (Control)
     # #########################################################
+    def _corner_radius_speed_scale(self):
+        """회전반경 기반 코너 감속 배율(0~1) — ROS2 Nav2 Regulated Pure Pursuit의
+        curvatureConstraint()와 동일한 공식(CORNER_MIN_RADIUS_PX 주석 참고): 회전반경이
+        CORNER_MIN_RADIUS_PX보다 작아지면 그 비율만큼 속도를 깎는다. 반경이 0에 가까워져도
+        속도가 0으로 죽지 않게 CORNER_MIN_SPEED_SCALE로 하한을 둔다.
+        STEERING_CONTROLLER가 'pure_pursuit'일 때만 적용한다 — lqr.py는 curvature가 아니라
+        횡오차/헤딩오차 상태로 도는 별개 모델이라 이 반경 개념이 안 맞는다."""
+        if STEERING_CONTROLLER != 'pure_pursuit':
+            return 1.0
+        curvature = self.pure_pursuit.last_curvature
+        if curvature == 0.0:
+            return 1.0
+        radius = abs(1.0 / curvature)
+        if radius >= CORNER_MIN_RADIUS_PX:
+            return 1.0
+        return max(CORNER_MIN_SPEED_SCALE, radius / CORNER_MIN_RADIUS_PX)
+
     def _lane_drive(self):
         """S1/S3 공통 차선 조향+감속 로직. ctrl_angle·ctrl_speed·_prev_speed·_corner_hold 갱신."""
         self.ctrl_angle = self._lane_steer()
@@ -1304,6 +1334,9 @@ class TrackDriverNode(Node):
         turn_for_speed = max(turn_now, turn_preview * 0.3)
         target_speed = max(SPEED_NORMAL * 0.15,
                            SPEED_NORMAL * (1.0 - 0.90 * turn_for_speed ** 3))
+        # 코너 진입(회전반경 감소) 시 추가 감속 — 기존 turn_for_speed 기반 감속과는 독립적으로
+        # 계산해서 더 낮은 쪽을 쓴다(대체가 아니라 추가 안전판).
+        target_speed = max(SPEED_NORMAL * 0.15, target_speed * self._corner_radius_speed_scale())
         speed_ratio = min(1.0, self._prev_speed / SPEED_NORMAL)
         corner_decay = CORNER_HOLD_DECAY_LO + (CORNER_HOLD_DECAY_HI - CORNER_HOLD_DECAY_LO) * speed_ratio
         self._corner_hold = max(turn_now, self._corner_hold * corner_decay)

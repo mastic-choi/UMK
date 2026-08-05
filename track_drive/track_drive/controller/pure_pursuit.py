@@ -100,10 +100,18 @@ class PurePursuitController:
         # 직전 control() 호출이 "새로 계산"했는지 "직전값을 그대로 유지"했는지 표시.
         # track_drive.py의 DEBUG_VIZ_STEER 디버그 창이 이 값을 읽어서 보여준다.
         self.held = False
+        # 직전에 새로 계산됐을 때의 curvature(=2*sin(alpha)/ld, 1/px 단위) — 조향각으로
+        # 변환되고 나면 사라지는 값이라 별도로 보관해둔다. track_drive.py가 코너 진입 시
+        # 감속량을 정하는 데 쓴다(ROS2 Nav2의 Regulated Pure Pursuit과 같은 발상: 회전반경이
+        # 작아질수록 속도를 줄여서, 짧은 lookahead에서 픽셀 노이즈가 조향으로 증폭되는 걸
+        # "속도를 늦춰 반응시간을 버는" 방식으로도 완화한다). held=True인 프레임에는
+        # 갱신하지 않고 직전값을 그대로 유지한다 — prev_steer_deg와 같은 원칙.
+        self.last_curvature = 0.0
 
     def reset(self):
         self.prev_steer_deg = 0.0
         self.held = False
+        self.last_curvature = 0.0
 
     def _target_point(self, path, vehicle_xy, lookahead_px):
         """path를 따라 vehicle_xy로부터 누적 호길이가 lookahead_px를 넘는 첫 지점을
@@ -129,7 +137,8 @@ class PurePursuitController:
                    않는다(위치를 적분하는 dead-reckoning과는 다름, 드리프트 없음).
            반환 : 조향각(도), ±angle_max_deg로 클램프.
            호출 후 self.held로 이번 호출이 "새로 계산"(False)했는지 "직전값 유지"(True)
-           했는지 확인할 수 있다(디버그 창용)."""
+           했는지, self.last_curvature로 이번(혹은 마지막 유효) curvature를 확인할 수
+           있다(디버그 창/코너 감속용)."""
         if not path:
             self.held = True
             return self.prev_steer_deg
@@ -159,4 +168,5 @@ class PurePursuitController:
         steer_deg = float(np.clip(steer_deg, -self.angle_max_deg, self.angle_max_deg))
         self.prev_steer_deg = steer_deg
         self.held = False
+        self.last_curvature = curvature
         return steer_deg

@@ -70,9 +70,9 @@ ros2 launch track_drive track_drive.launch.py
 
 ## 0.5 조향 컨트롤러 선택 (Pure Pursuit / LQR)
 
-차선 추종(`_lane_steer()`, [track_drive.py:1316](track_drive.py#L1316))도 백엔드처럼 pluggable합니다.
-`self.pure_pursuit`과 `self.lqr` 둘 다 미리 생성해두고([track_drive.py:414-416](track_drive.py#L414)),
-`STEERING_CONTROLLER`([track_drive.py:254](track_drive.py#L254)) 값에 따라 어느 쪽을 쓸지 고릅니다.
+차선 추종(`_lane_steer()`, [track_drive.py:1349](track_drive.py#L1349))도 백엔드처럼 pluggable합니다.
+`self.pure_pursuit`과 `self.lqr` 둘 다 미리 생성해두고([track_drive.py:428-429](track_drive.py#L428)),
+`STEERING_CONTROLLER`([track_drive.py:267](track_drive.py#L267)) 값에 따라 어느 쪽을 쓸지 고릅니다.
 `_lane_drive()`(S1/S3 차선주행)와 S2 진입 전 감속 구간이 전부 이 하나를 거치므로, 플래그만 바꾸면
 차선 추종 전체가 전환됩니다.
 
@@ -87,7 +87,7 @@ STEERING_CONTROLLER = 'pure_pursuit'  # 'pure_pursuit' | 'lqr'
 
 **주의:** `pure_pursuit.control()`은 속도적응형 lookahead 때문에 `speed=` 인자를 받지만, `lqr.control()`은
 자체 `speed_gain` 튜닝값을 쓰고 그 인자가 없습니다 — 그래서 `_lane_steer()`가 컨트롤러별로 분기해서
-호출합니다([track_drive.py:1334-1336](track_drive.py#L1334)). 두 컨트롤러를 직접 갖다 붙일 일이 있으면
+호출합니다([track_drive.py:1367-1369](track_drive.py#L1367)). 두 컨트롤러를 직접 갖다 붙일 일이 있으면
 이 시그니처 차이를 꼭 확인하세요.
 
 **LQR 튜닝 파라미터** (`controller/lqr.py:87` `__init__`, 전부 실차 미검증):
@@ -101,10 +101,35 @@ STEERING_CONTROLLER = 'pure_pursuit'  # 'pure_pursuit' | 'lqr'
 | `heading_probe_px`/`min_path_px=65.0` | 노이즈 방지 안전장치 | 조향이 자꾸 직전값 유지로 빠지면 낮출 것 |
 
 **디버그 방법:**
-- 창: `DEBUG_VIZ_STEER = True`(기본값, [track_drive.py:229](track_drive.py#L229)) → `steer_debug` 창에서
+- 창: `DEBUG_VIZ_STEER = True`(기본값, [track_drive.py:242](track_drive.py#L242)) → `steer_debug` 창에서
   지금 어느 컨트롤러가 쓰이는지, 이번 프레임이 "직전값 유지"(주황)인지 "현재값 반영"(초록)인지, 조향각과
   (`lqr`일 때) 횡오차 `e_y`/헤딩오차 `e_psi`까지 한글로 보여줍니다. cv2 기본폰트가 한글을 못 그려서
   `kr_text.py`의 PIL 기반 렌더러를 씁니다 — 한글 폰트가 없는 환경이면 영문 fallback으로 표시됩니다.
+
+### 0.5.1 코너 진입 시 회전반경 기반 감속 (`pure_pursuit` 전용)
+
+`_lane_drive()`([track_drive.py:1329](track_drive.py#L1329))는 조향각 크기(`turn_now`)와 lookahead
+편차(`turn_preview`)로 이미 코너에서 감속하는데, 여기에 **ROS2 Nav2의 Regulated Pure Pursuit**과 같은
+방식의 감속을 추가했습니다([track_drive.py:1312](track_drive.py#L1312) `_corner_radius_speed_scale()`).
+
+`pure_pursuit.control()`이 조향각을 계산하며 이미 구하는 `curvature`를 `self.pure_pursuit.last_curvature`로
+저장해두고(`controller/pure_pursuit.py`), 회전반경(`1/curvature`)이 `CORNER_MIN_RADIUS_PX`
+([track_drive.py:127](track_drive.py#L127), 기본 250px)보다 작아지면(=코너가 타이트해지면) 그 비율만큼
+목표속도를 깎습니다 — Nav2의 `curvatureConstraint()`와 동일한 공식
+(`속도 *= max(CORNER_MIN_SPEED_SCALE, 반경/CORNER_MIN_RADIUS_PX)`). 기존 `turn_now`/`turn_preview` 기반
+감속을 대체하는 게 아니라, 둘 중 더 낮은 속도를 쓰는 **추가 안전판**입니다.
+
+`PIXELS_PER_METER`가 미실측이라 반경도 미터가 아니라 픽셀 단위입니다. `CORNER_MIN_RADIUS_PX=250px`는
+`lookahead_base_px(90)~lookahead_max_px(150)` 범위에서 alpha 20~30도짜리 코너의 반경을 역산해 다소
+이르게(보수적으로) 개입하도록 잡은 추정치일 뿐 실차 미검증입니다.
+
+`STEERING_CONTROLLER='lqr'`일 때는 적용되지 않습니다 — LQR은 curvature가 아니라 횡오차/헤딩오차
+상태로 도는 별개 모델이라 이 반경 개념 자체가 안 맞습니다.
+
+**왜 추가했나:** 짧은 lookahead에서 조향이 얼어붙던 버그를 고친 뒤에도, 코너처럼 회전반경이 급격히
+작아지는 구간은 여전히 픽셀 노이즈에 민감합니다. 회전반경이 작아질수록 미리 속도를 낮춰두면, 같은
+각도 오차라도 프레임당 실제로 밀리는 거리가 줄고 인지/제어 루프가 반응할 시간을 더 벌 수 있어
+진동 억제에도 도움이 됩니다.
 
 **알려진 한계:**
 - LQR은 아직 실차 튜닝 전입니다. 처음 켤 때는 저속에서, 언제든 사람이 개입할 수 있는 상태로 테스트하세요.
