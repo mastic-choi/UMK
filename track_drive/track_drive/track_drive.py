@@ -1268,12 +1268,14 @@ class TrackDriverNode(Node):
         lane_util._fit_and_sample_path()가 self.roi_h로 샘플링해둔 값이라 별도로
         백엔드별 roi_h를 조회할 필요가 없다.
         경로가 비어있으면(첫 프레임, 혹은 roi_w를 아직 모르는 백엔드) 직전 조향각을
-        그대로 유지한다 — PurePursuitController.control()이 내부적으로 처리."""
+        그대로 유지한다 — PurePursuitController.control()이 내부적으로 처리.
+        속도는 _prev_speed(직전 프레임 출력속도)를 근사치로 넘긴다 — 이번 프레임 ctrl_speed는
+        이 조향각 계산 이후에나 정해지므로(아래 _lane_drive() 참고) 아직 알 수 없다."""
         roi_w = getattr(self.lane_detector, 'roi_w', 0) or 0
         if not self.lane_path or not roi_w:
             return self.pure_pursuit.prev_steer_deg
         vehicle_xy = (roi_w / 2.0, self.lane_path[0][1])
-        return self.pure_pursuit.control(self.lane_path, vehicle_xy)
+        return self.pure_pursuit.control(self.lane_path, vehicle_xy, speed=self._prev_speed)
 
     def _lane_pid(self, offset, deadzone=LANE_DEADZONE):
         """차선 중앙편차(offset)를 PID 제어로 조향각(angle)으로 변환한다."""
