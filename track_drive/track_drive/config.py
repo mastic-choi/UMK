@@ -73,6 +73,13 @@ LANE_DETECTOR_BACKEND = 'dl'  # 'hough' | 'classic_cv' | 'dl'
 SPEED_NORMAL  = 8.0    # 차선주행(S1) 기본속도. 0.0으로 두지 말 것 — _lane_drive()에서 나눗셈 분모로도 쓰여 ZeroDivisionError.
 SPEED_LAVACON = 2.5    # 라바콘 구간 속도
 SPEED_STOP    = 0.0
+# [2026-08-06] 코너 감속(_lane_drive())의 목표속도 하한 — 원래 SPEED_NORMAL*0.15(=1.2, 두 곳에
+#   하드코딩)로 잡혀 있었는데, config.py "6. 단위환산" 절의 실측 근거(정속 회귀선의 절편이
+#   음수라 speed≈1.4 미만은 모터 데드존으로 추정)보다 낮다. 실차에서 코너가 계속돼 이 하한까지
+#   깎이면 명령은 나가는데 실제로는 거의 안 움직이다 멈추고, 멈추면 조향 대상 lookahead도 안
+#   바뀌어 감속이 안 풀리는(=계속 정지) 증상이 재현됨. 데드존(1.4)보다 확실히 위인 3.0으로
+#   올려 하한에서도 실제로 전진하도록 한다 — 실차 재검증 필요, 그래도 안 움직이면 더 올릴 것.
+SPEED_CORNER_MIN = 3.0
 ANGLE_MAX     = 100.0  # 조향각 클램프(도)
 ANGLE_RATE_MAX = 12.0  # 조향 변화율 제한(도/주기, 20Hz 기준 12도/주기=240도/초) — drive()에서 모든 명령에 일괄 적용
 SPEED_ACCEL_STEP = 0.85  # 가속 속도제한(주기당 최대 증가량)

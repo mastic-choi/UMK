@@ -1183,11 +1183,11 @@ class TrackDriverNode(Node):
         turn_now     = min(1.0, abs(self.ctrl_angle) / ANGLE_MAX)
         turn_preview = min(1.0, abs(self.lane_lookahead) / LANE_LOOKAHEAD_REF)
         turn_for_speed = max(turn_now, turn_preview * 0.3)
-        target_speed = max(SPEED_NORMAL * 0.15,
+        target_speed = max(SPEED_CORNER_MIN,
                            SPEED_NORMAL * (1.0 - 0.90 * turn_for_speed ** 3))
         # 코너 진입(회전반경 감소) 시 추가 감속 — 기존 turn_for_speed 기반 감속과는 독립적으로
         # 계산해서 더 낮은 쪽을 쓴다(대체가 아니라 추가 안전판).
-        target_speed = max(SPEED_NORMAL * 0.15, target_speed * self._corner_radius_speed_scale())
+        target_speed = max(SPEED_CORNER_MIN, target_speed * self._corner_radius_speed_scale())
         speed_ratio = min(1.0, self._prev_speed / SPEED_NORMAL)
         corner_decay = CORNER_HOLD_DECAY_LO + (CORNER_HOLD_DECAY_HI - CORNER_HOLD_DECAY_LO) * speed_ratio
         self._corner_hold = max(turn_now, self._corner_hold * corner_decay)
