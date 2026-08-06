@@ -1298,18 +1298,21 @@ class TrackDriverNode(Node):
                 lines.append((f'헤딩오차 e_psi: {math.degrees(e_psi):+.1f}도', (10, 8 + 32 * len(lines)),
                                (255, 255, 255), 20, f'e_psi: {math.degrees(e_psi):+.1f}deg'))
 
-        # DA(주행가능영역) 면적비 — DL_DA_MAX_AREA_RATIO 실측 튜닝용. 원래 da_debug라는 별도
+        # DA(주행가능영역) 면적 — DL_DA_MAX_AREA_PX 실측 튜닝용. 원래 da_debug라는 별도
         # 창이었는데 조향 상태랑 같이 한눈에 보고 싶다는 요청으로 이 창에 합쳤다(2026-08-06).
-        # 'dl' 백엔드 전용(_slide 속성이 없는 hough/classic_cv 백엔드에서는 0.000으로만 표시됨).
+        # 'dl' 백엔드 전용(_slide 속성이 없는 hough/classic_cv 백엔드에서는 0px로만 표시됨).
+        #   [2026-08-06] 마스크 전체 대비 비율이 아니라 절대 픽셀값으로 바꿨다(config.py의
+        #   DL_DA_MAX_AREA_PX 주석 참고) — 직선 구간에서 이 창의 "largest" 값을 그대로 읽어서
+        #   DL_DA_MAX_AREA_PX 실측값으로 쓰면 된다.
         #   초록 : 임계값 대비 80% 미만 — 여유 있음
         #   주황 : 80~100% — 임계값에 근접
         #   빨강 : 100% 초과 — 이번 프레임 실제로 outlier 처리됨(_largest_da_component() 참고)
         slide = getattr(self.lane_detector, '_slide', None)
-        da_largest = getattr(slide, 'da_largest_area_ratio', 0.0) if slide is not None else 0.0
-        da_chosen = getattr(slide, 'da_chosen_area_ratio', 0.0) if slide is not None else 0.0
+        da_largest = getattr(slide, 'da_largest_area_px', 0) if slide is not None else 0
+        da_chosen = getattr(slide, 'da_chosen_area_px', 0) if slide is not None else 0
         da_fallback = getattr(slide, 'da_fallback_used', False) if slide is not None else False
-        da_ratio_of_max = (da_largest / DL_DA_MAX_AREA_RATIO) if DL_DA_MAX_AREA_RATIO > 0 else 0.0
-        if da_largest > DL_DA_MAX_AREA_RATIO:
+        da_ratio_of_max = (da_largest / DL_DA_MAX_AREA_PX) if DL_DA_MAX_AREA_PX > 0 else 0.0
+        if da_largest > DL_DA_MAX_AREA_PX:
             da_color = (0, 0, 220)
             da_kr = f'임계값 초과(outlier) {da_ratio_of_max*100:.0f}%'
             da_en = f'OVER THRESHOLD {da_ratio_of_max*100:.0f}%'
@@ -1319,12 +1322,12 @@ class TrackDriverNode(Node):
         else:
             da_color = (0, 200, 0)
             da_kr, da_en = f'정상 {da_ratio_of_max*100:.0f}%', f'OK {da_ratio_of_max*100:.0f}%'
-        lines.append((f'DA 면적비: {da_kr}', (10, 8 + 32 * len(lines)), da_color, 20, f'DA ratio: {da_en}'))
+        lines.append((f'DA 면적: {da_kr}', (10, 8 + 32 * len(lines)), da_color, 20, f'DA area: {da_en}'))
         lines.append((
-            f'DA largest:{da_largest:.3f} chosen:{da_chosen:.3f}'
-            f'{" [FALLBACK]" if da_fallback else ""} max:{DL_DA_MAX_AREA_RATIO:.2f}',
+            f'DA largest:{da_largest}px chosen:{da_chosen}px'
+            f'{" [FALLBACK]" if da_fallback else ""} max:{DL_DA_MAX_AREA_PX}px',
             (10, 8 + 32 * len(lines)), (255, 255, 255), 18,
-            f'DA largest:{da_largest:.3f} chosen:{da_chosen:.3f} max:{DL_DA_MAX_AREA_RATIO:.2f}'))
+            f'DA largest:{da_largest}px chosen:{da_chosen}px max:{DL_DA_MAX_AREA_PX}px'))
 
         canvas = np.full((8 + 32 * len(lines) + 16, 380, 3), 30, dtype=np.uint8)
         put_text_kr_multi(canvas, lines)

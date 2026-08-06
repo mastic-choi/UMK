@@ -160,7 +160,7 @@ from ..config import (
     DL_N_SLICES, DL_MIN_PIXELS, DL_NEAR_SLICES, DL_FAR_SLICES,
     DL_SLICE_OUTLIER_MAX, DL_SLICE_FIT_MIN,
     DL_STABLE_FRAME_MIN, DL_STABLE_JUMP_MAX,
-    DL_DA_MIN_COMPONENT_AREA, DL_DA_MAX_AREA_RATIO,
+    DL_DA_MIN_COMPONENT_AREA, DL_DA_MAX_AREA_PX,
     DL_LL_SANITY_MIN_RATIO, DL_LL_CLIP_MARGIN_PX,
     DEBUG_VIZ_DL_LANE, YELLOW_LOWER, YELLOW_UPPER, FPS_LOG_PERIOD_SEC,
 )
@@ -325,6 +325,8 @@ class DLSlideWindow(SlideWindow):
         self.da_fallback_used = False  # 이번 프레임 da가 최댓값이 아니라 차선책(2번째 이하) 덩어리인지 — visualize() 색상 구분용
         self.da_ll_clip_skipped = False  # 이번 프레임 ll 클리핑이 유효 밴드를 너무 줄여 건너뛰었는지 — visualize() 구분용
         self.da_largest_mask_roi = None  # 면적 1위 덩어리(차선책을 썼다면 그 사유가 된, 상한 초과로 버려진 덩어리) — fallback일 때 원래 색으로 같이 그리기용
+        self.da_largest_area_px = 0  # 면적 1위 덩어리의 절대 픽셀 면적(채택 여부 무관) — DL_DA_MAX_AREA_PX 실측 튜닝용
+        self.da_chosen_area_px = 0   # 실제로 채택돼 waypoint 추출에 쓰인 덩어리의 면적(무효 프레임엔 0)
 
         # DL_USE_BEV=True일 때만 쓰는 워프 행렬. 상수라 매 프레임 다시 안 만들고 한 번만 계산.
         self._bev_M = (
@@ -353,18 +355,24 @@ class DLSlideWindow(SlideWindow):
         지운다. 덩어리가 DL_DA_MIN_COMPONENT_AREA보다 작으면(사실상 안 보임) 빈 마스크를
         반환한다.
 
-        가장 큰 덩어리가 마스크 전체 면적의 DL_DA_MAX_AREA_RATIO를 넘을 만큼 크면 그
-        덩어리는 outlier로 버린다. 정상적인 자기 차선 폭이라면 이 정도로 넓을 수 없는데,
-        실측으로 확인된 두 실패모드가 여기 해당한다:
+        가장 큰 덩어리가 DL_DA_MAX_AREA_PX(절대 픽셀수)를 넘을 만큼 크면 그 덩어리는
+        outlier로 버린다. 정상적인 자기 차선 폭이라면 이 정도로 넓을 수 없는데, 실측으로
+        확인된 두 실패모드가 여기 해당한다:
           ① ㅓ교차로 등 분기에서 da가 옆 갈래까지 하나로 이어붙는 경우
           ② 차선(백선) 자체가 없는 맨바닥을 통째로 주행가능영역으로 오검출하는 경우
         두 경우 모두 원인은 다르지만 "정상보다 비정상적으로 넓다"는 신호는 공통이라
-        같은 임계값 하나로 같이 걸러낸다. 절대 픽셀수가 아니라 마스크 전체 대비
-        비율로 잡아서 DL_USE_BEV 캔버스 크기가 바뀌어도 그대로 유효하다.
+        같은 임계값 하나로 같이 걸러낸다.
+        [2026-08-06] 원래는 마스크 전체 대비 비율(DL_DA_MAX_AREA_RATIO=0.6, DL_USE_BEV
+        캔버스 크기가 바뀌어도 재계산 없이 유효하다는 장점)로 잡았는데, 실차에서 직선
+        구간 da 면적을 직접 실측해 절대 픽셀값(DL_DA_MAX_AREA_PX)으로 교체했다 — 비율은
+        "대충 이 정도면 비정상적으로 넓다"는 추정이었지만, 절대값은 "정상 직선 구간에서
+        실제로 관찰되는 면적"에 직접 근거하므로 더 정확하다. 대신 원거리 크롭
+        (DL_BEV_FAR_LIMIT_M, §2.5) 등으로 캔버스 크기 자체가 바뀌면 이 값도 다시
+        실측해야 한다(비율 방식과 달리 자동으로 안 따라감).
 
         [2026-08-06] 가장 큰 덩어리를 버린 뒤 곧바로 빈 마스크(=이번 프레임 무효)로
         처리하지 않고, 그다음으로 큰 덩어리부터 순서대로 [MIN_COMPONENT_AREA,
-        MAX_AREA_RATIO] 범위 안에 드는 것을 찾아 대신 채택한다("차선책"). S자 연속
+        MAX_AREA_PX] 범위 안에 드는 것을 찾아 대신 채택한다("차선책"). S자 연속
         커브 구간에서 실측으로 확인된 문제: 첫 덩어리가 옆 차로/노면 반사와 붙어
         면적 상한에 걸리는 프레임이 길게 이어지면, 예전 방식(그냥 무효 처리)은
         self.path가 몇 프레임짜리 튐이 아니라 사실상 무한정 정지 상태로 얼어붙어
@@ -380,15 +388,22 @@ class DLSlideWindow(SlideWindow):
         num, labels, stats, _ = cv2.connectedComponentsWithStats(da_mask, connectivity=8)
         self.da_fallback_used = False
         self.da_largest_mask_roi = None
+        self.da_largest_area_px = 0
+        self.da_chosen_area_px = 0
         if num <= 1:
             return np.zeros_like(da_mask)
 
         areas = stats[1:, cv2.CC_STAT_AREA]
         order = np.argsort(areas)[::-1]  # 큰 덩어리부터
-        max_area = DL_DA_MAX_AREA_RATIO * da_mask.size
+        max_area = DL_DA_MAX_AREA_PX
 
         largest_label = 1 + int(order[0])
         self.da_largest_mask_roi = np.where(labels == largest_label, np.uint8(255), np.uint8(0))
+        # [2026-08-06] 실측 튜닝용 — 가장 큰 덩어리 면적(채택 여부와 무관)을 항상 기록해둔다.
+        # DEBUG_VIZ_STEER 창(track_drive.py _debug_viz_steer())이 이 값을 그대로 읽어서
+        # "직선 구간 da 면적이 실제로 몇 px인지" 실측하는 용도로 쓴다 — DL_DA_MAX_AREA_PX를
+        # 이 실측값 기반으로 잡기 위함(config.py 주석 참고).
+        self.da_largest_area_px = int(areas[order[0]])
 
         for rank, idx in enumerate(order):
             area = int(areas[idx])
@@ -396,6 +411,7 @@ class DLSlideWindow(SlideWindow):
                 break  # 내림차순 정렬이라 이후는 전부 더 작다 — 더 볼 필요 없음
             if area <= max_area:
                 self.da_fallback_used = rank > 0
+                self.da_chosen_area_px = area  # 실제로 채택돼 waypoint 추출에 쓰이는 면적
                 label = 1 + int(idx)
                 return np.where(labels == label, np.uint8(255), np.uint8(0))
             # 이 덩어리는 outlier(면적 상한 초과) — 다음으로 큰 덩어리를 시도

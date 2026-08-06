@@ -448,7 +448,7 @@ TEST_FORCE_BEHAVIOR = False   # 라바콘 등 Behavior 없이 순수 차선주�
 ### 2.1 da 면적 상한 대응 — 차선책(fallback) 덩어리 채택 (2026-08-06)
 
 **증상:** S자 연속 커브 구간에서, da 최대 연결덩어리가 옆 차로/노면 반사와 붙어
-`DL_DA_MAX_AREA_RATIO`(면적 상한, §6.4)에 계속 걸리는 프레임이 길게 이어지면 — 디버그 창엔 여전히
+`DL_DA_MAX_AREA_PX`(면적 상한, §6.4·§2.6)에 계속 걸리는 프레임이 길게 이어지면 — 디버그 창엔 여전히
 경로(웨이포인트)가 그려지는데도 실차가 완전히 멈춰버리는 현상이 실측으로 확인됨.
 
 **원인:** 예전 `_largest_da_component()`([perception/dl_lane.py](perception/dl_lane.py))는 최댓값
@@ -463,7 +463,7 @@ TEST_FORCE_BEHAVIOR = False   # 라바콘 등 Behavior 없이 순수 차선주�
 계속 나가는데 실제로는 안 움직이는 상태로 굳어버린 것. (이 바닥값 자체는 이후 §2.3에서 별도로 고쳤다.)
 
 **수정:** 가장 큰 덩어리가 면적 상한에 걸리면 곧장 무효 처리하지 않고, 그다음으로 큰 덩어리부터
-순서대로 `[DL_DA_MIN_COMPONENT_AREA, DL_DA_MAX_AREA_RATIO]` 범위 안에 드는 걸 찾아 **대신 채택**한다
+순서대로 `[DL_DA_MIN_COMPONENT_AREA, DL_DA_MAX_AREA_PX]` 범위 안에 드는 걸 찾아 **대신 채택**한다
 (`_largest_da_component()`, `self.da_fallback_used` 플래그로 표시). 같은 프레임에서 다른 덩어리로
 분리돼 있었다는 건 그게 자기 차선일 가능성이 높다는 뜻이라, "몇 초씩 정지"보다 낫다는 판단. 어느
 덩어리도 범위 안에 없으면(전부 상한 초과 혹은 전부 너무 작음) 기존과 동일하게 무효 처리한다 — 동작이
@@ -584,9 +584,38 @@ da 전체(덩어리 선택/ll클리핑 전, `self.da_mask_all_roi`)를 **파란�
 - `DL_BEV_FAR_LIMIT_M=0.7`은 실차 미검증 값. `DEBUG_VIZ_DL_LANE` 창에서 크롭 경계(파란/초록 영역이
   갑자기 끝나는 지점)가 원하는 위치에 오는지 확인할 것.
 - 캔버스 높이가 줄어든 만큼(298→178px, 약 60%) `DL_N_SLICES`(8밴드)당 픽셀 수도 줄어든다 —
-  `DL_MIN_PIXELS`/`DL_DA_MIN_COMPONENT_AREA`/`DL_DA_MAX_AREA_RATIO` 등 절대·비율 픽셀 임계값들의
+  `DL_MIN_PIXELS`/`DL_DA_MIN_COMPONENT_AREA`/`DL_DA_MAX_AREA_PX` 등 절대 픽셀 임계값들의
   "픽셀당 의미"가 이 크롭 이전과 달라졌을 수 있다. 아직 재검증하지 않았으니 da가 이유 없이 무효 처리되는
   빈도가 늘면 이쪽을 먼저 볼 것.
+
+### 2.6 da 면적 상한을 실측 절대값으로 교체 (`DL_DA_MAX_AREA_PX`, 2026-08-06)
+
+`_largest_da_component()`의 면적 상한 판단(§2.1)이 원래 "마스크 전체 대비 비율"(`DL_DA_MAX_AREA_RATIO`,
+기본 0.6 — DL_USE_BEV 캔버스 크기가 바뀌어도 재계산 없이 유효하다는 장점으로 택한 값, §6.4)이었는데,
+"이 정도면 비정상적으로 넓다"는 대충의 추정치였다. 실차에서 `_debug_viz_steer()`(`DEBUG_VIZ_STEER` 창)로
+**직선 구간의 실제 da 면적**을 실측할 수 있게 됐으므로, 그 실측값 기반 절대 픽셀값(`DL_DA_MAX_AREA_PX`)
+으로 교체했다(요청 반영) — 판단 로직 자체("이 값보다 크면 outlier로 버리고 그다음 크기 덩어리를
+시도")는 `_largest_da_component()`에 이미 있던 그대로다(§2.1의 "차선책" 폴백), 비교 기준값의 근거만
+추정 → 실측으로 바뀐 것.
+
+**바뀐 것:**
+- `config.py`: `DL_DA_MAX_AREA_RATIO`(비율) → `DL_DA_MAX_AREA_PX`(절대 픽셀수)로 이름·단위 교체.
+- `perception/dl_lane.py`: `_largest_da_component()`가 매 프레임 `self.da_largest_area_px`(면적 1위
+  덩어리, 채택 여부 무관)와 `self.da_chosen_area_px`(실제 채택된 덩어리, 무효 프레임엔 0)를 기록
+  ([perception/dl_lane.py:388](perception/dl_lane.py#L388)).
+- `track_drive.py`: `_debug_viz_steer()`(`steer_debug` 창)의 DA 면적 표시를 비율(%)에서 위 두 절대
+  픽셀값 + `DL_DA_MAX_AREA_PX` 대비 퍼센트로 교체 — 이 창의 `DA largest:`가 그대로 실측값 후보다
+  ([track_drive.py:1301](track_drive.py#L1301)).
+
+**실측 방법:** 실차를 직선 구간에 놓고 `steer_debug` 창의 `DA largest:` 값을 몇 프레임 관찰 → 그 정상
+범위의 대표값(여유를 약간 둔 상한)을 `DL_DA_MAX_AREA_PX`에 대입.
+
+**알려진 한계:**
+- `DL_DA_MAX_AREA_PX=62478`은 아직 실측값이 아니라 **플레이스홀더**다 — 원거리 크롭(§2.5) 적용 후
+  캔버스 크기(585×178=104,130px²) 기준으로 옛 비율(0.6)이 의미하던 절대값을 그대로 환산만 한 것이라,
+  실제 안전 마진과는 무관하다. 위 실측 방법대로 관찰한 값으로 교체할 것.
+- 비율 방식과 달리 캔버스 크기가 또 바뀌면(예: `DL_BEV_FAR_LIMIT_M` 재조정) 이 값도 같이 재측정해야
+  한다 — 캔버스 크기 불변 가정 하의 값이라는 걸 기억할 것.
 
 ---
 
@@ -758,7 +787,9 @@ m/px 환산이 없었는데, BEV(585×298px 캔버스, 면적비 옛 ROI 대비 
 마스크가 더 이상 옆 차선으로 번지지 않는지 검증할 것 — **여전히 실차 미검증 추정치**입니다. 참고로 "da 면적이
 통째로 크게 튀는" 실패모드(ㅓ교차로에서 옆 갈래까지 하나로 이어붙는 경우, 차선 없는 맨바닥을 통째로
 오검출하는 경우)는 위 4개와 별개로 `DL_DA_MAX_AREA_RATIO`(마스크 전체 대비 면적 비율 상한, 기본 0.6)가
-잡아낸다 — 이쪽은 "중심선이 서서히 옆으로 새는" 경우를 잡는 역할로 서로 보완 관계.
+잡아낸다 — 이쪽은 "중심선이 서서히 옆으로 새는" 경우를 잡는 역할로 서로 보완 관계. (2026-08-06:
+`DL_DA_MAX_AREA_RATIO`는 이후 §2.6에서 실측 절대 픽셀값 `DL_DA_MAX_AREA_PX`로 교체됐습니다 — 비율
+방식이었던 이유·교체 근거는 그쪽 참고.)
 
 ### 6.5 속도 단위 ↔ m/s 환산 (`METERS_PER_SPEED_UNIT`, 2026-08-06 실측)
 
