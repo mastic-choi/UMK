@@ -149,6 +149,12 @@ class PurePursuitController:
         # "속도를 늦춰 반응시간을 버는" 방식으로도 완화한다). held=True인 프레임에는
         # 갱신하지 않고 직전값을 그대로 유지한다 — prev_steer_deg와 같은 원칙.
         self.last_curvature = 0.0
+        # 이번(혹은 마지막 유효) 프레임에서 실제로 damp 판단에 쓰인 IMU curvature(1/px) —
+        # track_drive.py._imu_curvature_px()가 넘겨준 값(IMU/VESC 둘 다 살아있고 dl+BEV
+        # 조합일 때만 not None). 디버그 창에서 "지금 IMU가 감쇠에 실제로 기여하는지"를
+        # 바로 확인할 수 있게 노출한다 — control()에 매번 넘어와도 probe_curvature가 더
+        # 크면 반영이 안 될 수 있으니 last_curvature만으로는 구분이 안 됨.
+        self.last_imu_curvature_px = None
 
     def reset(self):
         self.prev_steer_deg = 0.0
@@ -156,6 +162,7 @@ class PurePursuitController:
         self.last_curvature = 0.0
         self.last_target_xy = None
         self.last_lookahead_px = None
+        self.last_imu_curvature_px = None
 
     def _target_point(self, path, vehicle_xy, lookahead_px):
         """path를 따라 vehicle_xy로부터 누적 호길이가 lookahead_px를 넘는 첫 지점을
@@ -173,12 +180,18 @@ class PurePursuitController:
             prev = (x, y)
         return path[-1]
 
-    def control(self, path, vehicle_xy, speed=0.0):
+    def control(self, path, vehicle_xy, speed=0.0, imu_curvature_px=None):
         """path : [(x,y), ...] ROI 픽셀좌표, 가까운점(차량 근처)→먼점 순
            vehicle_xy : (x,y) 차량 기준점(관례상 ROI 하단 중앙 == path[0] 근방)
            speed : 직전 프레임 명령속도(track_drive.py의 _prev_speed, 모터 단위) 근사치 —
                    lookahead를 속도에 맞춰 늘이고 줄이는 데만 쓰는 순간값이라 누적하지
                    않는다(위치를 적분하는 dead-reckoning과는 다름, 드리프트 없음).
+           imu_curvature_px : IMU 각속도(yaw_rate) + VESC 실측속도로 구한 "차량이 지금
+                   실제로 얼마나 도는지" curvature(1/px, 부호 불문 — abs로만 쓰임).
+                   track_drive.py._imu_curvature_px()가 IMU/VESC가 둘 다 살아있고
+                   dl+BEV 조합일 때만 값을 주고, 그 외(둘 중 하나라도 죽어있거나 다른
+                   백엔드)엔 None을 줘서 아래 로직이 기존처럼 probe_curvature 단독
+                   판단으로 자동 폴백하게 만든다.
            반환 : 조향각(도), ±angle_max_deg로 클램프.
            호출 후 self.held로 이번 호출이 "새로 계산"(False)했는지 "직전값 유지"(True)
            했는지, self.last_curvature로 이번(혹은 마지막 유효) curvature를 확인할 수
@@ -204,7 +217,19 @@ class PurePursuitController:
         probe_dy = max(vehicle_xy[1] - probe_ty, 1e-3)
         probe_ld = max(math.hypot(probe_dx, probe_dy), min(self.min_lookahead_px, probe_px))
         probe_curvature = 2.0 * math.sin(math.atan2(probe_dx, probe_dy)) / probe_ld
-        curvature_damp = 1.0 / (1.0 + self.lookahead_curvature_gain * abs(probe_curvature))
+        # [2026-08-06] IMU 실측 curvature 반영 — probe_curvature는 "아직 안 가본 앞쪽
+        # 경로가 얼마나 휘었는지"에 대한 비전 추정치라, 경로 자체가 흔들리면 같이
+        # 흔들린다. imu_curvature_px는 "차량이 지금 실제로 얼마나 돌고 있는지" 실측값
+        # 이라 이 노이즈가 없다. 둘 중 하나만 믿기보다 둘 중 절댓값이 더 큰 쪽으로
+        # damp를 건다 — 비전이 못 본 코너를 IMU가 잡아내는 경우(혹은 그 반대)를 놓치지
+        # 않기 위한 보수적(더 세게 죽이는 쪽) 선택. imu_curvature_px가 None이면
+        # (IMU/VESC 중 하나라도 죽어있거나 dl+BEV 조합이 아니면) 기존과 동일하게
+        # probe_curvature 단독으로 판단한다.
+        damp_curvature = abs(probe_curvature)
+        if imu_curvature_px is not None:
+            damp_curvature = max(damp_curvature, abs(imu_curvature_px))
+        self.last_imu_curvature_px = imu_curvature_px
+        curvature_damp = 1.0 / (1.0 + self.lookahead_curvature_gain * damp_curvature)
         lookahead_px = float(np.clip(
             speed_lookahead_px * curvature_damp,
             self.lookahead_min_px, self.lookahead_max_px

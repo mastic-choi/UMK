@@ -386,6 +386,43 @@ lookahead가 `PP_LOOKAHEAD_MIN_PX(40px)` 근처에 계속 눌려있어 절대 �
   단위 사이를 오가며 미세하게 들쭉날쭉할 수 있습니다. 실측해보고 문제되면 전환 시 저역통과를 추가로
   걸 것.
 
+### 0.5.5 IMU 실측 curvature로 코너 감쇠 보강 (`pure_pursuit` 전용, 2026-08-06)
+
+§0.5.2의 코너 진입 lookahead 감쇠는 지금까지 `probe_curvature`(비전 경로에서 뽑은 "아직 안 가본 앞쪽이
+얼마나 휘었는지" 추정치) 하나에만 의존했습니다. IMU가 이번에 살아나면서(§8), "차량이 지금 실제로 얼마나
+돌고 있는지"를 자이로로 직접 재서 이 판단을 보강하도록 바꿨습니다.
+
+**구조** (`_imu_curvature_px()`, [track_drive.py:1241](track_drive.py#L1241)):
+1. `cb_imu()`가 `msg.angular_velocity.z`(yaw rate, rad/s)를 `self.imu_yaw_rate`로, 수신 시각을
+   `self._imu_t`로 저장합니다(기존엔 `orientation`만 쓰고 각속도는 버리고 있었음).
+2. `kappa_m = imu_yaw_rate / v_mps`(VESC 실측속도, §7)로 실제 curvature(1/m)를 구하고,
+   `DL_PIXELS_PER_METER`(=200px/m)로 나눠 `pure_pursuit`이 쓰는 픽셀 curvature 단위로 맞춥니다 —
+   이 환산은 `PP_WHEELBASE_PX`(§6.8)와 동일하게 `dl+BEV` 조합에서만 유효합니다.
+3. `controller/pure_pursuit.py`의 `control()`이 `probe_curvature`와 이 `imu_curvature_px` 중
+   **절댓값이 더 큰 쪽**으로 감쇠를 겁니다 — 비전이 못 본 코너를 IMU가 잡아내는 경우(또는 그 반대)를
+   놓치지 않기 위한 보수적 선택입니다. 부호는 안 맞춥니다(`abs()`로만 쓰여서 실차 미검증인 IMU 부호규약이
+   실제 조향에 영향을 못 줍니다).
+
+**가드 — IMU/VESC 둘 다 살아있을 때만 반영:** `LANE_DETECTOR_BACKEND=='dl' and DL_USE_BEV`가 아니거나,
+IMU가 죽어있거나(`IMU_STALE_SEC=0.5` 이상 미수신), VESC가 죽어있으면(§7 `VESC_STALE_SEC`/
+`VESC_MIN_SPEED_MPS` 동일 기준, `_vesc_live()`로 통합) `_imu_curvature_px()`가 `None`을 반환하고
+`pure_pursuit`은 기존처럼 `probe_curvature` 단독 판단으로 자동 폴백합니다 — 코드가 항상 들어가 있어도
+센서 중 하나라도 안 살아있으면 동작이 예전과 완전히 동일합니다.
+
+**현재 상태 (2026-08-06):** VESC가 지금 실차에서 안 잡히는 상태라(§7) `_imu_curvature_px()`가 항상
+`None`을 반환 중 — 즉 이 기능은 지금 당장은 아무 영향이 없습니다(의도된 동작). VESC 연결만 복구되면
+코드를 더 안 건드려도 자동으로 활성화됩니다.
+
+**확인 방법:** `DEBUG_VIZ_STEER=True`(기본값)의 `steer_debug` 창에 `pure_pursuit` 모드일 때
+`lookahead/curvature` 값과 `IMU curvature:` 줄이 추가로 표시됩니다 — 회색 `미반영(IMU/VESC 확인)`이면
+아직 폴백 중, 초록색 숫자가 뜨면 실제로 이번 프레임 감쇠 판단에 IMU 값이 반영된 것입니다.
+
+**알려진 한계:**
+- IMU 각속도 부호규약(z축 +가 좌/우 중 어느 쪽인지)이 실차 미검증입니다. 위에서 설명한 대로 `abs()`로만
+  쓰여서 조향 자체엔 영향이 없지만, 나중에 다른 용도로 부호를 쓰게 되면 먼저 검증할 것.
+- `probe_curvature`와 `imu_curvature_px`를 단순 `max(abs, abs)`로만 합칩니다 — 실제로 어느 쪽이 더
+  신뢰할 만한지 가중치를 다르게 주는 것(칼만 필터 등)은 아직 안 함. 실차 데이터 쌓이면 재검토.
+
 ---
 
 ## 1. 신호등 (S0 출발 / S2 교차로) — 통합 4구 신호등
@@ -943,3 +980,79 @@ m/px 환산이 없었는데, BEV(585×298px 캔버스, 면적비 옛 ROI 대비 
 구조를 그대로 갖고 있어 이식하지 않았습니다 — VESC 연동 파일 3개(`cb_vesc`/`_debug_viz_vesc`/구독 wiring,
 `launch/vesc_speed_bridge.py`, `launch/manual_drive.launch.py`)와 `LQR_WHEELBASE_M` 실측값만 선별해서
 가져왔습니다.
+
+---
+
+## 8. IMU 센서 연동 (SparkFun 9DoF Razor IMU M0, 2026-08-06)
+
+### 8.1 하드웨어 상태 — 지금까지 고장, 이번에 수리
+
+`/imu` 토픽은 처음부터 `track_drive.py`가 구독하고 있었지만(`cb_imu()`), **IMU 하드웨어 자체가 고장나
+있어서** 실제로는 한 번도 살아있었던 적이 없었습니다. 이번에 하드웨어를 수리했고, 사용 중인 보드는
+[SparkFun 9DoF Razor IMU M0 (SKU: SEN-14001)](https://learn.sparkfun.com/tutorials/9dof-razor-imu-m0-hookup-guide/all)
+입니다. 펌웨어는 SparkFun 가이드가 안내하는 방식대로 다시 올릴 예정입니다.
+
+**펌웨어를 처음부터 새로 만들 필요 없음 — 이미 이 보드 전용으로 준비돼 있었습니다.** 로봇의 기존
+`~/xycar_ws/src/xycar_device/xycar_imu` 패키지(버전관리 밖에 있던 워크스페이스)를 확인한 결과,
+`firmware/Razor_AHRS/Razor_AHRS.ino`에 정확히 `#define HW__VERSION_CODE 14001 // SparkFun "9DoF Razor
+IMU M0" version "SEN-14001"`로 지금 쓰는 보드용 설정이 이미 돼 있었습니다 — 이 `.ino`를 Arduino
+IDE(보드: SparkFun 9DoF Razor IMU M0)로 그대로 올리면 됩니다.
+
+### 8.2 `xycar_imu` 패키지를 이 저장소로 편입
+
+기존엔 이 IMU 드라이버 패키지가 실차의 `~/xycar_ws`(버전관리 안 됨)에만 있어서, 실차를 다시 세팅하거나
+다른 사람이 이어받을 때 그대로 사라질 위험이 있었습니다. 그래서 **`~/xycar_ws/src/xycar_device/xycar_imu`
+전체를 이 저장소의 [`xycar_device/xycar_imu/`](../../xycar_device/xycar_imu)로 그대로 복사해 버전관리에
+편입**했습니다(빌드 산출물 `__pycache__`/`*.pyc`는 제외, `package.xml`/`setup.py`/`config/`/`launch/`/
+`firmware/`/`src/` 등 ament_python 빌드에 필요한 파일은 전부 포함).
+
+**배포 방법 (실차):** 이 저장소를 pull한 뒤 `xycar_device/xycar_imu`를 `~/xycar_ws/src/xycar_device/`에
+그대로 붙여넣고 `colcon build --packages-select xycar_imu` → 다시 source하면 끝입니다.
+
+**편입하면서 발견해 고친 버그 (2개, 둘 다 같은 원인):** `xycar_imu` 패키지의 launch 파일 두 개가 존재하지
+않는 설정파일을 가리키고 있었습니다.
+- `launch/xycar_imu.launch.py`, `launch/xycar_imu_viewer.launch.py` 둘 다 `config/imu.yaml`을
+  로드하려 했는데, 실제로는 그런 파일이 없고(`config/`엔 `razor.yaml`/`razor_diags.yaml`/`xycar_imu.yaml`
+  세 개뿐, `razor.yaml`과 `xycar_imu.yaml`은 내용이 완전히 동일함) — `imu.yaml`로 오타가 난 것으로 보입니다.
+  이 상태로 `imu_node`를 띄우면 파라미터 파일을 못 찾아 시작 직후 죽습니다. 두 파일 모두 `"xycar_imu.yaml"`을
+  가리키도록 고쳤습니다.
+- (`launch/razor-pub-diags.launch.py` → `razor_diags.yaml`, `launch/xycar_imu_and_display.launch.py` →
+  `xycar_imu.yaml`은 원래부터 정확히 존재하는 파일을 가리키고 있어 손대지 않았습니다.)
+
+**아직 안 한 것 — 다음 단계:** [`launch/track_drive.launch.py`](launch/track_drive.launch.py)의
+`imu_include`가 여전히 주석 처리돼 있습니다(`# imu_include,  # S0->S1 테스트 단계에서 비활성화...`) —
+IMU 하드웨어를 고치고 `xycar_imu` 패키지를 빌드해도 이 줄을 살리지 않으면 `track_drive` 노드는 여전히
+`/imu`를 못 받습니다. 펌웨어 플래싱 + 패키지 빌드가 실차에서 확인되면 이 주석을 해제할 것.
+
+**시리얼 포트:** `config/xycar_imu.yaml`의 `port: /dev/ttyIMU`(57600bps)로 고정돼 있습니다. 이 udev
+별칭이 지금 로봇에도 잡혀 있는지(보드가 새 걸로 바뀌었으니) 실차에서 확인이 필요합니다.
+
+### 8.3 `track_drive.py`가 IMU를 쓰는 곳
+
+`cb_imu()`가 `/imu`(`sensor_msgs/Imu`) 메시지에서 두 값을 뽑습니다:
+- `self.imu_yaw` (orientation 쿼터니언 → yaw, 원래부터 있던 값) — 바퀴 카운트(아래 8.4)와 S3 지름길
+  `_handle_fixed_obstacle_astar()`의 Stanley 헤딩(`_yaw_delta()`)이 씁니다.
+- `self.imu_yaw_rate` (`angular_velocity.z`, 이번에 추가) + `self._imu_t`(수신 시각) — §0.5.5
+  `pure_pursuit` 코너 감쇠 보강 전용. `IMU_STALE_SEC=0.5`(config.py) 이상 안 들어오면 죽었다고 봅니다.
+
+### 8.4 이번에 발견한 버그 — 바퀴 카운트가 항상 0에 멈추는 문제
+
+**증상:** 실차에서 아무리 주행해도 CLI 로그의 `[LAP] 1/3 바퀴 누적=+0도/...`가 계속 0에 멈춰 있었음.
+
+**원인:** `_update_lap()`([track_drive.py:832](track_drive.py#L832))은 **휠 회전이 아니라 IMU yaw
+누적만으로** 바퀴 수를 셉니다 — `self.imu_yaw`의 프레임간 차이를 계속 더하는 구조라, 독립적인
+휠 기반 폴백이 전혀 없습니다. IMU 하드웨어가 죽어있던 동안엔 `self.imu_yaw`가 초기값 `0.0`에서 한 번도
+안 바뀌었으니(`/imu`를 아예 못 받음) 프레임간 차이가 항상 `0`이라 `_yaw_accum`도 영원히 `0`으로
+찍힌 것 — 코드 버그가 아니라 **§8.1의 하드웨어 고장이 그대로 드러난 증상**이었습니다.
+
+**대응:** 이번 IMU 수리(§8.1)로 `/imu`가 실제로 들어오기 시작하면 자동으로 해결됩니다 — `_update_lap()`
+자체는 손대지 않았습니다. 다만 §8.2의 "아직 안 한 것"(`imu_include` 주석 해제)까지 끝나야 실제로
+`/imu`가 `track_drive` 노드에 도달합니다.
+
+**확인 방법:** 실차 주행 중 CLI 로그의 `[LAP] n/3 바퀴 누적=...도` 값이 주행하는 동안 계속 늘어나는지
+확인하세요. 여전히 `0`에 멈춰 있다면 ①`imu_include` 주석 해제했는지 ②`xycar_imu` 노드 시작 로그에러
+③`/dev/ttyIMU` 포트 순으로 확인할 것.
+
+**알려진 한계:** IMU가 나중에 다시 죽어도(§7 VESC의 `vesc_debug` 창처럼) 바로 알아챌 디버그 창이 없습니다
+— `_imu_t`(§8.3)로 생존 체크 인프라 자체는 §0.5.5에서 만들었지만, 아직 전용 디버그 창(`imu_debug`
+같은)까지는 안 만들었습니다. 지금은 `[LAP] 누적=`이 안 늘어나는 것으로 간접 확인해야 합니다.

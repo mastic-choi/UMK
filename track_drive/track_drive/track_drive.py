@@ -75,6 +75,15 @@ class TrackDriverNode(Node):
         self.img_front = self.img_left = self.img_right = self.img_behind = None
         self.lidar_ranges = None
         self.imu_yaw = 0.0
+        # [2026-08-06] IMU 각속도(yaw_rate, rad/s) — cb_imu()가 msg.angular_velocity.z를
+        # 그대로 저장. _imu_curvature_px()가 VESC 실측속도와 묶어 pure_pursuit의 코너
+        # 감쇠(lookahead_curvature_gain)를 보강하는 데 쓴다(controller/pure_pursuit.py
+        # imu_curvature_px 주석 참고). _imu_t는 VESC의 _vesc_t와 동일한 생존 체크 용도 —
+        # IMU가 죽으면(메시지가 안 옴) imu_yaw_rate가 마지막 값에 얼어붙는데, 그 상태로
+        # 계속 curvature 계산에 쓰면 "코너가 아닌데 코너로 착각해 lookahead가 계속
+        # 눌려있는" 문제가 생기므로 반드시 이 타임스탬프로 살아있는지 먼저 확인할 것.
+        self.imu_yaw_rate = 0.0
+        self._imu_t = None
         self._img_front_t = 0.0   # 전방 카메라 최근 수신 시각(디버그: 카메라 살아있는지 나이로 판단)
         self._scan_t       = 0.0  # 라이다 최근 수신 시각(디버그용)
 
@@ -303,6 +312,8 @@ class TrackDriverNode(Node):
     def cb_imu(self, msg):
         q = msg.orientation
         self.imu_yaw = math.atan2(2.0*(q.w*q.z + q.x*q.y), 1.0 - 2.0*(q.y*q.y + q.z*q.z))
+        self.imu_yaw_rate = msg.angular_velocity.z
+        self._imu_t = time.time()
 
     def cb_vesc(self, msg):
         """'/vesc_speed_erpm'(std_msgs/Float32) — launch/vesc_speed_bridge.py(ROS1)가 VESC
@@ -1219,6 +1230,37 @@ class TrackDriverNode(Node):
         self.ctrl_speed = target_speed
         self._prev_speed = target_speed
 
+    def _vesc_live(self):
+        """VESC 실측속도(self.v_mps)를 지금 믿을 수 있는가 — _speed_for_lookahead()와
+        _imu_curvature_px()가 동일 기준으로 공유(2026-08-06 분리, 기존엔 _speed_for_lookahead()
+        안에 인라인돼 있던 걸 IMU curvature 쪽도 똑같이 필요해져서 뺐다)."""
+        return (self._vesc_t is not None
+                and (time.time() - self._vesc_t) < VESC_STALE_SEC
+                and abs(self.v_mps) >= VESC_MIN_SPEED_MPS)
+
+    def _imu_curvature_px(self):
+        """IMU 각속도(yaw_rate) + VESC 실측속도(v_mps)로 "차량이 지금 실제로 얼마나
+        도는지" curvature(1/px)를 구해 pure_pursuit의 코너 감쇠(lookahead_curvature_gain)를
+        보강한다(controller/pure_pursuit.py control()의 imu_curvature_px 주석 참고) —
+        비전 경로만으로 뽑던 probe_curvature와 달리 픽셀 노이즈에 영향을 안 받는다.
+
+        kappa_m = yaw_rate(rad/s) / v_mps(m/s) 는 물리적으로 옳은 실제 curvature(1/m)다.
+        이걸 픽셀 curvature로 바꾸려면 DL_PIXELS_PER_METER(BEV 목적캔버스 스케일, =200px/m)로
+        나누면 되는데, 이 환산은 dl+BEV 조합(self.lane_path가 그 스케일일 때)에서만 유효하다
+        — PP_WHEELBASE_PX를 물리 기반 값으로 바꿀 때와 동일 전제(config.py 참고).
+        부호는 안 맞춘다 — pure_pursuit이 abs()로만 소비하므로 crash/오조향 위험 없이
+        magnitude만 넘기는 게 더 안전하다(IMU 부호규약 실차 미검증).
+
+        IMU 또는 VESC 둘 중 하나라도 죽어있으면(stale/미수신) None을 반환해 pure_pursuit이
+        기존처럼 probe_curvature 단독 판단으로 자동 폴백하게 한다."""
+        if not (LANE_DETECTOR_BACKEND == 'dl' and DL_USE_BEV):
+            return None
+        imu_live = self._imu_t is not None and (time.time() - self._imu_t) < IMU_STALE_SEC
+        if not (imu_live and self._vesc_live()):
+            return None
+        kappa_m = self.imu_yaw_rate / self.v_mps
+        return kappa_m / DL_PIXELS_PER_METER
+
     def _speed_for_lookahead(self):
         """pure_pursuit의 속도 적응형 lookahead(PP_LOOKAHEAD_SPEED_GAIN)에 넣을 속도값을
         고른다(2026-08-06, VESC 실측속도 연동). 예전엔 항상 self._prev_speed(직전 "명령"
@@ -1234,10 +1276,7 @@ class TrackDriverNode(Node):
         VESC_STALE_SEC 이상 지남) 값이 너무 작으면(정지 근방, 노이즈 대비 신뢰 불가)
         예전처럼 self._prev_speed로 폴백한다 — cb_vesc()/VESC_MIN_SPEED_MPS 주석과 동일한
         가드 원칙(control_loop()의 self.lqr.set_speed_mps() 가드와 짝을 맞춤)."""
-        vesc_live = (self._vesc_t is not None
-                     and (time.time() - self._vesc_t) < VESC_STALE_SEC
-                     and abs(self.v_mps) >= VESC_MIN_SPEED_MPS)
-        if vesc_live:
+        if self._vesc_live():
             return abs(self.v_mps) / METERS_PER_SPEED_UNIT
         return self._prev_speed
 
@@ -1262,7 +1301,8 @@ class TrackDriverNode(Node):
         vehicle_xy = (roi_w / 2.0, self.lane_path[0][1])
         if STEERING_CONTROLLER == 'lqr':
             return self.lqr.control(self.lane_path, vehicle_xy)
-        return self.pure_pursuit.control(self.lane_path, vehicle_xy, speed=self._speed_for_lookahead())
+        return self.pure_pursuit.control(self.lane_path, vehicle_xy, speed=self._speed_for_lookahead(),
+                                          imu_curvature_px=self._imu_curvature_px())
 
     # [DEBUG_VIZ_STEER] 조향 컨트롤러가 이번 주기에 "새로 계산"했는지(초록/현재값 반영)
     # "직전 조향각을 그대로 유지"했는지(주황/직전값 유지)를 별도 창으로 바로 확인.
@@ -1297,6 +1337,23 @@ class TrackDriverNode(Node):
             if e_psi is not None:
                 lines.append((f'헤딩오차 e_psi: {math.degrees(e_psi):+.1f}도', (10, 8 + 32 * len(lines)),
                                (255, 255, 255), 20, f'e_psi: {math.degrees(e_psi):+.1f}deg'))
+        else:
+            # [2026-08-06] IMU curvature damping 보강이 실제로 반영되는지(그냥 코드만
+            # 들어가고 IMU/VESC 둘 중 하나가 죽어서 조용히 폴백 중인 건 아닌지) 여기서
+            # 바로 확인할 수 있게 노출한다 — _imu_curvature_px()가 None을 주면
+            # pure_pursuit.last_imu_curvature_px도 None으로 유지되므로(control() 참고)
+            # None이면 "지금은 probe_curvature 단독 판단 중"이라는 뜻.
+            lookahead_px = getattr(controller, 'last_lookahead_px', None)
+            curvature = getattr(controller, 'last_curvature', None)
+            imu_kappa = getattr(controller, 'last_imu_curvature_px', None)
+            if lookahead_px is not None and curvature is not None:
+                lines.append((f'lookahead: {lookahead_px:.0f}px  curvature: {curvature:+.4f}',
+                               (10, 8 + 32 * len(lines)), (255, 255, 255), 18,
+                               f'lookahead: {lookahead_px:.0f}px  curvature: {curvature:+.4f}'))
+            imu_color = (0, 200, 0) if imu_kappa is not None else (140, 140, 140)
+            imu_text = f'{imu_kappa:+.4f}' if imu_kappa is not None else '미반영(IMU/VESC 확인)'
+            lines.append((f'IMU curvature: {imu_text}', (10, 8 + 32 * len(lines)), imu_color, 18,
+                           f'IMU curvature: {imu_text if imu_kappa is not None else "N/A"}'))
 
         # DA(주행가능영역) 면적 — DL_DA_MAX_AREA_PX 실측 튜닝용. 원래 da_debug라는 별도
         # 창이었는데 조향 상태랑 같이 한눈에 보고 싶다는 요청으로 이 창에 합쳤다(2026-08-06).
