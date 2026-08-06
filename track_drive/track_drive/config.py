@@ -111,8 +111,11 @@ APPROACH_EXIT_TIME  = 1.0  # [진출] 감속 유지 시간(s)
 #   1/3바퀴만 등장 — RACE_RULES.md 11절), 이 구간에서는 비전을 아예 참조하지 않고
 #   APPROACH_SPEED로 직진(각도 0)만 유지하다가, 이 시간이 지난 뒤에야 실제 분기
 #   방향(직진 복귀 or 좌회전 스크립트 시작)을 실행한다. 값은 물리적 1m를
-#   APPROACH_SPEED로 주행하는 데 걸리는 시간으로 맞춰야 하나 METERS_PER_SPEED_UNIT이
-#   아직 미실측이라 우선 추정치로 둔다 — 실차에서 분기 진입 타이밍 보고 조정할 것.
+#   APPROACH_SPEED로 주행하는 데 걸리는 시간으로 맞춰야 한다. METERS_PER_SPEED_UNIT은
+#   이제 실측값이 있지만(README.md "6.5 속도 단위 ↔ m/s 환산" 참고) speed=5/10 두
+#   점으로만 회귀한 값이라 APPROACH_SPEED=2.0 같은 저속 구간(추정 데드존 ≈1.4에
+#   가까움)에 그대로 대입하면 못 미덥다 — 그래서 여기 대입해서 자동 계산하지 않고
+#   여전히 우선 추정치로 둔다 — 실차에서 분기 진입 타이밍 보고 조정할 것.
 S2_COMMIT_T = 1.0
 
 
@@ -265,7 +268,7 @@ LQR_MIN_PATH_M = 0.3        # [미터 모드] 경로 전체 길이가 이보다 
 DEBUG_LOG    = True   # 0.5초마다 CLI에 [LAP]/[SENS]/[LANE]/[TRIG]/[SIG]/[LAVA-ROI] 로그
 DEBUG_PERIOD = 0.5     # 위 로그 주기(s)
 
-DEBUG_VIZ_LIDAR    = True   # 라이다 BEV 장애물 감지 디버그 창 (track_drive.py)
+DEBUG_VIZ_LIDAR    = False  # 라이다 BEV 장애물 감지 디버그 창 (track_drive.py)
 DEBUG_VIZ_LAVACON  = False  # 라바콘 트리거 좌우 클러스터 BEV 디버그 창 (track_drive.py)
 DEBUG_PLANNER      = False  # Hybrid A* OccupancyGrid 디버그 창 (track_drive.py, USE_HYBRID_ASTAR_FOR_B2=True일 때만 의미있음)
 DEBUG_VIZ_STEER    = True   # 조향 컨트롤러(직전값유지/현재값반영) 한글 디버그 창 (track_drive.py)
@@ -414,7 +417,13 @@ MANEUVER_BLOCK_AFTER_STOPLINE_T = 2.0   # 정지선을 최근에 봤으면 이 �
 #   지금 코드에는 '모터 단위'(drive()가 ±100으로 클립하는 값)와 '미터'가 섞여
 #   있다. 아래 값이 0.0이면 아직 미실측 상태라는 뜻이고, 거리 기반 로직은
 #   보수적으로 동작한다.
-METERS_PER_SPEED_UNIT = 0.0   # 모터 속도단위 1당 m/s. (SPEED_NORMAL로 5초 직진 후 거리÷5÷SPEED_NORMAL) — 미실측
+# 실측(2026-08-06): speed=5(3s/1.04m, 6s/2.50m), speed=10(3s/2.3m·2.06m 평균, 5s/4.5m) 각각
+#   2개 시점 거리로 "정속구간 기울기(m/s)"와 "가속 오프셋"을 분리 추정(직선회귀, 아래 README
+#   6.5절 근거). speed=5 → 정속 0.487m/s(가속구간≈1.73s), speed=10 → 정속 1.16m/s(가속구간≈2.24s).
+#   두 점을 잇는 기울기 0.1347(m/s per unit)을 채택 — 단, 절편이 음수라 사실상 speed≈1.4
+#   미만에서는 이 선형식이 안 맞는(모터 데드존 추정) 2점짜리 근사이니 저속(APPROACH_SPEED=2.0
+#   등)에는 그대로 쓰지 말 것. 상세 도출 과정은 README.md "6.5 속도 단위 ↔ m/s 환산" 참고.
+METERS_PER_SPEED_UNIT = 0.1347   # 모터 속도단위 1당 m/s(정속구간 기준, speed 5~10 구간 회귀)
 LANE_WIDTH_M          = 0.4   # 실측(2026-08-04): 흰선-흰선(도로 전체폭) 80cm, 노란선 정중앙 확인 → 차선 1개 폭 = 40cm
 PIXELS_PER_METER      = 0.0   # BEV 픽셀 ↔ 미터 환산(전역) — 미실측. DL_USE_BEV가 검증돼 기본 전환되면 DL_PIXELS_PER_METER로 채울 것
 VEHICLE_WIDTH_M       = 0.31  # 실측(2026-08-04): xycar 본체 가로 31cm (세로64cm×가로31cm×높이20cm)

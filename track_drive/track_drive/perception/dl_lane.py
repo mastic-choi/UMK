@@ -312,6 +312,7 @@ class DLSlideWindow(SlideWindow):
         self.da_mask_roi = None    # 시각화용(가장 큰 덩어리만 남긴 이후의 da 마스크)
         self.ll_mask_roi = None    # 시각화용
         self.centerline = []       # da 밴드별 중심점(원본 관측점, 길이 self.n_slices)
+        self.da_fallback_used = False  # 이번 프레임 da가 최댓값이 아니라 차선책(2번째 이하) 덩어리인지 — visualize() 색상 구분용
 
         # DL_USE_BEV=True일 때만 쓰는 워프 행렬. 상수라 매 프레임 다시 안 만들고 한 번만 계산.
         self._bev_M = (
@@ -336,29 +337,52 @@ class DLSlideWindow(SlideWindow):
         )
 
     def _largest_da_component(self, da_mask):
-        """da 마스크에서 가장 큰 연결 덩어리 하나만 남기고 나머지(급커브 등에서 생기는
-        파편)는 지운다. 덩어리가 DL_DA_MIN_COMPONENT_AREA보다 작으면(사실상 안 보임)
-        빈 마스크를 반환한다.
+        """da 마스크에서 연결 덩어리 하나만 남기고 나머지(급커브 등에서 생기는 파편)는
+        지운다. 덩어리가 DL_DA_MIN_COMPONENT_AREA보다 작으면(사실상 안 보임) 빈 마스크를
+        반환한다.
 
-        반대로 덩어리가 마스크 전체 면적의 DL_DA_MAX_AREA_RATIO를 넘을 만큼 크면
-        outlier로 보고 마찬가지로 빈 마스크를 반환한다(=이번 프레임 무효, _debounce가
-        직전 확정값을 유지). 정상적인 자기 차선 폭이라면 이 정도로 넓을 수 없는데,
+        가장 큰 덩어리가 마스크 전체 면적의 DL_DA_MAX_AREA_RATIO를 넘을 만큼 크면 그
+        덩어리는 outlier로 버린다. 정상적인 자기 차선 폭이라면 이 정도로 넓을 수 없는데,
         실측으로 확인된 두 실패모드가 여기 해당한다:
           ① ㅓ교차로 등 분기에서 da가 옆 갈래까지 하나로 이어붙는 경우
           ② 차선(백선) 자체가 없는 맨바닥을 통째로 주행가능영역으로 오검출하는 경우
         두 경우 모두 원인은 다르지만 "정상보다 비정상적으로 넓다"는 신호는 공통이라
         같은 임계값 하나로 같이 걸러낸다. 절대 픽셀수가 아니라 마스크 전체 대비
-        비율로 잡아서 DL_USE_BEV 캔버스 크기가 바뀌어도 그대로 유효하다."""
+        비율로 잡아서 DL_USE_BEV 캔버스 크기가 바뀌어도 그대로 유효하다.
+
+        [2026-08-06] 가장 큰 덩어리를 버린 뒤 곧바로 빈 마스크(=이번 프레임 무효)로
+        처리하지 않고, 그다음으로 큰 덩어리부터 순서대로 [MIN_COMPONENT_AREA,
+        MAX_AREA_RATIO] 범위 안에 드는 것을 찾아 대신 채택한다("차선책"). S자 연속
+        커브 구간에서 실측으로 확인된 문제: 첫 덩어리가 옆 차로/노면 반사와 붙어
+        면적 상한에 걸리는 프레임이 길게 이어지면, 예전 방식(그냥 무효 처리)은
+        self.path가 몇 프레임짜리 튐이 아니라 사실상 무한정 정지 상태로 얼어붙어
+        조향이 점점 벌어진 stale 경로를 계속 따라가다 turn_for_speed가 포화되어
+        실차 속도가 바닥값까지 떨어지는(=사실상 정지) 결과로 이어졌다. 두 번째로 큰
+        덩어리가 범위 안에 들면 자기 차선일 가능성이 높으므로(같은 프레임에서 옆
+        차로 덩어리와 분리돼 있었다는 뜻) 이걸로 대체하는 편이 "몇 초씩 정지"보다
+        낫다 — self.da_fallback_used로 이번 프레임이 차선책을 썼는지 표시해
+        visualize()가 다른 색으로 구분해 그린다(디버깅용, 실제 판단 로직에는
+        영향 없음)."""
         num, labels, stats, _ = cv2.connectedComponentsWithStats(da_mask, connectivity=8)
+        self.da_fallback_used = False
         if num <= 1:
             return np.zeros_like(da_mask)
-        best = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-        area = stats[best, cv2.CC_STAT_AREA]
-        if area < DL_DA_MIN_COMPONENT_AREA:
-            return np.zeros_like(da_mask)
-        if area > DL_DA_MAX_AREA_RATIO * da_mask.size:
-            return np.zeros_like(da_mask)
-        return np.where(labels == best, np.uint8(255), np.uint8(0))
+
+        areas = stats[1:, cv2.CC_STAT_AREA]
+        order = np.argsort(areas)[::-1]  # 큰 덩어리부터
+        max_area = DL_DA_MAX_AREA_RATIO * da_mask.size
+
+        for rank, idx in enumerate(order):
+            area = int(areas[idx])
+            if area < DL_DA_MIN_COMPONENT_AREA:
+                break  # 내림차순 정렬이라 이후는 전부 더 작다 — 더 볼 필요 없음
+            if area <= max_area:
+                self.da_fallback_used = rank > 0
+                label = 1 + int(idx)
+                return np.where(labels == label, np.uint8(255), np.uint8(0))
+            # 이 덩어리는 outlier(면적 상한 초과) — 다음으로 큰 덩어리를 시도
+
+        return np.zeros_like(da_mask)
 
     def _clip_da_by_ll(self, da_mask, ll_mask, ref_x):
         """da_mask에서 ll(차선) 라인을 경계로 "내 차선 바깥"에 해당하는 픽셀을 지운다.
@@ -511,12 +535,12 @@ class DLSlideWindow(SlideWindow):
         return lane_valid, offset, lookahead, lane_center, self.path
 
     def visualize(self, offset):
-        """da(초록)/ll(빨강) 반투명 오버레이 + da 중심선 관측점 + 피팅된 경로 + offset/
-        lane_center 텍스트를 self.vis에 그려 넣기만 한다. ★ 여기서 cv2.imshow()/
-        cv2.waitKey()를 호출하면 안 된다 ★ 이 메서드는 DLLaneDetector의 백그라운드
-        추론 스레드에서 호출되는데, OpenCV HighGUI(특히 GTK 백엔드)는 스레드 세이프하지
-        않아서 메인 스레드(다른 디버그 창들이 이미 거기서 cv2.imshow/waitKey를 부르고
-        있음)와 다른 스레드가 동시에 GUI를 건드리면 초반 몇 초는 멀쩡하다가 GTK
+        """da(초록, 차선책이면 주황)/ll(빨강) 반투명 오버레이 + da 중심선 관측점 + 피팅된
+        경로 + offset/lane_center 텍스트를 self.vis에 그려 넣기만 한다. ★ 여기서
+        cv2.imshow()/cv2.waitKey()를 호출하면 안 된다 ★ 이 메서드는 DLLaneDetector의
+        백그라운드 추론 스레드에서 호출되는데, OpenCV HighGUI(특히 GTK 백엔드)는 스레드
+        세이프하지 않아서 메인 스레드(다른 디버그 창들이 이미 거기서 cv2.imshow/waitKey를
+        부르고 있음)와 다른 스레드가 동시에 GUI를 건드리면 초반 몇 초는 멀쩡하다가 GTK
         이벤트루프가 통째로 멈추는 형태로 실차에서 재현됐다(freeze). 그래서 그리기
         (cv2.rectangle/circle/putText/addWeighted, 창 없이 이미지 버퍼에만 작동)만
         여기서 하고, 실제 창 표시는 DLLaneDetector.show_debug_windows()가 메인 스레드
@@ -526,7 +550,11 @@ class DLSlideWindow(SlideWindow):
 
         if DEBUG_VIZ_DL_LANE and self.da_mask_roi is not None:
             overlay = self.vis.copy()
-            overlay[self.da_mask_roi > 0] = (0, 200, 0)    # 주행가능영역 = 초록
+            # 차선책(최댓값 덩어리가 면적 상한에 걸려 그다음 덩어리를 대신 쓴 프레임)은
+            # 주황으로 표시해 초록(정상: 최댓값 그대로 채택)과 구분한다 —
+            # _largest_da_component() 주석 참고.
+            da_color = (0, 140, 255) if self.da_fallback_used else (0, 200, 0)
+            overlay[self.da_mask_roi > 0] = da_color       # 주행가능영역
             overlay[self.ll_mask_roi > 0] = (0, 0, 220)    # 차선 = 빨강 (da 위에 덧그림)
             cv2.addWeighted(overlay, 0.35, self.vis, 0.65, 0, dst=self.vis)
 
@@ -535,8 +563,9 @@ class DLSlideWindow(SlideWindow):
 
         cv2.line(self.vis, (self.roi_w // 2, 0), (self.roi_w // 2, self.roi_h), (0, 0, 255), 1)
         lane_center = self.roi_w / 2.0 + offset
+        fallback_tag = ' [FALLBACK]' if self.da_fallback_used else ''
         cv2.putText(
-            self.vis, f'offset:{offset:+.1f} center:{lane_center:.1f} ll_cov:{self.ll_coverage:.3f}',
+            self.vis, f'offset:{offset:+.1f} center:{lane_center:.1f} ll_cov:{self.ll_coverage:.3f}{fallback_tag}',
             (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2
         )
 
