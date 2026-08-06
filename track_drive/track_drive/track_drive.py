@@ -359,7 +359,15 @@ class TrackDriverNode(Node):
         # 세이프하지 않아 반드시 메인 스레드(여기, control_loop 타이머 콜백)에서만 호출해야
         # 한다(dl_lane.DLLaneDetector.show_debug_windows() 주석 참고). hough/classic_cv
         # 백엔드는 이 메서드가 없으므로 getattr로 조용히 건너뛴다.
-        getattr(self.lane_detector, 'show_debug_windows', lambda: None)()
+        #   속도 적응형 look-ahead 목표점(pure_pursuit.py last_target_xy)도 같이 넘겨서
+        #   result 패널에 찍는다 — self._lane_steer()가 이번 틱에 아직 안 돌았으므로
+        #   엄밀히는 직전 틱 값(0.05s 이내 오차, 디버깅 목적엔 무시 가능). LQR을 쓰면
+        #   pure_pursuit이 안 갱신되므로 None이 넘어가 마커가 그려지지 않는다.
+        lookahead_xy = lookahead_px = None
+        if STEERING_CONTROLLER == 'pure_pursuit':
+            lookahead_xy = self.pure_pursuit.last_target_xy
+            lookahead_px = self.pure_pursuit.last_lookahead_px
+        getattr(self.lane_detector, 'show_debug_windows', lambda *a, **k: None)(lookahead_xy, lookahead_px)
 
         self.lane_center = lane_center
         self.lane_valid = valid

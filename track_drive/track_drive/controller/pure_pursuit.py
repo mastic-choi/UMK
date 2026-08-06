@@ -121,6 +121,12 @@ class PurePursuitController:
         # 직전 control() 호출이 "새로 계산"했는지 "직전값을 그대로 유지"했는지 표시.
         # track_drive.py의 DEBUG_VIZ_STEER 디버그 창이 이 값을 읽어서 보여준다.
         self.held = False
+        # 직전에 새로 계산된 lookahead 목표점(ROI/da 픽셀좌표)과 그때 쓴 lookahead_px —
+        # track_drive.py가 dl_lane.py의 'result' 패널에 그대로 찍어서(속도 적응형 lookahead가
+        # 실제로 어디를 보고 있는지) 디버깅할 수 있게 노출한다. path가 비어 held=True인
+        # 프레임에는 갱신하지 않고 직전값을 그대로 들고 있는다(다른 last_* 필드와 동일 원칙).
+        self.last_target_xy = None
+        self.last_lookahead_px = None
         # 직전에 새로 계산됐을 때의 curvature(=2*sin(alpha)/ld, 1/px 단위) — 조향각으로
         # 변환되고 나면 사라지는 값이라 별도로 보관해둔다. track_drive.py가 코너 진입 시
         # 감속량을 정하는 데 쓴다(ROS2 Nav2의 Regulated Pure Pursuit과 같은 발상: 회전반경이
@@ -133,6 +139,8 @@ class PurePursuitController:
         self.prev_steer_deg = 0.0
         self.held = False
         self.last_curvature = 0.0
+        self.last_target_xy = None
+        self.last_lookahead_px = None
 
     def _target_point(self, path, vehicle_xy, lookahead_px):
         """path를 따라 vehicle_xy로부터 누적 호길이가 lookahead_px를 넘는 첫 지점을
@@ -173,6 +181,8 @@ class PurePursuitController:
             self.lookahead_min_px, self.lookahead_max_px
         ))
         tx, ty = self._target_point(path, vehicle_xy, lookahead_px)
+        self.last_target_xy = (tx, ty)
+        self.last_lookahead_px = lookahead_px
         dx = tx - vehicle_xy[0]
         if abs(dx) < self.dx_deadzone_px:
             dx = 0.0

@@ -314,6 +314,7 @@ class DLSlideWindow(SlideWindow):
         self.centerline = []       # da 밴드별 중심점(원본 관측점, 길이 self.n_slices)
         self.da_fallback_used = False  # 이번 프레임 da가 최댓값이 아니라 차선책(2번째 이하) 덩어리인지 — visualize() 색상 구분용
         self.da_ll_clip_skipped = False  # 이번 프레임 ll 클리핑이 유효 밴드를 너무 줄여 건너뛰었는지 — visualize() 구분용
+        self.da_largest_mask_roi = None  # 면적 1위 덩어리(차선책을 썼다면 그 사유가 된, 상한 초과로 버려진 덩어리) — fallback일 때 원래 색으로 같이 그리기용
 
         # DL_USE_BEV=True일 때만 쓰는 워프 행렬. 상수라 매 프레임 다시 안 만들고 한 번만 계산.
         self._bev_M = (
@@ -363,15 +364,21 @@ class DLSlideWindow(SlideWindow):
         차로 덩어리와 분리돼 있었다는 뜻) 이걸로 대체하는 편이 "몇 초씩 정지"보다
         낫다 — self.da_fallback_used로 이번 프레임이 차선책을 썼는지 표시해
         visualize()가 다른 색으로 구분해 그린다(디버깅용, 실제 판단 로직에는
-        영향 없음)."""
+        영향 없음). 이때 버려진 면적 1위 덩어리 자체도 self.da_largest_mask_roi에
+        따로 남겨서, visualize()가 "원래(가장 큰) da"와 "실제로 채택한 차선책 da"를
+        동시에(각각 원래색/차선책색으로) 그릴 수 있게 한다."""
         num, labels, stats, _ = cv2.connectedComponentsWithStats(da_mask, connectivity=8)
         self.da_fallback_used = False
+        self.da_largest_mask_roi = None
         if num <= 1:
             return np.zeros_like(da_mask)
 
         areas = stats[1:, cv2.CC_STAT_AREA]
         order = np.argsort(areas)[::-1]  # 큰 덩어리부터
         max_area = DL_DA_MAX_AREA_RATIO * da_mask.size
+
+        largest_label = 1 + int(order[0])
+        self.da_largest_mask_roi = np.where(labels == largest_label, np.uint8(255), np.uint8(0))
 
         for rank, idx in enumerate(order):
             area = int(areas[idx])
@@ -584,7 +591,13 @@ class DLSlideWindow(SlideWindow):
                 da_color = (255, 255, 0)      # 청록
             else:
                 da_color = (0, 200, 0)        # 초록(정상)
-            overlay[self.da_mask_roi > 0] = da_color       # 주행가능영역
+            # 차선책을 쓴 프레임엔 실제로 버려진 면적 1위 덩어리도 원래색(초록)으로 같이
+            # 그려서, "원래대로였다면 뭘 골랐을지"와 "실제로 채택한 차선책"을 한 화면에서
+            # 바로 비교할 수 있게 한다. 서로 다른 connected component라 픽셀이 겹치지
+            # 않으므로 어느 순서로 칠해도 서로를 덮어쓰지 않는다.
+            if self.da_fallback_used and self.da_largest_mask_roi is not None:
+                overlay[self.da_largest_mask_roi > 0] = (0, 200, 0)
+            overlay[self.da_mask_roi > 0] = da_color       # 주행가능영역(실제 채택분)
             overlay[self.ll_mask_roi > 0] = (0, 0, 220)    # 차선 = 빨강 (da 위에 덧그림)
             cv2.addWeighted(overlay, 0.35, self.vis, 0.65, 0, dst=self.vis)
 
@@ -686,7 +699,7 @@ class DLLaneDetector:
         with self._lock:
             return self._latest_result
 
-    def show_debug_windows(self):
+    def show_debug_windows(self, lookahead_xy=None, lookahead_px=None):
         """da(초록)/ll(빨강) 오버레이가 그려진 result에 da/ll 원본 이진마스크를 위→아래로
         이어붙여 창 하나(`dl_lane`)로 띄운다 — result/da/ll 순서로 세로 스택.
         [2026-08-06] 예전엔 3개 별도 창(dl_lane_result/da/ll)이었는데, 창이 흩어져 있으면
@@ -694,6 +707,15 @@ class DLLaneDetector:
         하나로 합쳤다. da/ll은 원래 1채널 이진마스크라 result(3채널 BGR)와 그대로 못
         이어붙이므로 BGR로 변환 후 vconcat한다 — result/da/ll 모두 같은 ROI에서 나온
         동일 shape(BEV 캔버스 크기)이라 폭이 항상 맞는다.
+
+        lookahead_xy(있으면) : pure_pursuit.PurePursuitController가 직전에 계산한 look-ahead
+        목표점, (x, y) — self.lane_path와 같은 da ROI 픽셀좌표계라 result 패널에 좌표 변환
+        없이 그대로 찍을 수 있다. 속도가 오르면(lookahead_speed_gain) 이 점이 위로(원거리로)
+        멀어지는 걸 한눈에 보려는 디버그용 — 실제 판단 로직에는 영향 없다. pure_pursuit은
+        detect()가 만든 self.path를 한 제어 틱(0.05s) 뒤에 소비하므로, 여기 찍히는 점은
+        엄밀히는 "이번에 그려진 result"가 아니라 "직전 틱까지 계산된 최신 목표점"이다(한
+        프레임 이내 오차, 디버깅 목적엔 무시 가능). path가 아직 없거나(첫 프레임)
+        STEERING_CONTROLLER='lqr'이면 호출측이 None을 넘기고, 이 경우 마커를 그리지 않는다.
         ★ 반드시 메인 스레드(ROS 콜백/타이머가 도는 스레드)에서만 호출할 것 ★ — 워커
         스레드가 cv2.imshow를 직접 부르지 않는 이유는 _worker()/DLSlideWindow.visualize()
         주석 참고. track_drive.py의 perc_lane()이 detect() 직후 이 메서드를 호출한다
@@ -704,6 +726,16 @@ class DLLaneDetector:
             vis, da_mask, ll_mask = self._latest_debug
         if vis is None:
             return
+        if lookahead_xy is not None:
+            lx, ly = int(round(lookahead_xy[0])), int(round(lookahead_xy[1]))
+            cv2.drawMarker(vis, (lx, ly), (0, 255, 255), markerType=cv2.MARKER_CROSS,
+                            markerSize=14, thickness=2)
+            cv2.circle(vis, (lx, ly), 6, (0, 255, 255), 2)
+            if lookahead_px is not None:
+                cv2.putText(
+                    vis, f'ld:{lookahead_px:.0f}px', (lx + 8, ly - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1
+                )
         da_bgr = cv2.cvtColor(da_mask, cv2.COLOR_GRAY2BGR)
         ll_bgr = cv2.cvtColor(ll_mask, cv2.COLOR_GRAY2BGR)
         for label, panel in (('result', vis), ('da', da_bgr), ('ll', ll_bgr)):
