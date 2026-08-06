@@ -624,6 +624,33 @@ da 전체(덩어리 선택/ll클리핑 전, `self.da_mask_all_roi`)를 **파란�
 
 ---
 
+### 2.7 밴드별 중심 계산 모드 스위치 — `da` 단독 vs `ll`(차선)+`da` 하이브리드 (`DL_CENTER_MODE`, 2026-08-06)
+
+지금까지 밴드(row 구간)별 중심점은 항상 da(주행가능영역) 무게중심이었다. 그런데 da는 "주행 가능한
+영역"이지 "차로 중앙"이 아니라서, 갓길 등 여백이 넓은 구간에서 무게중심이 여백 쪽으로 쏠려 경로가
+차로 중앙을 벗어나는 문제가 실측으로 확인됐다. ll(차선 자체, 두 백선)은 여백 크기와 무관하게
+"선이 실제로 있는 위치"만 가리키므로 이 문제에서 자유롭지만, 아직 실차 전 구간에서 검증되지
+않았다 — 그래서 기존 da 단독 방식을 남겨두고, `config.py`의 `DL_CENTER_MODE` 하나로 두 방식을
+재시작만으로 전환해 실차에서 A/B 비교할 수 있게 했다.
+
+- `DL_CENTER_MODE = 'da'`(기본): 기존과 동일 — 밴드별 중심을 da 무게중심으로만 계산.
+- `DL_CENTER_MODE = 'll_da'`: 밴드마다 좌/우 ll이 둘 다 신뢰할 만하면(`DL_LL_SIDE_MIN_PIXELS`
+  이상 픽셀 + 두 선 간격이 `DL_LL_WIDTH_MIN_PX`~`DL_LL_WIDTH_MAX_PX` 범위) 그 중점을 채택하고,
+  그 외 밴드(점선 틈/마모/반사/편측 가려짐)만 da 무게중심으로 개별 폴백한다
+  (`DLSlideWindow._ll_slice_centers()`, [perception/dl_lane.py](perception/dl_lane.py)).
+  da 파편화 대응(`_largest_da_component`)/옆 차선 클리핑(`_clip_da_by_ll`)/ll sanity check는
+  두 모드에서 동일하게 적용된다.
+
+**디버그 시각화:** `DEBUG_VIZ_DL_LANE` 창에서 밴드별 중심점이 ll 채택 시 흰색, da 폴백 시 노란색
+(`'da'` 모드에선 항상 노란색)으로 표시되고, 좌상단 텍스트에 `mode:`와 `ll_bands:N/전체밴드수`가
+같이 뜬다.
+
+**알려진 한계:** `DL_LL_SIDE_MIN_PIXELS`/`DL_LL_WIDTH_MIN_PX`/`DL_LL_WIDTH_MAX_PX`는 실차 미검증
+초기값이다 — `'ll_da'`로 전환 후 여러 직선/커브 구간에서 `ll_bands` 비율과 흰/노랑 점 분포를 보고
+조정할 것.
+
+---
+
 ## 3. 라바콘 (B1_LAVACON)
 
 **수정할 곳:** `config.py:230` `START_STATE`, `config.py:246` `TEST_FORCE_BEHAVIOR`
