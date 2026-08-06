@@ -86,7 +86,7 @@ DL_OUTPUT_NAMES = ('da', 'll')
 # da/ll 둘 다 (1,2,360,640) raw logit. 채널축 softmax 후 채널1이 foreground 확률.
 # DL_FG_THRESHOLD(이진화 임계값), DL_ROI_Y0/Y1(원본 480행 기준 절대 픽셀, 실차 실측값)는
 # config.py에 있다 — 실차 테스트 중 값을 바꾸려면 이 파일이 아니라 config.py를 고칠 것.
-from ..config import DL_FG_THRESHOLD, DL_ROI_Y0, DL_ROI_Y1
+from ..config import DL_FG_THRESHOLD, DL_LL_FG_THRESHOLD, DL_ROI_Y0, DL_ROI_Y1
 
 # ── BEV(원근변환) — 2026-08-05 bev_point_picker.py로 실측 캘리브레이션 ──
 #   DL 백엔드는 원래 원근(perspective) 픽셀 스케일 그대로 da/ll 중심선을 뽑았다(위
@@ -313,6 +313,7 @@ class DLSlideWindow(SlideWindow):
         self.ll_mask_roi = None    # 시각화용
         self.centerline = []       # da 밴드별 중심점(원본 관측점, 길이 self.n_slices)
         self.da_fallback_used = False  # 이번 프레임 da가 최댓값이 아니라 차선책(2번째 이하) 덩어리인지 — visualize() 색상 구분용
+        self.da_ll_clip_skipped = False  # 이번 프레임 ll 클리핑이 유효 밴드를 너무 줄여 건너뛰었는지 — visualize() 구분용
 
         # DL_USE_BEV=True일 때만 쓰는 워프 행렬. 상수라 매 프레임 다시 안 만들고 한 번만 계산.
         self._bev_M = (
@@ -465,10 +466,22 @@ class DLSlideWindow(SlideWindow):
             yellow_roi = self._bev_warp(yellow_roi, nearest=True)
             vis_roi = self._bev_warp(vis_roi)
 
-        ll_mask = (ll_roi >= DL_FG_THRESHOLD).astype(np.uint8) * 255
+        # ll은 da(DL_FG_THRESHOLD)보다 높은 임계값을 쓴다 — BEV 워프가 원거리일수록 확률맵
+        # 경계 blur를 더 크게 확대해서, 낮은 임계값으로는 원거리 ll이 실제보다 두껍게 잡힌다
+        # (config.py DL_LL_FG_THRESHOLD 주석 참고).
+        ll_mask = (ll_roi >= DL_LL_FG_THRESHOLD).astype(np.uint8) * 255
         self.ll_coverage = float(np.count_nonzero(ll_mask)) / ll_mask.size if ll_mask.size else 0.0
 
         da_mask = (da_roi >= DL_FG_THRESHOLD).astype(np.uint8) * 255
+
+        # _slice_centers()가 self.vis/self.roi_h를 참조하므로(DEBUG_VIZ_LANE 디버그
+        # 사각형 — classic_cv 백엔드용 플래그지만 SlideWindow 공용 코드라 여기도 거친다),
+        # 아래에서 클리핑 전/후 시험 호출을 하기 전에 미리 채워둔다. da_mask.shape는 이후
+        # largest_component/clip을 거쳐도 안 바뀌므로 지금 확정해도 안전하다.
+        self.roi_h, self.roi_w = da_mask.shape
+        self.vis = vis_roi.copy()
+        self.ll_mask_roi = ll_mask
+
         # 급커브 파편화 대응: 가장 큰 덩어리만 남긴다(모듈 상단 주석 참고). ll 클리핑보다
         # 먼저 해야 한다 — 이 시점엔 da가 아직 하나의 연결된 덩어리라 "가장 큰 덩어리"가
         # 곧 도로 전체를 뜻하지만, 클리핑을 먼저 하면 밴드마다 독립적으로 좌우를 잘라
@@ -477,18 +490,28 @@ class DLSlideWindow(SlideWindow):
         # "가장 큰 덩어리"로 폭 넓은 밴드 하나만 통째로 골라버려 도로 모양이 아니라
         # 네모난 밴드 하나만 남는 문제가 생긴다(실측으로 확인됨).
         da_mask = self._largest_da_component(da_mask)
+
         # 옆 차선 침범 대응: ll 라인이 보이는 구간에서는 그 바깥(옆 차선 쪽) da를 잘라낸다
         # (모듈 상단 주석 참고). ref_x는 직전 프레임 확정 lane_center — 아직 없으면(첫
         # 프레임) ROI 중앙을 기준으로 시작한다. 이 클리핑이 밴드 간 연결을 끊어도 상관없다
         # — 아래 _slice_centers()는 밴드별로 독립적으로 moments를 구하므로 전역 연결성이
         # 필요 없다(그래서 여기선 largest_da_component를 다시 돌리지 않는다).
+        #
+        # [2026-08-06] 클리핑 결과가 fit 가능한 최소 밴드 수(DL_SLICE_FIT_MIN)에 못
+        # 미치면 클리핑을 버리고 클리핑 전 da로 되돌린다("차선책", _largest_da_component()의
+        # 면적상한 폴백과 같은 원칙). S자 연속 커브에서 원거리 ll이 DL_LL_FG_THRESHOLD를
+        # 올려도 여전히 두껍게 잡히면 _clip_da_by_ll()이 여러 밴드를 통째로 깎아버려
+        # da가 "작게 검출된" 것처럼 보이는 경우가 실측으로 확인됨 — da 자체는 멀쩡한데
+        # ll 클리핑이 지워버린 것이므로, 이럴 땐 클리핑 없는(=옆 차선 침범 위험은 있지만
+        # 최소한 주행은 하는) da를 쓰는 편이 self.path가 무한정 얼어붙어 완전정지하는
+        # 것보다 낫다는 판단. self.da_ll_clip_skipped로 표시해 visualize()가 구분 표시한다.
         ref_x = self._confirmed[3] if self._confirmed is not None else da_mask.shape[1] / 2.0
-        da_mask = self._clip_da_by_ll(da_mask, ll_mask, ref_x)
+        clipped = self._clip_da_by_ll(da_mask, ll_mask, ref_x)
+        clipped_valid = sum(1 for c in self._slice_centers(clipped, 0, (0, 255, 0)) if c is not None)
+        self.da_ll_clip_skipped = clipped_valid < self.slice_fit_min
+        da_mask = da_mask if self.da_ll_clip_skipped else clipped
 
         self.da_mask_roi = da_mask
-        self.ll_mask_roi = ll_mask
-        self.roi_h, self.roi_w = da_mask.shape
-        self.vis = vis_roi.copy()
 
         # da 중심선 — 밴드별 무게중심(_slice_centers는 색상/의미에 상관없이 "임의의
         # 이진마스크를 세로로 N등분해 구간별 moments 중심을 구하는" 범용 로직이라
@@ -535,8 +558,9 @@ class DLSlideWindow(SlideWindow):
         return lane_valid, offset, lookahead, lane_center, self.path
 
     def visualize(self, offset):
-        """da(초록, 차선책이면 주황)/ll(빨강) 반투명 오버레이 + da 중심선 관측점 + 피팅된
-        경로 + offset/lane_center 텍스트를 self.vis에 그려 넣기만 한다. ★ 여기서
+        """da(초록/면적상한 차선책이면 주황/ll클리핑 건너뜀이면 청록)/ll(빨강) 반투명
+        오버레이 + da 중심선 관측점 + 피팅된 경로 + offset/lane_center 텍스트를 self.vis에
+        그려 넣기만 한다. ★ 여기서
         cv2.imshow()/cv2.waitKey()를 호출하면 안 된다 ★ 이 메서드는 DLLaneDetector의
         백그라운드 추론 스레드에서 호출되는데, OpenCV HighGUI(특히 GTK 백엔드)는 스레드
         세이프하지 않아서 메인 스레드(다른 디버그 창들이 이미 거기서 cv2.imshow/waitKey를
@@ -551,9 +575,15 @@ class DLSlideWindow(SlideWindow):
         if DEBUG_VIZ_DL_LANE and self.da_mask_roi is not None:
             overlay = self.vis.copy()
             # 차선책(최댓값 덩어리가 면적 상한에 걸려 그다음 덩어리를 대신 쓴 프레임)은
-            # 주황으로 표시해 초록(정상: 최댓값 그대로 채택)과 구분한다 —
-            # _largest_da_component() 주석 참고.
-            da_color = (0, 140, 255) if self.da_fallback_used else (0, 200, 0)
+            # 주황, ll 클리핑을 건너뛴 프레임(클리핑하면 밴드가 너무 줄어드는 경우)은
+            # 청록으로 표시해 초록(정상)과 구분한다 — _largest_da_component()/detect()
+            # 주석 참고. 두 상황이 겹치면(둘 다 발동) 주황을 우선 표시한다.
+            if self.da_fallback_used:
+                da_color = (0, 140, 255)      # 주황
+            elif self.da_ll_clip_skipped:
+                da_color = (255, 255, 0)      # 청록
+            else:
+                da_color = (0, 200, 0)        # 초록(정상)
             overlay[self.da_mask_roi > 0] = da_color       # 주행가능영역
             overlay[self.ll_mask_roi > 0] = (0, 0, 220)    # 차선 = 빨강 (da 위에 덧그림)
             cv2.addWeighted(overlay, 0.35, self.vis, 0.65, 0, dst=self.vis)
@@ -563,9 +593,13 @@ class DLSlideWindow(SlideWindow):
 
         cv2.line(self.vis, (self.roi_w // 2, 0), (self.roi_w // 2, self.roi_h), (0, 0, 255), 1)
         lane_center = self.roi_w / 2.0 + offset
-        fallback_tag = ' [FALLBACK]' if self.da_fallback_used else ''
+        tags = ''
+        if self.da_fallback_used:
+            tags += ' [FALLBACK]'
+        if self.da_ll_clip_skipped:
+            tags += ' [LL_CLIP_SKIP]'
         cv2.putText(
-            self.vis, f'offset:{offset:+.1f} center:{lane_center:.1f} ll_cov:{self.ll_coverage:.3f}{fallback_tag}',
+            self.vis, f'offset:{offset:+.1f} center:{lane_center:.1f} ll_cov:{self.ll_coverage:.3f}{tags}',
             (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2
         )
 
