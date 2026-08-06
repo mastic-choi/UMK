@@ -294,13 +294,35 @@ LAD를 정하는데, 이 프로젝트는 그런 전역 지도/위치추정이 �
 비슷하지만 완전히 다른 역할입니다(둘 다 config.py에 있음). 후자를 코너에서도 고정 90으로 두면 curvature
 계산의 ld가 거의 항상 90으로 다시 눌려서 lookahead 축소 효과가 무효화되므로,
 `ld = max(hypot(dx,dy), min(min_lookahead_px, lookahead_px))`로 — lookahead가 의도적으로 줄어든
-프레임에는 그 줄어든 값 자체를 바닥으로 쓰도록 함께 수정했습니다([controller/pure_pursuit.py:195](controller/pure_pursuit.py#L195)).
+프레임에는 그 줄어든 값 자체를 바닥으로 쓰도록 함께 수정했습니다([controller/pure_pursuit.py:228](controller/pure_pursuit.py#L228)).
+
+**버그 — 자기순환 lookahead 락업 (2026-08-06 디버그 영상에서 발견, 같은 날 수정):** 위 구현은 damp
+근거로 **직전 프레임에 이미 계산된** `self.last_curvature`를 그대로 재사용했습니다. 이게 자기순환
+피드백을 만듭니다 — lookahead가 한번 짧아지면(`ld`↓), `curvature = 2·sin(α)/ld` 공식상 ld가 작을수록
+같은 픽셀 단위 dx도 더 크게 증폭되어 curvature가 커지고, 그 커진 curvature가 `self.last_curvature`로
+저장돼 다음 프레임 lookahead를 또 줄여버립니다. 한번 이 루프에 걸리면 실제 경로가 직진으로 돌아와도
+lookahead가 `PP_LOOKAHEAD_MIN_PX(40px)` 근처에 계속 눌려있어 절대 원래 lookahead(90px+)로 복귀하지
+못합니다.
+
+- **실차 증상**: `dl_lane` 디버그 창을 녹화한 영상(2026-08-06 14:05)에서, `offset:+1.5px`(차선 중앙에
+  거의 붙어있는, 육안으로도 직진 구간)인 프레임에서 조향각이 `ang=-65.7°`로 15초 넘게 고정. 같은 구간
+  오버레이의 lookahead 표시(`ld:`)가 매 프레임 40px(하한)에 눌려있었음 — 조향기가 경로 전체가 아니라
+  차량 바로 앞 40px짜리 구간만 보고 있었다는 뜻.
+- **고침**: damp 판단을 "직전에 실제로 쓴 lookahead에서 나온 curvature"가 아니라, **매 프레임 댐핑
+  적용 전 고정 기준 lookahead(`probe_px`)로 새로 계산한 `probe_curvature`**로 바꿨습니다
+  ([controller/pure_pursuit.py:195](controller/pure_pursuit.py#L195)). probe는 항상 같은 기준 거리에서
+  다시 재므로 "지금 경로가 진짜 코너인지"를 매 프레임 독립적으로 재평가해 순환을 끊습니다. 코너
+  감속(0.5.1)이 참조하는 `last_curvature`는 여전히 실제로 사용된(댐핑된) lookahead 기준으로 계산해
+  "지금 얼마나 세게 도는지"라는 원래 의미를 그대로 유지합니다.
 
 **알려진 한계:**
 - `PP_LOOKAHEAD_CURVATURE_GAIN=100.0`, `PP_LOOKAHEAD_MIN_PX=40px`(둘 다 config.py) 모두 추정치입니다
   (`curvature=0.01`, 반경≈100px짜리 중간 코너에서 배율 0.5가 되도록 잡음). `steer_debug` 창이나 CLI
   로그로 관찰하며 튜닝이 필요합니다.
 - `STEERING_CONTROLLER='lqr'`일 때는 적용되지 않습니다 — `lqr.py`는 curvature 개념 자체가 없습니다.
+- probe도 근거리 밴드 자체가 구조적으로(노이즈가 아니라 매 프레임 일관되게) 옆으로 치우쳐 있으면 여전히
+  큰 curvature를 재현합니다(자기순환은 끊었지만 "근거리 세그멘테이션이 원래 부정확한" 문제 자체를
+  고치진 않음) — da/ll 세그멘테이션 정확도 쪽(2.1/2.2절)이 근본 대응입니다.
 
 ---
 

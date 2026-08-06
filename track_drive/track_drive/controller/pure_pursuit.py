@@ -65,6 +65,15 @@ class PurePursuitController:
         #   한 프레임 지연된 반응이라 논문만큼 정교하진 않다.
         #   gain=100.0: curvature=0.01(반경≈100px, 중간 정도 코너)에서 배율이 0.5로
         #   떨어지도록 잡은 추정치 — 실차 미검증, steer_debug로 관찰하며 조정할 것.
+        #   [2026-08-06 버그 수정] 처음엔 "직전 프레임의 self.last_curvature"를 그대로 이번
+        #   프레임 damp 근거로 썼는데, 이러면 자기순환 피드백에 빠진다 — ld가 한번 짧아지면
+        #   같은 픽셀 노이즈(dx)도 ld가 작을수록 curvature 공식에서 더 크게 증폭되고, 그
+        #   커진 curvature가 다음 프레임 lookahead를 또 줄여버려 실제 경로가 직진으로
+        #   돌아와도 절대 원래 lookahead로 복귀를 못 한다(실차 디버그 영상에서 재현: offset
+        #   +1.5px로 사실상 직진인 프레임에서도 조향각 -65.7°가 15초 넘게 고정, 매 프레임
+        #   lookahead가 하한(lookahead_min_px)에 눌려있었음). control()은 이제 damp 판단용
+        #   probe_curvature를 매 프레임 "댐핑 적용 전 고정 기준 lookahead"로 새로 계산해서
+        #   이 순환을 끊는다 — 아래 control() 내부 주석 참고.
         self.lookahead_curvature_gain = lookahead_curvature_gain
         # 위 감쇠가 당길 수 있는 하한 — min_lookahead_px(curvature 계산의 ld 분모 바닥값,
         # 완전히 다른 용도)와 절대 헷갈리지 말 것. 둘 다 90.0이면 damp가 아무리 작아져도
@@ -173,9 +182,23 @@ class PurePursuitController:
             return self.prev_steer_deg
 
         speed_lookahead_px = self.lookahead_base_px + self.lookahead_speed_gain * max(speed, 0.0)
-        # 직전 프레임 curvature가 컸으면(코너였으면) 위 속도 기반 값을 낮춘다 — 직진이면
-        # (curvature≈0) damp≈1이라 기존과 동일하게 동작한다(클래스 상단 주석 참고).
-        curvature_damp = 1.0 / (1.0 + self.lookahead_curvature_gain * abs(self.last_curvature))
+
+        # [2026-08-06 버그 수정] damp 판단은 "직전에 실제로 쓴(이미 줄어들었을 수 있는)
+        # lookahead에서 나온 self.last_curvature"가 아니라, 매 프레임 댐핑 적용 전
+        # 고정 기준(probe_px)에서 새로 계산한 probe_curvature로 한다. self.last_curvature를
+        # 재사용하면 "ld가 짧아짐 → 노이즈가 curvature로 증폭됨 → damp가 ld를 또 줄임"이
+        # 무한 반복되는 자기순환 피드백에 빠져(클래스 상단 lookahead_curvature_gain 주석
+        # 참고) 실제 경로가 직진으로 돌아와도 절대 못 돌아오는 락업이 생긴다. probe는 항상
+        # 같은 기준거리에서 다시 재는 것이므로 "지금 경로가 진짜 코너인지"를 매 프레임
+        # 독립적으로 재평가한다 — 직진이면(probe_curvature≈0) damp≈1이라 기존과 동일하게
+        # 동작한다.
+        probe_px = float(np.clip(speed_lookahead_px, self.lookahead_min_px, self.lookahead_max_px))
+        probe_tx, probe_ty = self._target_point(path, vehicle_xy, probe_px)
+        probe_dx = probe_tx - vehicle_xy[0]
+        probe_dy = max(vehicle_xy[1] - probe_ty, 1e-3)
+        probe_ld = max(math.hypot(probe_dx, probe_dy), min(self.min_lookahead_px, probe_px))
+        probe_curvature = 2.0 * math.sin(math.atan2(probe_dx, probe_dy)) / probe_ld
+        curvature_damp = 1.0 / (1.0 + self.lookahead_curvature_gain * abs(probe_curvature))
         lookahead_px = float(np.clip(
             speed_lookahead_px * curvature_damp,
             self.lookahead_min_px, self.lookahead_max_px
