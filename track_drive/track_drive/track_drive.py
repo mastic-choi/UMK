@@ -31,7 +31,7 @@ import rclpy, cv2, math, time
 import numpy as np
 from rclpy.node import Node
 from sensor_msgs.msg import Image, LaserScan, Imu
-from std_msgs.msg import Float32MultiArray
+from std_msgs.msg import Float32MultiArray, Float32
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy, HistoryPolicy
 from cv_bridge import CvBridge
 from .perception.perc_lavacon import process_lavacon
@@ -247,18 +247,21 @@ class TrackDriverNode(Node):
         self._plan_ref_yaw = 0.0
         self._plan_last_t = 0.0
 
-        # ── 엔코더 기반 pose 추정기 (localization/pose_estimator.py) ──
-        #   위 self.vehicle_x/y/yaw(플래너용, 명령속도 적분 근사)와는 별개로 준비해둔
-        #   컴포넌트. 2026-08-05 기준 이 로봇에 실제 엔코더 ROS 토픽이 있는지/이름이
-        #   뭔지 아직 확인 전이라 지금은 아무 콜백도 이걸 갱신하지 않는다(가짜 값을
-        #   넣지 않기 위해 의도적으로 미배선 상태로 둠). 실제 토픽을 확인하면:
-        #     1) cb_encoder(msg) 콜백 추가 → v_mps 계산
-        #     2) control_loop()에서 매 주기
-        #        self.pose_estimator.update(v_mps, math.radians(self.ctrl_angle), 0.05)
-        #        (혹은 IMU 쓸 수 있게 되면 set_yaw_source('imu') 후
-        #         update(..., imu_yaw=self.imu_yaw))
-        #   wheelbase_m은 줄자로 축간거리 실측 후 대입(픽셀 환산과 무관, 바로 잴 수 있음).
-        self.pose_estimator = EncoderPoseEstimator(wheelbase_m=None)
+        # ── VESC 기반 실측 속도 (엔코더 대체, 2026-08-06 LQR 브랜치의 ROS1 연동 작업에서 이식) ──
+        #   cb_vesc()가 '/vesc_speed_erpm'(ROS1 launch/vesc_speed_bridge.py가 중계)을 받을 때마다
+        #   갱신한다. 그 브리지 노드가 안 떠 있거나 아직 메시지를 한 번도 못 받았으면 0.0으로
+        #   유지된다 — 아래 control_loop()의 LQR_MIN_SPEED_MPS 가드가 이 상태에서 self.lqr 게인을
+        #   건드리지 않게 막아준다(즉 이 값이 안 들어와도 LQRController 생성자 기본값
+        #   speed_mps=LQR_SPEED_MPS로 조용히 폴백하지, v=0으로 게인이 퇴화하는 일은 없다).
+        self.v_mps = 0.0
+        self._vesc_t = None
+
+        # ── 엔코더(VESC) 기반 pose 추정기 (localization/pose_estimator.py) ──
+        #   위 self.vehicle_x/y/yaw(플래너용, 명령속도 적분 근사)와는 별개 컴포넌트. wheelbase_m은
+        #   2026-08-06 실측값(LQR_WHEELBASE_M, config.py — LQR 컨트롤러와 같은 차량이므로 같은 값을
+        #   공유). v_mps는 cb_vesc()가 갱신하는 self.v_mps를 control_loop()에서 매 주기 넣어준다.
+        #   IMU를 yaw 소스로 쓰려면 set_yaw_source('imu') 후 update(..., imu_yaw=self.imu_yaw).
+        self.pose_estimator = EncoderPoseEstimator(wheelbase_m=LQR_WHEELBASE_M)
 
 
         # ── ROS 통신 ──
@@ -272,6 +275,12 @@ class TrackDriverNode(Node):
         self.create_subscription(Image,     '/usb_cam/image_raw/behind', self.cb_img_behind, image_qos)
         self.create_subscription(LaserScan, '/scan',                     self.cb_scan,       qos_profile_sensor_data)
         self.create_subscription(Imu,       '/imu',                      self.cb_imu,        qos_profile_sensor_data)
+        # VESC 실측 속도(ERPM, 2026-08-06 LQR 브랜치에서 이식) — launch/vesc_speed_bridge.py
+        # (ROS1, noetic_ws에 별도 배치)가 /sensors/core의 state.speed만 뽑아 std_msgs/Float32로
+        # 다시 뿌린 '/vesc_speed_erpm'을 구독한다(커스텀 메시지 vesc_msgs를 이 ROS2 워크스페이스에
+        # 안 깔아도 되게 하려는 우회 — config.py "VESC 실측 속도 연동" 절 참고). 표준 메시지라
+        # import 실패 걱정 없이 항상 구독 가능.
+        self.create_subscription(Float32,   '/vesc_speed_erpm',          self.cb_vesc,        qos_profile_sensor_data)
         self.create_timer(0.05, self.control_loop)
 
         self.get_logger().info(f'초기화 완료 | 시작={START_STATE.name}')
@@ -294,6 +303,19 @@ class TrackDriverNode(Node):
     def cb_imu(self, msg):
         q = msg.orientation
         self.imu_yaw = math.atan2(2.0*(q.w*q.z + q.x*q.y), 1.0 - 2.0*(q.y*q.y + q.z*q.z))
+
+    def cb_vesc(self, msg):
+        """'/vesc_speed_erpm'(std_msgs/Float32) — launch/vesc_speed_bridge.py(ROS1)가 VESC
+        드라이버의 state.speed(ERPM, 전기적 회전수/분)를 그대로 실어 보낸 것. 이 로봇의 사실상
+        엔코더. VESC_SPEED_TO_ERPM_GAIN(config.py, vesc.yaml의 speed_to_erpm_gain 실측값)으로
+        나눠야 실제 선속도(m/s)가 된다. offset 보정은 하지 않음(vesc_to_odom.cpp 참고 — 기본
+        offset=0.0이라 보정해도 차이가 없다고 판단, 실차에서 정지 상태 값이 0에 가깝지 않으면
+        여기에 offset 보정을 추가할 것)."""
+        try:
+            self.v_mps = float(msg.data) / VESC_SPEED_TO_ERPM_GAIN
+            self._vesc_t = time.time()
+        except Exception as e:
+            self.get_logger().error(f'[vesc] /vesc_speed_erpm 파싱 실패: {e}', throttle_duration_sec=2.0)
 
     def drive(self, angle, speed):
         # ROS1 xycar_motor.py 노드가 XycarMotor 대신 Float32MultiArray(data=[angle, speed])를
@@ -1261,6 +1283,49 @@ class TrackDriverNode(Node):
         cv2.imshow('steer_debug', canvas)
         cv2.waitKey(1)
 
+    # [DEBUG_VIZ_VESC] VESC 실측속도(/vesc_speed_erpm) 연동이 실제로 살아있는지 한눈에 보여주는
+    # 창(2026-08-06 LQR 브랜치에서 이식). cb_vesc()가 self.v_mps/self._vesc_t를 갱신하는 동안은
+    # 로그를 계속 지켜보지 않는 한 "지금 진짜 실측 속도를 받고 있는지" 알기 어려워서 별도 창으로
+    # 뺐다. 상태 3가지:
+    #   빨강/NEVER_RECEIVED : 지금까지 메시지를 한 번도 못 받음 — ROS1쪽 launch/vesc_speed_bridge.py
+    #                         노드가 안 떠 있거나, 토픽 이름이 다르거나, ros1_bridge가 이 토픽을
+    #                         안 넘기고 있거나.
+    #   주황/STALE          : 예전엔 받았는데 VESC_STALE_SEC 이상 새 메시지가 없음 — 브리지 노드나
+    #                         VESC 드라이버가 죽었을 가능성.
+    #   초록/LIVE           : 정상 수신 중.
+    # control_loop()에서 매 주기 호출.
+    def _debug_viz_vesc(self):
+        now = time.time()
+        if self._vesc_t is None:
+            color = (0, 0, 220)
+            text_kr, text_en = '/vesc_speed_erpm 메시지 수신 안 됨', 'NO MESSAGE RECEIVED YET'
+        else:
+            age = now - self._vesc_t
+            if age > VESC_STALE_SEC:
+                color = (0, 140, 255)
+                text_kr, text_en = f'수신 끊김 (마지막 {age:.1f}초 전)', f'STALE (last {age:.1f}s ago)'
+            else:
+                color = (0, 200, 0)
+                text_kr, text_en = f'정상 수신 중 ({age*1000:.0f}ms 전)', f'LIVE ({age*1000:.0f}ms ago)'
+
+        gain_fed = abs(self.v_mps) >= LQR_MIN_SPEED_MPS
+        canvas = np.full((160, 380, 3), 30, dtype=np.uint8)
+        lines = [
+            (f'VESC 연동: {text_kr}', (10, 8), color, 16, f'VESC link: {text_en}'),
+            (f'v_mps: {self.v_mps:+.3f} m/s', (10, 44), (255, 255, 255), 20,
+             f'v_mps: {self.v_mps:+.3f} m/s'),
+            (f'LQR 게인 반영: {"O" if gain_fed else "X (LQR_MIN_SPEED_MPS 미만)"}',
+             (10, 76), (255, 255, 255) if gain_fed else (150, 150, 150), 16,
+             f'LQR gain fed: {"YES" if gain_fed else "NO"}'),
+            ('토픽: /vesc_speed_erpm (std_msgs/Float32, vesc_speed_bridge.py 경유)',
+             (10, 108), (180, 180, 180), 12, 'topic: /vesc_speed_erpm'),
+        ]
+        put_text_kr_multi(canvas, lines)
+        cv2.rectangle(canvas, (0, 0), (canvas.shape[1] - 1, canvas.shape[0] - 1), color, 3)
+
+        cv2.imshow('vesc_debug', canvas)
+        cv2.waitKey(1)
+
     def _lane_pid(self, offset, deadzone=LANE_DEADZONE):
         """차선 중앙편차(offset)를 PID 제어로 조향각(angle)으로 변환한다."""
         if abs(offset) < deadzone:
@@ -1468,18 +1533,31 @@ class TrackDriverNode(Node):
         """
         self.perceive_all()                 # 1. 인지
         self._update_lap()                  #    바퀴 카운트(누적 yaw + 정지선)
+        # VESC 실측 속도를 LQR 게인에 반영(2026-08-06 LQR 브랜치에서 이식) — run_mission_fsm()보다
+        # 먼저 해야 이번 틱의 _lane_steer()가 최신 속도로 계산된 게인을 쓴다. LQR_MIN_SPEED_MPS
+        # 미만(정지/거의정지, 혹은 vesc_speed_bridge 노드 미실행으로 self.v_mps가 계속 0.0)이면
+        # 건너뛰고 직전 게인을 유지한다(cb_vesc()/LQR_MIN_SPEED_MPS 주석 참고).
+        if abs(self.v_mps) >= LQR_MIN_SPEED_MPS:
+            self.lqr.set_speed_mps(self.v_mps)
         self.run_mission_fsm()              # 2. 판단(Mission)
 
         if DEBUG_VIZ_STEER:
             # behavior override 이전 시점 — 차선 조향 컨트롤러 자체의 상태를 보여준다
             # (_debug_viz_steer() 상단 주석 참고).
             self._debug_viz_steer()
+        if DEBUG_VIZ_VESC:
+            self._debug_viz_vesc()
 
         if ENABLE_BEHAVIOR and self.mission_state == MissionState.S1_LANE_FOLLOW and self._behavior_enabled:
             self.run_behavior_fsm()         #    Behavior 상태 결정
             self.apply_behavior_override()  #    필요 시 조향/속도 덮어쓰기
         else:
             self.behavior_state = BehaviorState.B0_NORMAL   # OFF 구간은 항상 정상
+
+        # pose_estimator는 behavior override까지 반영된 "최종" ctrl_angle로 갱신한다(차량이 실제로
+        # 명령받는 조향각이 이거라서, 2026-08-06 LQR 브랜치에서 이식). v_mps=0.0 고정 상태
+        # (vesc_speed_bridge 노드 미실행 등)에서도 그냥 안 움직이는 것으로 적분될 뿐 안전하게 동작한다.
+        self.pose_estimator.update(self.v_mps, math.radians(self.ctrl_angle), 0.05)
 
         self.drive(self.ctrl_angle, self.ctrl_speed)   # 4. 발행
         if DEBUG_LOG:                                    # 5. 디버그

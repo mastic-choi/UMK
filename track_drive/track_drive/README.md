@@ -696,3 +696,55 @@ m/px 환산이 없었는데, BEV(585×298px 캔버스, 면적비 옛 ROI 대비 
 |---|---|---|
 | `PIXELS_PER_METER` (전역) | config.py | 0.0 (미실측) — `DL_USE_BEV`가 실차 검증돼 기본으로 전환되면 §6.3의 `DL_PIXELS_PER_METER`로 채울 것 |
 | `PP_MIN_LOOKAHEAD_PX`/`PP_WHEELBASE_PX`/`PP_LOOKAHEAD_BASE_PX` 등 | config.py | 전부 실차 미검증 튜닝값(추정/역산치일 뿐 실측 아님) |
+
+### 6.7 `LQR_WHEELBASE_M` 실측값 반영 (0.26 → 0.335, 2026-08-06, LQR 브랜치에서 이식)
+
+`config.py`의 `LQR_WHEELBASE_M`이 "★실측 필요★" 플레이스홀더(0.26)로 남아있었는데, `LQR` 브랜치가
+2026-08-06 같은 차량으로 줄자 실측한 값(0.335)을 갖고 있었습니다 — `planner/hybrid_astar.py`의
+`wheelbase` 기본값이 이미 이 값(0.335, "같은 차량이므로 stanley.py와 반드시 같은 값을 써야 한다"는
+주석과 함께)으로 갱신돼 있던 것과 같은 실측치입니다. `LQR_WHEELBASE_M`만 그 갱신에서 빠져 있었던
+것으로 보여, `LQR` 브랜치 값으로 맞췄습니다(`controller/lqr.py`의 생성자 기본값도 동일하게 갱신 —
+실제로는 `track_drive.py`가 항상 `LQR_WHEELBASE_M`을 명시적으로 넘기므로 이 기본값 자체는 안 쓰이지만,
+문서 목적상 실측 전 플레이스홀더로 오해되지 않도록 같이 맞춤).
+
+## 7. VESC 실측 속도 연동 (ROS1, 2026-08-06 LQR 브랜치에서 이식)
+
+`LQR` 브랜치가 main과 갈라진 뒤 독자적으로 진행한 작업 중, main에 없던 실차 연동 하나를 가져왔습니다 —
+**구동모터의 실제 회전속도(VESC 홀센서 기반)를 ROS2 쪽에서 받아오는 것**. `localization/pose_estimator.py`는
+진작에 준비돼 있었지만(`EncoderPoseEstimator`), "이 로봇에 엔코더 토픽이 있는지 확인 전이라 미배선"
+상태로 남아있었는데 — 그 확인이 이번에 됐습니다.
+
+**구조:**
+1. 이 로봇엔 별도 엔코더가 없고, VESC 드라이버(ROS1, `vesc_driver`)가 `/sensors/core`
+   (`vesc_msgs/VescStateStamped`)로 모터 회전속도(ERPM)를 발행합니다.
+2. `vesc_msgs`가 이 ROS2 워크스페이스엔 빌드돼 있지 않아(2026-08-06 실차 확인) `ros1_bridge`가 이
+   커스텀 메시지를 그대로 못 넘깁니다.
+3. 그래서 ROS1쪽에 작은 변환 노드([launch/vesc_speed_bridge.py](launch/vesc_speed_bridge.py))를 하나 더
+   띄워 `state.speed`(ERPM) 값 하나만 표준 메시지(`std_msgs/Float32`)로 `/vesc_speed_erpm`에 다시
+   뿌립니다 — 표준 메시지라 `ros1_bridge`가 별도 빌드 없이 자동으로 브리지해줍니다.
+4. ROS2쪽 `track_drive.py`의 `cb_vesc()`가 이 토픽을 구독해 `VESC_SPEED_TO_ERPM_GAIN`(=4614.0,
+   `vesc.yaml`의 `speed_to_erpm_gain` 실측값, [config.py](config.py))로 나눠 `self.v_mps`(m/s)로 변환합니다.
+
+**이 값을 쓰는 곳 두 군데** (`control_loop()`, [track_drive.py](track_drive.py)):
+- `self.lqr.set_speed_mps(self.v_mps)` — `LQR_MIN_SPEED_MPS`(=0.05) 이상일 때만 갱신합니다. 정지
+  상태(v≈0)에서 그대로 넣으면 LQR의 상태전이행렬 B가 퇴화(조향이 상태에 영향을 못 미치는 것으로
+  계산됨)하므로, 그 미만이면 직전 게인을 유지합니다.
+- `self.pose_estimator.update(self.v_mps, math.radians(self.ctrl_angle), 0.05)` — 매 주기 갱신. 이제
+  `EncoderPoseEstimator(wheelbase_m=LQR_WHEELBASE_M)`로 축거도 실측값이 물려 있어(§6.7), pose 추정이
+  플레이스홀더 없이 동작합니다.
+
+**배포 방법 (ROS1쪽, 이 워크스페이스 바깥):**
+[launch/vesc_speed_bridge.py](launch/vesc_speed_bridge.py) 자체는 ROS1 노드라 이 ROS2 워크스페이스
+안에서는 실행되지 않습니다 — noetic_ws 안 기존 패키지의 `scripts/`에 넣거나 새 패키지를 만들어
+`rosrun`으로 띄우세요(파일 상단 주석에 상세 절차 있음). `[launch/manual_drive.launch.py](launch/manual_drive.launch.py)`는
+수동주행/카메라 단독 테스트용 ROS2 launch로 이번에 같이 이식했습니다 — VESC 연동 자체와는 독립적입니다.
+
+**확인 방법:** `DEBUG_VIZ_VESC=True`([config.py](config.py))면 `vesc_debug` 창이 뜹니다 —
+빨강(NEVER_RECEIVED, 브리지 노드 미실행/토픽명 불일치/`ros1_bridge` 미전달 의심), 주황(STALE, 브리지·VESC
+드라이버가 죽었을 가능성), 초록(LIVE, 정상) 세 상태를 색으로 바로 구분합니다.
+
+**포팅하지 않은 것:** `LQR` 브랜치의 다른 커밋들(`변경사항`/`speed변경` 등)은 main이 그 이후 독자적으로
+더 발전시킨 부분(perception 리팩토링, 코너 감속·`pure_pursuit` 락업 수정 등)과 겹치거나 낡은 flat 파일
+구조를 그대로 갖고 있어 이식하지 않았습니다 — VESC 연동 파일 3개(`cb_vesc`/`_debug_viz_vesc`/구독 wiring,
+`launch/vesc_speed_bridge.py`, `launch/manual_drive.launch.py`)와 `LQR_WHEELBASE_M` 실측값만 선별해서
+가져왔습니다.

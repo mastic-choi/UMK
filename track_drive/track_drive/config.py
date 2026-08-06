@@ -276,10 +276,31 @@ LQR_DT = 0.05               # control_loop 타이머 주기(20Hz)와 반드시 �
 LQR_HEADING_PROBE_PX = 65.0
 LQR_ALPHA = 0.5
 LQR_MIN_PATH_PX = 65.0
-LQR_WHEELBASE_M = 0.26      # [미터 모드] ★실측 필요★ 실제 축거(m) — 줄자로 재면 됨
-LQR_SPEED_MPS = 1.0         # [미터 모드] 속도 추정치(m/s) — 엔코더 연동 전 임시값, 실차 최우선 튜닝 대상
+LQR_WHEELBASE_M = 0.335     # [미터 모드] 실측값(2026-08-06, 줄자로 앞바퀴-뒷바퀴 축간거리 실측 —
+                             #   LQR 브랜치에서 이식). planner/hybrid_astar.py의 wheelbase 기본값(같은
+                             #   차량이므로 반드시 같은 값)과 일치시킬 것 — 재실측 시 둘 다 갱신.
+LQR_SPEED_MPS = 1.0         # [미터 모드] 속도 추정치(m/s) — 아래 VESC 연동이 살아있으면 매 주기
+                             #   set_speed_mps()로 실측값으로 덮어써진다(track_drive.py의 cb_vesc()
+                             #   참고). 이 값은 그 전까지, 혹은 VESC 브리지가 안 떠 있을 때 쓰는 폴백.
 LQR_HEADING_PROBE_M = 0.3   # [미터 모드] 헤딩오차 추정용 근거리 참조거리(m)
 LQR_MIN_PATH_M = 0.3        # [미터 모드] 경로 전체 길이가 이보다 짧으면 직전값 유지
+
+# ── VESC 실측 속도 연동 (2026-08-06, LQR 브랜치의 ROS1 연동 작업에서 이식) ──
+#   이 로봇엔 별도 엔코더 토픽이 없고, VESC 드라이버(ROS1, vesc_driver)가 /sensors/core
+#   (vesc_msgs/VescStateStamped)로 모터 홀센서 기반 회전속도를 발행한다. vesc_msgs가 이
+#   ROS2 워크스페이스엔 안 빌드돼 있어(2026-08-06 실차 확인) ros1_bridge가 커스텀 메시지를
+#   그대로 못 넘기므로, ROS1쪽에 작은 변환 노드(launch/vesc_speed_bridge.py — 이 워크스페이스
+#   바깥 noetic_ws에 별도 배치해서 실행, 파일 상단 주석 참고)를 하나 더 띄워서 state.speed
+#   (ERPM) 값 하나만 std_msgs/Float32로 '/vesc_speed_erpm'에 다시 뿌리게 하고,
+#   track_drive.py의 cb_vesc()가 그 표준 메시지를 구독해 self.v_mps(m/s)로 변환한다.
+VESC_SPEED_TO_ERPM_GAIN = 4614.0  # VESC 드라이버 vesc.yaml의 speed_to_erpm_gain 값 그대로(실차 확인,
+                                   #   2026-08-06). 실속도(m/s) = state.speed(ERPM) / 이 값.
+VESC_STALE_SEC = 0.5        # 마지막 /vesc_speed_erpm 수신 후 이 시간(s)이 지나면 vesc_debug 창에서
+                             #   "끊김"으로 표시(20Hz 기준 약 10틱).
+LQR_MIN_SPEED_MPS = 0.05    # v_mps가 이 미만(정지/거의정지, 혹은 vesc_speed_bridge 노드 미실행으로
+                             #   0.0 고정)이면 self.lqr.set_speed_mps() 갱신을 건너뛰고 직전 게인을
+                             #   유지한다 — v≈0에서 B≈0으로 게인이 퇴화(조향이 상태에 영향을 못 미치는
+                             #   것으로 계산됨)하는 것을 피하기 위함.
 
 
 # #############################################################
@@ -292,6 +313,8 @@ DEBUG_VIZ_LIDAR    = False  # 라이다 BEV 장애물 감지 디버그 창 (trac
 DEBUG_VIZ_LAVACON  = False  # 라바콘 트리거 좌우 클러스터 BEV 디버그 창 (track_drive.py)
 DEBUG_PLANNER      = False  # Hybrid A* OccupancyGrid 디버그 창 (track_drive.py, USE_HYBRID_ASTAR_FOR_B2=True일 때만 의미있음)
 DEBUG_VIZ_STEER    = True   # 조향 컨트롤러(직전값유지/현재값반영) 한글 디버그 창 (track_drive.py)
+DEBUG_VIZ_VESC     = True   # VESC 실측속도(/vesc_speed_erpm) 연동 상태(수신중/끊김/미수신) 디버그 창
+                             #   (track_drive.py, 2026-08-06 LQR 브랜치에서 이식)
 
 DEBUG_VIZ_DL_LANE    = True   # 차선 — 기본 백엔드('dl') 디버그 창 (perception/dl_lane.py)
 DEBUG_VIZ_HOUGH_LANE = True   # 차선 — 대안 백엔드('hough') 디버그 창 (perception/hough_lane.py)

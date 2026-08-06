@@ -78,7 +78,7 @@ class LQRController:
 
     def __init__(self,
                  pixels_per_meter=None,   # BEV 등에서 px<->m 환산을 알면 그 값(px/m). None=레거시 픽셀 모드.
-                 wheelbase_m=0.26,        # ★실측 필요★ 실제 축거(m). 줄자로 재면 됨(캘리브레이션 실험 불필요).
+                 wheelbase_m=0.335,       # 실측값(2026-08-06, 줄자 실측 — LQR 브랜치에서 이식).
                                           #   pixels_per_meter가 있을 때만 사용.
                  speed_mps=1.0,           # 주행 속도 추정치(m/s). 엔코더 실측 전 임시값 — 실차에서 최우선
                                           #   튜닝 대상. localization.EncoderPoseEstimator 연결되면 그 값으로
