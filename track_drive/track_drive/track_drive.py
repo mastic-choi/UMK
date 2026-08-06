@@ -210,6 +210,16 @@ class TrackDriverNode(Node):
             lookahead_min_px=PP_LOOKAHEAD_MIN_PX,
         )
         self.lqr = LQRController(
+            # DL+BEV 조합일 때만 픽셀->미터 환산이 유효하다(DL_PIXELS_PER_METER는 BEV
+            # 워프 목적캔버스 기준값이라 BEV가 꺼져있으면 의미가 없다) — 그 외(hough/
+            # classic_cv, 혹은 DL_USE_BEV=False)엔 None을 넘겨 레거시 픽셀 게인 모드로
+            # 자동 폴백한다(controller/lqr.py 상단 "좌표계" 주석 참고).
+            pixels_per_meter=(DL_PIXELS_PER_METER
+                               if (LANE_DETECTOR_BACKEND == 'dl' and DL_USE_BEV) else None),
+            wheelbase_m=LQR_WHEELBASE_M,
+            speed_mps=LQR_SPEED_MPS,
+            heading_probe_m=LQR_HEADING_PROBE_M,
+            min_path_m=LQR_MIN_PATH_M,
             wheelbase_gain=LQR_WHEELBASE_GAIN,
             speed_gain=LQR_SPEED_GAIN,
             q_lateral=LQR_Q_LATERAL,

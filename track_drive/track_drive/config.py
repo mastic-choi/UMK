@@ -217,6 +217,18 @@ PP_DX_DEADZONE_PX = 6.0            # 이 이하 픽셀오차는 0으로 죽여 �
 #   복귀. wheelbase_gain: 조향 강도. alpha: 저역통과(반응 느리면 올리고 잔떨림
 #   있으면 낮출 것). heading_probe_px/min_path_px: 노이즈 방지 안전장치(조향이
 #   자꾸 직전값 유지로 빠지면 낮출 것).
+#
+#   [LQR 브랜치에서 이식, 2026-08-05] Q=diag(1,1)이 e_y(px, O(1~100))와 e_psi(rad,
+#   O(0.01~0.5))를 같은 가중치로 취급하면 Riccati가 극단적으로 큰 K를 내놓아 미세한
+#   오차에도 조향각이 클램프까지 튀는 버그가 실차에서 확인됐다(controller/lqr.py 상단
+#   주석 참고). DL+BEV 조합(LANE_DETECTOR_BACKEND='dl' and DL_USE_BEV)일 때는
+#   DL_PIXELS_PER_METER로 e_y를 미터로 환산하는 "미터 모드"를 쓰면 e_y·e_psi가 비슷한
+#   크기가 되어 이 문제가 사라진다 — track_drive.py가 LQRController 생성 시 이 조건을
+#   보고 pixels_per_meter를 넘길지(미터 모드) None을 넘길지(레거시 픽셀 모드, 아래
+#   LQR_WHEELBASE_GAIN/LQR_SPEED_GAIN/LQR_HEADING_PROBE_PX/LQR_MIN_PATH_PX 사용) 자동
+#   결정한다. 아래 LQR_WHEELBASE_M/LQR_SPEED_MPS/LQR_HEADING_PROBE_M/LQR_MIN_PATH_M은
+#   미터 모드 전용값 — wheelbase_m은 줄자 실측, speed_mps는 엔코더 연동 전 임시값(실차
+#   최우선 튜닝 대상).
 LQR_WHEELBASE_GAIN = 50.0
 LQR_SPEED_GAIN = 120.0
 LQR_Q_LATERAL = 1.0
@@ -226,6 +238,10 @@ LQR_DT = 0.05               # control_loop 타이머 주기(20Hz)와 반드시 �
 LQR_HEADING_PROBE_PX = 65.0
 LQR_ALPHA = 0.5
 LQR_MIN_PATH_PX = 65.0
+LQR_WHEELBASE_M = 0.26      # [미터 모드] ★실측 필요★ 실제 축거(m) — 줄자로 재면 됨
+LQR_SPEED_MPS = 1.0         # [미터 모드] 속도 추정치(m/s) — 엔코더 연동 전 임시값, 실차 최우선 튜닝 대상
+LQR_HEADING_PROBE_M = 0.3   # [미터 모드] 헤딩오차 추정용 근거리 참조거리(m)
+LQR_MIN_PATH_M = 0.3        # [미터 모드] 경로 전체 길이가 이보다 짧으면 직전값 유지
 
 
 # #############################################################
