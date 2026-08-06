@@ -66,8 +66,11 @@ def generate_launch_description():
         video_device_cmd,
         cam_node,
         lidar_include,
-        # imu_include,  # S0->S1 테스트 단계에서 비활성화. imu_yaw는 S2/S3 좌회전 로직에서만 쓰이므로
-        #               (track_drive.py의 _yaw_delta/_begin_left_turn/_s3_shortcut) 지금은 불필요.
-        #               좌회전(S2/S3) 테스트 시작하면 이 줄 다시 살릴 것.
+        # [2026-08-06] 재활성화 — 원래 "imu_yaw는 S2/S3 좌회전 로직에서만 쓰이므로 S0->S1
+        # 테스트 단계엔 불필요"라는 이유로 꺼져 있었는데, 이제 imu_yaw가 바퀴 카운트
+        # (_update_lap(), 모든 State/Phase에서 동작)와 pure_pursuit의 코너 lookahead 감쇠
+        # 보강(README §0.5.5, S1 차선주행에서 항상 씀)에도 쓰여서 그 전제가 더 이상
+        # 성립하지 않는다. IMU 하드웨어도 이번에 수리됨(README §8.1) — 다시 켠다.
+        imu_include,
         track_drive_node,
     ])
