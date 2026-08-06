@@ -85,6 +85,13 @@ ANGLE_RATE_MAX = 12.0  # 조향 변화율 제한(도/주기, 20Hz 기준 12도/�
 SPEED_ACCEL_STEP = 0.85  # 가속 속도제한(주기당 최대 증가량)
 CORNER_HOLD_DECAY_LO = 0.92  # 저속 시 코너 hold 감쇠 (빠른 회복)
 CORNER_HOLD_DECAY_HI = 0.97  # 고속 시 코너 hold 감쇠 (느린 회복, 연속코너 대응)
+# [2026-08-06] 코너 감속 판단용 조향각 signed EMA 계수(_lane_drive()의 self._corner_signal) —
+#   pure_pursuit 특유의 좌우 진동("와리가리")이 매 스윙마다 급코너로 오인돼 속도가 팍팍
+#   깎이는 문제 대응. 작을수록(더 스무딩) 진동 상쇄 효과는 커지지만 실제 코너 진입 반응은
+#   느려진다 — 0.15는 20Hz 기준 시정수 약 0.33초(진동 주기보다 확실히 길게, 실제 코너 진입
+#   시간보다는 짧게 잡은 첫 추정치). 너무 작으면 실제 코너 감속이 늦어져 위험할 수 있으니
+#   실차에서 진동 주기/코너 반응 둘 다 보며 조정할 것.
+CORNER_SIGN_EMA_ALPHA = 0.15
 LANE_LOOKAHEAD_REF = 220.0   # 예측감속 최대가 되는 lookahead 편차(px) — _lane_drive() 속도계획용
 LAVACON_KP = 210.0           # 라바콘 조향 게인
 
