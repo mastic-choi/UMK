@@ -161,7 +161,6 @@ class TrackDriverNode(Node):
         self._shortcut_ref_yaw = None # S3 진입 1초 후 기록한 기준 yaw (탈출 좌회전 전 보정용)
         self._prev_speed     = 0.0    # 가속 속도제한용(직전 출력 속도)
         self._corner_hold    = 0.0    # 코너 활성도(감쇠 peak-hold)
-        self._corner_signal  = 0.0    # 코너 감속 판단용 조향각 signed EMA(부호 유지, _lane_drive() 참고)
         self._last_debug_t   = 0.0
 
         # ── 바퀴 카운트 상태 ──
@@ -1189,14 +1188,10 @@ class TrackDriverNode(Node):
         CORNER_MIN_RADIUS_PX보다 작아지면 그 비율만큼 속도를 깎는다. 반경이 0에 가까워져도
         속도가 0으로 죽지 않게 CORNER_MIN_SPEED_SCALE로 하한을 둔다.
         STEERING_CONTROLLER가 'pure_pursuit'일 때만 적용한다 — lqr.py는 curvature가 아니라
-        횡오차/헤딩오차 상태로 도는 별개 모델이라 이 반경 개념이 안 맞는다.
-
-        [2026-08-06] curvature는 self.pure_pursuit.last_curvature(이번 틱의 순간값)가 아니라
-        _lane_drive()가 매 틱 갱신하는 self._corner_signal(조향각의 signed EMA)에서 역산한다 —
-        이유는 _lane_drive() 상단 주석 참고(진동을 매번 급코너로 오인해 감속하는 문제)."""
+        횡오차/헤딩오차 상태로 도는 별개 모델이라 이 반경 개념이 안 맞는다."""
         if STEERING_CONTROLLER != 'pure_pursuit':
             return 1.0
-        curvature = math.tan(math.radians(self._corner_signal)) / self.pure_pursuit.wheelbase_px
+        curvature = self.pure_pursuit.last_curvature
         if curvature == 0.0:
             return 1.0
         radius = abs(1.0 / curvature)
@@ -1207,20 +1202,7 @@ class TrackDriverNode(Node):
     def _lane_drive(self):
         """S1/S3 공통 차선 조향+감속 로직. ctrl_angle·ctrl_speed·_prev_speed·_corner_hold 갱신."""
         self.ctrl_angle = self._lane_steer()
-
-        # [2026-08-06] 코너 감속 판단은 "지금 순간 조향각이 얼마나 큰가"가 아니라 "최근 한동안
-        # 같은 방향으로 얼마나 꺾여 있었는가"를 봐야 한다. pure_pursuit은 구조상 좌우로 조금씩
-        # 진동("와리가리")하는데, turn_now를 매 틱 abs(ctrl_angle)로 그대로 계산하면 진동의
-        # 절반(방향이 바뀌는 쪽)마다 급코너로 오인해 아래 3제곱 감속식과
-        # _corner_radius_speed_scale()이 실제 코너가 아닌데도 속도를 깎는다(실차에서 재현:
-        # 진동할 때마다 속도가 팍팍 줄었다 늘었다 함). self._corner_signal은 ctrl_angle을
-        # signed(부호 유지) EMA로 누적한 값이다 — 진동처럼 부호가 계속 바뀌면 서로 상쇄돼 0
-        # 근처로 수렴하고, 실제 코너처럼 한 방향으로 계속 꺾이면 EMA가 실제 각도로 수렴한다.
-        # abs()는 반드시 이 EMA를 취한 "이후"에 적용해야 한다 — abs(ctrl_angle)을 먼저 평균내면
-        # 부호 정보가 지워져서 진동도 그대로 다 더해져 상쇄 효과가 없어진다.
-        self._corner_signal = (CORNER_SIGN_EMA_ALPHA * self.ctrl_angle
-                                + (1.0 - CORNER_SIGN_EMA_ALPHA) * self._corner_signal)
-        turn_now     = min(1.0, abs(self._corner_signal) / ANGLE_MAX)
+        turn_now     = min(1.0, abs(self.ctrl_angle) / ANGLE_MAX)
         turn_preview = min(1.0, abs(self.lane_lookahead) / LANE_LOOKAHEAD_REF)
         turn_for_speed = max(turn_now, turn_preview * 0.3)
         target_speed = max(SPEED_CORNER_MIN,
@@ -1271,7 +1253,6 @@ class TrackDriverNode(Node):
         controller = self.lqr if STEERING_CONTROLLER == 'lqr' else self.pure_pursuit
         held = getattr(controller, 'held', False)
 
-        canvas = np.full((200, 380, 3), 30, dtype=np.uint8)
         # 주황 = 직전값 유지(경로 부족/노이즈로 신뢰 못 함), 초록 = 현재값 반영(정상 계산됨)
         status_color = (0, 140, 255) if held else (0, 200, 0)
         status_text = '직전값 유지 (경로 부족/노이즈)' if held else '현재값 반영'
@@ -1288,12 +1269,41 @@ class TrackDriverNode(Node):
             e_y = getattr(controller, 'last_e_y', None)
             e_psi = getattr(controller, 'last_e_psi', None)
             if e_y is not None:
-                lines.append((f'횡오차 e_y: {e_y:+.1f}px', (10, 104), (255, 255, 255), 20,
+                lines.append((f'횡오차 e_y: {e_y:+.1f}px', (10, 8 + 32 * len(lines)), (255, 255, 255), 20,
                                f'e_y: {e_y:+.1f}px'))
             if e_psi is not None:
-                lines.append((f'헤딩오차 e_psi: {math.degrees(e_psi):+.1f}도', (10, 136), (255, 255, 255), 20,
-                               f'e_psi: {math.degrees(e_psi):+.1f}deg'))
+                lines.append((f'헤딩오차 e_psi: {math.degrees(e_psi):+.1f}도', (10, 8 + 32 * len(lines)),
+                               (255, 255, 255), 20, f'e_psi: {math.degrees(e_psi):+.1f}deg'))
 
+        # DA(주행가능영역) 면적비 — DL_DA_MAX_AREA_RATIO 실측 튜닝용. 원래 da_debug라는 별도
+        # 창이었는데 조향 상태랑 같이 한눈에 보고 싶다는 요청으로 이 창에 합쳤다(2026-08-06).
+        # 'dl' 백엔드 전용(_slide 속성이 없는 hough/classic_cv 백엔드에서는 0.000으로만 표시됨).
+        #   초록 : 임계값 대비 80% 미만 — 여유 있음
+        #   주황 : 80~100% — 임계값에 근접
+        #   빨강 : 100% 초과 — 이번 프레임 실제로 outlier 처리됨(_largest_da_component() 참고)
+        slide = getattr(self.lane_detector, '_slide', None)
+        da_largest = getattr(slide, 'da_largest_area_ratio', 0.0) if slide is not None else 0.0
+        da_chosen = getattr(slide, 'da_chosen_area_ratio', 0.0) if slide is not None else 0.0
+        da_fallback = getattr(slide, 'da_fallback_used', False) if slide is not None else False
+        da_ratio_of_max = (da_largest / DL_DA_MAX_AREA_RATIO) if DL_DA_MAX_AREA_RATIO > 0 else 0.0
+        if da_largest > DL_DA_MAX_AREA_RATIO:
+            da_color = (0, 0, 220)
+            da_kr = f'임계값 초과(outlier) {da_ratio_of_max*100:.0f}%'
+            da_en = f'OVER THRESHOLD {da_ratio_of_max*100:.0f}%'
+        elif da_ratio_of_max >= 0.8:
+            da_color = (0, 140, 255)
+            da_kr, da_en = f'임계값 근접 {da_ratio_of_max*100:.0f}%', f'NEAR THRESHOLD {da_ratio_of_max*100:.0f}%'
+        else:
+            da_color = (0, 200, 0)
+            da_kr, da_en = f'정상 {da_ratio_of_max*100:.0f}%', f'OK {da_ratio_of_max*100:.0f}%'
+        lines.append((f'DA 면적비: {da_kr}', (10, 8 + 32 * len(lines)), da_color, 20, f'DA ratio: {da_en}'))
+        lines.append((
+            f'DA largest:{da_largest:.3f} chosen:{da_chosen:.3f}'
+            f'{" [FALLBACK]" if da_fallback else ""} max:{DL_DA_MAX_AREA_RATIO:.2f}',
+            (10, 8 + 32 * len(lines)), (255, 255, 255), 18,
+            f'DA largest:{da_largest:.3f} chosen:{da_chosen:.3f} max:{DL_DA_MAX_AREA_RATIO:.2f}'))
+
+        canvas = np.full((8 + 32 * len(lines) + 16, 380, 3), 30, dtype=np.uint8)
         put_text_kr_multi(canvas, lines)
         # 한글 폰트가 없어 fallback(영문)만 그려진 경우에도 색 테두리만으로 상태 구분 가능하게.
         cv2.rectangle(canvas, (0, 0), (canvas.shape[1] - 1, canvas.shape[0] - 1), status_color, 3)
