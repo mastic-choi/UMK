@@ -250,7 +250,7 @@ class TrackDriverNode(Node):
         # ── VESC 기반 실측 속도 (엔코더 대체, 2026-08-06 LQR 브랜치의 ROS1 연동 작업에서 이식) ──
         #   cb_vesc()가 '/vesc_speed_erpm'(ROS1 launch/vesc_speed_bridge.py가 중계)을 받을 때마다
         #   갱신한다. 그 브리지 노드가 안 떠 있거나 아직 메시지를 한 번도 못 받았으면 0.0으로
-        #   유지된다 — 아래 control_loop()의 LQR_MIN_SPEED_MPS 가드가 이 상태에서 self.lqr 게인을
+        #   유지된다 — 아래 control_loop()의 VESC_MIN_SPEED_MPS 가드가 이 상태에서 self.lqr 게인을
         #   건드리지 않게 막아준다(즉 이 값이 안 들어와도 LQRController 생성자 기본값
         #   speed_mps=LQR_SPEED_MPS로 조용히 폴백하지, v=0으로 게인이 퇴화하는 일은 없다).
         self.v_mps = 0.0
@@ -1219,6 +1219,28 @@ class TrackDriverNode(Node):
         self.ctrl_speed = target_speed
         self._prev_speed = target_speed
 
+    def _speed_for_lookahead(self):
+        """pure_pursuit의 속도 적응형 lookahead(PP_LOOKAHEAD_SPEED_GAIN)에 넣을 속도값을
+        고른다(2026-08-06, VESC 실측속도 연동). 예전엔 항상 self._prev_speed(직전 "명령"
+        속도, 모터단위)를 근사치로 썼는데, lookahead는 원래 "실제로 얼마나 빨리 달리고
+        있는가"에 대한 개념이라 명령값은 근사일 뿐이다 — 모터 데드존/가속 지연/슬립처럼
+        명령≠실제인 구간(§2.3에서 다룬 코너 급감속 직후 등)에서는 이 근사가 특히 틀어진다.
+
+        VESC 실측값(self.v_mps, m/s)이 살아있으면(최근에 받았고 VESC_MIN_SPEED_MPS 이상)
+        그걸 METERS_PER_SPEED_UNIT(README §6.5 실측 회귀)으로 "명령속도와 같은 단위"로
+        역환산해서 쓴다 — 그러면 PP_LOOKAHEAD_SPEED_GAIN/PP_LOOKAHEAD_BASE_PX 등 기존에
+        명령속도 스케일로 튜닝된 게인을 그대로 재사용할 수 있다(단위를 바꾸면 게인도 전부
+        다시 튜닝해야 하므로). VESC 브리지가 안 떠 있거나 메시지가 끊겼거나(_vesc_t가
+        VESC_STALE_SEC 이상 지남) 값이 너무 작으면(정지 근방, 노이즈 대비 신뢰 불가)
+        예전처럼 self._prev_speed로 폴백한다 — cb_vesc()/VESC_MIN_SPEED_MPS 주석과 동일한
+        가드 원칙(control_loop()의 self.lqr.set_speed_mps() 가드와 짝을 맞춤)."""
+        vesc_live = (self._vesc_t is not None
+                     and (time.time() - self._vesc_t) < VESC_STALE_SEC
+                     and abs(self.v_mps) >= VESC_MIN_SPEED_MPS)
+        if vesc_live:
+            return abs(self.v_mps) / METERS_PER_SPEED_UNIT
+        return self._prev_speed
+
     def _lane_steer(self):
         """self.lane_path(DL/classic_cv/hough 백엔드가 만든 ROI 픽셀좌표 경로, 가까운점→
         먼점)를 STEERING_CONTROLLER로 고른 컨트롤러(pure_pursuit.py 또는 lqr.py)로
@@ -1229,9 +1251,10 @@ class TrackDriverNode(Node):
         그대로 유지한다 — 두 컨트롤러의 control()이 내부적으로 동일하게 처리.
         (구 이름 _pure_pursuit_steer — STEERING_CONTROLLER로 lqr도 고를 수 있게 되며
         컨트롤러 중립적인 이름으로 변경)
-        pure_pursuit은 속도 적응형 lookahead 때문에 speed(_prev_speed 근사치)를 받지만,
-        lqr은 자체 speed_gain 튜닝값을 쓰고 control()에 speed 인자가 없다(controller/lqr.py
-        참고) — 그래서 여기서 컨트롤러별로 분기해서 호출한다(공통 kwarg로 합칠 수 없음)."""
+        pure_pursuit은 속도 적응형 lookahead 때문에 speed(_speed_for_lookahead() 참고)를
+        받지만, lqr은 자체 speed_gain 튜닝값을 쓰고 control()에 speed 인자가 없다
+        (controller/lqr.py 참고) — 그래서 여기서 컨트롤러별로 분기해서 호출한다(공통
+        kwarg로 합칠 수 없음)."""
         controller = self.lqr if STEERING_CONTROLLER == 'lqr' else self.pure_pursuit
         roi_w = getattr(self.lane_detector, 'roi_w', 0) or 0
         if not self.lane_path or not roi_w:
@@ -1239,7 +1262,7 @@ class TrackDriverNode(Node):
         vehicle_xy = (roi_w / 2.0, self.lane_path[0][1])
         if STEERING_CONTROLLER == 'lqr':
             return self.lqr.control(self.lane_path, vehicle_xy)
-        return self.pure_pursuit.control(self.lane_path, vehicle_xy, speed=self._prev_speed)
+        return self.pure_pursuit.control(self.lane_path, vehicle_xy, speed=self._speed_for_lookahead())
 
     # [DEBUG_VIZ_STEER] 조향 컨트롤러가 이번 주기에 "새로 계산"했는지(초록/현재값 반영)
     # "직전 조향각을 그대로 유지"했는지(주황/직전값 유지)를 별도 창으로 바로 확인.
@@ -1253,7 +1276,6 @@ class TrackDriverNode(Node):
         controller = self.lqr if STEERING_CONTROLLER == 'lqr' else self.pure_pursuit
         held = getattr(controller, 'held', False)
 
-        canvas = np.full((200, 380, 3), 30, dtype=np.uint8)
         # 주황 = 직전값 유지(경로 부족/노이즈로 신뢰 못 함), 초록 = 현재값 반영(정상 계산됨)
         status_color = (0, 140, 255) if held else (0, 200, 0)
         status_text = '직전값 유지 (경로 부족/노이즈)' if held else '현재값 반영'
@@ -1270,12 +1292,44 @@ class TrackDriverNode(Node):
             e_y = getattr(controller, 'last_e_y', None)
             e_psi = getattr(controller, 'last_e_psi', None)
             if e_y is not None:
-                lines.append((f'횡오차 e_y: {e_y:+.1f}px', (10, 104), (255, 255, 255), 20,
+                lines.append((f'횡오차 e_y: {e_y:+.1f}px', (10, 8 + 32 * len(lines)), (255, 255, 255), 20,
                                f'e_y: {e_y:+.1f}px'))
             if e_psi is not None:
-                lines.append((f'헤딩오차 e_psi: {math.degrees(e_psi):+.1f}도', (10, 136), (255, 255, 255), 20,
-                               f'e_psi: {math.degrees(e_psi):+.1f}deg'))
+                lines.append((f'헤딩오차 e_psi: {math.degrees(e_psi):+.1f}도', (10, 8 + 32 * len(lines)),
+                               (255, 255, 255), 20, f'e_psi: {math.degrees(e_psi):+.1f}deg'))
 
+        # DA(주행가능영역) 면적 — DL_DA_MAX_AREA_PX 실측 튜닝용. 원래 da_debug라는 별도
+        # 창이었는데 조향 상태랑 같이 한눈에 보고 싶다는 요청으로 이 창에 합쳤다(2026-08-06).
+        # 'dl' 백엔드 전용(_slide 속성이 없는 hough/classic_cv 백엔드에서는 0px로만 표시됨).
+        #   [2026-08-06] 마스크 전체 대비 비율이 아니라 절대 픽셀값으로 바꿨다(config.py의
+        #   DL_DA_MAX_AREA_PX 주석 참고) — 직선 구간에서 이 창의 "largest" 값을 그대로 읽어서
+        #   DL_DA_MAX_AREA_PX 실측값으로 쓰면 된다.
+        #   초록 : 임계값 대비 80% 미만 — 여유 있음
+        #   주황 : 80~100% — 임계값에 근접
+        #   빨강 : 100% 초과 — 이번 프레임 실제로 outlier 처리됨(_largest_da_component() 참고)
+        slide = getattr(self.lane_detector, '_slide', None)
+        da_largest = getattr(slide, 'da_largest_area_px', 0) if slide is not None else 0
+        da_chosen = getattr(slide, 'da_chosen_area_px', 0) if slide is not None else 0
+        da_fallback = getattr(slide, 'da_fallback_used', False) if slide is not None else False
+        da_ratio_of_max = (da_largest / DL_DA_MAX_AREA_PX) if DL_DA_MAX_AREA_PX > 0 else 0.0
+        if da_largest > DL_DA_MAX_AREA_PX:
+            da_color = (0, 0, 220)
+            da_kr = f'임계값 초과(outlier) {da_ratio_of_max*100:.0f}%'
+            da_en = f'OVER THRESHOLD {da_ratio_of_max*100:.0f}%'
+        elif da_ratio_of_max >= 0.8:
+            da_color = (0, 140, 255)
+            da_kr, da_en = f'임계값 근접 {da_ratio_of_max*100:.0f}%', f'NEAR THRESHOLD {da_ratio_of_max*100:.0f}%'
+        else:
+            da_color = (0, 200, 0)
+            da_kr, da_en = f'정상 {da_ratio_of_max*100:.0f}%', f'OK {da_ratio_of_max*100:.0f}%'
+        lines.append((f'DA 면적: {da_kr}', (10, 8 + 32 * len(lines)), da_color, 20, f'DA area: {da_en}'))
+        lines.append((
+            f'DA largest:{da_largest}px chosen:{da_chosen}px'
+            f'{" [FALLBACK]" if da_fallback else ""} max:{DL_DA_MAX_AREA_PX}px',
+            (10, 8 + 32 * len(lines)), (255, 255, 255), 18,
+            f'DA largest:{da_largest}px chosen:{da_chosen}px max:{DL_DA_MAX_AREA_PX}px'))
+
+        canvas = np.full((8 + 32 * len(lines) + 16, 380, 3), 30, dtype=np.uint8)
         put_text_kr_multi(canvas, lines)
         # 한글 폰트가 없어 fallback(영문)만 그려진 경우에도 색 테두리만으로 상태 구분 가능하게.
         cv2.rectangle(canvas, (0, 0), (canvas.shape[1] - 1, canvas.shape[0] - 1), status_color, 3)
@@ -1308,13 +1362,13 @@ class TrackDriverNode(Node):
                 color = (0, 200, 0)
                 text_kr, text_en = f'정상 수신 중 ({age*1000:.0f}ms 전)', f'LIVE ({age*1000:.0f}ms ago)'
 
-        gain_fed = abs(self.v_mps) >= LQR_MIN_SPEED_MPS
+        gain_fed = abs(self.v_mps) >= VESC_MIN_SPEED_MPS
         canvas = np.full((160, 380, 3), 30, dtype=np.uint8)
         lines = [
             (f'VESC 연동: {text_kr}', (10, 8), color, 16, f'VESC link: {text_en}'),
             (f'v_mps: {self.v_mps:+.3f} m/s', (10, 44), (255, 255, 255), 20,
              f'v_mps: {self.v_mps:+.3f} m/s'),
-            (f'LQR 게인 반영: {"O" if gain_fed else "X (LQR_MIN_SPEED_MPS 미만)"}',
+            (f'LQR 게인 반영: {"O" if gain_fed else "X (VESC_MIN_SPEED_MPS 미만)"}',
              (10, 76), (255, 255, 255) if gain_fed else (150, 150, 150), 16,
              f'LQR gain fed: {"YES" if gain_fed else "NO"}'),
             ('토픽: /vesc_speed_erpm (std_msgs/Float32, vesc_speed_bridge.py 경유)',
@@ -1534,10 +1588,10 @@ class TrackDriverNode(Node):
         self.perceive_all()                 # 1. 인지
         self._update_lap()                  #    바퀴 카운트(누적 yaw + 정지선)
         # VESC 실측 속도를 LQR 게인에 반영(2026-08-06 LQR 브랜치에서 이식) — run_mission_fsm()보다
-        # 먼저 해야 이번 틱의 _lane_steer()가 최신 속도로 계산된 게인을 쓴다. LQR_MIN_SPEED_MPS
+        # 먼저 해야 이번 틱의 _lane_steer()가 최신 속도로 계산된 게인을 쓴다. VESC_MIN_SPEED_MPS
         # 미만(정지/거의정지, 혹은 vesc_speed_bridge 노드 미실행으로 self.v_mps가 계속 0.0)이면
-        # 건너뛰고 직전 게인을 유지한다(cb_vesc()/LQR_MIN_SPEED_MPS 주석 참고).
-        if abs(self.v_mps) >= LQR_MIN_SPEED_MPS:
+        # 건너뛰고 직전 게인을 유지한다(cb_vesc()/VESC_MIN_SPEED_MPS 주석 참고).
+        if abs(self.v_mps) >= VESC_MIN_SPEED_MPS:
             self.lqr.set_speed_mps(self.v_mps)
         self.run_mission_fsm()              # 2. 판단(Mission)
 
