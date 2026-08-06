@@ -105,7 +105,7 @@ from ..config import DL_FG_THRESHOLD, DL_LL_FG_THRESHOLD, DL_ROI_Y0, DL_ROI_Y1
 #   아직 미검증" 상태고, BEV로 좌표계를 바꾸면 DL_DA_MIN_COMPONENT_AREA/DL_SLICE_OUTLIER_MAX/
 #   DL_STABLE_JUMP_MAX 등 원근 픽셀 스케일 기준으로 잡힌 튜닝값들의 "픽셀당 의미"가 전부
 #   바뀐다(아래 캔버스 자동계산 결과 면적이 원래 ROI의 약 1.95배).
-from ..config import DL_USE_BEV, DL_BEV_SRC_PX_RAW, DL_PIXELS_PER_METER
+from ..config import DL_USE_BEV, DL_BEV_SRC_PX_RAW, DL_PIXELS_PER_METER, DL_BEV_FAR_LIMIT_M
 DL_BEV_SRC_PX = DL_BEV_SRC_PX_RAW - np.float32([0, DL_ROI_Y0])
 
 # ── [2026-08-05] 캔버스 크기를 손으로 정하지 않고 "ROI 전체가 어디까지 매핑되는지"
@@ -137,6 +137,15 @@ _dl_max_xy = _dl_mapped_corners.max(axis=0)
 DL_BEV_CANVAS_W = int(np.ceil(_dl_max_xy[0] - _dl_min_xy[0])) + 1
 DL_BEV_CANVAS_H = int(np.ceil(_dl_max_xy[1] - _dl_min_xy[1])) + 1
 DL_BEV_DST_PX = _dl_block_dst - _dl_min_xy  # 목적점을 캔버스 원점 기준으로 평행이동
+
+# [2026-08-06] 원거리 크롭 행(row) 계산 — config.py의 DL_BEV_FAR_LIMIT_M 주석 참고.
+#   block 좌표계에서 근거리 기준점(BL/BR)은 y=_dl_block_h(=1.0m*px/m)이고, 캔버스로 옮기면
+#   위 DL_BEV_DST_PX와 같은 평행이동(-_dl_min_xy)을 받는다. 거기서 DL_BEV_FAR_LIMIT_M(m)
+#   만큼 위(원거리 방향, y 감소)로 올라간 행이 크롭 경계 — 그 행 "위"(더 먼 부분)를 버린다.
+#   DL_PIXELS_PER_METER/DL_BEV_SRC_PX_RAW는 그대로라 캘리브레이션 왜곡 없이 순수하게
+#   "얼마나 먼 데까지 볼지"만 제한한다(위 config.py 주석 참고).
+_dl_near_canvas_y = _dl_block_h - _dl_min_xy[1]
+DL_BEV_FAR_CROP_ROW = max(0, int(round(_dl_near_canvas_y - DL_BEV_FAR_LIMIT_M * DL_PIXELS_PER_METER)))
 
 # ── SlideWindow moments 로직 재사용을 위한 DL 전용 튜닝값 ──
 #   classic 파이프라인은 BEV로 워프된 ROI px 스케일이고, DL은 원본 카메라 프레임 px
@@ -309,7 +318,8 @@ class DLSlideWindow(SlideWindow):
             stable_frame_min=DL_STABLE_FRAME_MIN, stable_jump_max=DL_STABLE_JUMP_MAX,
         )
         self.ll_coverage = 0.0     # 최근 프레임 ROI 내 ll foreground 비율(sanity check/디버그용)
-        self.da_mask_roi = None    # 시각화용(가장 큰 덩어리만 남긴 이후의 da 마스크)
+        self.da_mask_roi = None    # 시각화용(가장 큰 덩어리만 남긴 이후의 da 마스크 — 실제 waypoint 추출에 쓰는 것)
+        self.da_mask_all_roi = None  # 시각화용(이진화 직후, 덩어리 선택/ll클리핑 전 da 전체 — visualize()가 파란색으로 그림)
         self.ll_mask_roi = None    # 시각화용
         self.centerline = []       # da 밴드별 중심점(원본 관측점, 길이 self.n_slices)
         self.da_fallback_used = False  # 이번 프레임 da가 최댓값이 아니라 차선책(2번째 이하) 덩어리인지 — visualize() 색상 구분용
@@ -472,6 +482,14 @@ class DLSlideWindow(SlideWindow):
             da_roi = self._bev_warp(da_roi)
             yellow_roi = self._bev_warp(yellow_roi, nearest=True)
             vis_roi = self._bev_warp(vis_roi)
+            # [2026-08-06] 원거리 크롭 — DL_BEV_FAR_CROP_ROW보다 위(더 먼) 행은 버린다
+            # (config.py DL_BEV_FAR_LIMIT_M 주석 참고). 네 배열 전부 같은 행을 자르므로
+            # 이후 좌표계는 계속 서로 일치한다.
+            if DL_BEV_FAR_CROP_ROW > 0:
+                ll_roi = ll_roi[DL_BEV_FAR_CROP_ROW:]
+                da_roi = da_roi[DL_BEV_FAR_CROP_ROW:]
+                yellow_roi = yellow_roi[DL_BEV_FAR_CROP_ROW:]
+                vis_roi = vis_roi[DL_BEV_FAR_CROP_ROW:]
 
         # ll은 da(DL_FG_THRESHOLD)보다 높은 임계값을 쓴다 — BEV 워프가 원거리일수록 확률맵
         # 경계 blur를 더 크게 확대해서, 낮은 임계값으로는 원거리 ll이 실제보다 두껍게 잡힌다
@@ -480,6 +498,11 @@ class DLSlideWindow(SlideWindow):
         self.ll_coverage = float(np.count_nonzero(ll_mask)) / ll_mask.size if ll_mask.size else 0.0
 
         da_mask = (da_roi >= DL_FG_THRESHOLD).astype(np.uint8) * 255
+        # 덩어리 선택(_largest_da_component)/ll 클리핑 전, 이진화 직후의 da 전체 — 아래에서
+        # da_mask가 선택/클리핑된 결과로 재대입되기 전에 따로 남겨둔다(visualize()가 "모델이
+        # 주행가능하다고 본 전체"를 파란색으로, 실제 채택분(self.da_mask_roi)을 그 위에
+        # 초록/주황/청록으로 겹쳐 그려서 "전체 중 실제로 뭘 골랐는지" 한눈에 비교 가능하게 함).
+        self.da_mask_all_roi = da_mask
 
         # _slice_centers()가 self.vis/self.roi_h를 참조하므로(DEBUG_VIZ_LANE 디버그
         # 사각형 — classic_cv 백엔드용 플래그지만 SlideWindow 공용 코드라 여기도 거친다),
@@ -565,8 +588,9 @@ class DLSlideWindow(SlideWindow):
         return lane_valid, offset, lookahead, lane_center, self.path
 
     def visualize(self, offset):
-        """da(초록/면적상한 차선책이면 주황/ll클리핑 건너뜀이면 청록)/ll(빨강) 반투명
-        오버레이 + da 중심선 관측점 + 피팅된 경로 + offset/lane_center 텍스트를 self.vis에
+        """da 전체(파랑, self.da_mask_all_roi)/실제 채택 da(초록/면적상한 차선책이면 주황/
+        ll클리핑 건너뜀이면 청록)/ll(빨강) 반투명 오버레이 + da 중심선 관측점 + 피팅된 경로 +
+        offset/lane_center 텍스트를 self.vis에
         그려 넣기만 한다. ★ 여기서
         cv2.imshow()/cv2.waitKey()를 호출하면 안 된다 ★ 이 메서드는 DLLaneDetector의
         백그라운드 추론 스레드에서 호출되는데, OpenCV HighGUI(특히 GTK 백엔드)는 스레드
@@ -581,6 +605,14 @@ class DLSlideWindow(SlideWindow):
 
         if DEBUG_VIZ_DL_LANE and self.da_mask_roi is not None:
             overlay = self.vis.copy()
+            # 모델이 "주행가능하다"고 본 da 전체(덩어리 선택/ll클리핑 전, self.da_mask_all_roi)를
+            # 먼저 파란색으로 깔고, 그 위에 실제로 waypoint 추출에 쓰인 부분(self.da_mask_roi,
+            # 아래 초록/주황/청록)을 덧그린다 — "모델이 본 전체 vs 실제로 채택한 부분"을 한
+            # 화면에서 바로 비교할 수 있게 한다. da_mask_roi는 항상 da_mask_all_roi의 부분집합이라
+            # (largest-component 선택 + ll 클리핑으로 줄어들기만 함) 겹치는 픽셀은 뒤에 그리는
+            # 초록/주황/청록이 그대로 덮어써서 보인다.
+            if self.da_mask_all_roi is not None:
+                overlay[self.da_mask_all_roi > 0] = (255, 0, 0)  # 파랑 — da 전체(모델 원본 판단)
             # 차선책(최댓값 덩어리가 면적 상한에 걸려 그다음 덩어리를 대신 쓴 프레임)은
             # 주황, ll 클리핑을 건너뛴 프레임(클리핑하면 밴드가 너무 줄어드는 경우)은
             # 청록으로 표시해 초록(정상)과 구분한다 — _largest_da_component()/detect()

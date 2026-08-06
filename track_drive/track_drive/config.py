@@ -167,6 +167,20 @@ DL_BEV_SRC_PX_RAW = np.float32([
 ])
 DL_PIXELS_PER_METER = 200.0   # 설계값(실측 아님) — 목적 캔버스를 1m=200px 스케일로 만든다.
 
+# [2026-08-06] 원거리 크롭 — da/ll 처리가 근거리 기준점(BL/BR)으로부터 몇 m까지만 보게 할지.
+#   캔버스는 "ROI 전체가 여백 없이 들어가도록" 자동 확장되는데(perception/dl_lane.py의
+#   DL_BEV_CANVAS_H 계산 참고), 그 결과 실측 캘리브레이션 지점(TL/TR, 1.0m)보다도 더 먼
+#   영역(외삽, 실측값 기준 약 1.30m까지)까지 처리에 포함되고 있었다. 이 값을 낮추면 그
+#   외삽 영역과 원거리 blur(§2.2에서 다룬 S자 커브 ll 두께 과다검출의 원인)를 처리 대상에서
+#   제외할 수 있다.
+#   ★주의★ 이건 DL_BEV_SRC_PX_RAW/DL_PIXELS_PER_METER 같은 캘리브레이션 값이 아니다 — 그
+#   값들은 그대로 두고 "이미 정확하게 아는 좌표계에서 먼 부분을 그냥 안 본다"는 크롭일
+#   뿐이라 스케일 왜곡이 없다. 반대로 이 숫자를 바꾼다고 카메라가 실제로 보는 물리적 거리가
+#   바뀌는 것도 아니다(그건 DL_BEV_SRC_PX_RAW 4점의 실측 재측정이 필요 — README §6.3 참고).
+#   1.0 → 0.7로 낮춤(요청 반영) — 실차 미검증, DEBUG_VIZ_DL_LANE에서 크롭 경계가 원하는
+#   위치에 오는지 확인할 것.
+DL_BEV_FAR_LIMIT_M = 0.7
+
 # ── 세그멘테이션 결과에서 좌/우 차선 중심을 뽑을 관심영역 (원본 480행 기준 절대 픽셀, 실차 실측값) ──
 DL_ROI_Y0 = 250
 DL_ROI_Y1 = 390
@@ -312,10 +326,15 @@ VESC_SPEED_TO_ERPM_GAIN = 4614.0  # VESC 드라이버 vesc.yaml의 speed_to_erpm
                                    #   2026-08-06). 실속도(m/s) = state.speed(ERPM) / 이 값.
 VESC_STALE_SEC = 0.5        # 마지막 /vesc_speed_erpm 수신 후 이 시간(s)이 지나면 vesc_debug 창에서
                              #   "끊김"으로 표시(20Hz 기준 약 10틱).
-LQR_MIN_SPEED_MPS = 0.05    # v_mps가 이 미만(정지/거의정지, 혹은 vesc_speed_bridge 노드 미실행으로
-                             #   0.0 고정)이면 self.lqr.set_speed_mps() 갱신을 건너뛰고 직전 게인을
-                             #   유지한다 — v≈0에서 B≈0으로 게인이 퇴화(조향이 상태에 영향을 못 미치는
-                             #   것으로 계산됨)하는 것을 피하기 위함.
+VESC_MIN_SPEED_MPS = 0.05    # v_mps가 이 미만(정지/거의정지, 혹은 vesc_speed_bridge 노드 미실행으로
+                             #   0.0 고정)이면 "VESC 실측값을 못 믿는다"고 보고 폴백한다. 두 곳에서 씀:
+                             #   ① self.lqr.set_speed_mps() 갱신을 건너뛰고 직전 게인 유지 — v≈0에서
+                             #     B≈0으로 게인이 퇴화(조향이 상태에 영향을 못 미치는 것으로 계산됨)하는
+                             #     것을 피하기 위함.
+                             #   ② _speed_for_lookahead()(2026-08-06, pure_pursuit용)가 v_mps 대신
+                             #     self._prev_speed(명령속도)로 폴백 — track_drive.py 참고. 이름은
+                             #     LQR 전용처럼 보이지만 "VESC 값을 신뢰할 최소 속도"라는 의미라
+                             #     LQR_이 아니라 VESC_ 접두어를 씀.
 
 
 # #############################################################

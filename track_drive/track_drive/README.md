@@ -360,6 +360,32 @@ lookahead가 `PP_LOOKAHEAD_MIN_PX(40px)` 근처에 계속 눌려있어 절대 �
   덜 민감해지는 것"이지 진동 자체(pure_pursuit의 근본 특성)를 없애지 않습니다. 진동 자체를 줄이려면
   `PP_ALPHA`/`PATH_EMA_ALPHA`/`PP_DX_DEADZONE_PX`(전부 config.py) 쪽을 볼 것.
 
+### 0.5.4 VESC 실측속도를 lookahead 계산에 반영 (`pure_pursuit` 전용, 2026-08-06)
+
+`pure_pursuit`의 속도 적응형 lookahead(`PP_LOOKAHEAD_SPEED_GAIN`)는 원래 "실제로 얼마나 빨리 달리고
+있는가"를 봐야 하는데, 지금까지는 `self._prev_speed`(직전 **명령**속도, 모터단위)를 근사치로 썼습니다.
+§7에서 이식한 VESC 실측속도(`self.v_mps`)가 이제 있으니, 이걸 쓰도록 바꿨습니다
+([track_drive.py:1222](track_drive.py#L1222) `_speed_for_lookahead()`, [1265](track_drive.py#L1265) 호출부).
+
+**동작:** VESC가 살아있으면(최근 `VESC_STALE_SEC` 이내 수신 + `abs(v_mps) >= VESC_MIN_SPEED_MPS`)
+`v_mps`를 `METERS_PER_SPEED_UNIT`(§6.5 실측 회귀)로 나눠 "명령속도와 같은 단위"로 역환산해서 씁니다 —
+그러면 `PP_LOOKAHEAD_SPEED_GAIN`/`PP_LOOKAHEAD_BASE_PX` 등 기존에 명령속도 스케일로 튜닝된 값을 그대로
+재사용할 수 있습니다(단위를 바꾸면 게인도 전부 재튜닝해야 하므로 일부러 이렇게 함). VESC가 안 살아있으면
+예전처럼 `self._prev_speed`로 폴백합니다.
+
+**왜 도움이 되나:** 모터 데드존/가속 지연/슬립 때문에 "명령≠실제"인 구간(§2.3에서 다룬 코너 급감속
+직후 등)에서, 예전엔 명령값 기준으로 lookahead를 계산해 실제 속도와 안 맞을 수 있었습니다. 실측값을
+쓰면 그 구간에서도 lookahead가 실제 주행 상태를 반영합니다.
+
+**알려진 한계:**
+- `VESC_MIN_SPEED_MPS=0.05`(config.py, §7에서 이미 LQR용으로 쓰던 값을 공유 — 이름을
+  `LQR_MIN_SPEED_MPS`에서 `VESC_MIN_SPEED_MPS`로 일반화했습니다)가 그대로 재사용됩니다.
+- ROS1 `vesc_speed_bridge.py`가 안 떠 있으면 항상 폴백 경로만 타므로, 실제 개선 효과는 그 브리지가
+  실차에서 살아있을 때만 발생합니다 — §7의 `vesc_debug` 창으로 확인할 것.
+- 실차 미검증 — 폴백/실측 전환이 자주 일어나면(예: VESC 메시지가 간헐적으로 끊기는 경우) lookahead가
+  단위 사이를 오가며 미세하게 들쭉날쭉할 수 있습니다. 실측해보고 문제되면 전환 시 저역통과를 추가로
+  걸 것.
+
 ---
 
 ## 1. 신호등 (S0 출발 / S2 교차로) — 통합 4구 신호등
@@ -520,18 +546,47 @@ da 자체(세그멘테이션)는 멀쩡한데 ll 클리핑이 지워버려서 �
 ### 2.4 최고속도/코너 최저속도 재설정 (`SPEED_NORMAL` 8.0 → 25.0, `SPEED_CORNER_MIN` 3.0 → 5.0, 2026-08-06)
 
 요청에 따라 직진 최고속도(`SPEED_NORMAL`)를 8.0에서 25.0으로, 코너 최저속도(`SPEED_CORNER_MIN`, §2.3)를
-3.0에서 5.0으로 올렸다([config.py:73](config.py#L73), [82](config.py#L90)).
+3.0에서 5.0으로 올렸다([config.py:73](config.py#L73), [90](config.py#L90)).
 
 **주의 — 실차 재검증 필요:**
 - §6.5의 `METERS_PER_SPEED_UNIT` 회귀는 `speed=5`/`10` 두 점만 실측한 것이라, `SPEED_NORMAL=25`는 측정
   범위 밖(2.5배) 외삽이다. 실제 m/s·제동거리·코너 반응이 그 선형식대로 나올지 실차에서 다시 확인할 것.
-- `PP_LOOKAHEAD_SPEED_GAIN`(=4.0, [config.py:257](config.py#L257)) 등 `pure_pursuit`이 `speed`(현재는
-  `self._prev_speed`, 명령속도 그대로)를 직접 입력받는 게인들도 최고값이 8→25로 커진 만큼 lookahead가
-  더 크게 튈 수 있다(다만 `PP_LOOKAHEAD_MAX_PX=150`으로 클램프는 되므로 값이 무한정 커지진 않음) —
-  §0.5 문서에 있는 진동/오버슈트 증상이 심해지는지 관찰할 것.
+- `PP_LOOKAHEAD_SPEED_GAIN`(=4.0, [config.py:257](config.py#L257)) 등 `pure_pursuit`이 `speed`(§0.5.4에서
+  VESC 실측값 기반으로 바뀌었지만, 명령속도와 같은 단위로 역환산해서 넣으므로 스케일 자체는 그대로)를
+  직접 입력받는 게인들도 최고값이 8→25로 커진 만큼 lookahead가 더 크게 튈 수 있다(다만
+  `PP_LOOKAHEAD_MAX_PX=150`으로 클램프는 되므로 값이 무한정 커지진 않음) — §0.5 문서에 있는
+  진동/오버슈트 증상이 심해지는지 관찰할 것.
 - 가속 제한(`SPEED_ACCEL_STEP=0.85`/주기)은 그대로라, 0→25까지 도달하는 데 이전보다 더 오래 걸린다
   (약 29주기 ≈ 1.5초, 20Hz 기준) — 가속 자체는 안전 방향이라 값을 안 건드렸지만, 체감상 가속이 느리게
   느껴지면 `SPEED_ACCEL_STEP`을 같이 올릴 것.
+
+### 2.5 원거리 크롭 (`DL_BEV_FAR_LIMIT_M`) + da 전체/채택분 구분 시각화 (2026-08-06)
+
+**원거리 크롭**: BEV 캔버스는 "ROI 전체가 여백 없이 들어가도록" 자동 확장되는데(§6.3), 그 결과 da/ll
+처리가 실측 캘리브레이션 지점(TL/TR, 1.0m)보다 더 먼 영역(외삽, 근거리 기준점으로부터 약 1.30m까지)
+까지 포함하고 있었다는 걸 계산으로 확인했다. 실측 재측정(픽셀 좌표 재클릭) 없이, **이미 정확한**
+`DL_PIXELS_PER_METER` 스케일을 그대로 이용해 근거리 기준점으로부터 `DL_BEV_FAR_LIMIT_M`(=0.7m,
+[config.py:182](config.py#L182))보다 먼 캔버스 행을 워프 직후에 잘라낸다
+([perception/dl_lane.py:480](perception/dl_lane.py#L480)). `DL_BEV_SRC_PX_RAW`/`DL_PIXELS_PER_METER`
+자체는 그대로 두므로(캘리브레이션 안 건드림) 스케일 왜곡 없이 "얼마나 먼 데까지 볼지"만 제한한다 —
+1.0m를 0.7m로 그냥 바꿔치기하면 안 되는 이유(캘리브레이션 왜곡)와 이 방식을 택한 이유는
+`perception/dl_lane.py`의 `DL_BEV_FAR_CROP_ROW` 계산부 주석 참고. 원거리 ll 두께 과다검출(§2.2)
+문제에도 도움이 될 것으로 기대 — 가장 blur가 심한 먼 영역 자체를 이제 안 본다.
+
+**da 전체/채택분 구분 시각화**: `DEBUG_VIZ_DL_LANE` 오버레이에서 이제 모델이 "주행가능하다"고 판단한
+da 전체(덩어리 선택/ll클리핑 전, `self.da_mask_all_roi`)를 **파란색**으로 먼저 깔고, 실제로 waypoint
+추출에 쓰인 부분(`self.da_mask_roi`, 기존과 동일하게 초록/주황(면적상한 차선책)/청록(ll클리핑 건너뜀))을
+그 위에 덧그린다([perception/dl_lane.py:590](perception/dl_lane.py#L590) `visualize()`). 채택분은
+항상 전체의 부분집합이라 겹치는 픽셀은 초록/주황/청록이 그대로 덮어써 보이고, "모델이 본 전체 중 실제로
+얼마나/어느 부분을 골랐는지"를 한 화면에서 바로 비교할 수 있다.
+
+**알려진 한계:**
+- `DL_BEV_FAR_LIMIT_M=0.7`은 실차 미검증 값. `DEBUG_VIZ_DL_LANE` 창에서 크롭 경계(파란/초록 영역이
+  갑자기 끝나는 지점)가 원하는 위치에 오는지 확인할 것.
+- 캔버스 높이가 줄어든 만큼(298→178px, 약 60%) `DL_N_SLICES`(8밴드)당 픽셀 수도 줄어든다 —
+  `DL_MIN_PIXELS`/`DL_DA_MIN_COMPONENT_AREA`/`DL_DA_MAX_AREA_RATIO` 등 절대·비율 픽셀 임계값들의
+  "픽셀당 의미"가 이 크롭 이전과 달라졌을 수 있다. 아직 재검증하지 않았으니 da가 이유 없이 무효 처리되는
+  빈도가 늘면 이쪽을 먼저 볼 것.
 
 ---
 
@@ -778,7 +833,7 @@ m/px 환산이 없었는데, BEV(585×298px 캔버스, 면적비 옛 ROI 대비 
    `vesc.yaml`의 `speed_to_erpm_gain` 실측값, [config.py](config.py))로 나눠 `self.v_mps`(m/s)로 변환합니다.
 
 **이 값을 쓰는 곳 두 군데** (`control_loop()`, [track_drive.py](track_drive.py)):
-- `self.lqr.set_speed_mps(self.v_mps)` — `LQR_MIN_SPEED_MPS`(=0.05) 이상일 때만 갱신합니다. 정지
+- `self.lqr.set_speed_mps(self.v_mps)` — `VESC_MIN_SPEED_MPS`(=0.05) 이상일 때만 갱신합니다. 정지
   상태(v≈0)에서 그대로 넣으면 LQR의 상태전이행렬 B가 퇴화(조향이 상태에 영향을 못 미치는 것으로
   계산됨)하므로, 그 미만이면 직전 게인을 유지합니다.
 - `self.pose_estimator.update(self.v_mps, math.radians(self.ctrl_angle), 0.05)` — 매 주기 갱신. 이제
