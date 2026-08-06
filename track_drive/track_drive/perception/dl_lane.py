@@ -687,7 +687,13 @@ class DLLaneDetector:
             return self._latest_result
 
     def show_debug_windows(self):
-        """da(초록)/ll(빨강) 오버레이가 그려진 최근 결과를 디버그 창으로 띄운다.
+        """da(초록)/ll(빨강) 오버레이가 그려진 result에 da/ll 원본 이진마스크를 위→아래로
+        이어붙여 창 하나(`dl_lane`)로 띄운다 — result/da/ll 순서로 세로 스택.
+        [2026-08-06] 예전엔 3개 별도 창(dl_lane_result/da/ll)이었는데, 창이 흩어져 있으면
+        서로 다른 위치에 배치해야 해서 실차 테스트 중 한눈에 비교하기 불편하다는 피드백으로
+        하나로 합쳤다. da/ll은 원래 1채널 이진마스크라 result(3채널 BGR)와 그대로 못
+        이어붙이므로 BGR로 변환 후 vconcat한다 — result/da/ll 모두 같은 ROI에서 나온
+        동일 shape(BEV 캔버스 크기)이라 폭이 항상 맞는다.
         ★ 반드시 메인 스레드(ROS 콜백/타이머가 도는 스레드)에서만 호출할 것 ★ — 워커
         스레드가 cv2.imshow를 직접 부르지 않는 이유는 _worker()/DLSlideWindow.visualize()
         주석 참고. track_drive.py의 perc_lane()이 detect() 직후 이 메서드를 호출한다
@@ -698,9 +704,11 @@ class DLLaneDetector:
             vis, da_mask, ll_mask = self._latest_debug
         if vis is None:
             return
-        cv2.imshow('dl_lane_da', da_mask)
-        cv2.imshow('dl_lane_ll', ll_mask)
-        cv2.imshow('dl_lane_result', vis)
+        da_bgr = cv2.cvtColor(da_mask, cv2.COLOR_GRAY2BGR)
+        ll_bgr = cv2.cvtColor(ll_mask, cv2.COLOR_GRAY2BGR)
+        for label, panel in (('result', vis), ('da', da_bgr), ('ll', ll_bgr)):
+            cv2.putText(panel, label, (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        cv2.imshow('dl_lane', cv2.vconcat([vis, da_bgr, ll_bgr]))
         cv2.waitKey(1)
 
     def stop(self):
