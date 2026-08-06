@@ -7,9 +7,10 @@
 # 그대로 사용한다. hough_lane.HoughLaneDetector / perc_floor.LaneDetector와 동일하게
 #   detect(frame) -> (lane_valid, lane_offset, lane_lookahead, lane_center, path, debug_img)
 # 인터페이스를 구현하므로 track_drive.py의 perc_lane()은 수정 없이 그대로 재사용된다
-# (LANE_DETECTOR_BACKEND 플래그로 세 백엔드 중 하나를 고른다). path는 da(주행가능영역)
-# 마스크의 행(row)별 중심선에 lane_util._fit_and_sample_path()로 다항식을 피팅해 만든
-# 명시적 경로(ROI 픽셀좌표 웨이포인트, 가까운점→먼점) — controller/pure_pursuit.py가
+# (LANE_DETECTOR_BACKEND 플래그로 세 백엔드 중 하나를 고른다). path는 밴드(row 구간)별
+# 중심점(ll이 확실한 밴드는 ll 좌/우 중점, 그 외는 da 무게중심으로 폴백 — 아래
+# "ll을 밴드별 주 신호로" 참고)에 lane_util._fit_and_sample_path()로 다항식을 피팅해
+# 만든 명시적 경로(ROI 픽셀좌표 웨이포인트, 가까운점→먼점) — controller/pure_pursuit.py가
 # 조향각 계산에 직접 사용한다.
 #
 # ── 실시간 전략: 제어루프와 분리된 백그라운드 스레드 ──
@@ -26,24 +27,34 @@
 #   기준으로 걸어야 원래 의미(연속 몇 *프레임*이 안정적이었는가)가 유지되므로, 워커 스레드
 #   안(DLSlideWindow.detect() 내부, SlideWindow._debounce() 재사용)에서만 적용된다.
 #
-# ── da(주행가능영역)를 경로의 주 신호로, ll(차선)은 sanity check로 ──
-#   처음엔 ll(가는 선 두 줄)을 좌/우로 나눠 슬라이딩윈도우(구간별 moments)로 따로 찾고
-#   4단계 폴백(양쪽→한쪽→노랑→무효)으로 조립했는데, da는 "주행 가능한 영역 하나의 덩어리"라
-#   그 자체로 이미 자아-차선(ego lane)의 중심선을 담고 있다 — 좌/우를 따로 찾아 폭을
-#   추정해 중점을 계산하는 간접적인 방식보다, da 영역의 가로 중심을 행(row)별로 바로
-#   뽑는 쪽이 더 단순하고, 가는 선 하나가 반사/그림자로 한두 픽셀 끊기는 것보다 넓은
-#   덩어리가 노이즈에도 더 안정적이다.
-#   단, 급커브에서 da 마스크가 한두 프레임 파편화되는 실패모드가 이미 확인돼 있어서,
-#   ConnectedComponents로 가장 큰 덩어리 하나만 남기고(DL_DA_MIN_COMPONENT_AREA 미만이면
-#   그 프레임은 아예 무효 처리) 나머지 파편에 중심선이 끌려가지 않게 막는다
-#   (_largest_da_component() 참고).
-#   ll은 경로를 직접 만드는 데는 안 쓰지만, da가 점선 틈으로 옆 차선 da와 하나의
-#   덩어리로 이어붙는 실패모드에 대한 방어선 역할을 한다 — DLSlideWindow._clip_da_by_ll()이
-#   ll 라인이 보이는 구간에서는 그 바깥(옆 차선 쪽) da 픽셀을 밴드별로 잘라내고 나서
-#   _largest_da_component()를 적용한다. 그 외엔 여전히 sanity check 용도로, ROI 내
-#   커버리지가 DL_LL_SANITY_MIN_RATIO 미만이면(사실상 차선 신호가 전혀 없는 프레임 —
-#   모션블러 등) da가 뭘 내놓든 이번 프레임을 무효 처리한다. 디버그 시각화(빨강 반투명
-#   오버레이)에도 그대로 쓴다.
+# ── ll(차선)을 밴드별 주 신호로, da(주행가능영역)는 밴드별 폴백으로 ──
+#   [2026-08-06 이전] da를 "주행 가능한 영역 하나의 덩어리"로 보고 그 무게중심을
+#   경로의 유일한 신호로 썼다 — 좌/우를 따로 찾아 폭을 추정해 중점을 계산하는 간접적인
+#   방식보다 단순하고, 가는 선 하나가 반사/그림자로 끊기는 것보다 넓은 덩어리가
+#   노이즈에 더 안정적이라는 판단이었다.
+#   [2026-08-06] 그런데 차로 밖 여백(갓길 등)이 넓은 구간에서 da 자체가 여백까지 포함해
+#   넓게 잡히면 그 무게중심이 여백 쪽으로 쏠려 경로가 실제 차로 중앙을 벗어나는 문제가
+#   실측으로 확인됐다 — da는 "주행 가능한 영역"이지 "차로 중앙"이 아니므로, 차로 폭이
+#   일정하지 않으면 무게중심이 곧 차로 중앙이라는 전제 자체가 깨진다. 반면 ll(차선 자체,
+#   두 백선)은 여백 크기와 무관하게 "선이 실제로 있는 위치"만 가리키므로 이 문제에서
+#   자유롭다. 그래서 밴드(_slice_centers와 동일한 n_slices 분할)마다 좌/우 ll이 둘 다
+#   신뢰할 만큼(DL_LL_SIDE_MIN_PIXELS 이상, 두 선 간격이 DL_LL_WIDTH_MIN_PX~MAX_PX
+#   범위) 보이면 그 중점을 그 밴드의 중심으로 우선 채택한다(DLSlideWindow.
+#   _ll_slice_centers() 참고). ll이 부족한 밴드(점선 틈, 마모, 반사, 편측 가려짐 등)만
+#   개별적으로 da 중심으로 폴백한다 — 프레임 전체를 무효 처리하지 않고 밴드 단위로만
+#   대체하므로, ll이 촘촘한 구간에선 여백 영향을 거의 안 받고 ll이 끊긴 구간에서도
+#   da가 안전망 역할을 계속한다.
+#   da 쪽은 여전히 급커브 파편화 대응이 필요해서, ConnectedComponents로 가장 큰 덩어리
+#   하나만 남기고(DL_DA_MIN_COMPONENT_AREA 미만이면 그 프레임은 무효 처리) 나머지
+#   파편에 중심선이 끌려가지 않게 막는다(_largest_da_component() 참고). 또한 da가
+#   점선 틈으로 옆 차선 da와 하나의 덩어리로 이어붙는 실패모드에 대해서는
+#   DLSlideWindow._clip_da_by_ll()이 ll 라인이 보이는 구간에서 그 바깥(옆 차선 쪽) da
+#   픽셀을 밴드별로 잘라내고 나서 _largest_da_component()를 적용해, 폴백으로 쓰이는
+#   da 자체의 품질도 방어한다.
+#   ll은 그 외에 프레임 단위 sanity check로도 쓰인다 — ROI 내 커버리지가
+#   DL_LL_SANITY_MIN_RATIO 미만이면(사실상 차선 신호가 전혀 없는 프레임 — 모션블러 등)
+#   da가 뭘 내놓든 이번 프레임을 무효 처리한다. 디버그 시각화(빨강 반투명 오버레이)에도
+#   그대로 쓴다.
 #=============================================
 import argparse
 import os
@@ -153,6 +164,7 @@ from ..config import (
     DL_STABLE_FRAME_MIN, DL_STABLE_JUMP_MAX,
     DL_DA_MIN_COMPONENT_AREA, DL_DA_MAX_AREA_RATIO,
     DL_LL_SANITY_MIN_RATIO, DL_LL_CLIP_MARGIN_PX,
+    DL_LL_SIDE_MIN_PIXELS, DL_LL_WIDTH_MIN_PX, DL_LL_WIDTH_MAX_PX,
     DEBUG_VIZ_DL_LANE, YELLOW_LOWER, YELLOW_UPPER, FPS_LOG_PERIOD_SEC,
 )
 
@@ -292,13 +304,16 @@ class DLSlideWindow(SlideWindow):
     평균을 내고(_group_mean), 다항식으로 경로를 피팅/샘플링하고(_fit_and_sample_path),
     프레임 간 스파이크를 걸러내는(_debounce)" 범용 유틸리티들만 재사용한다.
 
-    좌/우 ll(차선) 라인을 따로 찾아 폭을 추정해 중점을 계산하던 이전 방식(4단계 폴백:
-    양쪽→한쪽→노랑→무효) 대신, da(주행가능영역) 마스크 자체를 "이미 자아-차선 중심을
-    담고 있는 하나의 덩어리"로 보고 그 가로 중심선을 행별로 바로 뽑는다 — 좌/우 두 갈래를
-    따로 다룰 필요가 없어져 calc_center()의 분기 로직 자체가 필요 없다(그래서 calc_center()를
-    호출하지 않고 detect() 안에서 직접 조립한다). ll은 경로를 직접 만드는 데는 안 쓰지만,
-    da가 옆 차선까지 이어붙었을 때 그 경계를 잘라내는 방어선(_clip_da_by_ll())과 sanity
-    check로 쓴다(모듈 상단 "da를 경로의 주 신호로" 주석 참고).
+    좌/우 ll(차선) 라인을 따로 찾아 폭을 추정해 중점을 계산하던 옛 4단계 폴백(양쪽→
+    한쪽→노랑→무효, classic_cv용 calc_center() 방식)과 순수 da 무게중심 방식(2026-08-06
+    이전)을 거쳐, 지금은 밴드(구간)마다 "ll이 확실하면 ll 중점을, 아니면 da 무게중심을"
+    쓰는 하이브리드다 — 밴드별 판단이라 calc_center()의 프레임 단위 4단계 분기와는
+    다르고, 그래서 여전히 calc_center()를 호출하지 않고 detect() 안에서 직접 조립한다.
+    da는 여백(갓길 등)이 넓으면 무게중심이 차로 중앙에서 벗어나는 약점이 있지만 ll보다
+    끊기지 않는다는 장점이 있어, ll이 부족한 밴드(점선 틈, 마모, 반사, 편측 가려짐)의
+    안전망으로 남는다. 그 외에 da가 옆 차선까지 이어붙었을 때 그 경계를 잘라내는
+    방어선(_clip_da_by_ll())과 프레임 단위 sanity check로도 ll을 쓴다(모듈 상단
+    "ll을 밴드별 주 신호로" 주석 참고).
     """
 
     def __init__(self):
@@ -311,7 +326,8 @@ class DLSlideWindow(SlideWindow):
         self.ll_coverage = 0.0     # 최근 프레임 ROI 내 ll foreground 비율(sanity check/디버그용)
         self.da_mask_roi = None    # 시각화용(가장 큰 덩어리만 남긴 이후의 da 마스크)
         self.ll_mask_roi = None    # 시각화용
-        self.centerline = []       # da 밴드별 중심점(원본 관측점, 길이 self.n_slices)
+        self.centerline = []       # 밴드별 중심점(원본 관측점, 길이 self.n_slices) — ll 우선, da는 밴드별 폴백
+        self.ll_band_used = []     # 이번 프레임 각 밴드가 ll 기반으로 채택됐는지(길이 self.n_slices bool) — visualize() 색상 구분용
         self.da_fallback_used = False  # 이번 프레임 da가 최댓값이 아니라 차선책(2번째 이하) 덩어리인지 — visualize() 색상 구분용
         self.da_ll_clip_skipped = False  # 이번 프레임 ll 클리핑이 유효 밴드를 너무 줄여 건너뛰었는지 — visualize() 구분용
         self.da_largest_mask_roi = None  # 면적 1위 덩어리(차선책을 썼다면 그 사유가 된, 상한 초과로 버려진 덩어리) — fallback일 때 원래 색으로 같이 그리기용
@@ -444,6 +460,60 @@ class DLSlideWindow(SlideWindow):
 
         return clipped
 
+    def _ll_slice_centers(self, ll_mask, ref_x):
+        """ll_mask(차선 이진마스크)를 _slice_centers()와 동일한 n_slices 밴드로 나눠,
+        밴드마다 cur_ref를 기준으로 좌/우로 나눈 뒤 각각 무게중심(cv2.moments)을 구한다.
+        양쪽 다 DL_LL_SIDE_MIN_PIXELS 이상이고 두 중심 간 거리가 실측 차로폭 범위
+        (DL_LL_WIDTH_MIN_PX~DL_LL_WIDTH_MAX_PX) 안에 들 때만 그 중점을 이번 밴드의
+        결과로 채택한다 — 한쪽만 보이거나 폭이 비정상이면(반대 차선을 잘못 짝짓는 등)
+        신뢰할 수 없다고 보고 None을 반환해 detect()가 그 밴드만 da로 폴백하게 한다.
+
+        cur_ref(좌/우 분리 기준점)는 _clip_da_by_ll()과 같은 원칙으로 근거리→원거리로
+        올라가며 갱신하되, ★ 이번 밴드에서 실제로 채택(양쪽 다 신뢰됨)됐을 때만 갱신한다 ★
+        — 그래야 ll이 부족해 이번 밴드를 못 쓴 경우, 그 밴드의 (있을 수도 있는) 애매한
+        위치가 다음 밴드의 좌/우 판정 기준으로 오염되어 누적되는 걸 막는다.
+
+          입력 : ll_mask — (roi_h, roi_w) uint8 이진마스크(da_mask와 동일 shape/좌표계)
+                 ref_x   — 첫(근거리) 밴드의 좌/우 분리 기준 x좌표. 보통 직전 프레임 lane_center.
+          출력 : (results, used) — 둘 다 길이 self.n_slices.
+                 results[i] : 채택되면 (y_center, cx), 아니면 None(da로 폴백해야 함을 뜻함)
+                 used[i]    : results[i]가 ll 기반으로 채택됐는지(bool) — 디버그 시각화용
+        """
+        h, w = ll_mask.shape
+        slice_h = h // self.n_slices
+        results = [None] * self.n_slices
+        used = [False] * self.n_slices
+        cur_ref = ref_x
+
+        for i in range(self.n_slices):
+            y_high = h - i * slice_h
+            y_low = 0 if i == self.n_slices - 1 else h - (i + 1) * slice_h
+            band = ll_mask[y_low:y_high, :]
+            y_center = (y_low + y_high) / 2.0
+
+            split = int(np.clip(cur_ref, 0, w))
+            left_band = band[:, :split]
+            right_band = band[:, split:]
+
+            M_l = cv2.moments(left_band, binaryImage=True)
+            M_r = cv2.moments(right_band, binaryImage=True)
+
+            if M_l['m00'] < DL_LL_SIDE_MIN_PIXELS or M_r['m00'] < DL_LL_SIDE_MIN_PIXELS:
+                continue  # 한쪽 이상 안 보임 — 이 밴드는 da로 폴백(ref_x도 갱신 안 함)
+
+            lx = M_l['m10'] / M_l['m00']
+            rx = split + M_r['m10'] / M_r['m00']
+            width = rx - lx
+            if not (DL_LL_WIDTH_MIN_PX < width < DL_LL_WIDTH_MAX_PX):
+                continue  # 폭이 비정상 — 반대 차선을 잘못 짝지었을 가능성, da로 폴백
+
+            cx = (lx + rx) / 2.0
+            results[i] = (y_center, cx)
+            used[i] = True
+            cur_ref = cx  # 실제로 채택된 밴드에서만 다음 밴드 기준점 갱신
+
+        return results, used
+
     def detect(self, raw_bgr, da_prob, ll_prob, yellow_mask):
         """입력 : raw_bgr — 원본 카메라 프레임 그대로의 (H,W,3) BGR(크롭/리사이즈 없음)
                  da_prob, ll_prob — 위와 같은 (H,W) float32 foreground 확률(모델은 360행
@@ -520,10 +590,20 @@ class DLSlideWindow(SlideWindow):
 
         self.da_mask_roi = da_mask
 
-        # da 중심선 — 밴드별 무게중심(_slice_centers는 색상/의미에 상관없이 "임의의
-        # 이진마스크를 세로로 N등분해 구간별 moments 중심을 구하는" 범용 로직이라
-        # 좌/우로 나눌 필요 없이 da 마스크 전체에 한 번만 적용하면 된다).
-        self.centerline = self._reject_outliers(self._slice_centers(da_mask, 0, (0, 255, 0)))
+        # 밴드별 중심점 — ll(차선) 우선, da(주행가능영역)는 밴드별 폴백(모듈 상단
+        # "ll을 밴드별 주 신호로" 주석 참고). ll_mask는 클리핑 전 원본을 쓴다 —
+        # _clip_da_by_ll()의 클리핑은 da를 깎아내기 위한 것이지 ll 자체의 좌/우 라인
+        # 위치를 바꾸는 게 아니므로 그대로 재사용해도 무방하고, da_mask가 da_ll_clip_skipped로
+        # 클리핑 전으로 되돌아간 경우에도 ll 판정 로직은 영향받지 않는다.
+        # ref_x는 위에서 _clip_da_by_ll()에 쓴 것과 같은 기준점(직전 프레임 확정
+        # lane_center, 없으면 ROI 중앙)을 그대로 재사용한다.
+        raw_da_centers = self._slice_centers(da_mask, 0, (0, 255, 0))
+        raw_ll_centers, self.ll_band_used = self._ll_slice_centers(ll_mask, ref_x)
+        merged_centers = [
+            ll_c if ll_c is not None else da_c
+            for ll_c, da_c in zip(raw_ll_centers, raw_da_centers)
+        ]
+        self.centerline = self._reject_outliers(merged_centers)
 
         # 노란 중앙선(lane_side 판정용) — 이제 밴드별로 나눌 필요 없이 hough_lane.py와
         # 동일하게 ROI 전체의 단순 평균 위치 하나만 뽑는다(경로 계산에는 안 쓰임).
@@ -533,9 +613,9 @@ class DLSlideWindow(SlideWindow):
         near_center = self._group_mean(self.centerline, self.near_slices, True)
         far_center = self._group_mean(self.centerline, self.far_slices, False)
 
-        # ll sanity check: da 중심선이 있어도 ll(차선) 신호가 거의 안 보이면(모션블러 등으로
+        # ll sanity check: 중심선이 있어도 ll(차선) 신호가 거의 안 보이면(모션블러 등으로
         # 세그멘테이션이 통째로 깨진 경우) 이번 프레임을 무효 처리한다 — da 커버리지만으로는
-        # 못 거르는 실패모드를 ll로 보강(모듈 상단 "da를 경로의 주 신호로" 주석 참고).
+        # 못 거르는 실패모드를 ll로 보강(모듈 상단 "ll을 밴드별 주 신호로" 주석 참고).
         lane_valid = near_center is not None and self.ll_coverage >= DL_LL_SANITY_MIN_RATIO
 
         offset = lookahead = 0.0
@@ -545,7 +625,7 @@ class DLSlideWindow(SlideWindow):
             lookahead = far_ref - self.roi_w / 2.0
         lane_center = self.roi_w / 2.0 + offset
 
-        # 명시적 경로(웨이포인트) — da 밴드 중심점에 다항식을 피팅해 만든다. 유효 밴드가
+        # 명시적 경로(웨이포인트) — 밴드 중심점(ll 우선/da 폴백)에 다항식을 피팅해 만든다. 유효 밴드가
         # 2개 미만이면 fitted_path가 None이 되고, 그 경우 _update_path()가 self.path를
         # 갱신하지 않아(직전 프레임 값 유지) offset/lane_offset과 동일한 "무효 프레임엔
         # 마지막 값 유지" 원칙을 따른다. 유효할 때도 그대로 대입하지 않고 직전 경로와
@@ -566,8 +646,8 @@ class DLSlideWindow(SlideWindow):
 
     def visualize(self, offset):
         """da(초록/면적상한 차선책이면 주황/ll클리핑 건너뜀이면 청록)/ll(빨강) 반투명
-        오버레이 + da 중심선 관측점 + 피팅된 경로 + offset/lane_center 텍스트를 self.vis에
-        그려 넣기만 한다. ★ 여기서
+        오버레이 + 밴드별 중심점(ll 채택=흰색/da 폴백=노랑) + 피팅된 경로 +
+        offset/lane_center 텍스트를 self.vis에 그려 넣기만 한다. ★ 여기서
         cv2.imshow()/cv2.waitKey()를 호출하면 안 된다 ★ 이 메서드는 DLLaneDetector의
         백그라운드 추론 스레드에서 호출되는데, OpenCV HighGUI(특히 GTK 백엔드)는 스레드
         세이프하지 않아서 메인 스레드(다른 디버그 창들이 이미 거기서 cv2.imshow/waitKey를
@@ -601,18 +681,38 @@ class DLSlideWindow(SlideWindow):
             overlay[self.ll_mask_roi > 0] = (0, 0, 220)    # 차선 = 빨강 (da 위에 덧그림)
             cv2.addWeighted(overlay, 0.35, self.vis, 0.65, 0, dst=self.vis)
 
-        self.draw_centers(self.centerline, (0, 255, 255))  # da 밴드별 원본 중심점(참고용)
-        self.draw_path(self.path)                          # 피팅된 최종 경로(자홍색)
+        # 밴드별 중심점 — ll 기반으로 채택된 밴드는 흰색, da로 폴백한 밴드는 노란색으로
+        # 구분해서(_ll_slice_centers()/detect() 병합 로직 참고) 어느 밴드가 ll을 못 써서
+        # da로 대체됐는지 한눈에 보이게 한다(실차 튜닝용 — draw_centers()는 단일 색만
+        # 지원해 여기선 직접 그린다). 점끼리 잇는 선은 기존과 동일하게 청록 유지.
+        pts = [
+            (int(np.clip(cx, 0, self.roi_w - 1)), int(y))
+            for c in self.centerline if c is not None
+            for (y, cx) in [c]
+        ]
+        for p1, p2 in zip(pts, pts[1:]):
+            cv2.line(self.vis, p1, p2, (0, 255, 255), 2)
+        for i, c in enumerate(self.centerline):
+            if c is None:
+                continue
+            y, cx = c
+            pt = (int(np.clip(cx, 0, self.roi_w - 1)), int(y))
+            ll_used = i < len(self.ll_band_used) and self.ll_band_used[i]
+            cv2.circle(self.vis, pt, 4, (255, 255, 255) if ll_used else (0, 255, 255), -1)
+        self.draw_path(self.path)  # 피팅된 최종 경로(자홍색)
 
         cv2.line(self.vis, (self.roi_w // 2, 0), (self.roi_w // 2, self.roi_h), (0, 0, 255), 1)
         lane_center = self.roi_w / 2.0 + offset
+        ll_band_count = sum(1 for u in self.ll_band_used if u)
         tags = ''
         if self.da_fallback_used:
             tags += ' [FALLBACK]'
         if self.da_ll_clip_skipped:
             tags += ' [LL_CLIP_SKIP]'
         cv2.putText(
-            self.vis, f'offset:{offset:+.1f} center:{lane_center:.1f} ll_cov:{self.ll_coverage:.3f}{tags}',
+            self.vis,
+            f'offset:{offset:+.1f} center:{lane_center:.1f} ll_cov:{self.ll_coverage:.3f} '
+            f'll_bands:{ll_band_count}/{self.n_slices}{tags}',
             (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2
         )
 
