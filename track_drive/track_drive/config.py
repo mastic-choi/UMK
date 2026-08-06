@@ -259,9 +259,9 @@ DL_LL_CLIP_MARGIN_PX = 8
 #             문제에서 자유롭다. da는 여전히 ll이 끊긴 구간을 메우는 안전망 역할로 남는다.
 #   두 모드 다 da 파편화 대응(_largest_da_component)/옆 차선 클리핑(_clip_da_by_ll)/ll
 #   sanity check는 동일하게 적용된다 — 차이는 "밴드별 중심점을 뭘로 뽑는가" 뿐이다.
-#   이 브랜치(ll차선인식)는 원래 ll_da를 무조건 켜서 검증하던 브랜치라 기본값을
-#   'll_da'로 유지한다(main 쪽 기본값은 'da') — 실차에서 A/B 비교 후 재조정할 것.
-DL_CENTER_MODE = 'll_da'  # 'da' | 'll_da'
+#   main 기본값은 실차에서 이미 어느 정도 검증된 'da'로 둔다 — 'll_da'는 아직 실차
+#   미검증이라, 켤 때는 이 값을 직접 'll_da'로 바꾸고 A/B 비교 후 재조정할 것.
+DL_CENTER_MODE = 'da'  # 'da' | 'll_da'
 
 # DL_CENTER_MODE='ll_da'일 때만 쓰는 ll 중점 채택 임계값.
 # 밴드 내 ll 픽셀수가 이 미만이면(좌/우 각각 판정) "이 밴드는 그쪽 선이 안 보임" 처리.
