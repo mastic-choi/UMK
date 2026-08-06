@@ -151,7 +151,8 @@ from ..config import (
     DL_N_SLICES, DL_MIN_PIXELS, DL_NEAR_SLICES, DL_FAR_SLICES,
     DL_SLICE_OUTLIER_MAX, DL_SLICE_FIT_MIN,
     DL_STABLE_FRAME_MIN, DL_STABLE_JUMP_MAX,
-    DL_DA_MIN_COMPONENT_AREA, DL_LL_SANITY_MIN_RATIO, DL_LL_CLIP_MARGIN_PX,
+    DL_DA_MIN_COMPONENT_AREA, DL_DA_MAX_AREA_RATIO,
+    DL_LL_SANITY_MIN_RATIO, DL_LL_CLIP_MARGIN_PX,
     DEBUG_VIZ_DL_LANE, YELLOW_LOWER, YELLOW_UPPER, FPS_LOG_PERIOD_SEC,
 )
 
@@ -337,12 +338,25 @@ class DLSlideWindow(SlideWindow):
     def _largest_da_component(self, da_mask):
         """da 마스크에서 가장 큰 연결 덩어리 하나만 남기고 나머지(급커브 등에서 생기는
         파편)는 지운다. 덩어리가 DL_DA_MIN_COMPONENT_AREA보다 작으면(사실상 안 보임)
-        빈 마스크를 반환한다."""
+        빈 마스크를 반환한다.
+
+        반대로 덩어리가 마스크 전체 면적의 DL_DA_MAX_AREA_RATIO를 넘을 만큼 크면
+        outlier로 보고 마찬가지로 빈 마스크를 반환한다(=이번 프레임 무효, _debounce가
+        직전 확정값을 유지). 정상적인 자기 차선 폭이라면 이 정도로 넓을 수 없는데,
+        실측으로 확인된 두 실패모드가 여기 해당한다:
+          ① ㅓ교차로 등 분기에서 da가 옆 갈래까지 하나로 이어붙는 경우
+          ② 차선(백선) 자체가 없는 맨바닥을 통째로 주행가능영역으로 오검출하는 경우
+        두 경우 모두 원인은 다르지만 "정상보다 비정상적으로 넓다"는 신호는 공통이라
+        같은 임계값 하나로 같이 걸러낸다. 절대 픽셀수가 아니라 마스크 전체 대비
+        비율로 잡아서 DL_USE_BEV 캔버스 크기가 바뀌어도 그대로 유효하다."""
         num, labels, stats, _ = cv2.connectedComponentsWithStats(da_mask, connectivity=8)
         if num <= 1:
             return np.zeros_like(da_mask)
         best = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-        if stats[best, cv2.CC_STAT_AREA] < DL_DA_MIN_COMPONENT_AREA:
+        area = stats[best, cv2.CC_STAT_AREA]
+        if area < DL_DA_MIN_COMPONENT_AREA:
+            return np.zeros_like(da_mask)
+        if area > DL_DA_MAX_AREA_RATIO * da_mask.size:
             return np.zeros_like(da_mask)
         return np.where(labels == best, np.uint8(255), np.uint8(0))
 

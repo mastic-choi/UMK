@@ -153,6 +153,8 @@ class TrackDriverNode(Node):
         self._pid_integral   = 0.0
         self._turn_yaw_start = None   # 좌회전 진행 중 플래그 (None=미회전)
         self._turn_frame_cnt = 0      # 좌회전 경과 프레임 수
+        self._s2_commit_t0  = None    # S2 신호 확정 후 물리적 분기 커밋 구간 시작 시각(None=미진입)
+        self._s2_commit_dir = None    # 커밋 구간에서 진행 중인 방향 ('straight'/'left')
         self._approach_t0    = None   # [진입] 정지선 감지 후 감속 시작 시각
         self._exit_approach_t0 = None # [진출] S3 탈출 정지선 감지 후 감속 시작 시각
         self._shortcut_t0    = None   # 지름길 진입 시각(끝감지 타이밍용)
@@ -879,6 +881,8 @@ class TrackDriverNode(Node):
             self.signal_left_confirmed     = False
             self._sig_straight_cnt = 0
             self._sig_left_cnt     = 0
+            self._s2_commit_t0  = None
+            self._s2_commit_dir = None
         # S1 진입 시 감속 플래그 초기화
         if new_state == MissionState.S1_LANE_FOLLOW:
             self._approach_t0 = None
@@ -945,30 +949,58 @@ class TrackDriverNode(Node):
         """
         4구 신호등 교차로 진입 후 흐름 (순수 신호 인식만으로 경로 선택):
           1. 진입 즉시 정지 (기본값 STOP, 명시적 신호만 출발)
-          2. 직진 초록(signal_straight_confirmed) → S1 복귀 + Behavior 활성화(라바콘부터 진행)
-             좌회전 신호(초록+빨강 동시, signal_left_confirmed) → 좌회전 후 S3(지름길)
+          2. 직진 초록(signal_straight_confirmed) → 커밋 구간(S2_COMMIT_T) 거쳐 S1 복귀
+             + Behavior 활성화(라바콘부터 진행)
+             좌회전 신호(signal_left_confirmed) → 커밋 구간 거쳐 좌회전 후 S3(지름길)
           3. 좌회전 진행 중이면 신호와 무관하게 완료 우선
+          4. 커밋 구간(_s2_commit_t0)에서는 신호와 무관하게 직진만 유지 — 신호가 보이는
+             지점과 실제 도로가 갈라지는 물리적 분기 지점이 떨어져 있고(config.py
+             S2_COMMIT_T 주석 참고), 그 사이에 _lane_drive()(비전)를 켜면 분기가
+             보이기 시작하는 순간 da가 반대쪽 갈래로 끌려간다(실측 재현됨). 신호로
+             이미 확정된 방향이므로 이 구간은 비전을 아예 참조하지 않는다.
         """
         if self._turn_yaw_start is not None:
             self._do_left_turn(next_state=MissionState.S3_SHORTCUT)
             return
 
+        if self._s2_commit_t0 is not None:
+            self.ctrl_angle = 0.0
+            self.ctrl_speed = APPROACH_SPEED
+            if time.time() - self._s2_commit_t0 >= S2_COMMIT_T:
+                commit_dir = self._s2_commit_dir
+                self._s2_commit_t0  = None
+                self._s2_commit_dir = None
+                if commit_dir == 'straight':
+                    self._behavior_enabled = True
+                    self._stopline_cooldown_t = time.time() + STOPLINE_COOLDOWN
+                    self._change_state(MissionState.S1_LANE_FOLLOW)
+                else:
+                    self._begin_left_turn()
+            return
+
         self.ctrl_angle, self.ctrl_speed = 0.0, SPEED_STOP
 
         if self.signal_straight_confirmed:
-            # 직진 신호 → S1 복귀, 이때부터 Behavior 시작
-            self._behavior_enabled = True
-            self._stopline_cooldown_t = time.time() + STOPLINE_COOLDOWN
-            self._change_state(MissionState.S1_LANE_FOLLOW)
+            self._s2_commit_t0  = time.time()
+            self._s2_commit_dir = 'straight'
         elif self.signal_left_confirmed:
-            # 좌회전 신호 → 지름길로 (Behavior 안 켬)
-            self._begin_left_turn()
+            self._s2_commit_t0  = time.time()
+            self._s2_commit_dir = 'left'
 
     # ── S3: 지름길 — 직진(+차선소실 대비), 끝에서 좌회전 ──
     def _s3_shortcut(self):
         """
         지름길 직진. 중간 차선소실 구간은 라이다로 딸 것이 없으므로 그냥 직진.
         끝에 도달하면 신호없이 좌회전으로 S1(차선주행) 복귀 (Behavior는 켜지 않음).
+
+        지름길 출구(본선 합류부)는 신호등이 없어 정지선 검출로만 끝(_shortcut_end())을
+        판단하는데, 합류부는 도로가 서서히 넓어지는 형태라 정지선이 실제로 잡히기 전에
+        da 세그멘테이션이 합류 쪽으로 먼저 끌려가는 문제가 있다(ㅓ교차로와 동일한
+        실패모드, config.py SHORTCUT_VISION_CUTOFF_T 주석 참고). 그래서 정지선 검출을
+        기다리지 않고 SHORTCUT_VISION_CUTOFF_T가 지나면 미리 비전(_lane_drive())을 끄고
+        _shortcut_ref_yaw 기준 헤딩홀드로 직진을 유지한다 — 좌회전 스크립트는 아직
+        시작하지 않고, 정지선이 실제로 잡히거나 SHORTCUT_MAX_T에 도달해 _shortcut_end()가
+        확정된 뒤에야 진출 시퀀스(감속+좌회전)로 넘어간다.
         """
         if self._turn_yaw_start is not None:
             self._do_left_turn(next_state=MissionState.S1_LANE_FOLLOW)
@@ -996,6 +1028,15 @@ class TrackDriverNode(Node):
                 self._shortcut_t0 = None
                 self._exit_approach_t0 = None
                 self._begin_left_turn()
+            return
+
+        shortcut_elapsed = time.time() - self._shortcut_t0
+        if shortcut_elapsed >= SHORTCUT_VISION_CUTOFF_T and self._shortcut_ref_yaw is not None:
+            # 합류부 근접 구간 — 정지선이 아직 안 잡혔어도 비전을 더는 믿지 않고
+            # 헤딩홀드로 직진 유지(진출 시퀀스는 _shortcut_end() 확정 후에만 시작).
+            yaw_err = self._yaw_delta(self._shortcut_ref_yaw)
+            self.ctrl_angle = float(np.clip(-yaw_err * 100.0, -30.0, 30.0))
+            self.ctrl_speed = SPEED_NORMAL
             return
 
         if self.lane_valid:
