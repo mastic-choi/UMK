@@ -306,7 +306,18 @@ PP_LOOKAHEAD_SPEED_GAIN = 4.0      # 속도가 오를수록 lookahead를 늘리�
 PP_LOOKAHEAD_MAX_PX = 150.0        # lookahead 상한
 PP_LOOKAHEAD_CURVATURE_GAIN = 100.0  # 직전 프레임 curvature가 클수록(코너) lookahead를 줄이는 게인
 PP_LOOKAHEAD_MIN_PX = 40.0         # 코너에서 lookahead가 줄어들 수 있는 하한
-PP_WHEELBASE_PX = 80.0             # "곡률→조향각" 게인(실제 축거리 대신 쓰는 튜닝값)
+# [2026-08-06] "곡률→조향각" 게인(pure_pursuit.py의 steer_deg = atan(curvature*wheelbase_px)).
+#   원래 80.0은 "실제 축거리 대신 쓰는" 임의 튜닝값이었다(pure_pursuit.py 상단 주석: "카메라
+#   픽셀→미터 변환이 아직 실측 전이라 wheelbase_px를 대신 쓴다, PIXELS_PER_METER가 실측되면
+#   실제 축거리(m)*PIXELS_PER_METER로 대체 가능"). LANE_DETECTOR_BACKEND='dl'(기본값) +
+#   DL_USE_BEV=True(기본값)에서는 self.lane_path가 정확히 DL_PIXELS_PER_METER(=200px/m,
+#   BEV 캔버스의 정의상 스케일)로 만들어진 픽셀좌표이므로, 이제 실측 `LQR_WHEELBASE_M`
+#   (0.335m, §6.7)을 그대로 곱해 물리 기반 값으로 대체할 수 있다: 0.335 * 200 = 67.0.
+#   ★ 실차 재검증 필요 ★ — 80.0은 그 자체로 실차에서 "이 정도 조향 반응이 적당하더라"고
+#   경험적으로 맞춰졌을 가능성이 있어(다른 근사 오차를 상쇄했을 수도 있음), 67.0로 바꾸면
+#   같은 curvature에도 조향각이 더 작게(atan 인자가 작아짐) 나와 코너링이 더 완만해질 수
+#   있다 — 너무 밋밋하게 느껴지면 이 값을 다시 올릴 것(단, 그때는 "튜닝값"임을 주석에 남길 것).
+PP_WHEELBASE_PX = 67.0             # = LQR_WHEELBASE_M(0.335) * DL_PIXELS_PER_METER(200) 실측 기반 계산값
 PP_ALPHA = 0.5                     # 프레임간 조향각 저역통과 필터(1=필터없음, 0=반응없음)
 PP_MIN_LOOKAHEAD_PX = 90.0         # curvature 분모(ld) 바닥값 — 노이즈 증폭 방지용. PP_LOOKAHEAD_MIN_PX와 다른 값이니 헷갈리지 말 것
 PP_DX_DEADZONE_PX = 6.0            # 이 이하 픽셀오차는 0으로 죽여 중앙 부근 잔떨림 제거

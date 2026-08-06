@@ -13,11 +13,15 @@
 # ── 좌표계: 왜 미터가 아니라 픽셀인가 ──
 #   controller/stanley.py는 planner/hybrid_astar.py가 만든 실세계 미터 단위 경로를
 #   차량 위치(x,y,yaw)와 함께 추종한다. 여기서는 그게 불가능한데, 카메라 픽셀→미터
-#   변환(track_drive.py의 PIXELS_PER_METER)이 아직 실측 전(0.0)이기 때문이다. 그래서
-#   차량은 항상 ROI 하단 중앙(vehicle_xy, path[0] 근방)에 고정된 것으로 보고, 카메라가
-#   보는 위쪽 방향(-y)을 "전방"으로 삼아 픽셀 좌표계 안에서 그대로 기하 계산을 한다.
-#   PIXELS_PER_METER가 실측되면 wheelbase_px를 "실제 축거리(m) * PIXELS_PER_METER"로
-#   대체해 진짜 물리 단위 Pure Pursuit으로 전환할 수 있다.
+#   변환(track_drive.py의 전역 PIXELS_PER_METER)이 아직 실측 전(0.0, classic_cv 백엔드
+#   기준)이기 때문이다. 그래서 차량은 항상 ROI 하단 중앙(vehicle_xy, path[0] 근방)에
+#   고정된 것으로 보고, 카메라가 보는 위쪽 방향(-y)을 "전방"으로 삼아 픽셀 좌표계 안에서
+#   그대로 기하 계산을 한다.
+#   [2026-08-06] 단, 기본 조합(LANE_DETECTOR_BACKEND='dl' + DL_USE_BEV=True)에서는
+#   self.lane_path가 정확히 config.DL_PIXELS_PER_METER(=200px/m) 스케일이므로,
+#   wheelbase_px를 실측 LQR_WHEELBASE_M(0.335m, README §6.7)*DL_PIXELS_PER_METER로
+#   계산한 물리 기반 값(67.0)으로 이미 대체했다(config.py PP_WHEELBASE_PX 주석 참고) —
+#   여전히 픽셀 좌표계에서 계산하지만 게인 자체는 이제 실측에 근거한다. 실차 재검증 필요.
 #=============================================
 import math
 
@@ -30,7 +34,7 @@ class PurePursuitController:
     lane_util._debounce()가 무효 프레임에 직전 확정값을 유지하는 것과 같은 원칙."""
 
     def __init__(self, lookahead_base_px=90.0, lookahead_speed_gain=4.0, lookahead_max_px=150.0,
-                 wheelbase_px=80.0, angle_max_deg=100.0, alpha=0.5,
+                 wheelbase_px=67.0, angle_max_deg=100.0, alpha=0.5,
                  min_lookahead_px=90.0, dx_deadzone_px=6.0, lookahead_curvature_gain=100.0,
                  lookahead_min_px=40.0):
         # [2026-08-05, 속도 적응형 lookahead — 1차 시도 후 수정]
@@ -90,11 +94,13 @@ class PurePursuitController:
         #   LANE_DEADZONE만큼 크게 죽이면 완만한 커브 진입까지 무시하게 된다. 실차 미검증.
         self.dx_deadzone_px = dx_deadzone_px
 
-        # 실제 차축거리(m) 대신 쓰는 "곡률→조향각" 게인. 표준 Pure Pursuit 공식
-        # steer = atan(2*L*sin(alpha)/Ld)에서 L 자리에 들어간다 — 크게 잡을수록 같은
-        # 곡률에도 조향각이 커진다(더 공격적). PIXELS_PER_METER 실측 전까지는 물리적
-        # 의미가 없는 순수 튜닝 게인이므로, 실차에서 직진 안정성/코너 추종성을 보고
-        # 맞출 것. 실차 미검증 튜닝값.
+        # "곡률→조향각" 게인. 표준 Pure Pursuit 공식 steer = atan(2*L*sin(alpha)/Ld)에서
+        # L 자리에 들어간다 — 크게 잡을수록 같은 곡률에도 조향각이 커진다(더 공격적).
+        # [2026-08-06] 기본 조합(dl+BEV)에서는 self.lane_path가 DL_PIXELS_PER_METER
+        # (200px/m) 스케일이라, 이제 실측 LQR_WHEELBASE_M(0.335m)*200=67.0으로 물리
+        # 기반 값을 쓴다(config.py PP_WHEELBASE_PX 주석 참고) — 그래도 여전히 실차에서
+        # 직진 안정성/코너 추종성을 보고 미세조정할 것(경험적으로 다른 근사 오차를
+        # 상쇄해온 값일 수 있어 재검증 필요).
         #   [2026-08-05] lookahead 하한(90) 복원 후에도 여전히 작은 dx에 조향이 과민하면,
         #   lookahead보다 이 값을 낮추는 쪽이 더 직접적인 레버다 — curvature*wheelbase_px에
         #   그대로 곱해지므로 ld 범위 전체에서 균일하게 민감도를 낮춘다(단, 실제 코너에서도

@@ -882,6 +882,26 @@ m/px 환산이 없었는데, BEV(585×298px 캔버스, 면적비 옛 ROI 대비 
 실제로는 `track_drive.py`가 항상 `LQR_WHEELBASE_M`을 명시적으로 넘기므로 이 기본값 자체는 안 쓰이지만,
 문서 목적상 실측 전 플레이스홀더로 오해되지 않도록 같이 맞춤).
 
+### 6.8 `PP_WHEELBASE_PX`를 물리 기반 값으로 계산 (80.0 → 67.0, 2026-08-06)
+
+`controller/pure_pursuit.py`의 `PP_WHEELBASE_PX`(곡률→조향각 게인, `steer=atan(curvature*wheelbase_px)`)는
+"실제 축거리 대신 쓰는 튜닝값"이라는 주석과 함께 80.0으로 하드코딩돼 있었다. 새로 실측값이 생긴 건
+아니지만, **기존 두 실측/설계값을 조합해 계산**할 수 있다는 걸 확인했다:
+
+- `LANE_DETECTOR_BACKEND='dl'`(기본값) + `DL_USE_BEV=True`(기본값)에서는 `self.lane_path`가
+  `config.DL_PIXELS_PER_METER`(=200px/m, §6.3 — BEV 캔버스 정의상 정확한 스케일) 좌표계로 만들어진다.
+- `LQR_WHEELBASE_M = 0.335m`(§6.7, 줄자 실측)는 pure_pursuit이 쓰는 것과 동일한 차량의 실제 축거리다.
+
+따라서 `PP_WHEELBASE_PX = LQR_WHEELBASE_M * DL_PIXELS_PER_METER = 0.335 * 200 = 67.0`으로, "임의
+튜닝값"이 아니라 물리적으로 근거 있는 값으로 대체할 수 있다(`config.py`, `controller/pure_pursuit.py`
+생성자 기본값도 문서 목적상 동일하게 갱신 — §6.7의 `LQR_WHEELBASE_M`과 같은 패턴).
+
+**★ 실차 재검증 필요 ★:** 80.0은 그 자체로 실차에서 "이 정도 조향 반응이 적당하더라"고 경험적으로
+맞춰졌을 가능성이 있다 — lookahead 근사, BEV 워프 오차, 세그멘테이션 노이즈 등 다른 근사 오차를
+상쇄해온 값일 수 있어서, 67.0로 바꾸면 같은 curvature에도 조향각이 더 작게(atan 인자↓) 나와 코너링이
+더 완만해질 수 있다. 실차에서 코너 추종이 둔해지면 이 값을 다시 올리되, 그때는 "물리 기반 값에서
+실차 튜닝으로 벗어난 것"임을 주석에 남길 것.
+
 ## 7. VESC 실측 속도 연동 (ROS1, 2026-08-06 LQR 브랜치에서 이식)
 
 `LQR` 브랜치가 main과 갈라진 뒤 독자적으로 진행한 작업 중, main에 없던 실차 연동 하나를 가져왔습니다 —
