@@ -155,13 +155,25 @@ DL_N_SLICES = 8               # da 중심선을 세로로 나눌 밴드 수
 DL_MIN_PIXELS = 40            # 밴드 내 da 픽셀수가 이 미만이면 그 밴드는 "차선 없음" 처리
 DL_NEAR_SLICES = 2            # 근거리(조향용) 편차 계산에 쓸 아래쪽 밴드 수
 DL_FAR_SLICES = 2             # 원거리(코너 예측용) 편차 계산에 쓸 위쪽 밴드 수
-DL_SLICE_OUTLIER_MAX = 60     # 추세선에서 이 이상(px) 벗어난 밴드는 이상치로 제외
+# [LQR 브랜치 dl_lane_BEV_파라미터_변경사유.md에서 이식, 2026-08-05] 아래 4개 값은
+#   원래 BEV 도입 전 원근(perspective) 640×140px ROI 스케일로 잡혔던 값을 그대로
+#   들고 있었다. BEV(585×298px 캔버스, DL_PIXELS_PER_METER=200px/m)로 좌표계가
+#   바뀌면서 "픽셀당 의미"가 달라졌는데도 재계산이 안 돼 있었던 것 — 반차로폭
+#   (LANE_WIDTH_M=0.4m)의 상당 부분(예: 옛 DL_SLICE_OUTLIER_MAX=60px는 반차로폭의
+#   75%)까지 "이상치 아님"으로 통과시켜서, 교차로 등에서 da/중심선이 옆 차선으로
+#   번지는 걸 걸러내지 못하는 원인 중 하나였다(DL_DA_MAX_AREA_RATIO로 잡는
+#   "면적이 통째로 큰 경우"와는 별개로, 이쪽은 "중심선이 서서히 옆으로 새는" 경우를
+#   못 잡는 문제). 아래는 새 BEV 스케일 기준으로 다시 계산한 값 — 여전히 실차 미검증,
+#   DEBUG_VIZ_DL_LANE 오버레이로 교차로 진입 구간에서 확인 후 조정할 것.
+DL_SLICE_OUTLIER_MAX = 40     # 반차로폭(0.4m=80px)의 1/2. 추세선에서 이 이상(px) 벗어난 밴드는 이상치로 제외
 DL_SLICE_FIT_MIN = 3          # 유효 밴드가 이 미만이면 추세 판단 생략
 DL_STABLE_FRAME_MIN = 3       # "새 추론이 끝난 시점" 기준 연속 안정 프레임 수(디바운스)
-DL_STABLE_JUMP_MAX = 30       # 이 이상(px) 차이나면 새 후보로 취급
+DL_STABLE_JUMP_MAX = 20       # 반차로폭의 1/4. 이 이상(px) 차이나면 새 후보로 취급
 
 # da 파편화 대응 — ConnectedComponents 최대 덩어리 면적이 이 미만이면 "da 안 보임" 처리
-DL_DA_MIN_COMPONENT_AREA = 800
+#   1560 = 옛 원근 ROI(89,600px²) 대비 800의 비율(0.893%)을 새 BEV 캔버스(174,330px²)에서
+#   그대로 유지한 값(89,600→174,330, ×1.9456배) — 위 [LQR 브랜치 이식] 주석 참고.
+DL_DA_MIN_COMPONENT_AREA = 1560
 # da 과대검출 대응 — 최대 덩어리 면적이 (마스크 전체 픽셀수 × 이 비율)을 넘으면 정상
 # 자기차선 폭이 아니라고 보고 outlier로 버린다(무효 처리, 직전 경로 유지). ㅓ교차로에서
 # da가 옆 갈림길까지 하나로 이어붙는 경우뿐 아니라, 차선(백선)이 아예 없는 맨바닥을
@@ -173,7 +185,10 @@ DL_DA_MAX_AREA_RATIO = 0.6
 # ll sanity check — ROI 내 ll(차선) foreground 비율이 이 미만이면 da 결과와 무관하게 무효 처리
 DL_LL_SANITY_MIN_RATIO = 0.005
 # da가 옆 차선과 이어붙었을 때 ll 라인 바깥(옆 차선 쪽) 픽셀을 잘라내는 여유폭(px)
-DL_LL_CLIP_MARGIN_PX = 15
+#   8 = 실측 라인 두께 2.5cm(=5px @200px/m) + 세그멘테이션 경계 흔들림(1~2px) 여유
+#   (위 [LQR 브랜치 이식] 주석 참고). 옛 값 15px은 필요 이상으로 넓게 잘라내 정상
+#   자기차선 폭까지 깎아내는 부작용이 있었다.
+DL_LL_CLIP_MARGIN_PX = 8
 
 # ── 색상기반 노란 중앙선 보조 검출 (lane_side 판정용, hough_lane.py와 공유) ──
 #   TwinLiteNet의 ll 출력은 흰/노랑을 구분하지 않아 HSV로 별도 검출한다.
