@@ -39,10 +39,12 @@
 #   DL_CENTER_MODE='ll_da'/'ll': da 경계 중점은 여전히 "주행 가능한 영역"이지 "차로 중앙"이
 #   아니므로(여백이 비대칭이면 경계 중점도 약간은 영향을 받을 수 있음), ll(차선 자체, 두
 #   백선)이 "선이 실제로 있는 위치"를 더 직접적으로 가리킨다는 점에서 여전히 우선한다 —
-#   밴드마다 좌/우 ll이 둘 다 신뢰할 만큼 보이면 그 중점을 채택한다
-#   (DLSlideWindow._ll_slice_centers()). 'll_da'는 ll이 부족한 밴드만 da 중심으로 개별
-#   폴백하고(프레임 전체 무효화 아님), 'll'은 그 폴백 없이 해당 밴드를 그냥 무효(None)로
-#   둔다(config.py DL_CENTER_MODE 주석 참고).
+#   좌/우 라인을 각각 독립된 슬라이딩 윈도우로 추적해(DLSlideWindow._ll_slice_centers())
+#   [2026-08-07] 밴드마다 양쪽 다 찾으면 중점을, 한쪽만 찾아도(반대쪽이 가려짐/반사 등)
+#   그 밴드를 버리지 않고 러닝 차로폭 추정치(self._ll_half_width)로 반대쪽을 추정해 쓴다.
+#   양쪽 다 못 찾은 밴드만 None. 'll_da'는 그 None 밴드만 da 중심으로 개별 폴백하고
+#   (프레임 전체 무효화 아님), 'll'은 그 폴백 없이 해당 밴드를 그냥 무효로 둔다(config.py
+#   DL_CENTER_MODE 주석 참고).
 #   세 모드 공통: 급커브에서 da 마스크가 파편화되는 실패모드에 대응해 ConnectedComponents로
 #   가장 큰 덩어리 하나만 남기고(DL_DA_MIN_COMPONENT_AREA 미만이면 그 프레임은 무효 처리)
 #   나머지 파편에 중심선이 끌려가지 않게 막는다 — 이때 "ROI 최하단 중앙(차량 위치)과 실제로
@@ -175,7 +177,7 @@ from ..config import (
     DL_DA_SEED_ROWS_PX, DL_DA_SEED_HALF_WIDTH_PX,
     DL_LL_SANITY_MIN_RATIO, DL_LL_CLIP_MARGIN_PX,
     DL_CENTER_MODE, DL_LL_SIDE_MIN_PIXELS, DL_LL_WIDTH_MIN_PX, DL_LL_WIDTH_MAX_PX,
-    DL_LL_SEARCH_HALF_WIDTH_PX,
+    DL_LL_SEARCH_HALF_WIDTH_PX, DL_LL_WIDTH_EMA_ALPHA,
     DEBUG_VIZ_DL_LANE, YELLOW_LOWER, YELLOW_UPPER, FPS_LOG_PERIOD_SEC,
 )
 
@@ -347,6 +349,7 @@ class DLSlideWindow(SlideWindow):
         self.da_largest_area_px = 0  # 면적 1위 덩어리의 절대 픽셀 면적(채택 여부 무관) — DL_DA_MAX_AREA_PX 실측 튜닝용
         self._prev_da_centroid = None  # [2026-08-07] 직전 프레임에 채택된 da 덩어리의 중심(cx,cy) — _largest_da_component()가 이번 프레임 후보를 "가장 가까운 것"으로 고르는 기준. 무효 프레임 뒤엔 None으로 리셋(옛 위치에 계속 붙잡히지 않도록)
         self.da_chosen_area_px = 0   # 실제로 채택돼 waypoint 추출에 쓰인 덩어리의 면적(무효 프레임엔 0)
+        self._ll_half_width = (DL_LL_WIDTH_MIN_PX + DL_LL_WIDTH_MAX_PX) / 4.0  # [2026-08-07] ll 좌/우 독립 슬라이딩 윈도우의 차로 반폭 러닝 추정치(px) — 양쪽 다 찾은 밴드에서 EMA 갱신, 편측만 찾았을 때 반대쪽 위치 추정에 씀(_ll_slice_centers() 참고)
 
         # DL_USE_BEV=True일 때만 쓰는 워프 행렬. 상수라 매 프레임 다시 안 만들고 한 번만 계산.
         self._bev_M = (
@@ -560,45 +563,52 @@ class DLSlideWindow(SlideWindow):
 
     def _ll_slice_centers(self, ll_mask, ref_x):
         """DL_CENTER_MODE='ll_da' 또는 'll'일 때 호출된다. ll_mask(차선 이진마스크)를
-        _slice_centers()와 동일한 n_slices 밴드로 나눠, 밴드마다 좌/우 각각 **좁은
-        고정폭 탐색창**(DL_LL_SEARCH_HALF_WIDTH_PX 반경) 안에서만 무게중심(cv2.moments)을
-        구한다. 양쪽 다 DL_LL_SIDE_MIN_PIXELS 이상이고 두 중심 간 거리가 실측 차로폭
-        범위(DL_LL_WIDTH_MIN_PX~DL_LL_WIDTH_MAX_PX) 안에 들 때만 그 중점을 이번 밴드의
-        결과로 채택한다 — 한쪽만 보이거나 폭이 비정상이면(반대 차선을 잘못 짝짓는 등)
-        신뢰할 수 없다고 보고 None을 반환한다. 이 None을 detect()가 'll_da'에서는 그
-        밴드만 da로 폴백시키는 신호로, 'll'에서는 그대로 무효 밴드로 쓰는 신호로 쓴다.
+        _slice_centers()와 동일한 n_slices 밴드로 나눠, **좌/우 라인을 각각 독립적인
+        슬라이딩 윈도우로 추적**한다 — 참고 프로젝트
+        (github.com/junhyukch7/Advanced-Lane-Detection)의 `slidingWindow()`가 좌/우를
+        따로 두 번 호출해 서로 무관하게 창을 옮기는 것과 동일한 원칙.
 
-        [2026-08-07] 원래는 좌/우를 나누는 기준점(cur_ref) 하나로 밴드 전체를 반씩(왼쪽
-        전체/오른쪽 전체) 나눠 그 안 전체 픽셀로 무게중심을 냈다. ROI 폭이 넓으면 그
-        "반쪽"도 수백 px라, 옆 차선 선이나 반사광이 그 반쪽 어디에 있든 평균에 그대로
-        섞여 들어가는 문제가 있었다(지난 대화의 "ll 다중 후보 선택 문제"). 참고 프로젝트
-        (github.com/junhyukch7/Advanced-Lane-Detection)의 슬라이딩 윈도우처럼, 좌/우 각각
-        예상 위치를 중심으로 좁은 창(고정폭)만 보게 바꿔 창 밖의 무관한 픽셀이 애초에
-        평균 계산에 안 들어오게 했다. 좌/우 각자의 중심(cur_left/cur_right)은
-        _clip_da_by_ll()과 같은 원칙으로 근거리→원거리로 올라가며 갱신하되, ★ 이번
-        밴드에서 실제로 채택(양쪽 다 신뢰됨)됐을 때만 갱신한다 ★ — 그래야 ll이 부족해
-        이번 밴드를 못 쓴 경우, 그 밴드의 (있을 수도 있는) 애매한 위치가 다음 밴드의
-        좌/우 탐색창 기준으로 오염되어 누적되는 걸 막는다. 좌/우 초기 위치는 ref_x(직전
-        프레임 확정 lane_center) 기준 ±(기대 차로폭/2)로 잡는다.
+        [2026-08-07] 기존에는 좌/우를 한 밴드 안에서 같이 판정해서, 한쪽이라도 실패하면
+        (한쪽 창에 픽셀이 모자라거나, 둘 다 찾았어도 폭이 비정상이면) 그 밴드 전체를
+        버렸다 — 반대쪽 선은 멀쩡히 보이는데도 같이 버려지는 게 낭비였다(예: 한쪽
+        차선이 반사/가려짐으로 몇 밴드 끊겨도 반대쪽은 계속 잘 보이는 실제 상황).
+        이번에 좌/우 창(cur_left/cur_right)을 완전히 독립적으로 갱신하도록 바꿨다 —
+        왼쪽 창은 왼쪽에서 뭔가 찾았을 때만(오른쪽 결과와 무관하게) 갱신하고, 오른쪽도
+        마찬가지다. 밴드별 최종 중심점은 세 갈래로 결정한다:
+          1. 양쪽 다 찾고 두 중심 간 거리가 실측 차로폭 범위(DL_LL_WIDTH_MIN_PX~MAX_PX)
+             안이면 → 중점을 채택하고, 이때의 실측 폭으로 self._ll_half_width(차로
+             반폭 러닝 추정치, DL_LL_WIDTH_EMA_ALPHA로 EMA 갱신)를 업데이트한다.
+          2. 한쪽만 찾았으면(또는 양쪽 다 찾았지만 폭이 비정상이라 서로 못 믿을 때는
+             제외) → 찾은 쪽 위치에서 self._ll_half_width만큼 반대쪽으로 밀어 중심을
+             추정한다(lane_util.SlideWindow.calc_center()의 "한쪽 차선만 검출" 폴백과
+             동일한 원칙 — classic_cv 백엔드가 이미 쓰던 패턴을 ll에도 적용).
+          3. 양쪽 다 못 찾았으면 → None.
+        좌/우 각자의 탐색창은 여전히 좁은 고정폭(DL_LL_SEARCH_HALF_WIDTH_PX 반경)만
+        본다 — ROI 폭 전체(수백 px)를 반씩 나눠 보던 옛 방식(2026-08-07 이전)은 옆
+        차선/반사광이 반쪽 어디에 있든 섞여 들어가는 문제가 있었다.
 
           입력 : ll_mask — (roi_h, roi_w) uint8 이진마스크(da_mask와 동일 shape/좌표계)
-                 ref_x   — 첫(근거리) 밴드의 좌/우 분리 기준 x좌표. 보통 직전 프레임 lane_center.
+                 ref_x   — 첫(근거리) 밴드의 좌/우 초기 중심 x좌표. 보통 직전 프레임 lane_center.
           출력 : (results, used) — 둘 다 길이 self.n_slices.
                  results[i] : 채택되면 (y_center, cx), 아니면 None(da로 폴백해야 함을 뜻함)
-                 used[i]    : results[i]가 ll 기반으로 채택됐는지(bool) — 디버그 시각화용
+                 used[i]    : results[i]가 ll 기반으로 채택됐는지(양쪽/편측 무관, bool) — 디버그 시각화용
 
-        알려진 한계: 탐색창이 좁아진 만큼, 급커브에서 밴드 간 실제 선 이동량이
-        DL_LL_SEARCH_HALF_WIDTH_PX보다 크면 창이 선을 놓치고 그 밴드부터 계속 이전
-        위치에 멈춰 서게 된다(추적 이탈) — 실차 미검증, 급커브 구간에서 ll_bands 비율이
-        갑자기 뚝 떨어지는지 확인할 것."""
+        알려진 한계:
+        - 탐색창이 좁은 만큼, 급커브에서 밴드 간 실제 선 이동량이
+          DL_LL_SEARCH_HALF_WIDTH_PX보다 크면 그 라인의 창이 선을 놓치고 이후 밴드까지
+          이전 위치에 멈춰 서게 된다(추적 이탈, 좌/우 독립이라 한쪽만 이탈해도 반대쪽은
+          영향 없음).
+        - 편측 폴백(2번)이 여러 밴드 연속으로 이어지면, self._ll_half_width가 그 사이
+          갱신되지 않아(양쪽 다 찾은 밴드에서만 갱신) 오래된 추정치를 계속 쓰게 된다 —
+          실차 미검증, 편측 검출이 긴 구간에서 추정 중심이 실제와 얼마나 벌어지는지
+          확인할 것."""
         h, w = ll_mask.shape
         slice_h = h // self.n_slices
         results = [None] * self.n_slices
         used = [False] * self.n_slices
 
-        half_lane = (DL_LL_WIDTH_MIN_PX + DL_LL_WIDTH_MAX_PX) / 4.0  # 기대 차로폭의 절반 — 좌/우 초기 위치 추정용
-        cur_left = ref_x - half_lane
-        cur_right = ref_x + half_lane
+        cur_left = ref_x - self._ll_half_width
+        cur_right = ref_x + self._ll_half_width
         win = DL_LL_SEARCH_HALF_WIDTH_PX
 
         for i in range(self.n_slices):
@@ -607,28 +617,36 @@ class DLSlideWindow(SlideWindow):
             band = ll_mask[y_low:y_high, :]
             y_center = (y_low + y_high) / 2.0
 
+            lx = None
             lx0, lx1 = int(np.clip(cur_left - win, 0, w)), int(np.clip(cur_left + win, 0, w))
+            if lx1 > lx0:
+                M_l = cv2.moments(band[:, lx0:lx1], binaryImage=True)
+                if M_l['m00'] >= DL_LL_SIDE_MIN_PIXELS:
+                    lx = lx0 + M_l['m10'] / M_l['m00']
+                    cur_left = lx  # 왼쪽 창은 왼쪽 결과만으로 독립 갱신 — 오른쪽 성패와 무관
+
+            rx = None
             rx0, rx1 = int(np.clip(cur_right - win, 0, w)), int(np.clip(cur_right + win, 0, w))
-            if lx1 <= lx0 or rx1 <= rx0:
-                continue  # 탐색창이 화면 밖으로 완전히 밀려남(추적 이탈) — 스킵, cur_left/right 유지
+            if rx1 > rx0:
+                M_r = cv2.moments(band[:, rx0:rx1], binaryImage=True)
+                if M_r['m00'] >= DL_LL_SIDE_MIN_PIXELS:
+                    rx = rx0 + M_r['m10'] / M_r['m00']
+                    cur_right = rx  # 오른쪽 창은 오른쪽 결과만으로 독립 갱신 — 왼쪽 성패와 무관
 
-            M_l = cv2.moments(band[:, lx0:lx1], binaryImage=True)
-            M_r = cv2.moments(band[:, rx0:rx1], binaryImage=True)
-
-            if M_l['m00'] < DL_LL_SIDE_MIN_PIXELS or M_r['m00'] < DL_LL_SIDE_MIN_PIXELS:
-                continue  # 한쪽 이상 안 보임 — 이 밴드는 da로 폴백(cur_left/right도 갱신 안 함)
-
-            lx = lx0 + M_l['m10'] / M_l['m00']
-            rx = rx0 + M_r['m10'] / M_r['m00']
-            width = rx - lx
-            if not (DL_LL_WIDTH_MIN_PX < width < DL_LL_WIDTH_MAX_PX):
-                continue  # 폭이 비정상 — 반대 차선을 잘못 짝지었을 가능성, da로 폴백
-
-            cx = (lx + rx) / 2.0
-            results[i] = (y_center, cx)
-            used[i] = True
-            cur_left = lx
-            cur_right = rx
+            if lx is not None and rx is not None:
+                width = rx - lx
+                if DL_LL_WIDTH_MIN_PX < width < DL_LL_WIDTH_MAX_PX:
+                    results[i] = (y_center, (lx + rx) / 2.0)
+                    used[i] = True
+                    alpha = DL_LL_WIDTH_EMA_ALPHA
+                    self._ll_half_width = (1 - alpha) * self._ll_half_width + alpha * (width / 2.0)
+                # 폭이 비정상 — 반대 차선을 잘못 짝지었을 가능성, 양쪽 다 못 믿으므로 무효
+            elif lx is not None:
+                results[i] = (y_center, lx + self._ll_half_width)
+                used[i] = True
+            elif rx is not None:
+                results[i] = (y_center, rx - self._ll_half_width)
+                used[i] = True
 
         return results, used
 

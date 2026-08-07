@@ -274,21 +274,24 @@ DL_LL_CLIP_MARGIN_PX = 8
 #   'da'    : 밴드별 중심을 da(주행가능영역) 좌우 경계 중점으로 계산한다(main의 기존
 #             방식 — [2026-08-07] 무게중심에서 경계 중점으로 교체, perception/lane_util.py
 #             _slice_edge_midpoints() 참고).
-#   'll_da' : 밴드마다 좌/우 ll(차선)이 둘 다 신뢰할 만하면(아래 DL_LL_SIDE_MIN_PIXELS/
-#             DL_LL_WIDTH_MIN_PX~MAX_PX) 그 중점을 우선 채택하고, ll이 부족한(점선 틈/
-#             마모/반사/편측 가려짐) 밴드만 da 경계 중점으로 폴백한다. ll(차선 자체)은
-#             여백 크기와 무관하게 "선이 실제로 있는 위치"를 직접 가리킨다는 점에서 da
-#             경계 중점보다도 더 직접적인 신호다. da는 여전히 ll이 끊긴 구간을 메우는
-#             안전망 역할로 남는다.
-#   'll'    : 'll_da'에서 da 폴백을 아예 없앤 순수 ll 모드. 밴드마다 좌/우 ll이 둘 다
-#             신뢰될 때만(DL_LL_SIDE_MIN_PIXELS/WIDTH_MIN~MAX_PX) 그 중점을 쓰고, 그
-#             조건을 못 채우는 밴드는 da로 메우지 않고 그냥 None(무효 밴드)으로 둔다 —
-#             da가 섞여 들어와 여백 쪽으로 경로가 쏠리는 걸 완전히 차단하고 싶을 때 쓴다.
-#             대가로 ll이 끊기는 구간(반사/마모/점선 틈)에서는 그만큼 유효 밴드가 줄어
-#             fit이 더 쉽게 실패한다(_fit_and_sample_path의 DL_SLICE_FIT_MIN 미만이면
-#             경로가 갱신 안 되고 직전 값 유지). da 파편화 대응/옆 차선 클리핑/ll sanity
-#             check는 이 모드에서도 그대로 적용된다(da_mask 자체는 여전히 클리핑용으로
-#             계산됨) — 다만 그 da 결과가 중심점 계산에는 전혀 섞이지 않는다.
+#   'll_da' : 좌/우 ll(차선)을 각각 독립된 슬라이딩 윈도우로 추적한다
+#             (DLSlideWindow._ll_slice_centers()). [2026-08-07] 밴드마다 양쪽 다 찾으면
+#             (아래 DL_LL_SIDE_MIN_PIXELS/DL_LL_WIDTH_MIN_PX~MAX_PX) 그 중점을, 한쪽만
+#             찾아도(점선 틈/마모/반사/편측 가려짐) 그 밴드를 버리지 않고 러닝 차로폭
+#             추정치(DL_LL_WIDTH_EMA_ALPHA)로 반대쪽을 추정해 쓴다. 양쪽 다 못 찾은
+#             밴드만 da 경계 중점으로 폴백한다. ll(차선 자체)은 여백 크기와 무관하게
+#             "선이 실제로 있는 위치"를 직접 가리킨다는 점에서 da 경계 중점보다도 더
+#             직접적인 신호다. da는 여전히 ll이 완전히 끊긴 구간을 메우는 안전망
+#             역할로 남는다.
+#   'll'    : 'll_da'에서 da 폴백을 아예 없앤 순수 ll 모드. 위와 동일하게 좌/우 독립
+#             추적 + 편측 폴백까지는 쓰되, 양쪽 다 못 찾는 밴드는 da로 메우지 않고 그냥
+#             None(무효 밴드)으로 둔다 — da가 섞여 들어와 여백 쪽으로 경로가 쏠리는 걸
+#             완전히 차단하고 싶을 때 쓴다. 대가로 ll이 완전히 끊기는 구간에서는 그만큼
+#             유효 밴드가 줄어 fit이 더 쉽게 실패한다(_fit_and_sample_path의
+#             DL_SLICE_FIT_MIN 미만이면 경로가 갱신 안 되고 직전 값 유지). da 파편화
+#             대응/옆 차선 클리핑/ll sanity check는 이 모드에서도 그대로 적용된다
+#             (da_mask 자체는 여전히 클리핑용으로 계산됨) — 다만 그 da 결과가 중심점
+#             계산에는 전혀 섞이지 않는다.
 #   세 모드 다 da 파편화 대응(_largest_da_component)/옆 차선 클리핑(_clip_da_by_ll)/ll
 #   sanity check는 동일하게 적용된다 — 차이는 "밴드별 중심점을 뭘로 뽑는가" 뿐이다.
 #   main 기본값은 실차에서 이미 어느 정도 검증된 'da'로 둔다 — 'll_da'/'ll'은 아직 실차
@@ -319,6 +322,14 @@ DL_LL_WIDTH_MAX_PX = 220
 #   실제 선 이동량이 이 값보다 크면 창이 선을 놓치고 추적이 끊길 수 있으니, 그런
 #   구간에서 ll_bands 비율이 뚝 떨어지면 이 값을 키울 것.
 DL_LL_SEARCH_HALF_WIDTH_PX = 60.0
+
+# [2026-08-07] _ll_slice_centers()가 좌/우 라인을 완전히 독립된 슬라이딩 윈도우로
+#   추적하도록 바꾸면서(한쪽만 찾아도 그 밴드를 버리지 않고, 반대쪽은 러닝 폭 추정치로
+#   메움 — lane_util.SlideWindow.calc_center()의 "한쪽 차선만 검출" 폴백과 같은 원칙)
+#   생긴 "차로 반폭 러닝 추정치" self._ll_half_width의 EMA 계수. 양쪽 다 찾아 실측 폭이
+#   나온 밴드에서만 이 계수로 갱신한다. classic_cv 백엔드의 LANE_WIDTH_EMA_ALPHA(=0.1,
+#   hough_lane.py)와 동일한 관례 — 실차 미검증 초기값.
+DL_LL_WIDTH_EMA_ALPHA = 0.1
 
 # ── 색상기반 노란 중앙선 보조 검출 (lane_side 판정용, hough_lane.py와 공유) ──
 #   TwinLiteNet의 ll 출력은 흰/노랑을 구분하지 않아 HSV로 별도 검출한다.
