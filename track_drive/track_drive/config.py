@@ -88,9 +88,17 @@ SPEED_STOP    = 0.0
 #   전진하도록 함. SPEED_NORMAL이 25.0으로 오른 만큼 최고/최저 속도 폭이 넓어졌으니, 코너
 #   진입/탈출 시 속도 급변이 과하게 느껴지면 이 값을 올리는 쪽으로 완화할 것.
 SPEED_CORNER_MIN = 5.0
-ANGLE_MAX     = 100.0  # 조향각 클램프(도)
+ANGLE_MAX     = 80.0  # 조향각 클램프(도)
 ANGLE_RATE_MAX = 12.0  # 조향 변화율 제한(도/주기, 20Hz 기준 12도/주기=240도/초) — drive()에서 모든 명령에 일괄 적용
-SPEED_ACCEL_STEP = 0.85  # 가속 속도제한(주기당 최대 증가량)
+#   [2026-08-07] 0.85 → 0.4. 실차에서 ros2 run 직후(정지→출발)와 가속 도중 차량이 갑자기
+#   멈췄다 살아나는 증상이 재현됨 — ctrl_speed(spd)는 그동안 계속 25로 발행되고 있었고
+#   v_mps(VESC 실측, vesc_debug 초록=LIVE 확인됨)만 순간 0으로 떨어졌다 회복되는 패턴이라
+#   판단(FSM) 로직이 아니라 배터리 전압 강하로 인한 ESC/VESC 저전압·과전류 보호(LVC) 트립으로
+#   추정된다(정지 직후 재출발·가속 구간 둘 다 모터 전류 요구가 가장 큰 지점과 일치).
+#   SPEED_NORMAL이 5→25로 오르며 가속 시 전류 피크도 커졌을 것 — 근본 해결은 배터리 점검/교체지만,
+#   가속 램프를 더 완만하게(0→25까지 약 1.5초→약 3.1초, 20Hz 기준) 늘려 전류 피크를 낮추는
+#   소프트웨어 완화책으로 우선 적용. 실차 재검증 필요 — 그래도 반복되면 배터리 자체를 볼 것.
+SPEED_ACCEL_STEP = 0.4  # 가속 속도제한(주기당 최대 증가량)
 CORNER_HOLD_DECAY_LO = 0.92  # 저속 시 코너 hold 감쇠 (빠른 회복)
 CORNER_HOLD_DECAY_HI = 0.97  # 고속 시 코너 hold 감쇠 (느린 회복, 연속코너 대응)
 # [2026-08-06] 코너 감속 판단용 조향각 signed EMA 계수(_lane_drive()의 self._corner_signal) —
@@ -239,7 +247,7 @@ DL_DA_MIN_COMPONENT_AREA = 1560
 #   직선 구간 3프레임): 13349px, 13361px, 12946px(평균 13,219px, 최대 13,361px) — 여기에
 #   여유를 두고 13,700으로 설정. 캔버스 크기가 또 바뀌면(원거리 크롭 값 재조정 등) 비율
 #   방식과 달리 이 값도 같이 재측정해야 한다.
-DL_DA_MAX_AREA_PX = 13700
+DL_DA_MAX_AREA_PX = 16000
 # ll sanity check — ROI 내 ll(차선) foreground 비율이 이 미만이면 da 결과와 무관하게 무효 처리
 DL_LL_SANITY_MIN_RATIO = 0.005
 # da가 옆 차선과 이어붙었을 때 ll 라인 바깥(옆 차선 쪽) 픽셀을 잘라내는 여유폭(px)
@@ -303,7 +311,16 @@ STEERING_CONTROLLER = 'pure_pursuit'  # 'pure_pursuit' | 'lqr'
 #   주석 참고 — 여기는 "현재 적용값"만 모아둔다.
 PP_LOOKAHEAD_BASE_PX = 90.0        # lookahead 하한(직진/저속 기준값)
 PP_LOOKAHEAD_SPEED_GAIN = 4.0      # 속도가 오를수록 lookahead를 늘리는 게인
-PP_LOOKAHEAD_MAX_PX = 150.0        # lookahead 상한
+# [2026-08-07] 150 → 190. speed_lookahead_px = BASE + GAIN*speed 공식이 SPEED_NORMAL=5
+#   기준(90+4*5=110)으로 설계됐는데(pure_pursuit.py __init__ 주석), SPEED_NORMAL이 이후
+#   25까지 오르면서(config.py 상단 SPEED_NORMAL 주석) 이론상 필요한 lookahead(90+4*25=190)가
+#   구 상한(150)에 막혀 speed>=15부터는 lookahead가 더 안 늘어났다. 실차에서 "속도 5는
+#   진동이 없는데 20으로 올리니 진동이 심해진다"는 증상으로 재현됨 — Pure Pursuit은 lookahead가
+#   짧을수록 curvature=2*sin(alpha)/ld 공식에서 같은 픽셀오차도 더 크게 증폭되므로(§0.5.2
+#   README), 속도만 오르고 lookahead가 그만큼 못 늘어나면 고속에서 과민 반응→진동이 커진다.
+#   190은 SPEED_NORMAL=25를 그대로 대입한 값 — 실차 재검증 필요. 그래도 진동이 남으면
+#   PP_ALPHA(현재 0.5)를 낮춰 조향각 저역통과를 더 강하게 거는 쪽을 다음으로 볼 것.
+PP_LOOKAHEAD_MAX_PX = 190.0        # lookahead 상한
 PP_LOOKAHEAD_CURVATURE_GAIN = 100.0  # 직전 프레임 curvature가 클수록(코너) lookahead를 줄이는 게인
 PP_LOOKAHEAD_MIN_PX = 40.0         # 코너에서 lookahead가 줄어들 수 있는 하한
 # [2026-08-06] "곡률→조향각" 게인(pure_pursuit.py의 steer_deg = atan(curvature*wheelbase_px)).
