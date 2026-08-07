@@ -748,6 +748,49 @@ da 전체(덩어리 선택/ll클리핑 전, `self.da_mask_all_roi`)를 **파란�
 가능성이 이론상 있음 — 실차 재검증 전. `DEBUG_VIZ_DL_LANE`의 주황 오버레이(차선책 발동 여부)로
 전환이 잦은 구간이 있는지 확인할 것.
 
+### 2.9 ll 좌/우 탐색을 "반쪽 전체"에서 "좁은 고정폭 창"으로 (`DL_LL_SEARCH_HALF_WIDTH_PX`, 2026-08-07)
+
+**증상:** `DLSlideWindow._ll_slice_centers()`(`DL_CENTER_MODE='ll_da'|'ll'`에서만 쓰임)가 밴드를 좌/우
+분리 기준점(`cur_ref`) 하나로 반씩(왼쪽 전체/오른쪽 전체) 나눠 그 반쪽 안의 모든 픽셀로 무게중심을
+냈다. ROI 폭이 넓으면 그 "반쪽"도 수백 px라, 옆 차선 선·반사광 등 무관한 픽셀이 반쪽 어디에 있든
+평균에 그대로 섞여 들어가는 구조적 문제가 있었다("여러 ll 후보 중 뭘 선택할지" 문제의 원인).
+
+**참고한 아이디어:** [github.com/junhyukch7/Advanced-Lane-Detection](https://github.com/junhyukch7/Advanced-Lane-Detection)의
+고전적 슬라이딩 윈도우는 좌/우 각각 폭 120px(반경 60px)짜리 좁은 창만 보고, 그 창에서 찾은 평균
+위치로 다음 창을 옮기는 방식이라 창 밖의 무관한 픽셀이 애초에 안 보인다.
+
+**수정:** `_ll_slice_centers()`가 좌/우 각각 `cur_left`/`cur_right`(예상 위치)를 따로 들고 다니며, 그
+위치 ±`DL_LL_SEARCH_HALF_WIDTH_PX`(초기값 60, [config.py](config.py))짜리 좁은 창 안에서만
+`cv2.moments`를 구하도록 바꿨다([perception/dl_lane.py](perception/dl_lane.py) `_ll_slice_centers()`).
+좌/우 초기 위치는 `ref_x`(직전 프레임 확정 lane_center) 기준 ±(기대 차로폭/2)로 잡고, 이번 밴드에서
+실제로 채택(양쪽 다 신뢰됨)됐을 때만 `cur_left`/`cur_right`를 갱신한다(기존 `cur_ref` 갱신 원칙과 동일).
+
+**알려진 한계:** 탐색창이 좁아진 만큼, 급커브에서 밴드 간 실제 선 이동량이
+`DL_LL_SEARCH_HALF_WIDTH_PX`보다 크면 창이 선을 놓치고 그 밴드부터 추적이 끊긴다 — 실차 미검증.
+`DEBUG_VIZ_DL_LANE`에서 급커브 구간의 `ll_bands` 비율이 갑자기 뚝 떨어지면 이 값을 키울 것.
+
+### 2.10 경로 생성을 "2차 다항식 피팅+외삽"에서 "구간별 선형보간"으로 (`_fit_and_sample_path`, 2026-08-07)
+
+**증상:** `lane_util.SlideWindow._fit_and_sample_path()`(dl/classic_cv 백엔드 공용)는 유효 밴드 점이
+3개 이상이면 2차 다항식 하나로 전 구간을 피팅하고, 실측 데이터가 하나도 없는 근거리(`roi_h`, 차량
+바로 앞 — 조향에 가장 큰 영향을 주는 구간)까지 그 곡선으로 외삽했다. 밴드 3~5개짜리 저차수 피팅이라
+노이즈로 계수가 조금만 튀어도 외삽 구간이 크게 휘어질 수 있었다(`PATH_EXTRAPOLATE_MARGIN` 클램프는
+안전판일 뿐 흔들림 자체를 줄이지 못함).
+
+**참고한 아이디어:** 같은 [Advanced-Lane-Detection](https://github.com/junhyukch7/Advanced-Lane-Detection)
+레포가 정확히 같은 이유("다항식 보간법은 고차항으로 갈수록 오차가 커질 가능성이 있어")로 고차 다항식
+대신 슬라이딩 윈도우 점들을 직선으로 잇는 선형보간을 쓴다.
+
+**수정:** `np.polyfit`(2차) 대신 `np.interp`로 밴드 점들을 구간별 선형보간하도록 바꿨다
+([perception/lane_util.py](perception/lane_util.py) `_fit_and_sample_path()`). `np.interp`는 데이터
+범위 밖에서 곡선으로 외삽하지 않고 가장 가까운 실측점의 x를 그대로 유지(hold)하므로, 근거리에 실측
+밴드가 없어도 값이 곡선으로 튈 수가 없다 — 외삽 자체가 없어져 클램프보다 근본적으로 안전하다. 더 이상
+쓰이지 않는 `PATH_EXTRAPOLATE_MARGIN` 상수는 제거했다.
+
+**알려진 한계:** 곡선 구간에서 부드러운 다항식 곡선 대신 각진(piecewise-linear) 경로가 나올 수 있다 —
+`PP_ALPHA`(조향각 저역통과)가 이미 완충하지만, 실차에서 커브 진입 시 조향이 미세하게 계단식으로
+반응하는지 확인할 것. 실차 미검증.
+
 ---
 
 ## 3. 라바콘 (B1_LAVACON)

@@ -116,14 +116,14 @@ WHITE_CCA_MIN_AREA = 15
 # config.py를 고칠 것.
 from ..config import STABLE_FRAME_MIN, STABLE_JUMP_MAX
 
-# 명시적 경로(곡선/웨이포인트) 생성 — controller/pure_pursuit.py가 소비
+# 명시적 경로(웨이포인트) 생성 — controller/pure_pursuit.py가 소비
 #   기존 offset/lookahead(근거리·원거리 두 그룹의 평균 스칼라)만으로는 Pure Pursuit이
 #   목표점을 고를 "경로"가 없다. 그래서 슬라이스별 중심점(구간마다 독립 계산된 값,
-#   반사광 등은 이미 _reject_outliers()로 제외된 상태)에 다항식을 피팅해 ROI 픽셀
-#   좌표계의 명시적 곡선을 만들고, 그 위를 일정 간격으로 샘플링해 웨이포인트로 쓴다.
+#   반사광 등은 이미 _reject_outliers()로 제외된 상태)을 선형보간(np.interp)으로 이어
+#   ROI 픽셀 좌표계의 명시적 경로를 만들고, 그 위를 일정 간격으로 샘플링해 웨이포인트로
+#   쓴다([2026-08-07] 원래 2차 다항식 피팅+외삽이었다 — _fit_and_sample_path() 주석 참고).
 #   실차 미검증 튜닝값.
-PATH_N_WAYPOINTS = 12       # 피팅한 곡선에서 뽑아낼 웨이포인트 수
-PATH_EXTRAPOLATE_MARGIN = 1.5  # 다항식 외삽이 튀는 걸 막는 안전클램프(roi_w의 배수)
+PATH_N_WAYPOINTS = 12       # 경로에서 뽑아낼 웨이포인트 수
 
 # 경로(웨이포인트) 프레임 간 EMA 스무딩 — PATH_EMA_ALPHA는 config.py에 있다
 # (설계 배경/변경 이력 주석도 그쪽에 있음). 실차 테스트 중 값을 바꾸려면
@@ -554,37 +554,40 @@ class SlideWindow:
         return points
 
     def _fit_and_sample_path(self, points):
-        """슬라이스 중심점에 다항식(x = f(y))을 피팅하고, 차량 근처(roi_h)부터 가장 먼
-        유효 슬라이스까지 균등 간격으로 self.path_n_waypoints개를 샘플링한다.
-        점이 2개 미만이면(직선조차 정의 못함) None — 호출부(calc_center())가 직전 경로를
+        """슬라이스 중심점을 구간별 선형보간(np.interp)으로 이어, 차량 근처(roi_h)부터
+        가장 먼 유효 슬라이스까지 균등 간격으로 self.path_n_waypoints개를 샘플링한다.
+        점이 2개 미만이면(선조차 정의 못함) None — 호출부(calc_center())가 직전 경로를
         유지하는 폴백을 담당한다.
-        점이 3개 이상이면 2차식(커브 대응), 정확히 2개면 1차식(직선)으로 피팅한다.
-        슬라이스가 3~5개뿐인 저차수 피팅이라 roi_h까지 살짝 외삽하는데, 노이즈가 큰
-        프레임에서 계수가 튀면 외삽 구간에서 x가 화면 밖으로 크게 벗어날 수 있어
-        PATH_EXTRAPOLATE_MARGIN으로 안전하게 clamp한다(그 이상은 물리적으로 말이 안 되는
-        조향각으로 이어지므로).
+
+        [2026-08-07] 원래는 점 3개 이상이면 2차 다항식(커브 대응) 하나로 전 구간을
+        피팅하고, roi_h(차량 바로 앞)까지 그 곡선으로 외삽했다. 슬라이스 3~5개짜리
+        저차수 피팅이라 노이즈로 계수가 조금만 튀어도, 그 외삽 구간(실측 데이터가
+        하나도 없는 근거리 — 조향에 가장 큰 영향을 주는 구간)이 크게 휘어지는 문제가
+        있었다(PATH_EXTRAPOLATE_MARGIN 클램프는 안전판일 뿐 흔들림 자체를 줄이진 못함).
+        참고 프로젝트(github.com/junhyukch7/Advanced-Lane-Detection)가 같은 이유로
+        고차 다항식 대신 슬라이딩 윈도우 점들을 직선으로 잇는 선형보간을 쓴 걸 보고
+        동일하게 바꿨다. np.interp는 데이터 범위 밖에서 곡선으로 외삽하지 않고 가장
+        가까운 실측점의 x를 그대로 유지(hold)하므로, roi_h까지의 근거리 구간에 실측
+        밴드가 없어도 값이 곡선으로 튈 수가 없다 — 외삽 자체가 없어져 클램프보다
+        근본적으로 안전하다. 실차 미검증.
         """
         if len(points) < 2:
             return None
 
         ys = np.array([p[0] for p in points], dtype=np.float64)
         xs = np.array([p[1] for p in points], dtype=np.float64)
-        deg = 2 if len(points) >= 3 else 1
-
-        try:
-            coeffs = np.polyfit(ys, xs, deg)
-        except np.linalg.LinAlgError:
-            return None
-        poly = np.poly1d(coeffs)
 
         y_near = float(self.roi_h)
         y_far = float(np.min(ys))
         if y_near <= y_far:
             return None
 
+        order = np.argsort(ys)  # np.interp는 xp가 오름차순이어야 함
+        ys_sorted = ys[order]
+        xs_sorted = xs[order]
+
         sample_ys = np.linspace(y_near, y_far, self.path_n_waypoints)
-        lo, hi = -PATH_EXTRAPOLATE_MARGIN * self.roi_w, (1.0 + PATH_EXTRAPOLATE_MARGIN) * self.roi_w
-        sample_xs = np.clip(poly(sample_ys), lo, hi)
+        sample_xs = np.interp(sample_ys, ys_sorted, xs_sorted)
 
         return [(float(x), float(y)) for x, y in zip(sample_xs, sample_ys)]
 

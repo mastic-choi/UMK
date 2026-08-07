@@ -11,7 +11,7 @@
 # 중심점(config.DL_CENTER_MODE='da'면 da 무게중심, 'll_da'면 ll이 확실한 밴드는 ll 좌/우
 # 중점 그 외는 da 무게중심으로 폴백, 'll'이면 ll이 확실한 밴드만 쓰고 그 외는 무효 —
 # 아래 "밴드별 중심 계산" 참고)에
-# lane_util._fit_and_sample_path()로 다항식을 피팅해 만든 명시적 경로(ROI 픽셀좌표
+# lane_util._fit_and_sample_path()로 선형보간해 만든 명시적 경로(ROI 픽셀좌표
 # 웨이포인트, 가까운점→먼점) — controller/pure_pursuit.py가 조향각 계산에 직접 사용한다.
 #
 # ── 실시간 전략: 제어루프와 분리된 백그라운드 스레드 ──
@@ -171,6 +171,7 @@ from ..config import (
     DL_DA_MIN_COMPONENT_AREA, DL_DA_MAX_AREA_PX,
     DL_LL_SANITY_MIN_RATIO, DL_LL_CLIP_MARGIN_PX,
     DL_CENTER_MODE, DL_LL_SIDE_MIN_PIXELS, DL_LL_WIDTH_MIN_PX, DL_LL_WIDTH_MAX_PX,
+    DL_LL_SEARCH_HALF_WIDTH_PX,
     DEBUG_VIZ_DL_LANE, YELLOW_LOWER, YELLOW_UPPER, FPS_LOG_PERIOD_SEC,
 )
 
@@ -307,7 +308,7 @@ class TwinLiteNetEngine:
 class DLSlideWindow(SlideWindow):
     """lane_util.SlideWindow에서 "임의의 이진마스크를 세로로 N등분해 구간별 moments
     중심을 구하고(_slice_centers), 이상치를 제거하고(_reject_outliers), 근거리/원거리
-    평균을 내고(_group_mean), 다항식으로 경로를 피팅/샘플링하고(_fit_and_sample_path),
+    평균을 내고(_group_mean), 선형보간으로 경로를 만들고/샘플링하고(_fit_and_sample_path),
     프레임 간 스파이크를 걸러내는(_debounce)" 범용 유틸리티들만 재사용한다.
 
     좌/우 ll(차선) 라인을 따로 찾아 폭을 추정해 중점을 계산하던 옛 4단계 폴백(양쪽→
@@ -522,30 +523,46 @@ class DLSlideWindow(SlideWindow):
 
     def _ll_slice_centers(self, ll_mask, ref_x):
         """DL_CENTER_MODE='ll_da' 또는 'll'일 때 호출된다. ll_mask(차선 이진마스크)를
-        _slice_centers()와 동일한 n_slices 밴드로 나눠, 밴드마다 cur_ref를 기준으로
-        좌/우로 나눈 뒤 각각 무게중심(cv2.moments)을 구한다. 양쪽 다
-        DL_LL_SIDE_MIN_PIXELS 이상이고 두 중심 간 거리가 실측 차로폭 범위
-        (DL_LL_WIDTH_MIN_PX~DL_LL_WIDTH_MAX_PX) 안에 들 때만 그 중점을 이번 밴드의
+        _slice_centers()와 동일한 n_slices 밴드로 나눠, 밴드마다 좌/우 각각 **좁은
+        고정폭 탐색창**(DL_LL_SEARCH_HALF_WIDTH_PX 반경) 안에서만 무게중심(cv2.moments)을
+        구한다. 양쪽 다 DL_LL_SIDE_MIN_PIXELS 이상이고 두 중심 간 거리가 실측 차로폭
+        범위(DL_LL_WIDTH_MIN_PX~DL_LL_WIDTH_MAX_PX) 안에 들 때만 그 중점을 이번 밴드의
         결과로 채택한다 — 한쪽만 보이거나 폭이 비정상이면(반대 차선을 잘못 짝짓는 등)
         신뢰할 수 없다고 보고 None을 반환한다. 이 None을 detect()가 'll_da'에서는 그
         밴드만 da로 폴백시키는 신호로, 'll'에서는 그대로 무효 밴드로 쓰는 신호로 쓴다.
 
-        cur_ref(좌/우 분리 기준점)는 _clip_da_by_ll()과 같은 원칙으로 근거리→원거리로
-        올라가며 갱신하되, ★ 이번 밴드에서 실제로 채택(양쪽 다 신뢰됨)됐을 때만 갱신한다 ★
-        — 그래야 ll이 부족해 이번 밴드를 못 쓴 경우, 그 밴드의 (있을 수도 있는) 애매한
-        위치가 다음 밴드의 좌/우 판정 기준으로 오염되어 누적되는 걸 막는다.
+        [2026-08-07] 원래는 좌/우를 나누는 기준점(cur_ref) 하나로 밴드 전체를 반씩(왼쪽
+        전체/오른쪽 전체) 나눠 그 안 전체 픽셀로 무게중심을 냈다. ROI 폭이 넓으면 그
+        "반쪽"도 수백 px라, 옆 차선 선이나 반사광이 그 반쪽 어디에 있든 평균에 그대로
+        섞여 들어가는 문제가 있었다(지난 대화의 "ll 다중 후보 선택 문제"). 참고 프로젝트
+        (github.com/junhyukch7/Advanced-Lane-Detection)의 슬라이딩 윈도우처럼, 좌/우 각각
+        예상 위치를 중심으로 좁은 창(고정폭)만 보게 바꿔 창 밖의 무관한 픽셀이 애초에
+        평균 계산에 안 들어오게 했다. 좌/우 각자의 중심(cur_left/cur_right)은
+        _clip_da_by_ll()과 같은 원칙으로 근거리→원거리로 올라가며 갱신하되, ★ 이번
+        밴드에서 실제로 채택(양쪽 다 신뢰됨)됐을 때만 갱신한다 ★ — 그래야 ll이 부족해
+        이번 밴드를 못 쓴 경우, 그 밴드의 (있을 수도 있는) 애매한 위치가 다음 밴드의
+        좌/우 탐색창 기준으로 오염되어 누적되는 걸 막는다. 좌/우 초기 위치는 ref_x(직전
+        프레임 확정 lane_center) 기준 ±(기대 차로폭/2)로 잡는다.
 
           입력 : ll_mask — (roi_h, roi_w) uint8 이진마스크(da_mask와 동일 shape/좌표계)
                  ref_x   — 첫(근거리) 밴드의 좌/우 분리 기준 x좌표. 보통 직전 프레임 lane_center.
           출력 : (results, used) — 둘 다 길이 self.n_slices.
                  results[i] : 채택되면 (y_center, cx), 아니면 None(da로 폴백해야 함을 뜻함)
                  used[i]    : results[i]가 ll 기반으로 채택됐는지(bool) — 디버그 시각화용
-        """
+
+        알려진 한계: 탐색창이 좁아진 만큼, 급커브에서 밴드 간 실제 선 이동량이
+        DL_LL_SEARCH_HALF_WIDTH_PX보다 크면 창이 선을 놓치고 그 밴드부터 계속 이전
+        위치에 멈춰 서게 된다(추적 이탈) — 실차 미검증, 급커브 구간에서 ll_bands 비율이
+        갑자기 뚝 떨어지는지 확인할 것."""
         h, w = ll_mask.shape
         slice_h = h // self.n_slices
         results = [None] * self.n_slices
         used = [False] * self.n_slices
-        cur_ref = ref_x
+
+        half_lane = (DL_LL_WIDTH_MIN_PX + DL_LL_WIDTH_MAX_PX) / 4.0  # 기대 차로폭의 절반 — 좌/우 초기 위치 추정용
+        cur_left = ref_x - half_lane
+        cur_right = ref_x + half_lane
+        win = DL_LL_SEARCH_HALF_WIDTH_PX
 
         for i in range(self.n_slices):
             y_high = h - i * slice_h
@@ -553,18 +570,19 @@ class DLSlideWindow(SlideWindow):
             band = ll_mask[y_low:y_high, :]
             y_center = (y_low + y_high) / 2.0
 
-            split = int(np.clip(cur_ref, 0, w))
-            left_band = band[:, :split]
-            right_band = band[:, split:]
+            lx0, lx1 = int(np.clip(cur_left - win, 0, w)), int(np.clip(cur_left + win, 0, w))
+            rx0, rx1 = int(np.clip(cur_right - win, 0, w)), int(np.clip(cur_right + win, 0, w))
+            if lx1 <= lx0 or rx1 <= rx0:
+                continue  # 탐색창이 화면 밖으로 완전히 밀려남(추적 이탈) — 스킵, cur_left/right 유지
 
-            M_l = cv2.moments(left_band, binaryImage=True)
-            M_r = cv2.moments(right_band, binaryImage=True)
+            M_l = cv2.moments(band[:, lx0:lx1], binaryImage=True)
+            M_r = cv2.moments(band[:, rx0:rx1], binaryImage=True)
 
             if M_l['m00'] < DL_LL_SIDE_MIN_PIXELS or M_r['m00'] < DL_LL_SIDE_MIN_PIXELS:
-                continue  # 한쪽 이상 안 보임 — 이 밴드는 da로 폴백(ref_x도 갱신 안 함)
+                continue  # 한쪽 이상 안 보임 — 이 밴드는 da로 폴백(cur_left/right도 갱신 안 함)
 
-            lx = M_l['m10'] / M_l['m00']
-            rx = split + M_r['m10'] / M_r['m00']
+            lx = lx0 + M_l['m10'] / M_l['m00']
+            rx = rx0 + M_r['m10'] / M_r['m00']
             width = rx - lx
             if not (DL_LL_WIDTH_MIN_PX < width < DL_LL_WIDTH_MAX_PX):
                 continue  # 폭이 비정상 — 반대 차선을 잘못 짝지었을 가능성, da로 폴백
@@ -572,7 +590,8 @@ class DLSlideWindow(SlideWindow):
             cx = (lx + rx) / 2.0
             results[i] = (y_center, cx)
             used[i] = True
-            cur_ref = cx  # 실제로 채택된 밴드에서만 다음 밴드 기준점 갱신
+            cur_left = lx
+            cur_right = rx
 
         return results, used
 
@@ -709,7 +728,7 @@ class DLSlideWindow(SlideWindow):
             lookahead = far_ref - self.roi_w / 2.0
         lane_center = self.roi_w / 2.0 + offset
 
-        # 명시적 경로(웨이포인트) — da 밴드 중심점에 다항식을 피팅해 만든다. 유효 밴드가
+        # 명시적 경로(웨이포인트) — da 밴드 중심점을 선형보간으로 이어 만든다. 유효 밴드가
         # 2개 미만이면 fitted_path가 None이 되고, 그 경우 _update_path()가 self.path를
         # 갱신하지 않아(직전 프레임 값 유지) offset/lane_offset과 동일한 "무효 프레임엔
         # 마지막 값 유지" 원칙을 따른다. 유효할 때도 그대로 대입하지 않고 직전 경로와
