@@ -1,15 +1,17 @@
 import cv2
 import numpy as np
 
+from .lane_util import CameraProcessor, SlideWindow
 # ── 정지선 감지 튜닝 파라미터 (전전년도 팀 실측값 그대로, 카메라 해상도 640x480 고정 가정) ──
 #   프로젝트 전체가 640x480 한 대의 카메라를 전제로 캘리브레이션돼 있어(BEV_SRC/DST, SIG_ROI 등)
 #   해상도가 달라지면 이 값들 전부 재보정 대상이므로, 비율 변환 없이 절대픽셀 그대로 사용.
 #   튜닝도 디버그 창에서 눈으로 사각형 맞추는 방식이라 절대픽셀이 더 직관적.
+#   ROI 크롭 좌표는 이 640x480 가정에 강하게 묶여있어 여기 그대로 두고, 임계값/디버그
+#   플래그만 config.py로 옮겼다(STOPLINE_TH는 track_drive.py에 있던 동명의 죽은 상수와
+#   헷갈리지 않게 STOPLINE_WHITE_RATIO_TH로 이름을 바꿨다).
 STOPLINE_ROI_Y0, STOPLINE_ROI_Y1 = 270, 320   # 세로 밴드
 STOPLINE_ROI_X0, STOPLINE_ROI_X1 = 150, 480   # 가로 중앙 크롭
-STOPLINE_WHITE_LOW = 180                      # 그레이스케일 흰색 임계
-STOPLINE_TH = 0.06                            # ROI 내 흰 픽셀 비율 임계 (실측: 1000/16500 ≈ 6%)
-DEBUG_VIZ_STOPLINE = False
+from ..config import STOPLINE_WHITE_LOW, STOPLINE_WHITE_RATIO_TH, DEBUG_VIZ_STOPLINE
 
 
 def check_stopline(image):
@@ -27,11 +29,11 @@ def check_stopline(image):
     _, binary = cv2.threshold(gray, STOPLINE_WHITE_LOW, 255, cv2.THRESH_BINARY)
 
     white_ratio = float(np.count_nonzero(binary)) / binary.size
-    detected = white_ratio > STOPLINE_TH
+    detected = white_ratio > STOPLINE_WHITE_RATIO_TH
 
     if DEBUG_VIZ_STOPLINE:
         vis = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
-        cv2.putText(vis, f'ratio={white_ratio:.3f} th={STOPLINE_TH:.2f}',
+        cv2.putText(vis, f'ratio={white_ratio:.3f} th={STOPLINE_WHITE_RATIO_TH:.2f}',
                     (4, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
         cv2.putText(vis, 'DETECTED' if detected else 'none',
                     (4, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
@@ -48,6 +50,10 @@ class LaneDetector:
     def __init__(self, camera_processor=None, slide_window_processor=None):
         self.camera_processor = camera_processor
         self.slide_window_processor = slide_window_processor
+        # hough_lane.HoughLaneDetector/dl_lane.DLLaneDetector와 동일하게 노출 —
+        # _update_lane_side()/controller.pure_pursuit이 백엔드 구분 없이 참조한다.
+        self.roi_w = 0
+        self.yellow_centers = []
 
     def set_processor(self, camera, slide_window):
         self.camera_processor = camera
@@ -56,15 +62,20 @@ class LaneDetector:
     def detect(self, frame):
         """
         입력 : 전방 카메라 BGR 프레임
-        출력 : (lane_valid, lane_offset, lane_lookahead, lane_center, bev)
+        출력 : (lane_valid, lane_offset, lane_lookahead, lane_center, path, bev)
+          path — ROI 픽셀좌표 (x,y) 웨이포인트 리스트, 가까운점→먼점 순
+          (lane_util.SlideWindow.calc_center()가 생성, controller.pure_pursuit이 소비)
         """
         bev, white_mask, yellow_mask = self.camera_processor.processor(frame)
 
         if bev is None:
-            return False, 0.0, 0.0, 320.0, None   # lane_center는 화면 중앙(640/2)을 기본값으로
+            # lane_center는 화면 중앙(640/2)을 기본값으로
+            return False, 0.0, 0.0, self.camera_processor.roi_w / 2, [], None
 
-        lane_valid, lane_offset, lookahead, lane_center = self.slide_window_processor.detect(
+        lane_valid, lane_offset, lookahead, lane_center, path = self.slide_window_processor.detect(
             bev, white_mask, yellow_mask
         )
+        self.roi_w = self.slide_window_processor.roi_w
+        self.yellow_centers = self.slide_window_processor.yellow_centers
 
-        return lane_valid, lane_offset, lookahead, lane_center, bev
+        return lane_valid, lane_offset, lookahead, lane_center, path, bev

@@ -1,0 +1,1238 @@
+# track_drive 테스트 가이드
+
+`track_drive.py`는 하나의 노드 안에서 신호등/차선/라바콘/장애물/추월을 전부 처리하는 2중 FSM 구조입니다
+(`MissionState` S0~S4 + `BehaviorState`/`Phase`). 인지 모듈은 `perception/`, 조향/회피 제어는 `controller/`,
+Hybrid A* 경로계획(B2 대안, 보존용)은 `planner/`에 모여 있습니다.
+
+## 🏁 대회 규정 요약 (국민대 자율주행 경진대회, 2026년 9회 — 본선 경주)
+
+> 출처: `2026년-9회대회-경주진행방법-7월29일자버전-1.pdf`(자이트론, 2026-07-29 버전). **본선 주행 경기(트랙
+> 미션) 규정만** 정리했습니다 — 주차 대회는 별도 경기라 제외했습니다. 대회 진행 방식과 미션은 **대회 직전까지
+> 변경될 수 있다고 원문에 명시**되어 있으니, 최종 확인은 항상 원본 공지로 할 것. 아래 규정이 `MissionState`
+> S0~S4 FSM(위 인트로 참고)과 `Phase`(라바콘→고정장애물→방해차량) 순서가 왜 그렇게 설계됐는지의 근거입니다.
+
+### 한눈에 보기
+- 차량: RC카 기반 자율주행 차량 (카메라 등 센서로 인식, ROS2 기반 SW)
+- 목표: 정해진 트랙을 **3바퀴** 자율주행하며 각 구간의 미션을 통과하고 결승선을 통과
+- 성적: `총 주행시간 = 순수 주행시간 + 벌초(penalty seconds)` — 시간이 짧을수록 좋은 성적
+- 경주는 오전 1회, 오후 1회 총 2회 진행되며 **둘 중 더 좋은 기록**으로 순위를 매김
+- 3바퀴 총 주행시간이 **4분(벌초 미포함)** 을 넘으면 실격
+
+### 미션 순서 (전체 흐름)
+```
+신호등 인식 출발
+   → 라바콘(러버콘) 구간 주행
+   → 차선인식 주행 (차선 준수)
+   → 고정장애물 회피 주행
+   → 방해차량(앞차) 추월 주행
+   → [트랙을 3바퀴 반복 주행, 이 중 2바퀴째 또는 3바퀴째 한 번만 "지름길" 선택 가능]
+   → 결승선 통과 (3바퀴 완주 후) → 경주 종료
+```
+
+### 트랙 구조
+- 트랙은 직사각형 순환 코스(반시계/시계 방향 하나의 루프)이며, 코스 중간에 트랙을 좌우로 나누는 **분기 구간
+  (지름길)** 이 있음(트랙 전체에 분기는 이 한 곳뿐).
+- 트랙 상 구간 배치(대략 시계 순서):
+  1. **출발 지점**: 4구 신호등 ↔ Gate(통과감지장치) 사이
+  2. **라바콘 구간**: 출발 직후 코너 부근, 지그재그로 배치된 라바콘 사이를 충돌 없이 통과
+  3. **차선 주행 구간**: 두 개의 실선(바깥쪽 경계) 사이를 벗어나지 않고 주행 (점선은 그냥 참고선, 1/2차선 구분 없음)
+  4. **고정 장애물 회피 구간**: 고장난 차량 모형 등 정지된 장애물을 충돌 없이 회피
+  5. **방해차량 추월 구간**: 저속으로 주행하는 방해차량을 추월
+  6. **신호등/지름길 분기점**: 트랙 중앙을 가로지르는 지름길 진입 여부를 결정하는 4구 신호등(좌회전 화살표
+     포함)이 있음
+  7. **결승선(Gate, 통과감지장치)**: 출발 지점 근처, 한 바퀴마다 통과 → 3바퀴 주행 시 총 3번 통과하면 경주 종료
+- 트랙을 총 **3바퀴** 주행해야 하며, **2바퀴째 또는 3바퀴째(마지막 바퀴) 중 한 번, 한 번만** 트랙 중앙의
+  지름길을 통과할 수 있음. 나머지 바퀴는 바깥쪽 정규 코스로 주행.
+
+### 진행 인력 / 셋업
+- 대회 당일 **차량에는 반드시 커버를 장착**하고 참가.
+- 팀원 2명 역할 분담: **팀원1**은 노트북을 들고 심판 옆에서 차량 SW를 원격 기동(`ros2 launch ...` 형태로
+  심판이 화면을 볼 수 있어야 함), **팀원2**는 트랙에서 차량을 따라다니며 벌점 상황 등에서 차량 터치 등 필요
+  조치를 수행.
+
+### 출발 절차 (신호등 인식 출발, `MissionState.S0_WAIT_GREEN`)
+- 출발 지점: Gate(통과감지장치)와 4구 신호등 사이. 심판이 신호등을 빨간불→파란불로 전환하는 순간부터
+  주행시간(랩타임) 측정 시작(중간 노란불 대기 없음).
+- **파란불 전 출발(신호위반)**: 10초 벌초 + 재출발 기회. 재출발에서도 빨간불에 출발하면 추가 10초 벌초 +
+  처음 출발 대기 위치로 재이동 후 재주행(`벌초 = 10초 + 10초 + 재위치 소요시간`).
+- 파란불로 바뀌었는데 출발 못 하면 차량 자세/위치를 전후좌우 **20cm 이내**로 손 조정 가능.
+- 파란불 전환 후 **1분 이내** 미출발 시 **실격**.
+
+### 주행 중 정지 금지 / 차량 터치 벌점
+- 주행시간 측정 시작 후 차량이 멈춘 채 **1분 이내**에 재개하지 못하면 **실격**.
+- 주행 중 사람이 차량에 손을 대면 **1회당 5초 벌초** (원칙적으로 심판 지시가 있을 때만). **한 바퀴 기준
+  15회(60초) 초과 시 실격.**
+
+### 라바콘 구간 (`Phase.LAVACON` / `BehaviorState.B1_LAVACON`)
+- 라바콘 충돌 시 **개당 3초 벌초** (충돌해도 정상 경로 주행 중이면 별도 조치 불필요).
+- 경로를 완전히 이탈하면 이탈 위치(앞바퀴가 이탈 발생 라바콘 위치 또는 그 뒤)로 옮겨 재주행 — **너무 앞으로
+  옮기면 안 됨**(부당하게 유리한 위치 금지).
+- **라바콘 구간을 1분 이내에 통과하지 못하면 실격.**
+
+### 차선 준수 주행 (`_lane_drive()`/`_lane_steer()`)
+- 양쪽 바깥쪽 **실선**을 벗어나지 않고 주행. 실선-실선 사이 어디로 주행해도 무방(점선/1·2차선 구분 없음).
+- **차선 이탈 판정 조건** (하나라도 해당하면 이탈위치로 옮겨 재주행):
+  1. 앞바퀴 2개가 동시에 실선 밖으로 나갈 때
+  2. 좌/우 바퀴 2개가 실선 밖 + 동시에 카메라(차량 중앙부)도 실선 밖(차량 절반 이상 이탈)
+  3. 좌/우 바퀴 2개가 실선 밖으로 나가서 **90cm 이상** 그 상태로 주행할 때
+- 코너 안쪽 컷을 막기 위해 일부 코너 안쪽에 **주행 방해용 고정 장애물**이 배치됨 — 여기 걸려 멈추면 빨리
+  판단해 터치(5초 벌초)로 옮겨야 함.
+
+### 고정 장애물 회피 (`Phase.FIXED_OBSTACLE` / `BehaviorState.B2_OBSTACLE`)
+- 고장난 차량 모형 등 정지 장애물을 충돌 없이 회피. 이 구간의 차선 이탈/터치는 위 일반 규정과 동일 적용
+  (별도 예외 없음).
+
+### 방해차량 추월 (`Phase.VEHICLE` / `BehaviorState.B3_VEHICLE`)
+- 방해차량 1대가 저속으로 1·2차선을 오가며 주행.
+- **추월 중에는 실선 이탈을 차선 이탈로 안 봄.** 추월 후 최대한 빨리 실선 안쪽 복귀 필요 — 복귀 후 방해차량과
+  간격이 **90cm 이상**이면 오히려 차선 이탈로 판정.
+- **추월 방향**: 방해차량이 주행 "안 하는" 차선 쪽으로만 추월 가능(같은 쪽 추월 시도는 차선이탈로 간주).
+- 뒤에서 추돌(가해) / 추돌당함(피해) 모두 각각 **10초 벌초**. 피해 시엔 50cm 이내로 앞으로 옮길 수 있음.
+
+### 지름길 분기 신호 (`MissionState.S2_INTERSECTION`, 1바퀴 주행 후)
+- 트랙 중앙 분기점 4구 신호등(좌회전 화살표 포함)에서 **좌회전(지름길) 신호**가 켜지면 지름길 진입 가능.
+- 좌회전(지름길) 신호는 **2바퀴째 시작 또는 3바퀴째(마지막 바퀴) 시작 중 랜덤으로 딱 한 번만** 등장 —
+  나머지는 항상 초록만 점등(직진 확정). 즉 지름길 선택 기회는 3바퀴 중 **정확히 한 번**.
+  - `signal_left_confirmed`(config.py `SIG_CONFIRM_FRAMES` 디바운스)가 이 좌회전 화살표 점등을 인식.
+
+### 시간 제한 및 실격 사유 총정리
+| 상황 | 조치 / 벌점 |
+|---|---|
+| 빨간불에 출발 | 10초 벌초 + 재출발 기회 |
+| 재출발에서도 빨간불에 출발 | 추가 10초 벌초 + 원위치 이동 후 재주행 (총 10+10초 + 재위치 시간) |
+| 파란불 전환 후 1분 내 미출발 | **실격** |
+| 주행 중 정지 후 1분 내 미재개 | **실격** |
+| 주행 중 차량 터치 1회 | 5초 벌초 (한 바퀴 기준 15회/60초 초과 시 **실격**) |
+| 라바콘 충돌 | 개당 3초 벌초 |
+| 라바콘 구간 1분 내 미통과 | **실격** |
+| 차선 이탈 (조건 3가지 중 하나 해당) | 이탈위치로 이동 후 재주행 |
+| 방해차량 추돌(가해/피해 모두) | 각 10초 벌초 |
+| 3바퀴 총 주행시간이 4분(벌초 제외) 초과 | 주행 중단 및 **실격** |
+| 결승선(Gate) 3회 통과 (3바퀴 완주) | 경주 종료 |
+
+### 성적 산출
+`총 주행시간 = 순수 주행시간 + 벌초 합계`. 오전/오후 각 1회 진행 → **두 기록 중 더 좋은(짧은) 시간**을
+최종 성적으로 채택, 짧은 순으로 순위 결정.
+
+---
+
+## ⚙️ 실차 테스트 중 값을 바꾸려면 → `config.py` 하나만 보세요
+
+**튜닝 파라미터, 디버그 on/off, 미션 state 관련 플래그가 전부 [`config.py`](config.py) 한 파일에
+모여 있습니다.** `track_drive.py`를 포함한 프로젝트 거의 모든 모듈이 `from .config import *`
+(또는 `from ..config import ...`)로 이 값을 가져다 씁니다 — 즉 `config.py`만 고치면 그 값을 쓰는
+모든 파일에 동시에 반영됩니다. 개별 모듈 파일(`track_drive.py`, `perception/dl_lane.py` 등)을
+헤집을 필요가 없습니다. `config.py` 안은 아래 순서로 구성돼 있습니다:
+
+1. 차선인식 백엔드 선택 (`LANE_DETECTOR_BACKEND`)
+2. 차량 속도/조향 기본값
+3. 차선인식(`dl_lane.py`) 세부 튜닝 — BEV 적용여부 포함
+4. 조향 컨트롤러 선택 (`STEERING_CONTROLLER`, Pure Pursuit/LQR 각 파라미터)
+5. 디버깅 ON/OFF (모든 `DEBUG_VIZ_*`)
+6. 미션 State / 실차 테스트 범위 제한 (`START_STATE`, `TEST_*`, 바퀴 카운트 등)
+7. 기타 튜닝 파라미터(PID, 트리거, 회피, 신호등, 정지선, 단위환산 등)
+
+**`config.py`에 없는 값들:** OpenCV 알고리즘 내부값(Canny/Hough 임계값, 블러 커널 크기 등)처럼
+"행동을 튜닝한다"기보다 "그 함수 내부 구현"에 가까운 상수, 그리고 현재 기본 백엔드가 아닌
+`hough`/`classic_cv` 차선인식·Hybrid A* B2 대안의 세부 알고리즘 상수는 원래 파일에 그대로
+남아있습니다. 아래 각 절의 참조 표시(`파일:줄번호`)를 따라가면 됩니다.
+
+실행 명령은 공통입니다:
+```bash
+ros2 launch track_drive track_drive.launch.py
+```
+
+## 공통 주의사항
+
+- **테스트 종료는 항상 `Ctrl+C`로**, launch가 "process has finished cleanly"까지 뜨는 걸 확인하고 끄세요.
+  `Ctrl+Z`(정지)나 터미널 강제종료는 `usb_cam_node_exe` 등이 좀비로 남아 `/dev/video0`를 붙잡고, 다음 실행에서
+  카메라가 아예 안 잡히는 원인이 됩니다. 증상 발생 시:
+  ```bash
+  sudo fuser -k /dev/video0                      # 카메라만 문제일 때 가장 빠른 해결
+  ps -eo pid,stat,cmd | awk '$2 ~ /^T/ && /usb_cam|ros2 launch|xycar_lidar|imu_node|track_drive/ {print $1}' | xargs -r kill -9   # 좀비 전체 정리
+  ```
+- `SPEED_NORMAL`([config.py:73](config.py#L73))을 `0.0`으로 두지 마세요. `_lane_drive()`에서 나눗셈
+  분모로도 쓰여서 `ZeroDivisionError`로 노드가 죽습니다. 저속 테스트는 `5.0`~`10.0` 같은 작은 양수를 쓰세요.
+- 실제 모터 구동은 ROS2 노드만으로 안 됩니다. 대회/실차 기준 **Docker(ROS1) 컨테이너 + `ros1_bridge`**가 같이
+  떠 있어야 합니다 (`/xycar_motor`는 `Float32MultiArray([angle, speed])`로 브릿지됨 — 구형 `XycarMotor` 커스텀
+  메시지는 `ros1_bridge`가 매핑을 못 함). 체크리스트: ①도커 컨테이너 기동 ②`ros1_bridge` 프로세스 기동 확인.
+- **모든 디버그 창 스위치는 `config.py`의 "5. 디버깅 ON/OFF" 절 한곳에 모여 있습니다** — 예전엔
+  `track_drive.py`에 `DEBUG_VIZ`/`DEBUG_VIZ_LANE`이라는 죽은 플래그(정의만 있고 어디서도 안 쓰임)가
+  있어서 실제 스위치(각 `perception/*.py`)와 헷갈리기 쉬웠는데, `config.py`로 통합하면서 이 죽은
+  플래그들은 삭제했습니다. 아래 표가 실제 스위치 위치입니다.
+
+| 기능 | 디버그 창 ON/OFF 스위치 (`config.py`) |
+|---|---|
+| 신호등(S0/S2 공용) | `DEBUG_VIZ_SIGNAL` |
+| 차선 — 기본 백엔드(`dl`) | `DEBUG_VIZ_DL_LANE` |
+| 차선 — 대안 백엔드(`hough`) | `DEBUG_VIZ_HOUGH_LANE` |
+| 차선 — 대안 백엔드(`classic_cv`) | `DEBUG_VIZ_LANE` |
+| 정지선(백엔드와 무관하게 항상 동작) | `DEBUG_VIZ_STOPLINE` |
+| 라이다 BEV(장애물) | `DEBUG_VIZ_LIDAR` |
+| 라이다 BEV(라바콘 트리거) | `DEBUG_VIZ_LAVACON` |
+| 조향 컨트롤러 상태 | `DEBUG_VIZ_STEER` |
+
+> **(2026-08-06)** `DEBUG_VIZ_LIDAR` 기본값을 `True`→`False`로 변경했습니다. 필요할 때만 켜서 쓰세요.
+
+> 이 프로젝트는 YOLO(yolo_ros)를 사용하지 않습니다 — 모든 인지는 카메라(차선/신호등)와 라이다(장애물/라바콘)만으로 수행합니다.
+
+---
+
+## 0. 차선인식 백엔드 선택
+
+`perc_lane()`은 `self.lane_detector.detect(frame) -> (valid, offset, lookahead, lane_center, path, debug_img)`
+인터페이스에만 의존하는 pluggable 구조라, 셋 중 하나를 자유롭게 골라 끼울 수 있습니다
+([config.py:67](config.py#L67) `LANE_DETECTOR_BACKEND`).
+
+| 값 | 구현 | 상태 |
+|---|---|---|
+| `'dl'` | `perception/dl_lane.py`의 `DLLaneDetector` (TwinLiteNet ONNX 세그멘테이션, 별도 스레드 추론) | **현재 기본값** |
+| `'hough'` | `perception/hough_lane.py`의 `HoughLaneDetector` | 대안, 실차 라바콘 테스트까지 검증됨. `'dl'` 초기화 실패 시 자동 폴백 |
+| `'classic_cv'` | `perception/lane_util.py`(`CameraProcessor`+`SlideWindow`) + `perception/perc_floor.py`(`LaneDetector`) 조립 | 보존용, 현재 라이브 미검증 |
+
+`'dl'` 선택 시 `onnxruntime` 미설치나 `models/best.onnx` 부재 등으로 초기화가 실패하면 `_build_lane_detector()`
+([track_drive.py:303-323](track_drive.py#L303))가 에러를 로깅하고 자동으로 `'hough'`로 폴백합니다(조용히
+무시하지 않음) — 노드 시작 로그에 `DL 차선인식 백엔드 초기화 실패, hough로 폴백합니다` 가 찍혔는지 꼭 확인하세요.
+
+---
+
+## 0.5 조향 컨트롤러 선택 (Pure Pursuit / LQR)
+
+차선 추종(`_lane_steer()`, [track_drive.py:1141](track_drive.py#L1141))도 백엔드처럼 pluggable합니다.
+`self.pure_pursuit`과 `self.lqr` 둘 다 미리 생성해두고([track_drive.py:198-221](track_drive.py#L198),
+튜닝값은 전부 `config.py`의 `PP_*`/`LQR_*`에서 가져옴), `STEERING_CONTROLLER`([config.py:176](config.py#L176))
+값에 따라 어느 쪽을 쓸지 고릅니다. `_lane_drive()`(S1/S3 차선주행)와 S2 진입 전 감속 구간이 전부 이
+하나를 거치므로, 플래그만 바꾸면 차선 추종 전체가 전환됩니다.
+
+```python
+STEERING_CONTROLLER = 'pure_pursuit'  # 'pure_pursuit' | 'lqr'
+```
+
+| 값 | 구현 | 상태 |
+|---|---|---|
+| `'pure_pursuit'` | `controller/pure_pursuit.py`의 `PurePursuitController` (기하학적, 속도/커브 적응형 lookahead) | **현재 기본값** |
+| `'lqr'` | `controller/lqr.py`의 `LQRController` (횡오차/헤딩오차 2-state 운동학 LQR) | 신규, 실차 미검증 |
+
+**주의:** `pure_pursuit.control()`은 속도적응형 lookahead 때문에 `speed=` 인자를 받지만, `lqr.control()`은
+자체 `speed_gain` 튜닝값을 쓰고 그 인자가 없습니다 — 그래서 `_lane_steer()`가 컨트롤러별로 분기해서
+호출합니다([track_drive.py:1158-1160](track_drive.py#L1158)). 두 컨트롤러를 직접 갖다 붙일 일이 있으면
+이 시그니처 차이를 꼭 확인하세요.
+
+**[2026-08-05, LQR 브랜치에서 이식] 단위버그 수정 — 픽셀/미터 두 모드:** 원래 `Q=diag(1,1)`이 `e_y`(px,
+O(1~100))와 `e_psi`(rad, O(0.01~0.5))를 같은 가중치로 취급해서, 미세한 오차에도 조향각이 클램프(±100°)까지
+튀는 버그가 실차 영상에서 확인됐다(`e_y=-40px` 하나만 넣어도 클램프 전 raw 조향각이 1234°). `LANE_DETECTOR_BACKEND=='dl'
+and DL_USE_BEV`이면 `track_drive.py`가 자동으로 `DL_PIXELS_PER_METER`를 넘겨 `e_y`를 미터로 환산하는
+**미터 모드**로 동작(같은 `e_y=-40px`에서 raw 조향각이 10.2°로 정상화됨) — 그 외 백엔드에서는 `None`이
+넘어가 기존 픽셀 게인 방식(**레거시 모드**)으로 자동 폴백한다(`controller/lqr.py` 상단 주석 참고).
+
+**LQR 튜닝 파라미터** (`config.py` `LQR_*`, 전부 실차 미검증):
+| 파라미터 | 의미 | 비고 |
+|---|---|---|
+| `LQR_R_STEER=1.0` | 조향각 가중치(올릴수록 조향 억제, 지그재그 완화) | `Q_LATERAL`/`Q_HEADING` 건드리기 전에 먼저 조정 |
+| `LQR_Q_LATERAL=1.0` / `LQR_Q_HEADING=1.0` | 횡오차/헤딩오차 비중 | lateral 비중↑ → 중앙복귀 서두름(오버슈트 위험), heading 비중↑ → 각도부터 맞추고 천천히 복귀 |
+| `LQR_ALPHA=0.5` | 프레임간 저역통과 필터 | 반응이 느리면 올리고, 잔떨림이 있으면 낮출 것 |
+| `LQR_WHEELBASE_M=0.26` / `LQR_SPEED_MPS=1.0` | [미터 모드] 실측 축거(m) / 속도 추정치(m/s) | `wheelbase_m`은 줄자 실측 가능. `speed_mps`는 엔코더 연동 전 임시값 — 실차 최우선 튜닝 대상 |
+| `LQR_HEADING_PROBE_M`/`LQR_MIN_PATH_M=0.3` | [미터 모드] 헤딩오차 참조거리 / 최소 경로길이(m) | 노이즈 방지 안전장치 |
+| `LQR_WHEELBASE_GAIN=50.0` / `LQR_SPEED_GAIN=120.0` | [레거시 모드 전용] 조향 강도 / 속도 대응값 | `pixels_per_meter=None`일 때만 사용 |
+| `LQR_HEADING_PROBE_PX`/`LQR_MIN_PATH_PX=65.0` | [레거시 모드 전용] 노이즈 방지 안전장치 | 조향이 자꾸 직전값 유지로 빠지면 낮출 것 |
+
+**디버그 방법:**
+- 창: `DEBUG_VIZ_STEER = True`(기본값, [config.py:218](config.py#L218)) → `steer_debug` 창에서
+  지금 어느 컨트롤러가 쓰이는지, 이번 프레임이 "직전값 유지"(주황)인지 "현재값 반영"(초록)인지, 조향각과
+  (`lqr`일 때) 횡오차 `e_y`/헤딩오차 `e_psi`까지 한글로 보여줍니다(디버그 표시는 미터 모드에서도 항상 픽셀
+  단위). cv2 기본폰트가 한글을 못 그려서 `kr_text.py`의 PIL 기반 렌더러를 씁니다 — 한글 폰트가 없는 환경이면
+  영문 fallback으로 표시됩니다.
+
+**알려진 한계:**
+- LQR은 아직 실차 튜닝 전입니다. 처음 켤 때는 저속에서, 언제든 사람이 개입할 수 있는 상태로 테스트하세요.
+- `localization/pose_estimator.py`의 `EncoderPoseEstimator`가 `self.pose_estimator`로 준비돼 있지만
+  ([track_drive.py:249](track_drive.py#L257)), 실제 엔코더 ROS 토픽이 아직 확인 전이라 **어떤 콜백도
+  갱신하지 않는 미배선 상태**입니다. 미터 모드도 지금은 이 pose 추정기를 쓰지 않고 `LQR_SPEED_MPS`(튜닝
+  임시값)로 대신합니다 — 엔코더 토픽이 확인되면 실제 m/s를 `set_speed_mps()`(레거시 모드면 `set_speed_gain()`)에
+  매 프레임 넣어주는 식으로 전환할 것.
+
+### 0.5.1 코너 진입 시 회전반경 기반 감속 (`pure_pursuit` 전용)
+
+`_lane_drive()`([track_drive.py:1121](track_drive.py#L1121))는 조향각 크기(`turn_now`)와 lookahead
+편차(`turn_preview`)로 이미 코너에서 감속하는데, 여기에 **ROS2 Nav2의 Regulated Pure Pursuit**과 같은
+방식의 감속을 추가했습니다([track_drive.py:1104](track_drive.py#L1104) `_corner_radius_speed_scale()`).
+
+`pure_pursuit.control()`이 조향각을 계산하며 이미 구하는 `curvature`를 `self.pure_pursuit.last_curvature`로
+저장해두고(`controller/pure_pursuit.py`), 회전반경(`1/curvature`)이 `CORNER_MIN_RADIUS_PX`
+([config.py:87](config.py#L87), 기본 250px)보다 작아지면(=코너가 타이트해지면) 그 비율만큼
+목표속도를 깎습니다 — Nav2의 `curvatureConstraint()`와 동일한 공식
+(`속도 *= max(CORNER_MIN_SPEED_SCALE, 반경/CORNER_MIN_RADIUS_PX)`). 기존 `turn_now`/`turn_preview` 기반
+감속을 대체하는 게 아니라, 둘 중 더 낮은 속도를 쓰는 **추가 안전판**입니다.
+
+`PIXELS_PER_METER`가 미실측이라 반경도 미터가 아니라 픽셀 단위입니다. `CORNER_MIN_RADIUS_PX=250px`는
+`PP_LOOKAHEAD_BASE_PX(90)~PP_LOOKAHEAD_MAX_PX(150)`(둘 다 config.py) 범위에서 alpha 20~30도짜리 코너의
+반경을 역산해 다소 이르게(보수적으로) 개입하도록 잡은 추정치일 뿐 실차 미검증입니다.
+
+`STEERING_CONTROLLER='lqr'`일 때는 적용되지 않습니다 — LQR은 curvature가 아니라 횡오차/헤딩오차
+상태로 도는 별개 모델이라 이 반경 개념 자체가 안 맞습니다.
+
+**왜 추가했나:** 짧은 lookahead에서 조향이 얼어붙던 버그를 고친 뒤에도, 코너처럼 회전반경이 급격히
+작아지는 구간은 여전히 픽셀 노이즈에 민감합니다. 회전반경이 작아질수록 미리 속도를 낮춰두면, 같은
+각도 오차라도 프레임당 실제로 밀리는 거리가 줄고 인지/제어 루프가 반응할 시간을 더 벌 수 있어
+진동 억제에도 도움이 됩니다.
+
+### 0.5.2 코너 진입 시 lookahead 축소 (curvature 기반, `pure_pursuit` 전용)
+
+Lee, Lee & Moon, *"Frequency Shaping-Based Control Framework for Reducing Motion Sickness in
+Autonomous Vehicles"* (Sensors 2025, 25, 819)의 "가변 LAD(Look-Ahead Distance)" 아이디어를
+반영했습니다. 그 논문은 GPS+사전 지도로 "지금 위치에서 LAD만큼 앞의 실제 커브 반경"을 미리 조회해
+LAD를 정하는데, 이 프로젝트는 그런 전역 지도/위치추정이 없어 그대로는 못 씁니다. 대신 **직전 프레임에
+이미 계산해둔 `self.last_curvature`**로 반응형 버전을 구현했습니다([controller/pure_pursuit.py:34](controller/pure_pursuit.py#L34)
+`lookahead_curvature_gain`/`lookahead_min_px`(생성자 파라미터명, 실제 값은 config.py의
+`PP_LOOKAHEAD_CURVATURE_GAIN`/`PP_LOOKAHEAD_MIN_PX`), [153](controller/pure_pursuit.py#L153) `control()`) —
+직전 프레임이 타이트한 코너였으면 이번 프레임 lookahead를 속도 기반 값보다 낮춰서(최소
+`PP_LOOKAHEAD_MIN_PX=40px`까지) 더 촘촘하게 추종하고, 직진이면(curvature≈0) 원래 속도 기반 값을 그대로
+씁니다. 한 프레임 지연된 반응이라 논문만큼 정교하진 않습니다.
+
+**주의 — `PP_MIN_LOOKAHEAD_PX`와 별개입니다:** lookahead를 줄이는 하한(`PP_LOOKAHEAD_MIN_PX=40`)과, curvature
+분모를 바닥까는 하한(`PP_MIN_LOOKAHEAD_PX=90`, 짧은 lookahead 얼어붙음 버그 수정에서 쓰인 값)은 이름이
+비슷하지만 완전히 다른 역할입니다(둘 다 config.py에 있음). 후자를 코너에서도 고정 90으로 두면 curvature
+계산의 ld가 거의 항상 90으로 다시 눌려서 lookahead 축소 효과가 무효화되므로,
+`ld = max(hypot(dx,dy), min(min_lookahead_px, lookahead_px))`로 — lookahead가 의도적으로 줄어든
+프레임에는 그 줄어든 값 자체를 바닥으로 쓰도록 함께 수정했습니다([controller/pure_pursuit.py:228](controller/pure_pursuit.py#L228)).
+
+**버그 — 자기순환 lookahead 락업 (2026-08-06 디버그 영상에서 발견, 같은 날 수정):** 위 구현은 damp
+근거로 **직전 프레임에 이미 계산된** `self.last_curvature`를 그대로 재사용했습니다. 이게 자기순환
+피드백을 만듭니다 — lookahead가 한번 짧아지면(`ld`↓), `curvature = 2·sin(α)/ld` 공식상 ld가 작을수록
+같은 픽셀 단위 dx도 더 크게 증폭되어 curvature가 커지고, 그 커진 curvature가 `self.last_curvature`로
+저장돼 다음 프레임 lookahead를 또 줄여버립니다. 한번 이 루프에 걸리면 실제 경로가 직진으로 돌아와도
+lookahead가 `PP_LOOKAHEAD_MIN_PX(40px)` 근처에 계속 눌려있어 절대 원래 lookahead(90px+)로 복귀하지
+못합니다.
+
+- **실차 증상**: `dl_lane` 디버그 창을 녹화한 영상(2026-08-06 14:05)에서, `offset:+1.5px`(차선 중앙에
+  거의 붙어있는, 육안으로도 직진 구간)인 프레임에서 조향각이 `ang=-65.7°`로 15초 넘게 고정. 같은 구간
+  오버레이의 lookahead 표시(`ld:`)가 매 프레임 40px(하한)에 눌려있었음 — 조향기가 경로 전체가 아니라
+  차량 바로 앞 40px짜리 구간만 보고 있었다는 뜻.
+- **고침**: damp 판단을 "직전에 실제로 쓴 lookahead에서 나온 curvature"가 아니라, **매 프레임 댐핑
+  적용 전 고정 기준 lookahead(`probe_px`)로 새로 계산한 `probe_curvature`**로 바꿨습니다
+  ([controller/pure_pursuit.py:195](controller/pure_pursuit.py#L195)). probe는 항상 같은 기준 거리에서
+  다시 재므로 "지금 경로가 진짜 코너인지"를 매 프레임 독립적으로 재평가해 순환을 끊습니다. 코너
+  감속(0.5.1)이 참조하는 `last_curvature`는 여전히 실제로 사용된(댐핑된) lookahead 기준으로 계산해
+  "지금 얼마나 세게 도는지"라는 원래 의미를 그대로 유지합니다.
+
+**알려진 한계:**
+- `PP_LOOKAHEAD_CURVATURE_GAIN=100.0`, `PP_LOOKAHEAD_MIN_PX=40px`(둘 다 config.py) 모두 추정치입니다
+  (`curvature=0.01`, 반경≈100px짜리 중간 코너에서 배율 0.5가 되도록 잡음). `steer_debug` 창이나 CLI
+  로그로 관찰하며 튜닝이 필요합니다.
+- `STEERING_CONTROLLER='lqr'`일 때는 적용되지 않습니다 — `lqr.py`는 curvature 개념 자체가 없습니다.
+- probe도 근거리 밴드 자체가 구조적으로(노이즈가 아니라 매 프레임 일관되게) 옆으로 치우쳐 있으면 여전히
+  큰 curvature를 재현합니다(자기순환은 끊었지만 "근거리 세그멘테이션이 원래 부정확한" 문제 자체를
+  고치진 않음) — da/ll 세그멘테이션 정확도 쪽(2.1/2.2절)이 근본 대응입니다.
+
+### 0.5.3 진동을 코너로 오인해 매번 감속하는 문제 (`pure_pursuit` 전용, 2026-08-06)
+
+`pure_pursuit`은 구조상 차선 중앙 부근에서 좌우로 조금씩 진동("와리가리", `PATH_EMA_ALPHA`/`PP_ALPHA`
+주석에서 여러 차례 다룬 문제)하는데, 실차에서 이 진동이 있을 때마다 속도가 팍팍 줄었다 늘었다 하는
+증상이 확인됐습니다.
+
+**원인:** `_lane_drive()`의 코너 감속 두 갈래(3제곱 `turn_for_speed` 감속, `_corner_radius_speed_scale()`)
+가 전부 "이번 틱 `abs(ctrl_angle)`"(혹은 그로부터 나온 curvature)을 그대로 코너 판단 신호로 썼습니다.
+진동은 부호만 계속 바뀔 뿐인데, `abs()`를 취하면 부호 정보가 사라져서 진동의 매 스윙이 "지금 급하게
+꺾고 있다"는 신호로 그대로 들어갑니다 — 실제 코너와 구분이 안 됐던 것. 게다가 `_corner_hold`(가속
+제한용 peak-hold, 감쇠만 하고 절대 즉시 안 내려감)가 `max(turn_now, ...)`로 매 진동 스윙마다 다시
+갱신되니, 속도가 깎인 뒤 다시 올라오는 것까지 늦어져 체감상 더 심하게 느껴졌습니다.
+
+**수정:** 코너 판단 신호를 `self.ctrl_angle`의 **signed(부호를 유지한) EMA**(`self._corner_signal`,
+`CORNER_SIGN_EMA_ALPHA=0.15`, [config.py](config.py))로 바꿨습니다([track_drive.py:1202](track_drive.py#L1202)
+`_lane_drive()`, [1185](track_drive.py#L1185) `_corner_radius_speed_scale()`). 핵심은 **abs()를 EMA
+"이후"에 적용**하는 것 — 진동처럼 부호가 계속 바뀌면 signed EMA 단계에서 서로 상쇄돼 0 근처로
+수렴하고(그 다음 abs를 취해도 여전히 작음), 실제 코너처럼 한 방향으로 계속 꺾이면 EMA가 실제 각도로
+수렴합니다(부호가 안 바뀌니 상쇄될 게 없음). `turn_for_speed`·`_corner_radius_speed_scale`·`_corner_hold`
+전부 이 하나의 신호를 공유하므로 세 군데를 따로 고칠 필요 없이 한 번에 해결됩니다.
+
+시뮬레이션(파이썬, 20Hz 가정)으로 확인한 결과:
+- 매틱 부호가 바뀌는 진동(±25°): `turn_now` 최대 0.0375, 평균 0.02 — 사실상 무시됨.
+- 4틱마다 반전하는 더 느린 진동(±35°): `turn_now` 최대 0.17 — 예전 방식(고정 0.35)의 절반 이하.
+- 한 방향으로 유지되는 실제 코너(+40°): 20틱(≈1초)만에 `turn_now`가 0.38까지 수렴, 60틱에 0.40(정상
+  포화값)에 도달 — 실제 코너는 여전히 정상적으로 감지·감속됩니다.
+
+**알려진 한계:**
+- `CORNER_SIGN_EMA_ALPHA=0.15`(시정수 ≈0.33초)는 실차 미검증 첫 추정치입니다. 값을 낮추면 진동 상쇄는
+  더 잘 되지만 실제 코너 진입 감속도 그만큼 늦어집니다 — `turn_preview`(원거리 lookahead 기반 예측감속,
+  이 신호와 무관하게 독립적으로 동작)가 어느 정도 보완하지만, 너무 낮추면 급코너에서 감속이 늦어 위험할
+  수 있습니다. 실차에서 진동 주기와 코너 반응 속도를 같이 보며 조정할 것.
+- 실제 조향 출력(`self.ctrl_angle`, 서보에 나가는 값)은 그대로입니다 — 이 수정은 "속도 계획이 진동에
+  덜 민감해지는 것"이지 진동 자체(pure_pursuit의 근본 특성)를 없애지 않습니다. 진동 자체를 줄이려면
+  `PP_ALPHA`/`PATH_EMA_ALPHA`/`PP_DX_DEADZONE_PX`(전부 config.py) 쪽을 볼 것.
+
+### 0.5.4 VESC 실측속도를 lookahead 계산에 반영 (`pure_pursuit` 전용, 2026-08-06)
+
+`pure_pursuit`의 속도 적응형 lookahead(`PP_LOOKAHEAD_SPEED_GAIN`)는 원래 "실제로 얼마나 빨리 달리고
+있는가"를 봐야 하는데, 지금까지는 `self._prev_speed`(직전 **명령**속도, 모터단위)를 근사치로 썼습니다.
+§7에서 이식한 VESC 실측속도(`self.v_mps`)가 이제 있으니, 이걸 쓰도록 바꿨습니다
+([track_drive.py:1222](track_drive.py#L1222) `_speed_for_lookahead()`, [1265](track_drive.py#L1265) 호출부).
+
+**동작:** VESC가 살아있으면(최근 `VESC_STALE_SEC` 이내 수신 + `abs(v_mps) >= VESC_MIN_SPEED_MPS`)
+`v_mps`를 `METERS_PER_SPEED_UNIT`(§6.5 실측 회귀)로 나눠 "명령속도와 같은 단위"로 역환산해서 씁니다 —
+그러면 `PP_LOOKAHEAD_SPEED_GAIN`/`PP_LOOKAHEAD_BASE_PX` 등 기존에 명령속도 스케일로 튜닝된 값을 그대로
+재사용할 수 있습니다(단위를 바꾸면 게인도 전부 재튜닝해야 하므로 일부러 이렇게 함). VESC가 안 살아있으면
+예전처럼 `self._prev_speed`로 폴백합니다.
+
+**왜 도움이 되나:** 모터 데드존/가속 지연/슬립 때문에 "명령≠실제"인 구간(§2.3에서 다룬 코너 급감속
+직후 등)에서, 예전엔 명령값 기준으로 lookahead를 계산해 실제 속도와 안 맞을 수 있었습니다. 실측값을
+쓰면 그 구간에서도 lookahead가 실제 주행 상태를 반영합니다.
+
+**알려진 한계:**
+- `VESC_MIN_SPEED_MPS=0.05`(config.py, §7에서 이미 LQR용으로 쓰던 값을 공유 — 이름을
+  `LQR_MIN_SPEED_MPS`에서 `VESC_MIN_SPEED_MPS`로 일반화했습니다)가 그대로 재사용됩니다.
+- ROS1 `vesc_speed_bridge.py`가 안 떠 있으면 항상 폴백 경로만 타므로, 실제 개선 효과는 그 브리지가
+  실차에서 살아있을 때만 발생합니다 — §7의 `vesc_debug` 창으로 확인할 것.
+- 실차 미검증 — 폴백/실측 전환이 자주 일어나면(예: VESC 메시지가 간헐적으로 끊기는 경우) lookahead가
+  단위 사이를 오가며 미세하게 들쭉날쭉할 수 있습니다. 실측해보고 문제되면 전환 시 저역통과를 추가로
+  걸 것.
+
+### 0.5.5 IMU 실측 curvature로 코너 감쇠 보강 (`pure_pursuit` 전용, 2026-08-06)
+
+§0.5.2의 코너 진입 lookahead 감쇠는 지금까지 `probe_curvature`(비전 경로에서 뽑은 "아직 안 가본 앞쪽이
+얼마나 휘었는지" 추정치) 하나에만 의존했습니다. IMU가 이번에 살아나면서(§8), "차량이 지금 실제로 얼마나
+돌고 있는지"를 자이로로 직접 재서 이 판단을 보강하도록 바꿨습니다.
+
+**구조** (`_imu_curvature_px()`, [track_drive.py:1241](track_drive.py#L1241)):
+1. `cb_imu()`가 `msg.angular_velocity.z`(yaw rate, rad/s)를 `self.imu_yaw_rate`로, 수신 시각을
+   `self._imu_t`로 저장합니다(기존엔 `orientation`만 쓰고 각속도는 버리고 있었음).
+2. `kappa_m = imu_yaw_rate_ema / v_mps`(VESC 실측속도, §7)로 실제 curvature(1/m)를 구하고,
+   `DL_PIXELS_PER_METER`(=200px/m)로 나눠 `pure_pursuit`이 쓰는 픽셀 curvature 단위로 맞춥니다 —
+   이 환산은 `PP_WHEELBASE_PX`(§6.8)와 동일하게 `dl+BEV` 조합에서만 유효합니다.
+   - **[2026-08-06 같은 날 보완] `imu_yaw_rate` 저역통과 추가.** `probe_curvature`는 경로 위 여러
+     점을 누적한 값이라 어느 정도 스무딩이 걸려있는데, 자이로 순간값(`imu_yaw_rate`)은 그런 스무딩이
+     없었습니다. 바로 아래 3번처럼 두 값 중 절댓값이 큰 쪽을 그대로 채택하는 구조라, 스무딩이 없는
+     쪽이 노이즈 스파이크 한 프레임만으로 감쇠를 확 눌러버릴 위험이 있어서 — `IMU_YAW_RATE_EMA_ALPHA`
+     (=0.3, config.py, `PP_ALPHA`/`CORNER_SIGN_EMA_ALPHA`와 동일한 관례)로 저역통과한
+     `self._imu_yaw_rate_ema`를 대신 씁니다(`_imu_curvature_px()`, [track_drive.py:1246](track_drive.py#L1246)).
+     IMU/VESC가 죽어있는 동안엔 이 EMA도 갱신을 건너뛰고 그대로 얼어있습니다(held 프레임에
+     `last_curvature`를 안 건드리는 것과 같은 원칙) — 다시 살아나면 몇 프레임 안에 자연 수렴합니다.
+3. `controller/pure_pursuit.py`의 `control()`이 `probe_curvature`와 이 `imu_curvature_px` 중
+   **절댓값이 더 큰 쪽**으로 감쇠를 겁니다 — 비전이 못 본 코너를 IMU가 잡아내는 경우(또는 그 반대)를
+   놓치지 않기 위한 보수적 선택입니다. 부호는 안 맞춥니다(`abs()`로만 쓰여서 실차 미검증인 IMU 부호규약이
+   실제 조향에 영향을 못 줍니다).
+
+**가드 — IMU/VESC 둘 다 살아있을 때만 반영:** `LANE_DETECTOR_BACKEND=='dl' and DL_USE_BEV`가 아니거나,
+IMU가 죽어있거나(`IMU_STALE_SEC=0.5` 이상 미수신), VESC가 죽어있으면(§7 `VESC_STALE_SEC`/
+`VESC_MIN_SPEED_MPS` 동일 기준, `_vesc_live()`로 통합) `_imu_curvature_px()`가 `None`을 반환하고
+`pure_pursuit`은 기존처럼 `probe_curvature` 단독 판단으로 자동 폴백합니다 — 코드가 항상 들어가 있어도
+센서 중 하나라도 안 살아있으면 동작이 예전과 완전히 동일합니다.
+
+**현재 상태 (2026-08-06):** VESC가 지금 실차에서 안 잡히는 상태라(§7) `_imu_curvature_px()`가 항상
+`None`을 반환 중 — 즉 이 기능은 지금 당장은 아무 영향이 없습니다(의도된 동작). VESC 연결만 복구되면
+코드를 더 안 건드려도 자동으로 활성화됩니다.
+
+**확인 방법:** `DEBUG_VIZ_STEER=True`(기본값)의 `steer_debug` 창에 `pure_pursuit` 모드일 때
+`lookahead/curvature` 값과 `IMU curvature:` 줄이 추가로 표시됩니다 — 회색 `미반영(IMU/VESC 확인)`이면
+아직 폴백 중, 초록색 숫자가 뜨면 실제로 이번 프레임 감쇠 판단에 IMU 값이 반영된 것입니다.
+
+**알려진 한계:**
+- IMU 각속도 부호규약(z축 +가 좌/우 중 어느 쪽인지)이 실차 미검증입니다. 위에서 설명한 대로 `abs()`로만
+  쓰여서 조향 자체엔 영향이 없지만, 나중에 다른 용도로 부호를 쓰게 되면 먼저 검증할 것.
+- `probe_curvature`와 (저역통과된) `imu_curvature_px`를 여전히 단순 `max(abs, abs)`로만 합칩니다 —
+  실제로 어느 쪽이 더 신뢰할 만한지 가중치를 다르게 주는 것(칼만 필터 등)은 아직 안 함. 실차 데이터
+  쌓이면 재검토.
+- `IMU_YAW_RATE_EMA_ALPHA=0.3`도 다른 값들처럼 실차 미검증 추정치입니다. VESC 복구 후 `steer_debug`의
+  `IMU curvature` 값이 여전히 프레임마다 들쭉날쭉하면 낮추고, 코너 반응이 눈에 띄게 늦으면 올릴 것.
+
+---
+
+## 1. 신호등 (S0 출발 / S2 교차로) — 통합 4구 신호등
+
+**(2026-08 규정 변경)** S0(출발)도 더 이상 3구 신호가 아니라 S2(교차로)와 동일한 4구 신호등을 재사용합니다.
+`SignalDetector.detect_s2()`([perception/traffic_signal.py:102](perception/traffic_signal.py#L102)) 하나로
+양쪽 상태를 다 처리합니다:
+- S0: 초록(직진 위치)만 점등 → 출발
+- S2: 초록만 점등 → 직진 / 초록+빨강 동시 점등 → 좌회전
+
+두 상태 모두 `SIG_CONFIRM_FRAMES`([config.py:318](config.py#L318), 기본 3프레임) 연속 확정돼야
+`signal_straight_confirmed`/`signal_left_confirmed`로 승격되는 디바운스가 걸려 있습니다(단발성 오검출 방지).
+
+**수정할 곳:** `config.py:230` `START_STATE`
+```python
+START_STATE = MissionState.S0_WAIT_GREEN   # 신호(출발) 테스트
+# 또는
+START_STATE = MissionState.S2_INTERSECTION # 신호(교차로) 테스트 — 시작하자마자 정지 상태로 대기
+```
+S2로 시작할 땐 `TEST_DISABLE_INTERSECTION` 값과 무관하게 무조건 S2에서 시작합니다(이 플래그는
+S1→S2 전환 경로만 막는 것이라 `START_STATE` 자체를 바꾸는 것과는 별개입니다). S2는 신호(직진/좌회전)를
+인식할 때까지 `ang=0, spd=0`으로 계속 정지하는 게 정상 동작이니, 안 움직인다고 바로 버그로 보지 말고
+로그의 `[SIG]` 값부터 확인하세요.
+
+**디버그 방법:**
+- 창: `DEBUG_VIZ_SIGNAL = True`([config.py:224](config.py#L224)) → `signal4_roi` 창 하나(S0/S2 공용,
+  더 이상 `signal_roi`/`signal4_roi`로 나뉘어 있지 않음).
+- CLI 로그: `DEBUG_LOG=True`면 S0든 S2든 0.5초마다 `[SIG]` 줄을 찍습니다(`roi=`, `circles=`, `reason=`,
+  `bright=`) — 원 검출이 어느 단계(개수 부족/배치 불량/밝기 대비 부족)에서 막혔는지 터미널만으로 바로
+  보입니다. 같이 찍히는 `[SENS] sig=` 줄에는 `R/L/S` 원시 판정값과 `confirmS(n/3)`/`confirmL(n/3)` 디바운스
+  카운터도 함께 나옵니다.
+
+**알려진 한계(실차 미검증):**
+- `find_circles()`(Hough Circle)가 원을 4개 미만으로 찾으면 그 프레임은 무조건 인식 실패 — 폴백 없음
+  (4개 **초과**로 잡히는 경우는 `pick_best_4()`가 배치가 맞는 4개 조합을 골라 완화합니다,
+  [perception/traffic_signal.py:71](perception/traffic_signal.py#L71)).
+- ROI(`SIG4_ROI_*`)와 반지름 범위(`SIG4_MIN/MAX_RADIUS=15~25px`, 전부 config.py)가 S0/S2 공용 고정값이라,
+  카메라 각도·정지 위치가 튜닝 당시와 다르면 신호등이 ROI 밖이거나 반지름 범위 밖이라 아예 못 잡을 수 있음.
+- 색상(Hue)을 직접 보지 않고 **위치(좌→우=빨강/노랑/좌회전/직진) + 밝기 대비**로만 판정 — 밝은 반사광이
+  ROI에 섞이면 오탐 가능.
+
+---
+
+## 2. 라인트래킹 (차선주행, S1)
+
+**수정할 곳:** `config.py:230` `START_STATE`, `config.py:246` `TEST_FORCE_BEHAVIOR`
+```python
+START_STATE = MissionState.S1_LANE_FOLLOW
+TEST_FORCE_BEHAVIOR = False   # 라바콘 등 Behavior 없이 순수 차선주행 PID만 보고 싶을 때
+```
+`TEST_DISABLE_INTERSECTION = True`(기본값)면 정지선을 밟아도 S2로 안 새고 차선주행을 계속합니다.
+
+**디버그 방법 (기본 백엔드 `dl` 기준 — 백엔드별 차이는 "0. 차선인식 백엔드 선택" 참고):**
+- 창: `DEBUG_VIZ_DL_LANE = True`([config.py:220](config.py#L220)) → da(주행가능영역, 초록 — 너비 상한에
+  걸려 차선책 덩어리를 대신 쓴 프레임은 **주황**, ll 클리핑을 건너뛴 프레임은 **청록**)/ll(차선, 빨강)
+  반투명 오버레이 + 밴드별 중심점(ll로 채택된 밴드는 **흰색**, ll이 부족해 da로 폴백한 밴드는 **노란색**
+  — §2.4) + 피팅된 경로(웨이포인트) + `offset` 텍스트(각각 `[FALLBACK]`/`[LL_CLIP_SKIP]` 태그와
+  `ll_bands:N/전체밴드수` 추가).
+- CLI 로그: `[LANE] lane=편차px(검출여부) side=R/L차선 obs=... lava=...`.
+
+### 2.1 da 면적 상한 대응 — 차선책(fallback) 덩어리 채택 (2026-08-06)
+
+> **[2026-08-07 갱신]** 이 절에서 "면적 상한"이라 부르는 판단 기준은 §2.8에서 너비(bounding box
+> 가로폭) 기준으로 교체됐습니다 — `DL_DA_MAX_AREA_PX` → `DL_DA_MAX_WIDTH_PX`. 아래는 교체 전 원래
+> 문제/수정 내용을 그대로 남겨둔 기록이고, 폴백("차선책") 로직 구조 자체는 §2.8 이후에도 동일합니다.
+
+**증상:** S자 연속 커브 구간에서, da 최대 연결덩어리가 옆 차로/노면 반사와 붙어
+`DL_DA_MAX_WIDTH_PX`(당시엔 `DL_DA_MAX_AREA_PX`, 면적 상한 — §6.4·§2.6·§2.8)에 계속 걸리는 프레임이 길게 이어지면 — 디버그 창엔 여전히
+경로(웨이포인트)가 그려지는데도 실차가 완전히 멈춰버리는 현상이 실측으로 확인됨.
+
+**원인:** 예전 `_largest_da_component()`([perception/dl_lane.py](perception/dl_lane.py))는 최댓값
+덩어리가 면적 상한을 넘으면 그 프레임을 곧바로 무효 처리(빈 마스크 반환)했다. `_update_path()`는
+무효 프레임엔 `self.path`를 갱신하지 않고 직전 경로를 그대로 유지하는데(원래 "1~2프레임짜리 튐 방지"
+목적), 이 무효 상태가 여러 프레임 연속되면 `self.path`가 사실상 무한정 옛 카메라 좌표에 얼어붙는다.
+그런데 `_s1_lane_follow()`는 `self.lane_valid`를 확인하지 않고 매 주기 `_lane_drive()`를 호출하므로
+(아래 "알려진 한계" 참고), 이 stale 경로를 계속 pure_pursuit/LQR에 먹인다 — 차는 계속 움직이는데
+경로가 안 따라오니 조향이 점점 커지고(`turn_now`→1.0 포화), `_lane_drive()`의 3제곱 감속식이
+`target_speed`를 바닥값 `SPEED_NORMAL*0.15`까지 계속 눌러버린다. §6.5 실측 결과 이 바닥값(실측
+`SPEED_NORMAL=8.0` 기준 1.2)이 실차 구동 최소치(§6.5에서 추정한 데드존 ≈1.4)보다 낮아서, 명령은
+계속 나가는데 실제로는 안 움직이는 상태로 굳어버린 것. (이 바닥값 자체는 이후 §2.3에서 별도로 고쳤다.)
+
+**수정:** 가장 큰 덩어리가 상한에 걸리면 곧장 무효 처리하지 않고, 그다음으로 큰 덩어리부터
+순서대로 `[DL_DA_MIN_COMPONENT_WIDTH_PX, DL_DA_MAX_WIDTH_PX]`(당시엔 면적 기준 범위) 안에 드는 걸 찾아 **대신 채택**한다
+(`_largest_da_component()`, `self.da_fallback_used` 플래그로 표시). 같은 프레임에서 다른 덩어리로
+분리돼 있었다는 건 그게 자기 차선일 가능성이 높다는 뜻이라, "몇 초씩 정지"보다 낫다는 판단. 어느
+덩어리도 범위 안에 없으면(전부 상한 초과 혹은 전부 너무 작음) 기존과 동일하게 무효 처리한다 — 동작이
+완전히 바뀐 게 아니라 "무효 처리 전에 한 번 더 시도"가 추가된 것.
+
+**알려진 한계(이 수정 자체):** 차선책 채택 기준이 여전히 같은 면적 비율 임계값이라, 옆 차로 덩어리가
+우연히 그 범위 안에 들면(자기 차선과 비슷한 크기로 잘려 보이는 경우) 잘못된 덩어리를 고를 수 있음 —
+아직 실차 S자 구간 재검증 전. `DEBUG_VIZ_DL_LANE`의 주황 오버레이로 실제로 자기 차선을 골랐는지
+확인할 것.
+
+### 2.2 S자 커브 원거리 ll 두께 과다 검출 + da "작게 검출" 대응 (2026-08-06)
+
+§2.1을 반영한 뒤에도 S자 연속 커브에서 여전히 정지 현상이 재현됐는데, 이번엔 da가 면적 상한(너무 큼)이
+아니라 **너무 작게** 잡혀 `DL_DA_MIN_COMPONENT_AREA` 미만으로 걸러지는 경우였다. 원인을 실측 디버그
+오버레이로 추적한 결과, 카메라에서 먼 커브 구간의 ll(차선)이 실제 선 두께보다 눈에 띄게 두껍게 잡히는
+것을 확인 — `DL_USE_BEV`(BEV 원근보정) 특유의 실패모드였다.
+
+**원인 (BEV 워프의 원거리 확대):** `DLSlideWindow._bev_warp()`는 da/ll을 이진화하기 **전**(float 확률맵)
+상태로 원근변환한다(계단 현상 방지 목적, [perception/dl_lane.py](perception/dl_lane.py) 주석 참고).
+호모그래피 성질상 카메라에서 먼 지점일수록 원근압축을 되돌리기 위해 더 크게 확대해야 하는데, 이때 모델
+출력의 확률 0.5 근방 애매한 경계(blur)도 같이 확대된다. 근거리는 원래 확률이 뚜렷해 영향이 적지만,
+원거리는 이 blur가 커져서 이진화(`DL_FG_THRESHOLD=0.5`) 후 ll이 실제보다 두껍게 잡힌다. 이 두꺼운 ll이
+`_clip_da_by_ll()`에서 "차선 바깥" 판정 경계로 쓰이면서, 원거리 밴드의 da를 필요 이상으로 깎아낸다 —
+da 자체(세그멘테이션)는 멀쩡한데 ll 클리핑이 지워버려서 마치 "da가 작게 검출된 것"처럼 보이는 것.
+이렇게 여러 밴드가 무효화되면 §2.1과 동일한 경로 동결 → 조향 포화 → 속도 바닥값 정체로 이어진다.
+
+**수정 (2단계):**
+1. **ll 전용 이진화 임계값 상향** (`DL_LL_FG_THRESHOLD=0.7`, [config.py](config.py) — 기존 `da`용
+   `DL_FG_THRESHOLD=0.5`와 분리). blur로 번진 저확률 가장자리를 미리 잘라내 원거리 ll이 두꺼워지는
+   정도를 줄인다. `da`는 대회 요구사항에 명시된 `0.5`를 그대로 유지(건드리지 않음).
+2. **ll 클리핑 결과가 너무 부실하면 클리핑을 건너뜀** (`detect()`, [perception/dl_lane.py](perception/dl_lane.py)).
+   ①을 적용해도 여전히 클리핑 후 유효 밴드 수가 `DL_SLICE_FIT_MIN`(fit 최소 밴드 수) 미만이면, 클리핑
+   전(=옆 차선 침범 방지가 없는 원본) da로 되돌려서 쓴다. §2.1과 같은 원칙 — "완전 무효화(→ 정지)"보다는
+   "덜 안전하지만 주행 가능한 신호"를 우선한다. `self.da_ll_clip_skipped` 플래그로 표시.
+
+**알려진 한계(이 수정 자체):**
+- `DL_LL_FG_THRESHOLD=0.7`은 실차 미검증 첫 추정치. 너무 높으면 원거리 ll이 아예 안 보여서(반대로
+  `_clip_da_by_ll()`이 "ll 안 보임 → 클리핑 생략"으로 넘어가는 것과 결과적으로 비슷해짐) 옆 차선 침범
+  방지 효과 자체가 약해질 수 있음 — `DEBUG_VIZ_DL_LANE`의 빨강(ll) 오버레이로 원거리/근거리 선 두께가
+  비슷해지는 지점을 찾아 조정할 것.
+- ②(클리핑 건너뛰기)이 발동하면 그 프레임은 옆 차선 침범 방지가 아예 꺼진다 — 정지보다는 낫지만
+  ㅓ교차로처럼 옆 차로 da가 실제로 붙어있는 상황에서 하필 같이 발동하면(이론상 가능, 실측 미확인) 옆
+  차로로 새는 조향이 나올 수 있음. 청록 오버레이가 잦게 뜨는 구간이 있으면 원인(①로 부족한 건지, 다른
+  구조적 문제인지)을 더 파야 함.
+
+**알려진 한계 (기존, 미수정):**
+- `_s1_lane_follow()`가 `self.lane_valid`를 확인하지 않고 `_lane_drive()`를 호출함(`_s3_shortcut()`은 확인함,
+  [track_drive.py:1001](track_drive.py#L1001)). 카메라가 순간적으로 차선을 놓쳐도 마지막 유효 offset으로
+  계속 조향하니, 실차 테스트 시 차선 이탈 구간에서 주의 깊게 볼 것. 위 2.1 증상의 근본 원인 중 하나이기도
+  해서, S1에도 S3처럼 무효 지속시간 기반 폴백을 추가하는 게 다음 후보. (아직 미수정)
+- (`classic_cv` 대안 백엔드) `perception/lane_util.py`의 CLAHE+adaptiveThreshold 기반 흰색 검출은
+  "보존용"으로 유지 중이며 현재 라이브 미검증입니다.
+
+### 2.3 코너 감속 하한이 모터 데드존보다 낮아 정지하는 문제 (2026-08-06)
+
+§2.1/§2.2는 "da/ll 인식이 깨져서 경로가 얼어붙는" 경로로 정지에 이르는 문제였는데, 별도로 **인식이
+멀쩡해도** 코너가 이어지면 같은 결과(정지)에 이를 수 있다는 게 확인됐다 — `_lane_drive()`([track_drive.py:1207](track_drive.py#L1207))의
+코너 감속식(3제곱 `turn_for_speed` 감속 + `_corner_radius_speed_scale()`)이 둘 다 목표속도를
+`SPEED_NORMAL*0.15`(=1.2, 두 곳에 하드코딩)까지 낮게 깎을 수 있었는데, §6.5에서 추정한 모터 데드존
+(≈1.4)보다 낮다. 급커브가 잠깐이 아니라 좀 이어지면 목표속도가 이 바닥에 눌린 채 유지되고, 그러면
+실차는 거의/전혀 못 움직이면서도 조향각 계산에 쓰이는 lookahead/오프셋은 차가 안 움직이니 안 바뀌어
+감속이 안 풀리는 정지 상태로 굳는다 — §2.1/§2.2의 "경로 동결로 인한 정지"와 증상은 같지만 원인(인식
+정상, 순수 속도계획 하한값 문제)은 다르다.
+
+**수정:** 두 곳의 `SPEED_NORMAL*0.15` 하드코딩을 이름 있는 상수 `SPEED_CORNER_MIN`([config.py:90](config.py#L90))
+으로 빼고, 데드존(≈1.4)보다 확실히 위인 값으로 올렸다([track_drive.py:1226](track_drive.py#L1226),
+[1230](track_drive.py#L1230)). `_run_passing()`의 "양쪽 통과 불가 서행" 폴백([track_drive.py:1528](track_drive.py#L1528))도
+같은 `SPEED_NORMAL*0.15` 패턴을 쓰지만 B2/B3는 `TEST_DISABLE_B2_B3=True`로 현재 꺼져 있어 이번엔
+건드리지 않았다 — B2/B3 실차 검증 시 같이 정리할 것. 처음엔 3.0으로 올렸다가, 이후 최고속도
+상향(아래 §2.4)과 함께 5.0으로 재상향(요청 반영) — 데드존 대비 여유를 더 두었다.
+
+**알려진 한계:** `SPEED_CORNER_MIN=5.0`은 데드존 추정치(≈1.4)에 여유를 둔 값일 뿐 실차 미검증. §6.5가
+이미 지적했듯 데드존 자체가 2점(speed 5, 10)짜리 외삽 추정이라, 실제 데드존이 다르면 이 값도 다시
+맞출 필요가 있음.
+
+### 2.4 최고속도/코너 최저속도 재설정 (`SPEED_NORMAL` 8.0 → 25.0, `SPEED_CORNER_MIN` 3.0 → 5.0, 2026-08-06)
+
+요청에 따라 직진 최고속도(`SPEED_NORMAL`)를 8.0에서 25.0으로, 코너 최저속도(`SPEED_CORNER_MIN`, §2.3)를
+3.0에서 5.0으로 올렸다([config.py:73](config.py#L73), [90](config.py#L90)).
+
+**주의 — 실차 재검증 필요:**
+- §6.5의 `METERS_PER_SPEED_UNIT` 회귀는 `speed=5`/`10` 두 점만 실측한 것이라, `SPEED_NORMAL=25`는 측정
+  범위 밖(2.5배) 외삽이다. 실제 m/s·제동거리·코너 반응이 그 선형식대로 나올지 실차에서 다시 확인할 것.
+- `PP_LOOKAHEAD_SPEED_GAIN`(=4.0, [config.py:257](config.py#L257)) 등 `pure_pursuit`이 `speed`(§0.5.4에서
+  VESC 실측값 기반으로 바뀌었지만, 명령속도와 같은 단위로 역환산해서 넣으므로 스케일 자체는 그대로)를
+  직접 입력받는 게인들도 최고값이 8→25로 커진 만큼 lookahead가 더 크게 튈 수 있다(다만
+  `PP_LOOKAHEAD_MAX_PX=150`으로 클램프는 되므로 값이 무한정 커지진 않음) — §0.5 문서에 있는
+  진동/오버슈트 증상이 심해지는지 관찰할 것.
+- 가속 제한(`SPEED_ACCEL_STEP=0.85`/주기)은 그대로라, 0→25까지 도달하는 데 이전보다 더 오래 걸린다
+  (약 29주기 ≈ 1.5초, 20Hz 기준) — 가속 자체는 안전 방향이라 값을 안 건드렸지만, 체감상 가속이 느리게
+  느껴지면 `SPEED_ACCEL_STEP`을 같이 올릴 것.
+
+### 2.5 원거리 크롭 (`DL_BEV_FAR_LIMIT_M`) + da 전체/채택분 구분 시각화 (2026-08-06)
+
+**원거리 크롭**: BEV 캔버스는 "ROI 전체가 여백 없이 들어가도록" 자동 확장되는데(§6.3), 그 결과 da/ll
+처리가 실측 캘리브레이션 지점(TL/TR, 1.0m)보다 더 먼 영역(외삽, 근거리 기준점으로부터 약 1.30m까지)
+까지 포함하고 있었다는 걸 계산으로 확인했다. 실측 재측정(픽셀 좌표 재클릭) 없이, **이미 정확한**
+`DL_PIXELS_PER_METER` 스케일을 그대로 이용해 근거리 기준점으로부터 `DL_BEV_FAR_LIMIT_M`(=0.7m,
+[config.py:182](config.py#L182))보다 먼 캔버스 행을 워프 직후에 잘라낸다
+([perception/dl_lane.py:480](perception/dl_lane.py#L480)). `DL_BEV_SRC_PX_RAW`/`DL_PIXELS_PER_METER`
+자체는 그대로 두므로(캘리브레이션 안 건드림) 스케일 왜곡 없이 "얼마나 먼 데까지 볼지"만 제한한다 —
+1.0m를 0.7m로 그냥 바꿔치기하면 안 되는 이유(캘리브레이션 왜곡)와 이 방식을 택한 이유는
+`perception/dl_lane.py`의 `DL_BEV_FAR_CROP_ROW` 계산부 주석 참고. 원거리 ll 두께 과다검출(§2.2)
+문제에도 도움이 될 것으로 기대 — 가장 blur가 심한 먼 영역 자체를 이제 안 본다.
+
+**da 전체/채택분 구분 시각화**: `DEBUG_VIZ_DL_LANE` 오버레이에서 이제 모델이 "주행가능하다"고 판단한
+da 전체(덩어리 선택/ll클리핑 전, `self.da_mask_all_roi`)를 **파란색**으로 먼저 깔고, 실제로 waypoint
+추출에 쓰인 부분(`self.da_mask_roi`, 기존과 동일하게 초록/주황(면적상한 차선책)/청록(ll클리핑 건너뜀))을
+그 위에 덧그린다([perception/dl_lane.py:590](perception/dl_lane.py#L590) `visualize()`). 채택분은
+항상 전체의 부분집합이라 겹치는 픽셀은 초록/주황/청록이 그대로 덮어써 보이고, "모델이 본 전체 중 실제로
+얼마나/어느 부분을 골랐는지"를 한 화면에서 바로 비교할 수 있다.
+
+**알려진 한계:**
+- `DL_BEV_FAR_LIMIT_M=0.7`은 실차 미검증 값. `DEBUG_VIZ_DL_LANE` 창에서 크롭 경계(파란/초록 영역이
+  갑자기 끝나는 지점)가 원하는 위치에 오는지 확인할 것.
+- 캔버스 높이가 줄어든 만큼(298→178px, 약 60%) `DL_N_SLICES`(8밴드)당 픽셀 수도 줄어든다 —
+  `DL_MIN_PIXELS`/`DL_DA_MIN_COMPONENT_WIDTH_PX`/`DL_DA_MAX_WIDTH_PX` 등 절대 픽셀 임계값들의
+  "픽셀당 의미"가 이 크롭 이전과 달라졌을 수 있다. 아직 재검증하지 않았으니 da가 이유 없이 무효 처리되는
+  빈도가 늘면 이쪽을 먼저 볼 것.
+
+### 2.6 da 면적 상한을 실측 절대값으로 교체 (`DL_DA_MAX_AREA_PX`, 2026-08-06)
+
+`_largest_da_component()`의 면적 상한 판단(§2.1)이 원래 "마스크 전체 대비 비율"(`DL_DA_MAX_AREA_RATIO`,
+기본 0.6 — DL_USE_BEV 캔버스 크기가 바뀌어도 재계산 없이 유효하다는 장점으로 택한 값, §6.4)이었는데,
+"이 정도면 비정상적으로 넓다"는 대충의 추정치였다. 실차에서 `_debug_viz_steer()`(`DEBUG_VIZ_STEER` 창)로
+**직선 구간의 실제 da 면적**을 실측할 수 있게 됐으므로, 그 실측값 기반 절대 픽셀값(`DL_DA_MAX_AREA_PX`)
+으로 교체했다(요청 반영) — 판단 로직 자체("이 값보다 크면 outlier로 버리고 그다음 크기 덩어리를
+시도")는 `_largest_da_component()`에 이미 있던 그대로다(§2.1의 "차선책" 폴백), 비교 기준값의 근거만
+추정 → 실측으로 바뀐 것.
+
+**바뀐 것:**
+- `config.py`: `DL_DA_MAX_AREA_RATIO`(비율) → `DL_DA_MAX_AREA_PX`(절대 픽셀수)로 이름·단위 교체.
+- `perception/dl_lane.py`: `_largest_da_component()`가 매 프레임 `self.da_largest_area_px`(면적 1위
+  덩어리, 채택 여부 무관)와 `self.da_chosen_area_px`(실제 채택된 덩어리, 무효 프레임엔 0)를 기록
+  ([perception/dl_lane.py:388](perception/dl_lane.py#L388)). — **[2026-08-07]** 이후 §2.8에서
+  판정 기준이 면적→너비로 바뀌면서 각각 `da_largest_width_px`/`da_chosen_width_px`로 개명됨.
+- `track_drive.py`: `_debug_viz_steer()`(`steer_debug` 창)의 DA 면적 표시를 비율(%)에서 위 두 절대
+  픽셀값 + `DL_DA_MAX_AREA_PX` 대비 퍼센트로 교체 — 이 창의 `DA largest:`가 그대로 실측값 후보다
+  ([track_drive.py:1301](track_drive.py#L1301)).
+
+**실측 방법:** 실차를 직선 구간에 놓고 `steer_debug` 창의 `DA largest:` 값을 몇 프레임 관찰 → 그 정상
+범위의 대표값(여유를 약간 둔 상한)을 `DL_DA_MAX_AREA_PX`에 대입.
+
+**실측값 (2026-08-06):** 직선 구간 3프레임 — 13,349px / 13,361px / 12,946px(평균 13,219px, 최대
+13,361px). 여유를 두고 `DL_DA_MAX_AREA_PX = 13700`으로 설정 — 원래 플레이스홀더였던 62,478(옛 비율
+0.6을 캔버스 크기로 그냥 환산한 값)보다 4.5배 이상 작다. 즉 그 플레이스홀더는 사실상 outlier
+판정이 거의 안 걸리는 값이었고, 이번 실측으로 판정이 실제로 유효하게 작동하는 범위로 바로잡혔다.
+
+**알려진 한계:**
+- 3프레임(직선 구간 한 번)만 관찰한 값이라 표본이 적다 — 다른 직선 구간(조명/노면이 다른 곳)에서도
+  비슷한 범위인지 추가로 관찰해볼 것. 완만한 커브에서도 정상적으로 da 면적이 다소 늘 수 있는데
+  13,700이 그런 정상 범위까지 outlier로 잘못 거를 만큼 타이트한지도 같이 확인할 것.
+- 비율 방식과 달리 캔버스 크기가 또 바뀌면(예: `DL_BEV_FAR_LIMIT_M` 재조정) 이 값도 같이 재측정해야
+  한다 — 캔버스 크기(585×178px) 불변 가정 하의 값이라는 걸 기억할 것.
+
+**[2026-08-07 후속]** 실제로는 이 절의 "정상 범위" 우려가 커브 때문이 아니라 §2.8에서 설명하는 다른
+원인(da가 가로로 트레이프조이드 대부분을 뒤덮음)으로 재현됐고, 그에 따라 판정 기준 자체가 면적→너비로
+교체됐습니다. `DL_DA_MAX_AREA_PX`는 `DL_DA_MAX_WIDTH_PX`로 대체됐습니다 — 자세한 내용은 §2.8 참고.
+
+---
+
+### 2.7 밴드별 중심 계산 모드 스위치 — `da` 단독 vs `ll`(차선)+`da` 하이브리드 (`DL_CENTER_MODE`, 2026-08-06)
+
+지금까지 밴드(row 구간)별 중심점은 항상 da(주행가능영역) 무게중심이었다. 그런데 da는 "주행 가능한
+영역"이지 "차로 중앙"이 아니라서, 갓길 등 여백이 넓은 구간에서 무게중심이 여백 쪽으로 쏠려 경로가
+차로 중앙을 벗어나는 문제가 실측으로 확인됐다. ll(차선 자체, 두 백선)은 여백 크기와 무관하게
+"선이 실제로 있는 위치"만 가리키므로 이 문제에서 자유롭지만, 아직 실차 전 구간에서 검증되지
+않았다 — 그래서 기존 da 단독 방식을 남겨두고, `config.py`의 `DL_CENTER_MODE` 하나로 두 방식을
+재시작만으로 전환해 실차에서 A/B 비교할 수 있게 했다.
+
+- `DL_CENTER_MODE = 'da'`(main 기본값): 기존과 동일 — 밴드별 중심을 da 무게중심으로만 계산.
+- `DL_CENTER_MODE = 'll_da'`(이 브랜치 기본값): 밴드마다 좌/우 ll이 둘 다 신뢰할 만하면
+  (`DL_LL_SIDE_MIN_PIXELS` 이상 픽셀 + 두 선 간격이 `DL_LL_WIDTH_MIN_PX`~`DL_LL_WIDTH_MAX_PX`
+  범위) 그 중점을 채택하고, 그 외 밴드(점선 틈/마모/반사/편측 가려짐)만 da 무게중심으로
+  개별 폴백한다(`DLSlideWindow._ll_slice_centers()`, [perception/dl_lane.py](perception/dl_lane.py)).
+  da 파편화 대응(`_largest_da_component`)/옆 차선 클리핑(`_clip_da_by_ll`)/ll sanity check는
+  두 모드에서 동일하게 적용된다.
+
+**디버그 시각화:** `DEBUG_VIZ_DL_LANE` 창에서 밴드별 중심점이 ll 채택 시 흰색, da 폴백 시 노란색
+(`'da'` 모드에선 항상 노란색)으로 표시되고, 좌상단 텍스트에 `mode:`와 `ll_bands:N/전체밴드수`가
+같이 뜬다.
+
+**알려진 한계:**
+- `DL_LL_SIDE_MIN_PIXELS=15`, `DL_LL_WIDTH_MIN_PX=100`, `DL_LL_WIDTH_MAX_PX=220`([config.py](config.py))은
+  실측 차로폭(0.8m@200px/m=160px 기준 ±40% 여유)으로 잡은 첫 추정치, 실차 미검증. 너무 좁으면 정상 밴드도
+  da로 자주 폴백해 `'ll_da'`의 효과가 약해지고, 너무 넓으면 반대 차선을 잘못 짝짓는 밴드를 걸러내지
+  못할 수 있음 — `'ll_da'`로 전환 후 여러 직선/커브 구간에서 `ll_bands` 비율과 흰/노랑 점 분포를 보고
+  조정할 것.
+- `'ll_da'`는 밴드 단위 폴백이라 한 프레임 안에서 근거리는 ll, 원거리는 da처럼 신호 출처가 섞일 수
+  있다 — 두 신호의 좌표계(둘 다 같은 BEV ROI 픽셀좌표)는 같지만, 실제 정확도 특성이 달라 그 경계에서
+  미세한 경로 꺾임이 생길 가능성이 있음(이론상, 실측 미확인). 밴드별 흰/노란 점 색으로 출처 전환이
+  잦은지, 전환 지점에서 경로가 부자연스럽게 꺾이는지 확인할 것.
+- 노란 중앙선은 여전히 `lane_side`(주행 차선 판정)에만 쓰이고 경로 계산 자체에는 관여하지 않는다.
+
+---
+
+### 2.8 da 최적 덩어리 판정 기준을 면적 → 너비로 교체 (`DL_DA_MAX_WIDTH_PX`, 2026-08-07)
+
+**증상:** §2.6에서 실측한 `DL_DA_MAX_AREA_PX`(당시 13,700)로도 실제 대회 트랙(백선 테이핑 완료) 영상을
+재확인하니 직선 구간에서 da 최대 덩어리 면적이 13,877~27,360px까지 나왔다. 처음엔 "완만한 커브라 면적이
+늘어난 것"으로 오판해 상한을 mastic-choi 커밋(eb4c640)의 16,000으로 유지했는데, `DEBUG_VIZ_DL_LANE`
+오버레이를 직접 들여다보니 da(초록)가 좁은 차선 폭을 따라가는 게 아니라 BEV 트레이프조이드 캔버스
+대부분을 **가로로** 뒤덮고 있었다 — §2.1이 원래 막으려던 "차선 밖 여백까지 da가 먹어버리는" 문제 그
+자체가 실측으로 재현된 것이었다.
+
+**원인:** `_largest_da_component()`([perception/dl_lane.py](perception/dl_lane.py))의 판정 기준이
+연결 덩어리의 **면적**(`cv2.CC_STAT_AREA`, 픽셀 개수)이었다. 면적은 "세로로 얼마나 길게 이어졌는가"와
+"가로로 얼마나 퍼졌는가"를 구분하지 못한다 — 정상적으로 멀리까지 곧게 뻗은 직선 구간 da(세로로 길어
+면적은 크지만 가로 폭은 정상)와, 옆 차선/갓길 여백까지 가로로 새서 뒤덮은 da(가로 폭 자체가 비정상)가
+같은 "면적이 크다"는 신호로 뭉뚱그려졌다. 그 결과 상한을 낮추면 전자(정상 직선)까지 outlier로 잘못
+거르고, 상한을 실측값에 맞춰 올리면 후자(원래 문제)까지 통과시켜버리는 구조적 딜레마가 있었다 — 어느
+쪽으로 값을 조정해도 근본 해결이 안 되는 상태였던 것.
+
+**수정:** 판정 기준을 면적에서 **너비**(`cv2.CC_STAT_WIDTH` — 연결 덩어리 bounding box의 가로 길이)로
+바꿨다(요청 반영). 실패 신호가 실제로는 "가로로 비정상적으로 퍼졌다"였으므로, 이제 그 자체를 직접 잰다.
+판단 로직 구조(너비가 큰 덩어리부터 정렬 → `[DL_DA_MIN_COMPONENT_WIDTH_PX, DL_DA_MAX_WIDTH_PX]` 범위
+안에 드는 첫 후보를 채택 → 없으면 다음 후보 시도 → 그래도 없으면 무효, §2.1의 "차선책" 폴백)는 그대로고
+비교 기준값만 교체됐다.
+
+- `config.py`: `DL_DA_MIN_COMPONENT_AREA`(1560px²)/`DL_DA_MAX_AREA_PX`(16000px²) →
+  `DL_DA_MIN_COMPONENT_WIDTH_PX`(**30**px)/`DL_DA_MAX_WIDTH_PX`(**220**px)로 이름·단위 교체.
+  상한(`DL_DA_MAX_WIDTH_PX=220`)은 새로 추정하지 않고, 동일한 물리량(실측 차로폭 0.8m=
+  `LANE_WIDTH_M*2` @ `DL_PIXELS_PER_METER=200px/m` → 160px에 ±40% 여유)으로 이미 잡혀 있던
+  `DL_LL_WIDTH_MAX_PX`(§2.7 `'ll_da'` 모드 임계값)와 같은 값을 그대로 재사용했다 — 자기 차선 하나의
+  가로 폭이 정상적으로 이보다 넓을 순 없다는 같은 근거이므로 별도 실측 없이 공유. 하한
+  (`DL_DA_MIN_COMPONENT_WIDTH_PX=30`)은 "노이즈 수준 파편이 아닌지"만 걸러내면 되는 훨씬 느슨한
+  목적이라 차로폭 하한(100px)보다 낮게 별도로 잡았다.
+- `perception/dl_lane.py`: `_largest_da_component()`가 `stats[:, cv2.CC_STAT_AREA]` 대신
+  `stats[:, cv2.CC_STAT_WIDTH]`로 정렬/필터링. 디버그용 속성도 `da_largest_area_px`/
+  `da_chosen_area_px` → `da_largest_width_px`/`da_chosen_width_px`로 개명.
+- `track_drive.py`: `_debug_viz_steer()`(`steer_debug` 창)의 `DA 면적:`/`DA largest:...` 표시를
+  `DA 너비:`/같은 포맷의 너비(px)로 교체 — 단위가 면적(px²)에서 가로 길이(px)로 바뀌었을 뿐 표시
+  로직(초록/주황/빨강 임계값 비율 색상 구분)은 동일.
+
+**알려진 한계:**
+- `DL_DA_MAX_WIDTH_PX=220`은 `DL_LL_WIDTH_MAX_PX`에서 값만 그대로 복제해온 것이라 da 자체의 실측
+  검증은 아직 없다 — bounding box 너비는 커브 구간에서 밴드마다 x중심이 옆으로 이동하는 만큼 직선보다
+  자연스럽게 더 커질 수 있어(차로 자체가 넓어진 게 아니라 곡선을 따라가며 덩어리 전체의 가로 범위가
+  넓어지는 것), 완만한 커브에서도 outlier로 잘못 걸러질 가능성이 있다. `DEBUG_VIZ_DL_LANE`의 주황
+  (차선책)/빨강 계열(steer_debug `DA 너비:` outlier) 빈도가 직선보다 커브에서 눈에 띄게 잦은지 확인할 것.
+- `DL_DA_MIN_COMPONENT_WIDTH_PX=30`은 실차 미검증 첫 추정치 — 노이즈 파편을 통과시키면 낮추고, 정상
+  근거리 da(아직 좁게만 보이는 첫 프레임 등)까지 무효 처리하면 높일 것.
+- `DL_DA_MAX_WIDTH_PX`와 `DL_LL_WIDTH_MAX_PX`는 코드상 자동으로 동기화되지 않는 별개 상수다 — 한쪽만
+  실측/조정하고 다른 쪽을 잊으면 두 값이 다시 벌어질 수 있으니, 어느 한쪽을 바꿀 땐 다른 쪽도 같이
+  검토할 것.
+
+---
+
+## 3. 라바콘 (B1_LAVACON)
+
+**수정할 곳:** `config.py:230` `START_STATE`, `config.py:246` `TEST_FORCE_BEHAVIOR`
+```python
+START_STATE = MissionState.S1_LANE_FOLLOW
+TEST_FORCE_BEHAVIOR = True    # S2를 거치지 않고 시작부터 Behavior(라바콘부터) 강제 활성화
+```
+`self.phase`는 기본이 `Phase.LAVACON`([track_drive.py:144](track_drive.py#L144))이라 따로 안 건드려도 됩니다.
+`TEST_DISABLE_B2_B3 = True`(기본값)면 라바콘 구간이 끝나도 B2/B3로 안 넘어가고 그냥 일반 차선주행으로
+돌아오니, 라바콘만 격리 테스트하기 좋습니다.
+
+라바콘 진입은 **라이다 좌우 클러스터 동시검출**이 `LAVACON_TRIGGER_FRAMES(5프레임)` 연속 유지돼야
+확정됩니다(`perc_lavacon_trigger()`, 라이다 단독 판단 — 카메라/YOLO 이중확인 없음).
+
+**디버그 방법:**
+- CLI 로그: `trigL=본선카운트/기준(L{좌클러스터}R{우클러스터})` — 좌/우 중 어느 쪽을 못 잡는지 바로 구분됨.
+  추가로 `[LAVA-ROI] L pts=... run=... R pts=... run=...` 줄에서 ROI 안에 잡힌 점 개수(pts)와 그중 최대
+  연속 묶음 길이(run, 2 이상이어야 클러스터로 인정)까지 확인 가능.
+- 창: `DEBUG_VIZ_LAVACON = True`([config.py:216](config.py#L216)) → `lavacon_bev` 창(트리거 ROI와 좌/우 클러스터를
+  시각으로 확인).
+
+**알려진 한계:**
+- `LAVACON_DONE_FRAMES=80`(우측 콘 연속 미검출 시 구간 종료 판정)이 실차 미검증 값.
+
+---
+
+## 4. 사물회피 (B2_OBSTACLE, 고정장애물)
+
+> **코드 주석 주의:** `track_drive.py`에는 아직 "★재설계 예정(placeholder)" 식 주석이 여러 곳 남아있지만
+> (예: [track_drive.py:1356](track_drive.py#L1356)), 이건 오래된 주석이고 **실제 구현은 이미 교체됐습니다.**
+> 지금은 `controller/obstacle_avoidance.py`의 `TargetPassing`이 붙어 있어, 감속 후 대기가 아니라
+> **SHIFT → ALONGSIDE → RETURN 3단계로 실제 옆차선 통과 기동**을 수행합니다. 코드 주석이 구현을 못
+> 따라간 상태이니, 동작을 파악할 때는 이 문서와 `controller/obstacle_avoidance.py`를 기준으로 보세요.
+
+**수정할 곳:** `config.py:230` `START_STATE`, `config.py:242` `TEST_DISABLE_B2_B3`, `config.py:246` `TEST_FORCE_BEHAVIOR`, `track_drive.py:144` `self.phase`
+```python
+START_STATE = MissionState.S1_LANE_FOLLOW
+TEST_DISABLE_B2_B3 = False     # B2 트리거 검사를 켜야 함
+TEST_FORCE_BEHAVIOR = True
+self.phase = Phase.FIXED_OBSTACLE   # __init__ 안의 self.phase 초기값을 임시로 변경 (격리 테스트용)
+```
+정상 흐름은 라바콘(B1) 완료 후 자동으로 `Phase.FIXED_OBSTACLE`로 넘어가는 것이라, 이 기능만 격리
+테스트하려면 `__init__`의 `self.phase = Phase.LAVACON`을 위처럼 임시로 바꾸면 됩니다.
+
+**동작 방식** (`TargetPassing`, [controller/obstacle_avoidance.py:49](controller/obstacle_avoidance.py#L49)):
+1. **IDLE** — 전방 장애물이 감지되면 `choose_side()`로 통과 방향을 정합니다: ①타겟이 없는 차선 쪽(규정
+   1순위) ②정면이라 못 가리면 비어있는 쪽(`left_clear`/`right_clear`) ③둘 다 비었으면 노란선 건너편.
+   양쪽 다 막히면 `status='blocked'`(흰 실선 밖으로 안 나가고 서행하며 재시도).
+2. **SHIFT** — 목표 횡오프셋(`PASS_OFFSET=100px`)까지 서서히 이동(`LATERAL_ALPHA_OUT`).
+3. **ALONGSIDE** — 장애물이 안 보이는 상태가 `CLEAR_FRAMES_TO_RETURN`(6프레임) 유지되면 RETURN으로.
+4. **RETURN** — 원 차선으로 복귀(`LATERAL_ALPHA_BACK`, SHIFT보다 빠르게) — 목표 오프셋이 5px 미만이면 완료.
+
+`USE_HYBRID_ASTAR_FOR_B2 = True`([config.py:256](config.py#L256))로 바꾸면 위 방식 대신
+Hybrid A* + OccupancyGrid + Stanley(`planner/`, `_handle_fixed_obstacle_astar()`) 경로계획 대안을 씁니다
+— 비교/보존용이며 기본은 `False`.
+
+**디버그 방법:**
+- CLI 로그: `obs=검출여부(거리m,폭m,fixed/vehicle)`. `status='blocked'`가 되면 `[B2] 양쪽 통과 불가 —
+  서행 후 재시도` 경고 로그가 뜹니다.
+
+**알려진 한계:**
+- `PASS_OFFSET=100px`(config.py)가 실측 차선 폭 대신 쓰는 자리표시값입니다(차선 폭 실측 후 교체 예정,
+  [controller/obstacle_avoidance.py:31](controller/obstacle_avoidance.py#L31) 주석 참고).
+- `LATERAL_ALPHA_OUT/BACK`, `MIN_GAP_M`, `CENTER_DEADZONE_M` 등 수렴 속도·안전거리 파라미터 다수가
+  실차 미검증 튜닝값입니다.
+- 좌우 선택은 카메라/YOLO 이중확인 없이 라이다 `obstacle_y` + `lane_side`만으로 판단 — 콘·차량 구분이 없어
+  고정장애물(콘/박스류)도 동일한 로직으로 회피 방향이 잡힙니다.
+
+---
+
+## 5. 차량회피/추월 (B3_VEHICLE)
+
+**수정할 곳:** `config.py:230` `START_STATE`, `config.py:242` `TEST_DISABLE_B2_B3`, `config.py:246` `TEST_FORCE_BEHAVIOR`, `track_drive.py:144` `self.phase`
+```python
+START_STATE = MissionState.S1_LANE_FOLLOW
+TEST_DISABLE_B2_B3 = False
+TEST_FORCE_BEHAVIOR = True
+self.phase = Phase.VEHICLE     # 격리 테스트용 임시 변경
+```
+B2와 마찬가지로 별도 노드 전환 없이 `self.phase = Phase.VEHICLE`만 바꾸면 격리 테스트할 수 있습니다.
+진입 조건은 **라이다 단독** — 전방 장애물 + 거리 < `OVERTAKE_TRIGGER=6.5m`가 `VEHICLE_TRIGGER_FRAMES(5프레임)`
+연속 유지되면 확정됩니다(`perc_vehicle_trigger()`).
+
+B2와 동일한 `TargetPassing`을 `moving=True`로 재사용합니다
+([track_drive.py:177](track_drive.py#L177), `self.vehicle_controller`). 차이는 방해차량이 차선을 오가므로
+SHIFT 단계에서 타겟이 내가 지나가려는 쪽으로 넘어오는 상태가 `SWITCH_FRAMES`(8프레임) 연속되면, 반대쪽이
+비어 있는 경우에 한해 통과 방향을 바꾸는 재평가 로직(`_target_cuts_in()`)이 추가로 걸린다는 점입니다.
+반대쪽도 막혀 있으면 RETURN으로 물러나 원 차선에서 재시도합니다.
+
+**디버그 방법:**
+- CLI 로그: `trigV=본선카운트/기준`.
+
+**알려진 한계:**
+- B2와 동일하게 카메라/YOLO 이중확인이 없어 콘·차량 구분 없이 라이다 근접만으로 트리거되므로, 콘이
+  남아있는 상태에서도 거리 조건만 맞으면 B3로 오인 진입할 수 있음(Phase 순서가 지켜지는 정상 흐름에서는
+  라바콘 구간을 먼저 통과한 뒤라 위험이 적지만, 격리 테스트 시에는 주의).
+- `SWITCH_FRAMES`로 조절하는 방향 재전환 로직도 실차 미검증.
+
+---
+
+## 6. 실측값 기록 (캘리브레이션)
+
+실차/트랙에서 직접 측정해 코드 상수로 반영한 값들의 근거를 한곳에 모아둡니다. **실측값**과
+(값은 채워져 있지만 측정한 게 아니라 우리가 고른) **설계값**을 구분해서 표기합니다 — 헷갈리면
+다음 사람이 "이미 실측됐다"고 착각하고 재검증을 건너뛸 수 있어서입니다.
+
+### 6.1 도로/차량 치수 (2026-08-04 실측)
+
+| 상수 | 값 | 근거 |
+|---|---|---|
+| `LANE_WIDTH_M` (config.py) | 0.4m | 흰선~흰선(도로 전체폭) 80cm 실측, 노란 중앙선이 정중앙임을 확인 → 차선 1개 폭 = 80/2 = 40cm |
+| `VEHICLE_WIDTH_M` (config.py) | 0.31m | xycar 본체 실측: 세로64cm × 가로31cm × 높이20cm |
+| 고정장애물(고장난 차량) 실측 크기 | 가로20cm×세로41cm×높이16cm | 방해차량과의 라이다 폭 분류 기준(`OBSTACLE_VEHICLE_WIDTH_M=0.24`, config.py) 산출 근거 |
+| 방해차량 실측 크기 | 가로28cm×세로54cm×높이19cm | 위와 동일. `OBSTACLE_VEHICLE_WIDTH_M = (0.20+0.28)/2 = 0.24` |
+
+### 6.2 라이다 장착 각도 보정 (2026-07-22 재실측)
+
+| 상수 | 값 | 근거 |
+|---|---|---|
+| `LIDAR_ANGLE_OFFSET_DEG` (config.py) | 80.0 | 차량 정면에 사람을 세우고 라이다 BEV 디버그 창(각도/인덱스 컴퍼스)으로 확인 — 자기가림 마스크를 끄고 보니 정면 클러스터가 인덱스 90이 아니라 80에서 찍힘 |
+
+### 6.3 DL 백엔드 BEV 캘리브레이션 (2026-08-05 실측)
+
+`perception/dl_lane.py`의 `DL_USE_BEV` 실험적 경로에 쓰이는 값 — 현재 `True`로 실차 검증 중입니다
+(검증 전까지는 기본 `False`였다가, 그 이후 실차에서 계속 켜둔 채 테스트하고 있는 상태입니다).
+`bev_point_picker.py`로 라이브 카메라에서 직접 클릭해 픽셀좌표를 얻었다(방법: 좌/우 백선을 근거리
+지점과 1m 지점에서 각각 찍음).
+
+- **실측 픽셀좌표** (원본 640×480 프레임 기준, `config.py`의 `DL_BEV_SRC_PX_RAW`):
+  - TL(좌상/먼왼쪽) = (246, 257)
+  - TR(우상/먼오른쪽) = (455, 257)
+  - BR(우하/가까운오른쪽) = (635, 333)
+  - BL(좌하/가까운왼쪽) = (60, 333)
+  - (`perception/dl_lane.py`가 이 절대좌표에서 `DL_ROI_Y0`만큼 뺀 ROI-상대좌표 `DL_BEV_SRC_PX`를 따로 계산해서 씀)
+- **실측 실제 거리**:
+  - 폭 W = 0.8m (좌/우 백선 간격 — §6.1 `LANE_WIDTH_M`과 동일 근거, 근거리/1m 지점 모두 같은 두 백선이므로 공통 적용)
+  - 길이 L = 1.0m (TL~BL 실측, 근거리 지점과 1m 지점 사이 거리)
+- **설계값(실측 아님, 캘리브레이션 계산 시 우리가 고른 값)**:
+  - `DL_PIXELS_PER_METER = 200.0` (config.py, px/m 해상도 — 임의 선택)
+- `DL_BEV_CANVAS_W`/`DL_BEV_CANVAS_H`는 손으로 정하는 값이 아니라 `perception/dl_lane.py`가 위 4점 +
+  `DL_PIXELS_PER_METER`로부터 "ROI 전체가 여백 없이 들어가는 캔버스 크기"를 매 프로세스 시작 시
+  자동으로 역산합니다([perception/dl_lane.py:137-138](perception/dl_lane.py#L137)).
+- **주의**: 카메라 마운트가 바뀌면(재장착, 진동 등) `DL_BEV_SRC_PX_RAW`(config.py) 4점은 무효가 되므로
+  재측정 필요. `bev_point_picker.py`로 재측정 가능.
+
+### 6.4 DL da/ll 튜닝값 BEV 재계산 (2026-08-05, `dl_lane_BEV_파라미터_변경사유.md` 이식)
+
+`816d283 BEV 반영` 커밋에서 §6.3의 원근→BEV 좌표계 전환이 있었는데, `DLSlideWindow`의 da(주행가능영역)/
+ll(차선) 마스크를 다루는 픽셀 기준 튜닝값 4개는 **원근 640×140px ROI 스케일로 잡힌 옛값 그대로 남아있었다.**
+원근 좌표계는 깊이(화면 위치)에 따라 같은 실제 거리가 다른 픽셀 수로 보이는 왜곡된 좌표계라 애초에 고정된
+m/px 환산이 없었는데, BEV(585×298px 캔버스, 면적비 옛 ROI 대비 **×1.9456**, `DL_PIXELS_PER_METER=200px/m`)로
+바뀌면서 "픽셀당 의미"가 생겼는데도 재계산이 안 된 상태였다.
+
+**문제였던 것**: 옛 `DL_SLICE_OUTLIER_MAX=60px`는 반차로폭(`LANE_WIDTH_M=0.4m`=80px)의 75%나 돼서, 사실상
+옆 차선에 걸친 점도 "이상치 아님"으로 통과시켰다 — 교차로 진입부 등에서 점선으로 나뉜 옆 차선의 da가 한
+덩어리로 이어붙어 중심선이 그쪽으로 끌려가는("차선을 뺏기는") 실패모드의 원인 중 하나.
+
+| 상수 (config.py) | 옛값 (원근 스케일) | 새값 (BEV 스케일) | 근거 |
+|---|---|---|---|
+| `DL_DA_MIN_COMPONENT_AREA` | 800 | **1560** | 옛 ROI(89,600px²) 대비 비율(0.893%)을 새 캔버스(174,330px²)에서 유지 |
+| `DL_SLICE_OUTLIER_MAX` | 60 | **40** | 반차로폭(0.4m=80px)의 1/2 |
+| `DL_STABLE_JUMP_MAX` | 30 | **20** | 반차로폭의 1/4 (한 프레임 만에 옆 차선만큼 튀는 걸 "그럴듯한 변화"로 받아들이면 안 됨) |
+| `DL_LL_CLIP_MARGIN_PX` | 15 | **8** | 실측 라인 두께 2.5cm(=5px @200px/m) + 세그멘테이션 경계 흔들림(1~2px) 여유 |
+
+적용 후 `DEBUG_VIZ_DL_LANE` 오버레이로 교차로 진입 구간(좌회전 전용 차선 분기점)을 실제로 녹화/확인해 da
+마스크가 더 이상 옆 차선으로 번지지 않는지 검증할 것 — **여전히 실차 미검증 추정치**입니다. 참고로 "da 면적이
+통째로 크게 튀는" 실패모드(ㅓ교차로에서 옆 갈래까지 하나로 이어붙는 경우, 차선 없는 맨바닥을 통째로
+오검출하는 경우)는 위 4개와 별개로 `DL_DA_MAX_AREA_RATIO`(마스크 전체 대비 면적 비율 상한, 기본 0.6)가
+잡아낸다 — 이쪽은 "중심선이 서서히 옆으로 새는" 경우를 잡는 역할로 서로 보완 관계. (2026-08-06:
+`DL_DA_MAX_AREA_RATIO`는 이후 §2.6에서 실측 절대 픽셀값 `DL_DA_MAX_AREA_PX`로 교체됐습니다 — 비율
+방식이었던 이유·교체 근거는 그쪽 참고.)
+
+### 6.5 속도 단위 ↔ m/s 환산 (`METERS_PER_SPEED_UNIT`, 2026-08-06 실측)
+
+`drive()`가 발행하는 "모터 속도단위"(±100 클립)와 실제 속도(m/s)의 환산값입니다. 정지 상태에서 출발하면
+목표속도까지 즉시 도달하지 않고(소프트웨어 가속 제한 `SPEED_ACCEL_STEP` + 모터/바퀴 관성) 서서히
+가속하므로, 단순히 "거리÷시간"으로 나누면 가속 구간이 섞여 정속 속도를 과소평가합니다. 그래서 같은
+속도값을 서로 다른 두 주행시간으로 측정해(각 2점) 회귀로 "정속 구간 기울기(m/s)"와 "가속 때문에 못 간
+거리(오프셋)"를 분리했습니다 — 등가속 후 정속으로 가정하면 `거리 = v_정속×(시간 − 가속시간/2)`이므로
+두 점을 지나는 직선의 기울기가 정속 속도, x절편의 2배가 가속시간입니다.
+
+**실측 원시값:**
+
+| speed 파라미터 | 주행시간(s) | 이동거리(m) |
+|---|---|---|
+| 5 | 3 | 1.04 |
+| 5 | 6 | 2.50 |
+| 10 | 3 (2회 평균) | 2.18 (=（2.30+2.06)/2) |
+| 10 | 5 | 4.50 |
+
+**회귀 결과:**
+
+| speed 파라미터 | 정속 속도(m/s) | 가속 구간(참고, s) |
+|---|---|---|
+| 5 | **≈0.487** | ≈1.73 |
+| 10 | **≈1.16** | ≈2.24 |
+
+두 점(5, 0.487)/(10, 1.16)을 잇는 직선의 기울기는 `(1.16−0.487)/(10−5) ≈ 0.1347 m/s/unit` —
+`METERS_PER_SPEED_UNIT`([config.py:417](config.py#L417))에 이 값을 채웠습니다.
+
+**주의(2점 회귀의 한계):** 이 직선을 그대로 역산하면 x절편(속도=0이 되는 지점)이 **speed≈1.4**로
+나옵니다 — 즉 그 아래로는 모터가 사실상 못 움직이는 데드존일 가능성이 있다는 뜻인데, 딱 2개 speed
+값(5, 10)만 측정한 상태라 저속 구간을 실측 없이 외삽한 추정일 뿐입니다. `APPROACH_SPEED=2.0`
+([config.py:99](config.py#L99))이 이 추정 데드존(≈1.4)에 가까워서, §2.1에서 다룬 "da 면적 상한 →
+경로 정지 → 속도 바닥값(`SPEED_NORMAL*0.15`=1.2)"이 정확히 이 데드존 부근이라는 게 우연이 아닐
+수 있습니다 — `SPEED_NORMAL`(8.0)이나 `APPROACH_SPEED`(2.0) 자체를 낮은 speed 값 몇 개로 추가
+실측해서 이 데드존 추정을 검증/보정할 필요가 있습니다. (코너 감속 하한 자체는 §2.3에서
+`SPEED_CORNER_MIN=3.0`으로 데드존 위로 올렸습니다 — `APPROACH_SPEED`는 아직 그대로입니다.)
+
+### 6.6 아직 미실측 (플레이스홀더로 남아있는 값)
+
+| 상수 | 위치 | 상태 |
+|---|---|---|
+| `PIXELS_PER_METER` (전역) | config.py | 0.0 (미실측) — `DL_USE_BEV`가 실차 검증돼 기본으로 전환되면 §6.3의 `DL_PIXELS_PER_METER`로 채울 것 |
+| `PP_MIN_LOOKAHEAD_PX`/`PP_WHEELBASE_PX`/`PP_LOOKAHEAD_BASE_PX` 등 | config.py | 전부 실차 미검증 튜닝값(추정/역산치일 뿐 실측 아님) |
+
+### 6.7 `LQR_WHEELBASE_M` 실측값 반영 (0.26 → 0.335, 2026-08-06, LQR 브랜치에서 이식)
+
+`config.py`의 `LQR_WHEELBASE_M`이 "★실측 필요★" 플레이스홀더(0.26)로 남아있었는데, `LQR` 브랜치가
+2026-08-06 같은 차량으로 줄자 실측한 값(0.335)을 갖고 있었습니다 — `planner/hybrid_astar.py`의
+`wheelbase` 기본값이 이미 이 값(0.335, "같은 차량이므로 stanley.py와 반드시 같은 값을 써야 한다"는
+주석과 함께)으로 갱신돼 있던 것과 같은 실측치입니다. `LQR_WHEELBASE_M`만 그 갱신에서 빠져 있었던
+것으로 보여, `LQR` 브랜치 값으로 맞췄습니다(`controller/lqr.py`의 생성자 기본값도 동일하게 갱신 —
+실제로는 `track_drive.py`가 항상 `LQR_WHEELBASE_M`을 명시적으로 넘기므로 이 기본값 자체는 안 쓰이지만,
+문서 목적상 실측 전 플레이스홀더로 오해되지 않도록 같이 맞춤).
+
+### 6.8 `PP_WHEELBASE_PX`를 물리 기반 값으로 계산 (80.0 → 67.0, 2026-08-06)
+
+`controller/pure_pursuit.py`의 `PP_WHEELBASE_PX`(곡률→조향각 게인, `steer=atan(curvature*wheelbase_px)`)는
+"실제 축거리 대신 쓰는 튜닝값"이라는 주석과 함께 80.0으로 하드코딩돼 있었다. 새로 실측값이 생긴 건
+아니지만, **기존 두 실측/설계값을 조합해 계산**할 수 있다는 걸 확인했다:
+
+- `LANE_DETECTOR_BACKEND='dl'`(기본값) + `DL_USE_BEV=True`(기본값)에서는 `self.lane_path`가
+  `config.DL_PIXELS_PER_METER`(=200px/m, §6.3 — BEV 캔버스 정의상 정확한 스케일) 좌표계로 만들어진다.
+- `LQR_WHEELBASE_M = 0.335m`(§6.7, 줄자 실측)는 pure_pursuit이 쓰는 것과 동일한 차량의 실제 축거리다.
+
+따라서 `PP_WHEELBASE_PX = LQR_WHEELBASE_M * DL_PIXELS_PER_METER = 0.335 * 200 = 67.0`으로, "임의
+튜닝값"이 아니라 물리적으로 근거 있는 값으로 대체할 수 있다(`config.py`, `controller/pure_pursuit.py`
+생성자 기본값도 문서 목적상 동일하게 갱신 — §6.7의 `LQR_WHEELBASE_M`과 같은 패턴).
+
+**★ 실차 재검증 필요 ★:** 80.0은 그 자체로 실차에서 "이 정도 조향 반응이 적당하더라"고 경험적으로
+맞춰졌을 가능성이 있다 — lookahead 근사, BEV 워프 오차, 세그멘테이션 노이즈 등 다른 근사 오차를
+상쇄해온 값일 수 있어서, 67.0로 바꾸면 같은 curvature에도 조향각이 더 작게(atan 인자↓) 나와 코너링이
+더 완만해질 수 있다. 실차에서 코너 추종이 둔해지면 이 값을 다시 올리되, 그때는 "물리 기반 값에서
+실차 튜닝으로 벗어난 것"임을 주석에 남길 것.
+
+## 7. VESC 실측 속도 연동 (ROS1, 2026-08-06 LQR 브랜치에서 이식)
+
+`LQR` 브랜치가 main과 갈라진 뒤 독자적으로 진행한 작업 중, main에 없던 실차 연동 하나를 가져왔습니다 —
+**구동모터의 실제 회전속도(VESC 홀센서 기반)를 ROS2 쪽에서 받아오는 것**. `localization/pose_estimator.py`는
+진작에 준비돼 있었지만(`EncoderPoseEstimator`), "이 로봇에 엔코더 토픽이 있는지 확인 전이라 미배선"
+상태로 남아있었는데 — 그 확인이 이번에 됐습니다.
+
+**구조:**
+1. 이 로봇엔 별도 엔코더가 없고, VESC 드라이버(ROS1, `vesc_driver`)가 `/sensors/core`
+   (`vesc_msgs/VescStateStamped`)로 모터 회전속도(ERPM)를 발행합니다.
+2. `vesc_msgs`가 이 ROS2 워크스페이스엔 빌드돼 있지 않아(2026-08-06 실차 확인) `ros1_bridge`가 이
+   커스텀 메시지를 그대로 못 넘깁니다.
+3. 그래서 ROS1쪽에 작은 변환 노드([launch/vesc_speed_bridge.py](launch/vesc_speed_bridge.py))를 하나 더
+   띄워 `state.speed`(ERPM) 값 하나만 표준 메시지(`std_msgs/Float32`)로 `/vesc_speed_erpm`에 다시
+   뿌립니다 — 표준 메시지라 `ros1_bridge`가 별도 빌드 없이 자동으로 브리지해줍니다.
+4. ROS2쪽 `track_drive.py`의 `cb_vesc()`가 이 토픽을 구독해 `VESC_SPEED_TO_ERPM_GAIN`(=4614.0,
+   `vesc.yaml`의 `speed_to_erpm_gain` 실측값, [config.py](config.py))로 나눠 `self.v_mps`(m/s)로 변환합니다.
+
+**이 값을 쓰는 곳 두 군데** (`control_loop()`, [track_drive.py](track_drive.py)):
+- `self.lqr.set_speed_mps(self.v_mps)` — `VESC_MIN_SPEED_MPS`(=0.05) 이상일 때만 갱신합니다. 정지
+  상태(v≈0)에서 그대로 넣으면 LQR의 상태전이행렬 B가 퇴화(조향이 상태에 영향을 못 미치는 것으로
+  계산됨)하므로, 그 미만이면 직전 게인을 유지합니다.
+- `self.pose_estimator.update(self.v_mps, math.radians(self.ctrl_angle), 0.05)` — 매 주기 갱신. 이제
+  `EncoderPoseEstimator(wheelbase_m=LQR_WHEELBASE_M)`로 축거도 실측값이 물려 있어(§6.7), pose 추정이
+  플레이스홀더 없이 동작합니다.
+
+**배포 방법 (ROS1쪽, 이 워크스페이스 바깥):**
+[launch/vesc_speed_bridge.py](launch/vesc_speed_bridge.py) 자체는 ROS1 노드라 이 ROS2 워크스페이스
+안에서는 실행되지 않습니다 — noetic_ws 안 기존 패키지의 `scripts/`에 넣거나 새 패키지를 만들어
+`rosrun`으로 띄우세요(파일 상단 주석에 상세 절차 있음). `[launch/manual_drive.launch.py](launch/manual_drive.launch.py)`는
+수동주행/카메라 단독 테스트용 ROS2 launch로 이번에 같이 이식했습니다 — VESC 연동 자체와는 독립적입니다.
+
+**확인 방법:** `DEBUG_VIZ_VESC=True`([config.py](config.py))면 `vesc_debug` 창이 뜹니다 —
+빨강(NEVER_RECEIVED, 브리지 노드 미실행/토픽명 불일치/`ros1_bridge` 미전달 의심), 주황(STALE, 브리지·VESC
+드라이버가 죽었을 가능성), 초록(LIVE, 정상) 세 상태를 색으로 바로 구분합니다.
+
+**포팅하지 않은 것:** `LQR` 브랜치의 다른 커밋들(`변경사항`/`speed변경` 등)은 main이 그 이후 독자적으로
+더 발전시킨 부분(perception 리팩토링, 코너 감속·`pure_pursuit` 락업 수정 등)과 겹치거나 낡은 flat 파일
+구조를 그대로 갖고 있어 이식하지 않았습니다 — VESC 연동 파일 3개(`cb_vesc`/`_debug_viz_vesc`/구독 wiring,
+`launch/vesc_speed_bridge.py`, `launch/manual_drive.launch.py`)와 `LQR_WHEELBASE_M` 실측값만 선별해서
+가져왔습니다.
+
+---
+
+## 8. IMU 센서 연동 (SparkFun 9DoF Razor IMU M0, 2026-08-06)
+
+### 8.1 하드웨어 상태 — 지금까지 고장, 이번에 수리
+
+`/imu` 토픽은 처음부터 `track_drive.py`가 구독하고 있었지만(`cb_imu()`), **IMU 하드웨어 자체가 고장나
+있어서** 실제로는 한 번도 살아있었던 적이 없었습니다. 이번에 하드웨어를 수리했고, 사용 중인 보드는
+[SparkFun 9DoF Razor IMU M0 (SKU: SEN-14001)](https://learn.sparkfun.com/tutorials/9dof-razor-imu-m0-hookup-guide/all)
+입니다. 펌웨어는 SparkFun 가이드가 안내하는 방식대로 다시 올릴 예정입니다.
+
+**펌웨어를 처음부터 새로 만들 필요 없음 — 이미 이 보드 전용으로 준비돼 있었습니다.** 로봇의 기존
+`~/xycar_ws/src/xycar_device/xycar_imu` 패키지(버전관리 밖에 있던 워크스페이스)를 확인한 결과,
+`firmware/Razor_AHRS/Razor_AHRS.ino`에 정확히 `#define HW__VERSION_CODE 14001 // SparkFun "9DoF Razor
+IMU M0" version "SEN-14001"`로 지금 쓰는 보드용 설정이 이미 돼 있었습니다 — 이 `.ino`를 Arduino
+IDE(보드: SparkFun 9DoF Razor IMU M0)로 그대로 올리면 됩니다.
+
+### 8.2 `xycar_imu` 패키지를 이 저장소로 편입
+
+기존엔 이 IMU 드라이버 패키지가 실차의 `~/xycar_ws`(버전관리 안 됨)에만 있어서, 실차를 다시 세팅하거나
+다른 사람이 이어받을 때 그대로 사라질 위험이 있었습니다. 그래서 **`~/xycar_ws/src/xycar_device/xycar_imu`
+전체를 이 저장소의 [`xycar_device/xycar_imu/`](../../xycar_device/xycar_imu)로 그대로 복사해 버전관리에
+편입**했습니다(빌드 산출물 `__pycache__`/`*.pyc`는 제외, `package.xml`/`setup.py`/`config/`/`launch/`/
+`firmware/`/`src/` 등 ament_python 빌드에 필요한 파일은 전부 포함).
+
+**배포 방법 (실차):** 이 저장소를 pull한 뒤 `xycar_device/xycar_imu`를 `~/xycar_ws/src/xycar_device/`에
+그대로 붙여넣고 `colcon build --packages-select xycar_imu` → 다시 source하면 끝입니다.
+
+**편입하면서 발견해 고친 버그 (2개, 둘 다 같은 원인):** `xycar_imu` 패키지의 launch 파일 두 개가 존재하지
+않는 설정파일을 가리키고 있었습니다.
+- `launch/xycar_imu.launch.py`, `launch/xycar_imu_viewer.launch.py` 둘 다 `config/imu.yaml`을
+  로드하려 했는데, 실제로는 그런 파일이 없고(`config/`엔 `razor.yaml`/`razor_diags.yaml`/`xycar_imu.yaml`
+  세 개뿐, `razor.yaml`과 `xycar_imu.yaml`은 내용이 완전히 동일함) — `imu.yaml`로 오타가 난 것으로 보입니다.
+  이 상태로 `imu_node`를 띄우면 파라미터 파일을 못 찾아 시작 직후 죽습니다. 두 파일 모두 `"xycar_imu.yaml"`을
+  가리키도록 고쳤습니다.
+- (`launch/razor-pub-diags.launch.py` → `razor_diags.yaml`, `launch/xycar_imu_and_display.launch.py` →
+  `xycar_imu.yaml`은 원래부터 정확히 존재하는 파일을 가리키고 있어 손대지 않았습니다.)
+
+**아직 안 한 것 — 다음 단계:** [`launch/track_drive.launch.py`](launch/track_drive.launch.py)의
+`imu_include`가 여전히 주석 처리돼 있습니다(`# imu_include,  # S0->S1 테스트 단계에서 비활성화...`) —
+IMU 하드웨어를 고치고 `xycar_imu` 패키지를 빌드해도 이 줄을 살리지 않으면 `track_drive` 노드는 여전히
+`/imu`를 못 받습니다. 펌웨어 플래싱 + 패키지 빌드가 실차에서 확인되면 이 주석을 해제할 것.
+
+**시리얼 포트:** `config/xycar_imu.yaml`의 `port: /dev/ttyIMU`(57600bps)로 고정돼 있습니다. 이 udev
+별칭이 지금 로봇에도 잡혀 있는지(보드가 새 걸로 바뀌었으니) 실차에서 확인이 필요합니다.
+
+### 8.3 `track_drive.py`가 IMU를 쓰는 곳
+
+`cb_imu()`가 `/imu`(`sensor_msgs/Imu`) 메시지에서 두 값을 뽑습니다:
+- `self.imu_yaw` (orientation 쿼터니언 → yaw, 원래부터 있던 값) — 바퀴 카운트(아래 8.4)와 S3 지름길
+  `_handle_fixed_obstacle_astar()`의 Stanley 헤딩(`_yaw_delta()`)이 씁니다.
+- `self.imu_yaw_rate` (`angular_velocity.z`, 이번에 추가) + `self._imu_t`(수신 시각) — §0.5.5
+  `pure_pursuit` 코너 감쇠 보강 전용. `IMU_STALE_SEC=0.5`(config.py) 이상 안 들어오면 죽었다고 봅니다.
+
+### 8.4 이번에 발견한 버그 — 바퀴 카운트가 항상 0에 멈추는 문제
+
+**증상:** 실차에서 아무리 주행해도 CLI 로그의 `[LAP] 1/3 바퀴 누적=+0도/...`가 계속 0에 멈춰 있었음.
+
+**원인:** `_update_lap()`([track_drive.py:832](track_drive.py#L832))은 **휠 회전이 아니라 IMU yaw
+누적만으로** 바퀴 수를 셉니다 — `self.imu_yaw`의 프레임간 차이를 계속 더하는 구조라, 독립적인
+휠 기반 폴백이 전혀 없습니다. IMU 하드웨어가 죽어있던 동안엔 `self.imu_yaw`가 초기값 `0.0`에서 한 번도
+안 바뀌었으니(`/imu`를 아예 못 받음) 프레임간 차이가 항상 `0`이라 `_yaw_accum`도 영원히 `0`으로
+찍힌 것 — 코드 버그가 아니라 **§8.1의 하드웨어 고장이 그대로 드러난 증상**이었습니다.
+
+**대응:** 이번 IMU 수리(§8.1)로 `/imu`가 실제로 들어오기 시작하면 자동으로 해결됩니다 — `_update_lap()`
+자체는 손대지 않았습니다. 다만 §8.2의 "아직 안 한 것"(`imu_include` 주석 해제)까지 끝나야 실제로
+`/imu`가 `track_drive` 노드에 도달합니다.
+
+**확인 방법:** 실차 주행 중 CLI 로그의 `[LAP] n/3 바퀴 누적=...도` 값이 주행하는 동안 계속 늘어나는지
+확인하세요. 여전히 `0`에 멈춰 있다면 ①`imu_include` 주석 해제했는지 ②`xycar_imu` 노드 시작 로그에러
+③`/dev/ttyIMU` 포트 순으로 확인할 것.
+
+**알려진 한계:** IMU가 나중에 다시 죽어도(§7 VESC의 `vesc_debug` 창처럼) 바로 알아챌 디버그 창이 없습니다
+— `_imu_t`(§8.3)로 생존 체크 인프라 자체는 §0.5.5에서 만들었지만, 아직 전용 디버그 창(`imu_debug`
+같은)까지는 안 만들었습니다. 지금은 `[LAP] 누적=`이 안 늘어나는 것으로 간접 확인해야 합니다.
+
+---
+
+## 9. SLAM 지도 생성 + AMCL 실주행 로컬라이제이션 (설계만 완료, 실차 미검증, 2026-08-07)
+
+### 9.0 왜 이 구조인가 — "IMU로 SLAM"은 성립하지 않는다
+
+IMU는 관성센서(proprioceptive)라 "내가 얼마나 돌았나/가속했나"만 알 뿐, 주변 환경을 보는 감각이
+없습니다. 그래서 IMU 값만 적분(dead reckoning)하면 위치를 추정할 순 있어도 오차가 시간에 따라
+무한정 누적되고, 애초에 "지도"를 만들 방법이 없습니다(지도를 만들려면 벽/장애물처럼 외부를 관측하는
+exteroceptive 센서가 있어야 함). 이 로봇엔 다행히 `/scan`(라이다, `xycar_lidar` — 이 저장소엔 없고
+시스템 설치 패키지로 추정, [track_drive.launch.py:49-52](../launch/track_drive.launch.py)의
+`lidar_include` 참고)이 이미 있으므로, 실제로는 **lidar SLAM에 IMU를 보조 융합**하는 구조입니다.
+
+또한 이 로봇은 매 대회마다 정해진 트랙을 도는 구조라(§0 대회 규정 요약) 매번 새로 지도를 만드는
+온라인 SLAM은 불필요합니다. 그래서:
+1. **매핑은 대회 전 1회**만 — `slam_toolbox`로 트랙을 한 바퀴 돌며 지도를 만들고 저장.
+2. **실주행은 그 저장된 지도에 대해 AMCL로 위치만 추정** — 지도를 더 안 바꾸니 계산량이 훨씬 적고
+   실차에서 더 안정적입니다.
+
+**범위 안내:** 이번 작업은 이 SLAM/AMCL "스택"(launch + 파라미터 + 브리지 노드)까지만입니다.
+`track_drive.py`의 `control_loop()`(카메라 차선인식 + `pose_estimator.py` 데드레커닝 기반)는
+전혀 건드리지 않았습니다 — AMCL이 만드는 `/amcl_pose`를 실제 주행 판단(예: `hybrid_astar`/
+`pure_pursuit`/`stanley`의 pose 소스 교체)에 연결하는 건 의도적으로 별도 작업으로 남겨뒀습니다.
+
+### 9.1 새로 추가한 파일
+
+| 파일 | 역할 |
+|---|---|
+| [`localization/vesc_twist_bridge.py`](localization/vesc_twist_bridge.py) | `/vesc_speed_erpm`(ERPM, §7)을 `TwistWithCovarianceStamped`로 재발행 — EKF 입력용. 휠 엔코더가 없는 이 로봇의 유일한 속도 소스를 §7의 `cb_vesc()`와 동일한 환산식(`VESC_SPEED_TO_ERPM_GAIN`)으로 재사용. |
+| [`../launch/robot_frames.launch.py`](../launch/robot_frames.launch.py) | `base_link -> base_imu_link`, `base_link -> laser` 정적 TF. 이 저장소에 URDF/TF 발행이 전혀 없던 상태라 이번에 처음 추가 — 오프셋은 전부 0.0 placeholder(실측 필요, §9.3). |
+| [`../config/ekf.yaml`](../config/ekf.yaml) | `robot_localization` EKF — IMU(yaw + yaw_rate)와 vesc twist(linear.x)만 융합해 `odom -> base_link` 발행. |
+| [`../config/mapper_params_online_async.yaml`](../config/mapper_params_online_async.yaml) | `slam_toolbox` online_async(매핑 모드) 파라미터. |
+| [`../config/amcl_params.yaml`](../config/amcl_params.yaml) | `nav2_map_server` + `nav2_amcl` + `nav2_lifecycle_manager` 파라미터(실주행 로컬라이제이션 전용). |
+| [`../launch/slam_mapping.launch.py`](../launch/slam_mapping.launch.py) | 대회 전 1회, 지도 생성용 통합 launch. |
+| [`../launch/amcl_localization.launch.py`](../launch/amcl_localization.launch.py) | 실주행 중 저장된 지도에 대해 위치만 추정하는 통합 launch. |
+| `../config/maps/` | `map_saver_cli`로 저장할 지도 파일(`track_map.yaml`/`.pgm`) 위치. 아직 지도 자체는 없음(`.gitkeep`만 있음) — 실차에서 매핑을 실제로 돌려야 생김. |
+
+### 9.2 사용 절차 (실차에서, 이 워크스페이스 배포 후)
+
+```
+# 1) 지도 생성 (트랙을 한 바퀴 수동/teleop으로 주행하며 스캔)
+ros2 launch track_drive slam_mapping.launch.py
+
+# 2) 다른 터미널에서 지도 저장 (1)이 떠 있는 동안)
+ros2 run nav2_map_server map_saver_cli -f <워크스페이스>/track_drive/config/maps/track_map \
+  --ros-args -p save_map_timeout:=5000
+
+# 3) (1) 종료 후, 저장된 지도로 실주행 로컬라이제이션만 기동
+ros2 launch track_drive amcl_localization.launch.py map:=<워크스페이스>/track_drive/config/maps/track_map.yaml
+
+# 4) 위치가 잘 잡히는지 확인
+ros2 topic echo /amcl_pose
+```
+
+### 9.3 실차에서 반드시 확인/실측해야 하는 것 (미검증 목록)
+
+- **`robot_frames.launch.py`의 TF 오프셋**: 전부 `0 0 0 0 0 0`(센서가 차량 중심에 달려있다는
+  가정) placeholder입니다. `LQR_WHEELBASE_M`([config.py](config.py))처럼 줄자로 IMU/라이다
+  장착 위치를 실측해서 채울 것.
+- **라이다 `frame_id`**: `xycar_lidar` 패키지가 이 저장소에 없어(§ 상단 "저장소 = 실차 배포 소스"
+  참고, 시스템 설치 패키지로 추정) 실제 `/scan` 메시지의 `header.frame_id`를 코드로 확인 못 했습니다.
+  `robot_frames.launch.py`는 `laser`로 가정했으니 `ros2 topic echo /scan --field header.frame_id`로
+  실차에서 확인 후 다르면 맞출 것.
+- **`max_laser_range`(mapper/amcl 파라미터 12.0m)**: xycar 라이다 실측 스펙 미확인 — 데이터시트나
+  `ros2 topic echo /scan --field range_max`로 확인 후 맞출 것.
+- **`ekf.yaml`의 `imu0_config`/`process_noise_covariance`, `vesc_twist_bridge.py`의 속도 분산**: 전부
+  실측 없는 표준값/추정치입니다. EKF 결과(`/odometry/filtered`)가 튀거나 밀리면 이 값부터 튜닝.
+- **`amcl_params.yaml`의 `alpha1~5`/파티클 수**: 이 트랙 형태(직선 비중, 라바콘 배치)에서 파티클이
+  잘 수렴하는지 실차에서 확인 후 튜닝 필요.
+
+### 9.4 `setup.py` 부재 — 이 스택이 실제로 설치되려면 반드시 해결해야 함
+
+**이 저장소의 `track_drive` 패키지엔 `setup.py`/`setup.cfg`가 없습니다** (`xycar_device/xycar_imu`엔
+있음 — 대조 확인함). `ament_python` 빌드는 `setup.py`의 `data_files`로 `config/`, `launch/`를
+`share/track_drive/`에 설치하고 `entry_points`로 콘솔 스크립트를 등록하는데, 그게 없으면:
+- 위 launch 파일들이 `get_package_share_directory('track_drive')`로 찾는 `config/*.yaml`이 설치
+  경로에 없어서 **런타임에 파일을 못 찾고 실패**합니다.
+- `launch/track_drive.launch.py`의 `executable='track_drive'`가 지금 실제로 동작한다는 건 실차의
+  `~/xycar_ws/src/track_drive/`엔 `setup.py`가 **있다**는 뜻입니다 — 이 저장소에만 커밋이 안 된
+  상태로 보입니다(`.gitignore` 없음, 의도적 제외로 보긴 어려움).
+
+**이번에 임의로 새로 만들지 않은 이유:** 실차의 실제 `setup.py`가 어떤 버전/추가 `console_scripts`를
+갖고 있는지 이 환경에선 확인할 수 없는데, 여기서 지어낸 `setup.py`를 커밋하면 다음 배포 때(이
+폴더를 통째로 `xycar_ws/src/track_drive/`에 덮어쓰는 방식) 실차의 진짜 `setup.py`를 덮어써 버릴
+위험이 있습니다. 그래서 `vesc_twist_bridge.py`는 `entry_point` 없이도 뜨도록
+`python3 -m track_drive.localization.vesc_twist_bridge`로 직접 모듈 실행하게 launch 파일을
+짰습니다(§9.1 launch 파일들 참고) — 이건 `entry_point` 문제를 우회하지만, `config/*.yaml`이
+설치되는 문제는 우회할 방법이 없습니다.
+
+**실차에서 꼭 할 일:** 기존 `~/xycar_ws/src/track_drive/setup.py`를 열어서 `data_files`에 아래
+두 글롭이 있는지 확인하고 없으면 추가할 것(`xycar_imu/setup.py` 패턴과 동일):
+```python
+(os.path.join(SHARE_DIR, 'config'), glob(os.path.join('config', '*.yaml'))),
+(os.path.join(SHARE_DIR, 'launch'), glob(os.path.join('launch', '*.launch.py'))),
+```
+확인 후엔 그 실제 `setup.py`도 이 저장소에 `git add`해서 다음부턴 버전관리에 편입하는 걸 권장합니다
+(§8.2가 `xycar_imu`에 대해 했던 것과 동일한 조치).
+
+### 9.5 알려진 한계
+
+- **실차 전 과정 미검증**: `colcon`/`ros2` 툴체인이 없는 환경(이 저장소 상단 안내 참고)이라
+  `python3 -m py_compile`(문법)과 `yaml.safe_load`(문법)까지만 확인했습니다. 노드 간 실제 통신,
+  TF 트리 완결성, `slam_toolbox`/`nav2_amcl` 버전 호환성은 실차에서만 확인 가능합니다.
+- **제어 루프 미연결**: §9.0에서 밝힌 대로 `/amcl_pose`를 실제 주행 판단에 쓰는 배선은 안 했습니다.
+- **`set_initial_pose: false`**: AMCL이 시작 시 초기 위치를 모릅니다 — 매 실주행 시작 시 rviz의
+  "2D Pose Estimate"로 대략적인 시작 위치/방향을 찍어줘야 하거나, 항상 같은 출발선에서 시작한다면
+  `amcl_params.yaml`에 `set_initial_pose: true` + `initial_pose` 좌표를 고정값으로 채우는 걸 권장.
