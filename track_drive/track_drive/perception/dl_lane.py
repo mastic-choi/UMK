@@ -9,7 +9,8 @@
 # 인터페이스를 구현하므로 track_drive.py의 perc_lane()은 수정 없이 그대로 재사용된다
 # (LANE_DETECTOR_BACKEND 플래그로 세 백엔드 중 하나를 고른다). path는 밴드(row 구간)별
 # 중심점(config.DL_CENTER_MODE='da'면 da 무게중심, 'll_da'면 ll이 확실한 밴드는 ll 좌/우
-# 중점 그 외는 da 무게중심으로 폴백 — 아래 "밴드별 중심 계산" 참고)에
+# 중점 그 외는 da 무게중심으로 폴백, 'll'이면 ll이 확실한 밴드만 쓰고 그 외는 무효 —
+# 아래 "밴드별 중심 계산" 참고)에
 # lane_util._fit_and_sample_path()로 다항식을 피팅해 만든 명시적 경로(ROI 픽셀좌표
 # 웨이포인트, 가까운점→먼점) — controller/pure_pursuit.py가 조향각 계산에 직접 사용한다.
 #
@@ -27,19 +28,21 @@
 #   기준으로 걸어야 원래 의미(연속 몇 *프레임*이 안정적이었는가)가 유지되므로, 워커 스레드
 #   안(DLSlideWindow.detect() 내부, SlideWindow._debounce() 재사용)에서만 적용된다.
 #
-# ── 밴드별 중심 계산: 'da' 단독 vs 'll(차선)+da' 하이브리드 — config.DL_CENTER_MODE ──
-#   DL_CENTER_MODE='da'(main 기본값. 이 브랜치 기본값은 'll_da' — config.py 참고):
+# ── 밴드별 중심 계산: 'da' 단독 / 'll(차선)+da' 하이브리드 / 'll' 단독 — config.DL_CENTER_MODE ──
+#   DL_CENTER_MODE='da'(main 기본값):
 #   da(주행가능영역)를 "주행 가능한 영역 하나의 덩어리"로 보고
 #   그 가로 중심을 밴드(행 구간)별로 바로 뽑는다 — 좌/우 ll을 따로 찾아 폭을 추정해
 #   중점을 계산하는 간접적인 방식보다 단순하고, 가는 선 하나가 반사/그림자로 끊기는 것보다
 #   넓은 덩어리가 노이즈에 더 안정적이라는 판단.
-#   DL_CENTER_MODE='ll_da': da 무게중심은 "주행 가능한 영역"이지 "차로 중앙"이 아니므로,
+#   DL_CENTER_MODE='ll_da'/'ll': da 무게중심은 "주행 가능한 영역"이지 "차로 중앙"이 아니므로,
 #   갓길 등 여백이 넓은 구간에서 무게중심이 여백 쪽으로 쏠려 경로가 차로 중앙을 벗어나는
 #   문제가 실측으로 확인됐다. ll(차선 자체, 두 백선)은 여백 크기와 무관하게 "선이 실제로
 #   있는 위치"만 가리키므로, 밴드마다 좌/우 ll이 둘 다 신뢰할 만큼 보이면 그 중점을
-#   우선 채택하고(DLSlideWindow._ll_slice_centers()), ll이 부족한 밴드만 da 중심으로
-#   개별 폴백한다(프레임 전체 무효화 아님) — config.py DL_CENTER_MODE 주석 참고.
-#   두 모드 공통: 급커브에서 da 마스크가 파편화되는 실패모드에 대응해 ConnectedComponents로
+#   채택한다(DLSlideWindow._ll_slice_centers()). 'll_da'는 ll이 부족한 밴드만 da 중심으로
+#   개별 폴백하고(프레임 전체 무효화 아님), 'll'은 그 폴백 없이 해당 밴드를 그냥 무효(None)로
+#   둔다 — da가 섞여 여백 쪽으로 쏠리는 걸 완전히 배제하고 싶을 때 쓰는 모드
+#   (config.py DL_CENTER_MODE 주석 참고).
+#   세 모드 공통: 급커브에서 da 마스크가 파편화되는 실패모드에 대응해 ConnectedComponents로
 #   가장 큰 덩어리 하나만 남기고(DL_DA_MIN_COMPONENT_AREA 미만이면 그 프레임은 무효 처리)
 #   나머지 파편에 중심선이 끌려가지 않게 막는다(_largest_da_component() 참고). 또한 da가
 #   점선 틈으로 옆 차선 da와 하나의 덩어리로 이어붙는 실패모드에 대해서는
@@ -518,13 +521,14 @@ class DLSlideWindow(SlideWindow):
         return clipped
 
     def _ll_slice_centers(self, ll_mask, ref_x):
-        """DL_CENTER_MODE='ll_da'일 때만 호출된다. ll_mask(차선 이진마스크)를
+        """DL_CENTER_MODE='ll_da' 또는 'll'일 때 호출된다. ll_mask(차선 이진마스크)를
         _slice_centers()와 동일한 n_slices 밴드로 나눠, 밴드마다 cur_ref를 기준으로
         좌/우로 나눈 뒤 각각 무게중심(cv2.moments)을 구한다. 양쪽 다
         DL_LL_SIDE_MIN_PIXELS 이상이고 두 중심 간 거리가 실측 차로폭 범위
         (DL_LL_WIDTH_MIN_PX~DL_LL_WIDTH_MAX_PX) 안에 들 때만 그 중점을 이번 밴드의
         결과로 채택한다 — 한쪽만 보이거나 폭이 비정상이면(반대 차선을 잘못 짝짓는 등)
-        신뢰할 수 없다고 보고 None을 반환해 detect()가 그 밴드만 da로 폴백하게 한다.
+        신뢰할 수 없다고 보고 None을 반환한다. 이 None을 detect()가 'll_da'에서는 그
+        밴드만 da로 폴백시키는 신호로, 'll'에서는 그대로 무효 밴드로 쓰는 신호로 쓴다.
 
         cur_ref(좌/우 분리 기준점)는 _clip_da_by_ll()과 같은 원칙으로 근거리→원거리로
         올라가며 갱신하되, ★ 이번 밴드에서 실제로 채택(양쪽 다 신뢰됨)됐을 때만 갱신한다 ★
@@ -664,11 +668,13 @@ class DLSlideWindow(SlideWindow):
         # 밴드별 중심점 — DL_CENTER_MODE='da'면 da 무게중심을 그대로 쓰고(_slice_centers는
         # 색상/의미에 상관없이 "임의의 이진마스크를 세로로 N등분해 구간별 moments 중심을
         # 구하는" 범용 로직), 'll_da'면 밴드마다 ll이 신뢰되면 ll 중점을 우선 채택하고
-        # 그 외 밴드만 da 중심으로 폴백한다(모듈 상단 주석 참고). ll_mask는 클리핑 전
-        # 원본을 쓴다 — _clip_da_by_ll()의 클리핑은 da를 깎아내기 위한 것이지 ll 자체의
-        # 좌/우 라인 위치를 바꾸는 게 아니므로 그대로 재사용해도 무방하다. ref_x는 위에서
-        # _clip_da_by_ll()에 쓴 것과 같은 기준점(직전 프레임 확정 lane_center, 없으면
-        # ROI 중앙)을 그대로 재사용한다.
+        # 그 외 밴드만 da 중심으로 폴백하며, 'll'은 그 da 폴백 없이 ll이 신뢰되는 밴드만
+        # 쓰고 나머지는 무효(None)로 둔다(모듈 상단 주석 참고) — None은 이후
+        # _reject_outliers/_fit_and_sample_path가 원래부터 걸러내는 값이라 별도 처리가
+        # 필요 없다. ll_mask는 클리핑 전 원본을 쓴다 — _clip_da_by_ll()의 클리핑은 da를
+        # 깎아내기 위한 것이지 ll 자체의 좌/우 라인 위치를 바꾸는 게 아니므로 그대로
+        # 재사용해도 무방하다. ref_x는 위에서 _clip_da_by_ll()에 쓴 것과 같은 기준점
+        # (직전 프레임 확정 lane_center, 없으면 ROI 중앙)을 그대로 재사용한다.
         raw_da_centers = self._slice_centers(da_mask, 0, (0, 255, 0))
         if DL_CENTER_MODE == 'll_da':
             raw_ll_centers, self.ll_band_used = self._ll_slice_centers(ll_mask, ref_x)
@@ -676,6 +682,8 @@ class DLSlideWindow(SlideWindow):
                 ll_c if ll_c is not None else da_c
                 for ll_c, da_c in zip(raw_ll_centers, raw_da_centers)
             ]
+        elif DL_CENTER_MODE == 'll':
+            merged_centers, self.ll_band_used = self._ll_slice_centers(ll_mask, ref_x)
         else:
             merged_centers = raw_da_centers
             self.ll_band_used = [False] * len(raw_da_centers)
@@ -770,7 +778,9 @@ class DLSlideWindow(SlideWindow):
         # 폴백한 밴드는 노란색으로 구분해서(_ll_slice_centers()/detect() 병합 로직 참고)
         # 어느 밴드가 ll을 못 써서 da로 대체됐는지 한눈에 보이게 한다('da' 모드에선
         # ll_band_used가 항상 전부 False라 전부 노란색 — 기존 draw_centers() 색과 동일해
-        # 시각적으로 하위호환). draw_centers()는 단일 색만 지원해 여기선 직접 그린다.
+        # 시각적으로 하위호환. 'll' 모드에선 애초에 da 폴백이 없어 그려지는 점은 전부
+        # 흰색이고, ll이 부족해 무효 처리된 밴드는 centerline이 None이라 아예 안 그려짐).
+        # draw_centers()는 단일 색만 지원해 여기선 직접 그린다.
         pts = [
             (int(np.clip(cx, 0, self.roi_w - 1)), int(y))
             for c in self.centerline if c is not None
