@@ -361,20 +361,27 @@ class SlideWindow:
         self._pending = None      # 연속성 검사 중인 후보값
         self._pending_count = 0   # 후보가 연속으로 유지된 프레임 수
 
-    def _slice_centers(self, mask, x_offset, color):
+    def _slice_centers(self, mask, x_offset, color, min_pixels=None):
         """
         mask를 아래→위로 MOMENT_N_SLICES개 구간으로 나눠 구간마다 cv2.moments()로
         무게중심(cx)을 구한다. 슬라이딩 윈도우처럼 이전 구간 위치를 이어받지
         않고 구간마다 독립적으로 계산하므로, 한 구간이 반사/잡음으로 날아가도
         다른 구간에는 전혀 영향이 없다.
-          입력 : mask     — 이진마스크(좌/우 절반 등으로 이미 열 방향이 잘려있을 수 있음)
-                x_offset — mask가 원본 ROI에서 잘려나온 경우의 x좌표 보정값(좌우 분리용)
-                color    — 디버그 사각형 색상
+          입력 : mask       — 이진마스크(좌/우 절반 등으로 이미 열 방향이 잘려있을 수 있음)
+                x_offset   — mask가 원본 ROI에서 잘려나온 경우의 x좌표 보정값(좌우 분리용)
+                color      — 디버그 사각형 색상
+                min_pixels — 구간 채택 최소 픽셀수. None이면 self.min_pixels(원래 da용
+                             기본값)를 쓴다. da처럼 면을 채우는 마스크가 아니라 ll처럼
+                             가늘게 선만 있는 마스크에 쓸 땐 그 선 전용 임계값(예:
+                             DL_LL_SIDE_MIN_PIXELS)을 넘겨서 self.min_pixels(da 기준,
+                             훨씬 큼)로 인해 항상 무효 처리되는 걸 막아야 한다
+                             (DLSlideWindow.detect()의 yellow_band_centers 계산 참고).
           출력 : centers — 길이 self.n_slices 리스트. 각 원소는 (y_center, cx) 또는
-                 해당 구간 픽셀수가 self.min_pixels 미만이면 None
+                 해당 구간 픽셀수가 min_pixels 미만이면 None
         """
         slice_h = self.roi_h // self.n_slices
         centers = []
+        threshold = self.min_pixels if min_pixels is None else min_pixels
 
         for i in range(self.n_slices):
             y_high = self.roi_h - i * slice_h
@@ -392,7 +399,7 @@ class SlideWindow:
 
             M = cv2.moments(band, binaryImage=True)
 
-            if M['m00'] < self.min_pixels:
+            if M['m00'] < threshold:
                 centers.append(None)
                 continue
 

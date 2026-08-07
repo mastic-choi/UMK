@@ -320,13 +320,16 @@ DL_CENTER_MODE = 'da'  # 'da' | 'll_da' | 'll'
 #   DL_MIN_PIXELS(=40, da용)보다 낮은 이유: ll은 da처럼 면을 채우는 마스크가 아니라 가는
 #   선이라 같은 밴드 안에 있는 픽셀수 자체가 원래 훨씬 적다. 실차 미검증 초기값.
 DL_LL_SIDE_MIN_PIXELS = 15
-# 밴드 내 좌/우 ll 중점을 채택하기 위한 두 선 사이 거리(px) 허용범위 — 실측 차로폭
-#   0.8m(=DL_LL_CLIP_MARGIN_PX 주석의 근거와 동일 실측, @200px/m=160px)에 ±40% 여유를
-#   둔 값. 이 범위 밖이면(예: 반대쪽 밴드의 다른 차선을 잘못 짝지은 경우) 그 밴드는
-#   버리고 da로 폴백한다. 실차 미검증 초기값 — DEBUG_VIZ_DL_LANE으로 실제 정상 주행
-#   중 밴드별 폭이 이 범위 안에 드는지 보고 조정할 것.
-DL_LL_WIDTH_MIN_PX = 100
-DL_LL_WIDTH_MAX_PX = 220
+# 밴드 내 좌/우 ll 중점을 채택하기 위한 두 선 사이 거리(px) 허용범위 — 범위 밖이면(예:
+#   반대쪽 밴드의 다른 차선을 잘못 짝지은 경우) 그 밴드는 버리고 da로 폴백한다.
+#   원래는 실측 차로폭 0.8m(=DL_LL_CLIP_MARGIN_PX 주석의 근거와 동일 실측, @200px/m=
+#   160px)에 ±40% 여유를 둔 100~220이었으나, 녹화 영상 분석에서 측정된 라인 간격이
+#   75~80px로 하한(100)보다 작게 나와 실제 환경과 안 맞을 가능성이 있었다. [2026-08-07]
+#   튜닝 중이라 우선 50~200으로 넓게 열어뒀다 — visualize()가 밴드별 실측 폭을
+#   화면에 찍어주니(DLSlideWindow._ll_slice_centers()/visualize() 참고) 그 값을 보고
+#   이 범위를 다시 좁힐 것. 실차 미검증 초기값.
+DL_LL_WIDTH_MIN_PX = 50
+DL_LL_WIDTH_MAX_PX = 200
 
 # [2026-08-07] _ll_slice_centers()가 좌/우 ll을 찾을 때 보는 탐색창 반경(px). 원래는
 #   좌/우 분리 기준점(cur_ref) 하나로 밴드를 절반씩(왼쪽 전체/오른쪽 전체, 보통 수백 px)
@@ -352,6 +355,19 @@ DL_LL_WIDTH_EMA_ALPHA = 0.1
 #   TwinLiteNet의 ll 출력은 흰/노랑을 구분하지 않아 HSV로 별도 검출한다.
 YELLOW_LOWER = np.array([15, 80, 80])
 YELLOW_UPPER = np.array([40, 255, 255])
+
+# [2026-08-07] ll을 흰선/노란선으로 분리하는 데 쓰는 커넥티드 컴포넌트 투표 기준.
+#   ll 픽셀 자체는 흰/노랑 구분이 없으므로(위 YELLOW_LOWER/UPPER 주석 참고),
+#   ll_mask의 커넥티드 컴포넌트(=점선 한 조각/실선 한 덩어리) 단위로 그 안에
+#   YELLOW_LOWER/UPPER 기준 노란 픽셀이 얼마나 겹치는지를 보고 "덩어리 전체"를
+#   노란선/흰선 중 하나로 확정한다(픽셀 단위로 빼는 것보다 dash 가장자리가
+#   깔끔하게 갈린다 — DLSlideWindow._split_ll_by_yellow() 참고).
+#   DL_LL_YELLOW_MIN_AREA 미만인 자잘한 컴포넌트(반사/노이즈)는 투표 자체를
+#   생략하고 흰선 쪽에 그대로 둔다(어차피 이후 DL_LL_SIDE_MIN_PIXELS/CCA에서 걸러짐).
+#   실차 미검증 초기값 — 흰선 일부가 노랗게(역광/그림자) 물들어 오분류되면
+#   DL_LL_YELLOW_VOTE_RATIO를 올릴 것, 노란 점선이 흰선으로 새면 내릴 것.
+DL_LL_YELLOW_VOTE_RATIO = 0.35
+DL_LL_YELLOW_MIN_AREA = 10
 
 FPS_LOG_PERIOD_SEC = 5.0   # dl_lane.py 워커 스레드 FPS/provider 로그 주기(s)
 

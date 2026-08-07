@@ -187,6 +187,7 @@ from ..config import (
     DL_LL_DECAY_ALPHA, DL_LL_DECAY_MIN_VALUE,
     DL_CENTER_MODE, DL_LL_SIDE_MIN_PIXELS, DL_LL_WIDTH_MIN_PX, DL_LL_WIDTH_MAX_PX,
     DL_LL_SEARCH_HALF_WIDTH_PX, DL_LL_WIDTH_EMA_ALPHA,
+    DL_LL_YELLOW_VOTE_RATIO, DL_LL_YELLOW_MIN_AREA,
     DEBUG_VIZ_DL_LANE, YELLOW_LOWER, YELLOW_UPPER, FPS_LOG_PERIOD_SEC,
 )
 
@@ -361,6 +362,12 @@ class DLSlideWindow(SlideWindow):
         self.da_chosen_area_px = 0   # 실제로 채택돼 waypoint 추출에 쓰인 덩어리의 면적(무효 프레임엔 0)
         self._ll_half_width = (DL_LL_WIDTH_MIN_PX + DL_LL_WIDTH_MAX_PX) / 4.0  # [2026-08-07] ll 좌/우 독립 슬라이딩 윈도우의 차로 반폭 러닝 추정치(px) — 양쪽 다 찾은 밴드에서 EMA 갱신, 편측만 찾았을 때 반대쪽 위치 추정에 씀(_ll_slice_centers() 참고). _clip_da_by_ll()의 가상경계 최후수단에도 재사용.
         self._ll_decay_mask = None   # [2026-08-07] ll 잔상(decay) 누적 마스크(float32, roi shape) — detect()가 매 프레임 갱신, _clip_da_by_ll() 전용(centerline 추출엔 안 씀). None이면 첫 프레임이라 detect()에서 새로 할당.
+        # [2026-08-07] ll 흰선/노란선 분리(_split_ll_by_yellow()) 이후 부가 정보 — 전부
+        # visualize()용이고 경로/조향 계산에는 안 쓰인다.
+        self.ll_white_mask_roi = None    # 흰선으로 확정된 ll 컴포넌트만 남은 마스크(_ll_slice_centers()의 실제 입력)
+        self.ll_yellow_mask_roi = None   # 노란선으로 확정된 ll 컴포넌트만 남은 마스크
+        self.yellow_band_centers = []    # ll_yellow_mask_roi를 밴드별 무게중심(_slice_centers(), 탐색창 없는 stateless 방식)으로 뽑은 결과 — 길이 self.n_slices, 아직 경로 계산에는 반영 안 함(추후 "도로 중앙" 힌트용)
+        self.ll_search_windows = []      # _ll_slice_centers()가 이번 프레임에 훑은 좌/우 탐색창 좌표(밴드별) — visualize()가 사각형으로 그림
 
         # DL_USE_BEV=True일 때만 쓰는 워프 행렬. 상수라 매 프레임 다시 안 만들고 한 번만 계산.
         self._bev_M = (
@@ -596,6 +603,40 @@ class DLSlideWindow(SlideWindow):
 
         return clipped, virtual_used
 
+    def _split_ll_by_yellow(self, ll_mask, yellow_roi):
+        """ll_mask(흰/노랑 구분 없는 차선 이진마스크)를 커넥티드 컴포넌트 단위로
+        흰선/노란선 마스크로 나눈다.
+
+        ll 픽셀 자체엔 색 정보가 없으므로(모듈 상단 "TwinLiteNet의 ll 출력은 흰/노랑을
+        구분하지 않아" 주석 참고), 픽셀 하나하나를 yellow_roi로 지우는 대신 ll의
+        커넥티드 컴포넌트(점선 한 조각/실선 한 덩어리) 단위로 "이 덩어리 안에 노란
+        픽셀이 DL_LL_YELLOW_VOTE_RATIO 이상 겹치는가"를 투표해 덩어리 전체를 한
+        색으로 확정한다. 픽셀 단위로 빼면 dash 가장자리(HSV가 못 잡는 안티앨리어싱
+        경계)가 지저분하게 흰색 잔여물로 남는데, 컴포넌트째로 넘기면 그 경계까지
+        깔끔하게 갈린다.
+
+          입력 : ll_mask    — (roi_h, roi_w) uint8 이진마스크(0/255)
+                 yellow_roi — 같은 shape의 HSV 기반 노란색 이진마스크(0/255,
+                              detect()에서 ll_mask와 동일한 크롭/BEV 좌표계로 이미 정렬됨)
+          출력 : (ll_white, ll_yellow) — 둘 다 ll_mask와 같은 shape/dtype.
+                 컴포넌트 하나는 반드시 둘 중 하나에만 속한다(합치면 ll_mask와 동일).
+        """
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(ll_mask, connectivity=8)
+        ll_white = ll_mask.copy()
+        ll_yellow = np.zeros_like(ll_mask)
+
+        for i in range(1, num):
+            area = stats[i, cv2.CC_STAT_AREA]
+            if area < DL_LL_YELLOW_MIN_AREA:
+                continue   # 너무 작은 덩어리는 투표 생략, 흰선 쪽에 그대로 둠(이후 CCA/픽셀수 필터가 처리)
+            comp = (labels == i)
+            yellow_overlap = np.count_nonzero(yellow_roi[comp])
+            if yellow_overlap / area >= DL_LL_YELLOW_VOTE_RATIO:
+                ll_yellow[comp] = 255
+                ll_white[comp] = 0
+
+        return ll_white, ll_yellow
+
     def _ll_slice_centers(self, ll_mask, ref_x):
         """DL_CENTER_MODE='ll_da' 또는 'll'일 때 호출된다. ll_mask(차선 이진마스크)를
         _slice_centers()와 동일한 n_slices 밴드로 나눠, **좌/우 라인을 각각 독립적인
@@ -641,6 +682,9 @@ class DLSlideWindow(SlideWindow):
         slice_h = h // self.n_slices
         results = [None] * self.n_slices
         used = [False] * self.n_slices
+        # 디버그 시각화용 — 밴드별 좌/우 탐색창 좌표 + 실제로 찾았는지(visualize()가
+        # 사각형/색으로 그림). 알고리즘 자체엔 전혀 쓰이지 않는 부가 정보.
+        self.ll_search_windows = []
 
         cur_left = ref_x - self._ll_half_width
         cur_right = ref_x + self._ll_half_width
@@ -682,6 +726,8 @@ class DLSlideWindow(SlideWindow):
             elif rx is not None:
                 results[i] = (y_center, rx - self._ll_half_width)
                 used[i] = True
+
+            self.ll_search_windows.append((y_low, y_high, lx0, lx1, lx, rx0, rx1, rx))
 
         return results, used
 
@@ -759,6 +805,14 @@ class DLSlideWindow(SlideWindow):
         self.vis = vis_roi.copy()
         self.ll_mask_roi = ll_mask
 
+        # ll 흰선/노란선 분리(_split_ll_by_yellow() 참고) — 좌/우 슬라이딩 윈도우
+        # (_ll_slice_centers())는 이제 흰선만 담긴 ll_white_mask를 본다. 중앙 노란
+        # 점선(ll_yellow_mask)은 아직 경로 계산에 안 섞고, 밴드별 무게중심만 뽑아
+        # visualize() 디버그 표시용으로만 쓴다(추후 "도로 중앙" 힌트로 확장 예정).
+        ll_white_mask, ll_yellow_mask = self._split_ll_by_yellow(ll_mask, yellow_roi)
+        self.ll_white_mask_roi = ll_white_mask
+        self.ll_yellow_mask_roi = ll_yellow_mask
+
         # 급커브 파편화 대응: 가장 큰 덩어리만 남긴다(모듈 상단 주석 참고). ll 클리핑보다
         # 먼저 해야 한다 — 이 시점엔 da가 아직 하나의 연결된 덩어리라 "가장 큰 덩어리"가
         # 곧 도로 전체를 뜻하지만, 클리핑을 먼저 하면 밴드마다 독립적으로 좌우를 잘라
@@ -805,17 +859,27 @@ class DLSlideWindow(SlideWindow):
         # (직전 프레임 확정 lane_center, 없으면 ROI 중앙)을 그대로 재사용한다.
         raw_da_centers = self._slice_edge_midpoints(da_mask, 0, (0, 255, 0))
         if DL_CENTER_MODE == 'll_da':
-            raw_ll_centers, self.ll_band_used = self._ll_slice_centers(ll_mask, ref_x)
+            raw_ll_centers, self.ll_band_used = self._ll_slice_centers(ll_white_mask, ref_x)
             merged_centers = [
                 ll_c if ll_c is not None else da_c
                 for ll_c, da_c in zip(raw_ll_centers, raw_da_centers)
             ]
         elif DL_CENTER_MODE == 'll':
-            merged_centers, self.ll_band_used = self._ll_slice_centers(ll_mask, ref_x)
+            merged_centers, self.ll_band_used = self._ll_slice_centers(ll_white_mask, ref_x)
         else:
             merged_centers = raw_da_centers
             self.ll_band_used = [False] * len(raw_da_centers)
+            self.ll_search_windows = []
         self.centerline = self._reject_outliers(merged_centers)
+
+        # 중앙 노란 점선의 밴드별 무게중심 — 탐색창 없는 stateless 방식(_slice_centers(),
+        # lane_util.py 참고)으로 뽑는다. 이미 _split_ll_by_yellow()가 컴포넌트 단위로
+        # 노란선만 분리해뒀으므로, 좌/우처럼 다른 선과 헷갈릴 걱정이 없어 슬라이딩
+        # 윈도우(탐색창 추적)가 굳이 필요 없다 — 점선이라 밴드 간 끊김이 잦은데,
+        # 탐색창을 쓰면 끊긴 동안 커브를 돌았을 때 창이 다음 조각을 놓칠 위험만 커진다.
+        self.yellow_band_centers = self._slice_centers(
+            ll_yellow_mask, 0, (0, 255, 255), min_pixels=DL_LL_SIDE_MIN_PIXELS
+        )
 
         # 노란 중앙선(lane_side 판정용) — 이제 밴드별로 나눌 필요 없이 hough_lane.py와
         # 동일하게 ROI 전체의 단순 평균 위치 하나만 뽑는다(경로 계산에는 안 쓰임).
@@ -858,9 +922,9 @@ class DLSlideWindow(SlideWindow):
 
     def visualize(self, offset):
         """da 전체(파랑, self.da_mask_all_roi)/실제 채택 da(초록/면적상한 차선책이면 주황/
-        ll클리핑 건너뜀이면 청록)/ll(빨강) 반투명 오버레이 + da 중심선 관측점 + 피팅된 경로 +
-        offset/lane_center 텍스트를 self.vis에
-        그려 넣기만 한다. ★ 여기서
+        ll클리핑 건너뜀이면 청록)/ll(흰선=흰색, 노란선=노랑) 반투명 오버레이 + 좌/우
+        슬라이딩 윈도우 탐색창 + da 중심선 관측점 + 피팅된 경로 + offset/lane_center
+        텍스트를 self.vis에 그려 넣기만 한다. ★ 여기서
         cv2.imshow()/cv2.waitKey()를 호출하면 안 된다 ★ 이 메서드는 DLLaneDetector의
         백그라운드 추론 스레드에서 호출되는데, OpenCV HighGUI(특히 GTK 백엔드)는 스레드
         세이프하지 않아서 메인 스레드(다른 디버그 창들이 이미 거기서 cv2.imshow/waitKey를
@@ -899,8 +963,47 @@ class DLSlideWindow(SlideWindow):
             if self.da_fallback_used and self.da_largest_mask_roi is not None:
                 overlay[self.da_largest_mask_roi > 0] = (0, 200, 0)
             overlay[self.da_mask_roi > 0] = da_color       # 주행가능영역(실제 채택분)
-            overlay[self.ll_mask_roi > 0] = (0, 0, 220)    # 차선 = 빨강 (da 위에 덧그림)
+            # ll을 흰선/노란선 분리 결과(_split_ll_by_yellow())대로 실제 색과 맞춰 칠한다
+            # — "이 라인이 지금 흰선/노란선 중 뭘로 인식되고 있는지"를 색만 보고 바로
+            # 알 수 있게(예전엔 색 구분 없이 전부 빨강 한 가지였음).
+            if self.ll_white_mask_roi is not None:
+                overlay[self.ll_white_mask_roi > 0] = (255, 255, 255)  # 흰선
+            if self.ll_yellow_mask_roi is not None:
+                overlay[self.ll_yellow_mask_roi > 0] = (0, 255, 255)   # 노란선
             cv2.addWeighted(overlay, 0.35, self.vis, 0.65, 0, dst=self.vis)
+
+            # 좌/우 슬라이딩 윈도우 탐색창(_ll_slice_centers()가 이번 프레임에 훑은 범위) —
+            # DL_CENTER_MODE가 'll_da'/'ll'일 때만 self.ll_search_windows가 채워진다('da'
+            # 모드에선 detect()가 빈 리스트로 리셋해둠). 찾았으면 초록, 못 찾았으면(창 안에
+            # 픽셀 부족) 회색 테두리로 구분 — 밴드별로 좌/우 창이 실제로 어디를 보고 있고
+            # 각각 성공/실패했는지 한눈에 보려는 용도.
+            # 밴드별 실측 차로폭(rx-lx) 텍스트 — DL_LL_WIDTH_MIN_PX~MAX_PX 튜닝용. 범위
+            # 안이면 초록(채택), 밖이면 빨강(그 밴드는 버려지고 da로 폴백)으로 색을 나눠서
+            # 지금 이 값이 통과되는지 바로 보이게 한다.
+            for (y_low, y_high, lx0, lx1, lx, rx0, rx1, rx) in self.ll_search_windows:
+                cv2.rectangle(self.vis, (lx0, y_low), (lx1, max(y_high - 1, y_low)),
+                              (0, 255, 0) if lx is not None else (120, 120, 120), 1)
+                cv2.rectangle(self.vis, (rx0, y_low), (rx1, max(y_high - 1, y_low)),
+                              (0, 255, 0) if rx is not None else (120, 120, 120), 1)
+                if lx is not None and rx is not None:
+                    width = rx - lx
+                    in_range = DL_LL_WIDTH_MIN_PX < width < DL_LL_WIDTH_MAX_PX
+                    cv2.putText(
+                        self.vis, f'{width:.0f}px', (int(rx1) + 4, int((y_low + y_high) / 2) + 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35,
+                        (0, 255, 0) if in_range else (0, 0, 255), 1
+                    )
+
+            # 중앙 노란 점선의 밴드별 무게중심(detect()에서 self._slice_centers()로 뽑아둔
+            # self.yellow_band_centers) — 아직 경로 계산엔 안 쓰지만, 어디를 "노란 중앙선"
+            # 으로 보고 있는지 확인할 수 있게 노란 다이아몬드로 표시한다.
+            for c in self.yellow_band_centers:
+                if c is None:
+                    continue
+                y, cx = c
+                pt = (int(np.clip(cx, 0, self.roi_w - 1)), int(y))
+                cv2.drawMarker(self.vis, pt, (0, 255, 255), markerType=cv2.MARKER_DIAMOND,
+                               markerSize=10, thickness=2)
 
         # 밴드별 중심점 — DL_CENTER_MODE='ll_da'에서 ll 기반으로 채택된 밴드는 흰색, da로
         # 폴백한 밴드는 노란색으로 구분해서(_ll_slice_centers()/detect() 병합 로직 참고)
@@ -935,10 +1038,13 @@ class DLSlideWindow(SlideWindow):
             tags += ' [LL_CLIP_SKIP]'
         if self.da_ll_virtual_clip_used:
             tags += ' [LL_VIRTUAL]'
+        yellow_band_count = sum(1 for c in self.yellow_band_centers if c is not None)
         cv2.putText(
             self.vis,
             f'offset:{offset:+.1f} center:{lane_center:.1f} ll_cov:{self.ll_coverage:.3f} '
-            f'mode:{DL_CENTER_MODE} ll_bands:{ll_band_count}/{self.n_slices}{tags}',
+            f'mode:{DL_CENTER_MODE} white_bands:{ll_band_count}/{self.n_slices} '
+            f'yellow_bands:{yellow_band_count}/{self.n_slices} '
+            f'lane_w_est:{self._ll_half_width * 2:.0f}px{tags}',
             (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2
         )
 
@@ -969,7 +1075,7 @@ class DLLaneDetector:
         # 워커 스레드가 여기 값만 갱신하고, 실제 cv2.imshow()는 show_debug_windows()가
         # 메인 스레드에서만 호출한다(스레드 간 GUI 호출 혼용 방지 — 아래 _worker()/
         # show_debug_windows() 주석 참고).
-        self._latest_debug = (None, None, None)   # (vis, da_mask_roi, ll_mask_roi)
+        self._latest_debug = (None, None, None, None)   # (vis, da_mask_roi, ll_mask_roi, ll_yellow_mask_roi)
         self._stopped = False
         self._last_fps_log_t = time.time()
 
@@ -1011,7 +1117,10 @@ class DLLaneDetector:
             with self._lock:
                 self.yellow_centers = self._slide.yellow_centers
                 self._latest_result = (lane_valid, offset, lookahead, lane_center, path, debug_img)
-                self._latest_debug = (self._slide.vis, self._slide.da_mask_roi, self._slide.ll_mask_roi)
+                self._latest_debug = (
+                    self._slide.vis, self._slide.da_mask_roi, self._slide.ll_mask_roi,
+                    self._slide.ll_yellow_mask_roi,
+                )
 
             now = time.time()
             if now - self._last_fps_log_t >= FPS_LOG_PERIOD_SEC:
@@ -1026,13 +1135,17 @@ class DLLaneDetector:
             return self._latest_result
 
     def show_debug_windows(self, lookahead_xy=None, lookahead_px=None):
-        """da(초록)/ll(빨강) 오버레이가 그려진 result에 da/ll 원본 이진마스크를 위→아래로
-        이어붙여 창 하나(`dl_lane`)로 띄운다 — result/da/ll 순서로 세로 스택.
+        """da(초록)/ll(흰선=흰색·노란선=노랑) 오버레이 + 좌우 슬라이딩 윈도우가 그려진
+        result에 da/ll/노란선 원본 이진마스크를 위→아래로 이어붙여 창 하나(`dl_lane`)로
+        띄운다 — result/da/ll/yellow 순서로 세로 스택.
         [2026-08-06] 예전엔 3개 별도 창(dl_lane_result/da/ll)이었는데, 창이 흩어져 있으면
         서로 다른 위치에 배치해야 해서 실차 테스트 중 한눈에 비교하기 불편하다는 피드백으로
-        하나로 합쳤다. da/ll은 원래 1채널 이진마스크라 result(3채널 BGR)와 그대로 못
-        이어붙이므로 BGR로 변환 후 vconcat한다 — result/da/ll 모두 같은 ROI에서 나온
-        동일 shape(BEV 캔버스 크기)이라 폭이 항상 맞는다.
+        하나로 합쳤다. [2026-08-07] ll을 흰선/노란선으로 분리(_split_ll_by_yellow())하면서
+        노란선만 따로 보이는 패널을 추가했다(result 패널에 이미 색으로 겹쳐 그려지긴 하지만,
+        da/ll 전체 위에 옅게 깔린 것보다 노란선만 100% 불투명하게 보이는 게 dash가
+        끊기는지 확인하기 더 쉽다). da/ll/yellow는 원래 1채널 이진마스크라 result(3채널
+        BGR)와 그대로 못 이어붙이므로 BGR로 변환 후 vconcat한다 — 넷 다 같은 ROI에서
+        나온 동일 shape(BEV 캔버스 크기)이라 폭이 항상 맞는다.
 
         lookahead_xy(있으면) : pure_pursuit.PurePursuitController가 직전에 계산한 look-ahead
         목표점, (x, y) — self.lane_path와 같은 da ROI 픽셀좌표계라 result 패널에 좌표 변환
@@ -1049,7 +1162,7 @@ class DLLaneDetector:
         if not DEBUG_VIZ_DL_LANE:
             return
         with self._lock:
-            vis, da_mask, ll_mask = self._latest_debug
+            vis, da_mask, ll_mask, ll_yellow_mask = self._latest_debug
         if vis is None:
             return
         if lookahead_xy is not None:
@@ -1064,9 +1177,14 @@ class DLLaneDetector:
                 )
         da_bgr = cv2.cvtColor(da_mask, cv2.COLOR_GRAY2BGR)
         ll_bgr = cv2.cvtColor(ll_mask, cv2.COLOR_GRAY2BGR)
-        for label, panel in (('result', vis), ('da', da_bgr), ('ll', ll_bgr)):
+        # 노란선 패널만 실제 노란색(BGR 0,255,255)으로 칠해서 흰/회색인 다른 패널과
+        # 바로 구분되게 한다 — 단순 GRAY2BGR이면 da/ll처럼 흰색 마스크로 보여서
+        # "이게 노란선 전용 패널"이라는 게 라벨 텍스트 말곤 안 보임.
+        yellow_bgr = np.zeros((*ll_yellow_mask.shape, 3), dtype=np.uint8)
+        yellow_bgr[ll_yellow_mask > 0] = (0, 255, 255)
+        for label, panel in (('result', vis), ('da', da_bgr), ('ll', ll_bgr), ('yellow', yellow_bgr)):
             cv2.putText(panel, label, (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-        cv2.imshow('dl_lane', cv2.vconcat([vis, da_bgr, ll_bgr]))
+        cv2.imshow('dl_lane', cv2.vconcat([vis, da_bgr, ll_bgr, yellow_bgr]))
         cv2.waitKey(1)
 
     def stop(self):
