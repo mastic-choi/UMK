@@ -418,13 +418,16 @@ DEBUG_VIZ_HOUGH_LANE = True   # 차선 — 대안 백엔드('hough') 디버그 �
 DEBUG_VIZ_LANE       = True   # 차선 — 대안 백엔드('classic_cv') 디버그 창 (perception/lane_util.py)
 DEBUG_VIZ_STOPLINE   = False  # 정지선 디버그 창, 백엔드 무관 항상 동작 (perception/perc_floor.py)
 DEBUG_VIZ_SIGNAL     = False  # 신호등(S0/S2 공용) 디버그 창 (perception/traffic_signal.py)
+DEBUG_VIZ_YOLO_CONE  = True   # 라바콘 YOLO 검출 박스 디버그 창 (perception/yolo_cone.py)
 
 
 # #############################################################
 # 6. 미션 State / 실차 테스트 범위 제한
 # #############################################################
 START_STATE     = MissionState.S1_LANE_FOLLOW
-ENABLE_BEHAVIOR = False   # S1에서 라바콘/장애물/추월 Behavior를 켤지 여부(최상위 스위치)
+ENABLE_BEHAVIOR = True    # S1에서 라바콘/장애물/추월 Behavior를 켤지 여부(최상위 스위치)
+                          #   [2026-08-07] 라바콘(B1) 실차 검증을 위해 활성화. TEST_DISABLE_B2_B3=True라서
+                          #   B2/B3(아직 실차 미검증인 placeholder)는 여전히 안 걸리고 B1만 동작한다.
 
 # ── 실차 테스트 범위 제한 ──
 #   지금 단계에서 실차로 검증 가능한 건 딱 세 가지: ①신호등 인식 후 출발(S0)
@@ -507,7 +510,18 @@ PATH_EMA_ALPHA = 0.4   # 새 프레임에 줄 가중치(작을수록 더 부드�
 
 # ── 라바콘/장애물/방해차량/신호등 트리거 ──
 LAVACON_DONE_FRAMES = 80      # 우측콘 미검출이 연속 N프레임(20Hz→약 4초) 쌓이면 Phase 전환(디바운스)
-LAVACON_TRIGGER_FRAMES = 5    # 좌우 클러스터 동시검출이 연속 N프레임 쌓이면 B1_LAVACON 진입 확정
+LAVACON_TRIGGER_FRAMES = 5    # (YOLO 콘 검출 AND 좌우 라이다 클러스터 동시검출)이 연속 N프레임
+                               #   쌓이면 B1_LAVACON 진입 확정. [2026-08-07] 카메라(YOLO)+라이다
+                               #   이중확인으로 강화 — 값 자체는 기존 그대로 유지.
+
+# ── 라바콘 카메라 이중확인 (perception/yolo_cone.py, YOLOv8n ONNX) ──
+#   perc_lavacon_trigger()가 기존 라이다 좌우 클러스터 판정에 "카메라로도 콘이 보이는가"를
+#   AND로 추가한다 — 라이다 단독 클러스터 판정은 벽 모서리 등에서 오검출 여지가 있어서,
+#   실제로 콘(cone) 클래스가 화면에 잡힐 때만 진입을 인정하도록 이중화한다.
+YOLO_CONE_INPUT_SIZE = 640     # cone_best_n.onnx export 시 imgsz와 반드시 일치시킬 것
+YOLO_CONE_CONF_THRESHOLD = 0.5 # 이 신뢰도 이상인 검출만 인정(모델이 nms=True로 export돼 좌표 디코딩은 불필요)
+YOLO_CONE_MODEL_PATH = None    # None이면 yolo_ros/cone_best_n.onnx(형제 디렉터리)를 자동으로 찾음(perception/yolo_cone.py 참고)
+
 SAFETY_DIST      = 5.0        # B2(고정장애물) 발동 거리(m)
 OVERTAKE_TRIGGER = 6.5        # B3(방해차량) 발동 거리(m)
 VEHICLE_TRIGGER_FRAMES = 5    # 라이다 단독검출 연속 N프레임이면 B3_VEHICLE 진입 확정

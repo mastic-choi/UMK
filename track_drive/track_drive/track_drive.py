@@ -40,6 +40,7 @@ from .perception.perc_floor import check_stopline, LaneDetector as ClassicLaneDe
 from .perception.lane_util import CameraProcessor, SlideWindow
 from .perception.dl_lane import DLLaneDetector
 from .perception.traffic_signal import SignalDetector
+from .perception.yolo_cone import YoloConeDetector
 from .controller.obstacle_avoidance import ObstacleAvoidance, AvoidPhase
 # vehicle_overtake.py 의 구 VehicleOvertake 는 더 이상 쓰지 않는다.
 #   추월/회피가 규정상 같은 기동("타겟이 없는 차선으로 지나간다")이라
@@ -138,7 +139,8 @@ class TrackDriverNode(Node):
         self._lavacon_empty_cnt = 0   # 우측콘 연속 미검출 프레임 수(Phase 전환 디바운스)
         self.lavacon_left_detected  = False  # 좌측 라이다 클러스터 검출 여부(B1 진입 트리거용)
         self.lavacon_right_detected = False  # 우측 라이다 클러스터 검출 여부(B1 진입 트리거용)
-        self.lavacon_trigger        = False  # 좌우 동시검출이 디바운스 프레임수만큼 유지되면 True
+        self.cone_detected_yolo     = False  # YOLO 카메라 콘 검출 여부(B1 진입 트리거 이중확인용)
+        self.lavacon_trigger        = False  # (YOLO 검출 AND 좌우 라이다 동시검출)이 디바운스 프레임수만큼 유지되면 True
         self._lavacon_trigger_cnt   = 0      # 동시검출 연속 프레임 수(디바운스 카운터)
         self._lavacon_dbg = (0, 0, 0, 0)     # 디버그용 (좌ROI점수, 좌최대연속묶음, 우ROI점수, 우최대연속묶음)
         self._lavacon_mask_dbg = (0, -1.0)   # 디버그용 (BODY_LO~HI 마스킹 구간 원본 점수, 최소거리)
@@ -151,6 +153,18 @@ class TrackDriverNode(Node):
         # ── 외부 차선 인식 모듈 초기화 (LANE_DETECTOR_BACKEND로 선택, 인터페이스는 셋 다 동일) ──
         self.lane_detector = self._build_lane_detector(LANE_DETECTOR_BACKEND)
         self.signal_detector = SignalDetector()          # 신호등(3구/4구) Hough Circle 인식기
+
+        # 라바콘 카메라 이중확인용 YOLO 콘 검출기. onnxruntime 미설치/모델 파일 부재 등으로
+        # 초기화가 실패하면 _build_lane_detector()의 dl→hough 폴백과 달리 대체 백엔드가
+        # 없으므로(카메라 이중확인 자체가 선택사항), None으로 두고 perc_lavacon_trigger()가
+        # "카메라 확인 불가 시 라이다 단독 판정으로 폴백"하도록 한다 — 원인은 에러 로그로 남긴다.
+        try:
+            self.yolo_cone_detector = YoloConeDetector(logger=self.get_logger())
+        except Exception as e:
+            self.get_logger().error(
+                f'YOLO 콘 검출기 초기화 실패, 라바콘 트리거는 라이다 단독 판정으로 폴백합니다: {e}'
+            )
+            self.yolo_cone_detector = None
 
         # ── 판단/제어 상태 ──
         self.mission_state  = START_STATE
@@ -380,9 +394,25 @@ class TrackDriverNode(Node):
         self.perc_signal()      # 비전
         self.perc_obstacle()    # 라이다
         self.perc_lavacon()     # 라이다
-        self.perc_lavacon_trigger()  # 라이다 (좌우 클러스터 동시검출 → B1_LAVACON 진입 트리거)
+        self.perc_yolo_cone()   # 비전 (YOLO, perc_lavacon_trigger()가 라이다와 AND 결합해서 씀)
+        self.perc_lavacon_trigger()  # 라이다+비전 (YOLO 콘 검출 AND 좌우 클러스터 동시검출 → B1_LAVACON 진입 트리거)
         self.perc_vehicle_trigger()  # 라이다 (전방 장애물 근접 → B3_VEHICLE 진입 트리거)
         self.perc_stopline()    # 비전
+
+    # [2-4a] 라바콘 카메라 이중확인 (YOLO)
+    #   입력 self.img_front → 출력 self.cone_detected_yolo
+    #   yolo_cone.py가 별도 스레드에서 자기 페이스로 추론하므로 여기선 논블로킹으로
+    #   최신 결과만 받아온다(dl_lane.py의 perc_lane()과 동일한 패턴).
+    def perc_yolo_cone(self):
+        if self.yolo_cone_detector is None:
+            # 초기화 실패 상태 — perc_lavacon_trigger()가 이 경우 라이다 단독 판정으로
+            # 폴백하므로 여기선 그냥 False로 둔다(카메라 확인 "안 됨"이 아니라 "못 함").
+            self.cone_detected_yolo = False
+            return
+        if self.img_front is None:
+            return
+        self.cone_detected_yolo = self.yolo_cone_detector.detect(self.img_front)
+        self.yolo_cone_detector.show_debug_windows()  # 메인 스레드에서만 호출(yolo_cone.py 주석 참고)
 
     # [2-1] 차선
     #   입력 self.img_front → 출력 self.lane_offset(우측+), self.lane_valid
@@ -646,14 +676,20 @@ class TrackDriverNode(Node):
     def perc_lavacon(self):
         self.lavacon_offset, self.lavacon_done = process_lavacon(self.lidar_ranges)
 
-    # [2-4b] 라바콘 좌우 클러스터 검출 → B1_LAVACON 진입 트리거
-    #   입력 self.lidar_ranges
+    # [2-4b] 라바콘 좌우 클러스터 검출 + YOLO 카메라 이중확인 → B1_LAVACON 진입 트리거
+    #   입력 self.lidar_ranges, self.cone_detected_yolo(perc_yolo_cone()이 먼저 채워둠)
     #   출력 lavacon_left_detected/right_detected, lavacon_trigger
     #   설계 의도: 라이다 포인트가 "존재"하는 것만으로는 벽·바닥 잡음과 구분이 안 되므로,
     #     인접 인덱스(=인접 각도)로 붙어있는 포인트 묶음(클러스터)이 좌/우 각각 최소 1개씩
     #     동시에 있어야 "라바콘 구간 진입"으로 인정한다. perc_obstacle()과 동일한 차체 마스킹/
     #     극좌표 변환 방식을 사용하되, ROI와 목적은 별개(장애물 회피용이 아니라 콘 게이트 진입 판단용)이므로
-    #     여기서 독립적으로 계산한다. 좌우 동시검출이 LAVACON_TRIGGER_FRAMES 연속 유지되면 진입 확정(디바운스).
+    #     여기서 독립적으로 계산한다.
+    #   [2026-08-07] 라이다 클러스터 판정 단독으로는 벽 모서리 등에서 오검출 여지가 있어,
+    #     YOLO(perception/yolo_cone.py)로 카메라에도 실제 cone 클래스가 보이는지 AND 조건을
+    #     추가했다. YOLO 콘 검출 AND 좌우 라이다 동시검출이 LAVACON_TRIGGER_FRAMES 연속
+    #     유지되면 진입 확정(디바운스). YOLO 검출기 초기화 실패(self.yolo_cone_detector is
+    #     None)로 카메라 확인 자체가 불가능하면, 카메라 이중확인 없이 라이다 단독 판정으로
+    #     폴백한다(전체가 영영 안 켜지는 것보다 낫다는 판단).
     def perc_lavacon_trigger(self):
         # ── 튜닝 파라미터 (실측 라바콘 간격 기준 추정치, 실차 튜닝 필요) ──
         LON_MIN, LON_MAX = 0.3, 0.5   # 트리거 ROI 전방 종방향(m) — 너무 가깝거나(차체 반사) 먼 점 배제
@@ -723,8 +759,11 @@ class TrackDriverNode(Node):
                                     left_pts, left_run, right_pts, right_run,
                                     r_raw, deg, BODY_LO, body_hi_eff)
 
-        # 좌우 클러스터 동시검출이 연속 프레임 유지되면 진입 확정(디바운스)
-        if self.lavacon_left_detected and self.lavacon_right_detected:
+        # YOLO 콘 검출 AND 좌우 라이다 클러스터 동시검출이 연속 프레임 유지되면 진입 확정(디바운스).
+        # yolo_cone_detector 초기화 실패 시엔 카메라 조건을 무조건 통과(True)시켜 라이다
+        # 단독 판정으로 자연스럽게 폴백한다.
+        cone_confirmed_cam = self.cone_detected_yolo if self.yolo_cone_detector is not None else True
+        if cone_confirmed_cam and self.lavacon_left_detected and self.lavacon_right_detected:
             self._lavacon_trigger_cnt += 1
         else:
             self._lavacon_trigger_cnt = 0
@@ -784,12 +823,15 @@ class TrackDriverNode(Node):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, l_col, 1, cv2.LINE_AA)
         cv2.putText(bev, f'R pts={right_pts} run={right_run} (need run>=2)', (8, 44),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, r_col, 1, cv2.LINE_AA)
+        cone_col = (0, 255, 0) if self.cone_detected_yolo else (0, 0, 255)
+        cv2.putText(bev, f'YOLO cone={self.cone_detected_yolo}', (8, 66),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, cone_col, 1, cv2.LINE_AA)
         cv2.putText(bev, f'trig={self._lavacon_trigger_cnt}/{LAVACON_TRIGGER_FRAMES}',
-                    (8, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
+                    (8, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
         masked_pts, masked_min = self._lavacon_mask_dbg
         masked_min_s = f'{masked_min:.2f}m' if masked_min >= 0 else 'N/A'
         cv2.putText(bev, f'masked(magenta) pts={masked_pts} min={masked_min_s}',
-                    (8, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1, cv2.LINE_AA)
+                    (8, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1, cv2.LINE_AA)
         cv2.imshow('lavacon_bev', bev)
         cv2.waitKey(1)
 
@@ -1762,7 +1804,8 @@ class TrackDriverNode(Node):
             f'obs={self.obstacle_front}({self.obstacle_dist:.1f}m,w={self.obstacle_width:.2f}m,{self.obstacle_type}) '
             f'lava={self.lavacon_offset:+.2f}(done={int(self.lavacon_done)})\n'
             f'  [TRIG] trigL={self._lavacon_trigger_cnt}/{LAVACON_TRIGGER_FRAMES}'
-            f'(L{int(self.lavacon_left_detected)}R{int(self.lavacon_right_detected)}) '
+            f'(L{int(self.lavacon_left_detected)}R{int(self.lavacon_right_detected)}'
+            f'Y{int(self.cone_detected_yolo)}) '
             f'trigV={self._vehicle_trigger_cnt}/{VEHICLE_TRIGGER_FRAMES}\n'
             f'  [LAVA-ROI] L pts={lava_lp} run={lava_lrun}(need>=2) '
             f'R pts={lava_rp} run={lava_rrun}(need>=2) '

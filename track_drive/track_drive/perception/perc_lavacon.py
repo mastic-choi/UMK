@@ -34,12 +34,20 @@
 import math
 import numpy as np
 from scipy.spatial import Voronoi, QhullError   # 보로노이 다이어그램 + 퇴화 예외
- 
+
+# [2026-08-07] LIDAR_ANGLE_OFFSET_DEG를 이 파일에 별도 상수로 하드코딩해뒀던 게
+#   config.py와 값이 어긋날 수 있는 위험이었다(위 "2026-06-19 구 규약" 버그가 정확히
+#   이 종류의 비동기화로 생겼었음) — config.py를 단일 소스로 삼아 여기서도 그대로
+#   가져다 쓰도록 고쳤다. 값 자체(80.0)는 바뀌지 않았다.
+from ..config import LIDAR_ANGLE_OFFSET_DEG
+
 # ─────────────────────────────────────────────
 # 튜닝 상수 (track_drive.py 의 실측 ROI 값과 일치시킴)
 # ─────────────────────────────────────────────
-LIDAR_ANGLE_OFFSET_DEG = 80.0   # 라이다 장착 각도 보정(track_drive.py와 동일값 유지)
 BODY_LO, BODY_HI = 215, 305     # 차체 가림 인덱스 구간 [215, 304] 마스킹 경계 (305는 미포함)
+                                 # (config.py엔 중앙화돼 있지 않음 — perc_obstacle()/
+                                 #  perc_lavacon_trigger()도 각 함수 안에 동일 값을 로컬로
+                                 #  들고 있는 게 이 프로젝트의 기존 관례라 그대로 따름)
 LON_MIN, LON_MAX = 0.0, 4.0     # 보로노이 정점 종방향(전방) 관심영역 (m)
 LAT_LIMIT        = 2.5          # 보로노이 정점 횡방향(좌우) 관심영역 한계 (m)
 CONE_LON_MAX     = 4.0          # 콘 후보 점의 전방 최대거리 (m) — 벽/원거리 잡음 배제
