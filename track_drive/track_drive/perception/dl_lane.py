@@ -57,6 +57,14 @@
 #   커버리지가 DL_LL_SANITY_MIN_RATIO 미만이면(사실상 차선 신호가 전혀 없는 프레임 —
 #   모션블러 등) da가 뭘 내놓든 이번 프레임을 무효 처리한다. 디버그 시각화(빨강 반투명
 #   오버레이)에도 그대로 쓴다.
+#   [2026-08-07] ll이 프레임 전체에서 거의 안 보이는 구간(실차 재현: ll_cov=0.022,
+#   ll_bands=0/8)에서는 da 자체가 두 차선을 구분하는 내부 경계 없이 통째로 나와,
+#   _clip_da_by_ll()이 자를 근거가 그 순간 아예 없는 경우가 확인됐다(침식으로 끊을
+#   "얇은 다리" 구조 자체가 없어 그 방향은 포기). 이에 대응해 _clip_da_by_ll()에 두
+#   단계를 추가했다 — ① 최근 몇 프레임 확실했던 ll 픽셀을 감쇠 가중치로 유지하는
+#   잔상(DL_LL_DECAY_ALPHA/MIN_VALUE)을 클리핑 전용 입력으로 쓰고, ② 잔상마저 없는
+#   밴드는 기대 차로 반폭(self._ll_half_width)만큼 증거 없이 강제로 자르는 가상경계로
+#   최후 방어한다(_clip_da_by_ll() docstring 참고).
 #=============================================
 import argparse
 import os
@@ -176,6 +184,7 @@ from ..config import (
     DL_DA_MIN_COMPONENT_AREA, DL_DA_MAX_AREA_PX,
     DL_DA_SEED_ROWS_PX, DL_DA_SEED_HALF_WIDTH_PX,
     DL_LL_SANITY_MIN_RATIO, DL_LL_CLIP_MARGIN_PX,
+    DL_LL_DECAY_ALPHA, DL_LL_DECAY_MIN_VALUE,
     DL_CENTER_MODE, DL_LL_SIDE_MIN_PIXELS, DL_LL_WIDTH_MIN_PX, DL_LL_WIDTH_MAX_PX,
     DL_LL_SEARCH_HALF_WIDTH_PX, DL_LL_WIDTH_EMA_ALPHA,
     DEBUG_VIZ_DL_LANE, YELLOW_LOWER, YELLOW_UPPER, FPS_LOG_PERIOD_SEC,
@@ -345,11 +354,13 @@ class DLSlideWindow(SlideWindow):
         self.ll_band_used = []     # 이번 프레임 각 밴드가 ll 기반으로 채택됐는지(길이 self.n_slices bool, 'da' 모드에선 항상 전부 False) — visualize() 색상 구분용
         self.da_fallback_used = False  # 이번 프레임 da가 직전 채택 덩어리와의 근접성이 아니라 면적순위 차선책으로 골라졌는지 — visualize() 색상 구분용
         self.da_ll_clip_skipped = False  # 이번 프레임 ll 클리핑이 유효 밴드를 너무 줄여 건너뛰었는지 — visualize() 구분용
+        self.da_ll_virtual_clip_used = False  # [2026-08-07] 이번 프레임 _clip_da_by_ll()이 ll/잔상 없이 가상경계(기대 차로폭)로 클리핑한 밴드가 있었는지 — visualize() 구분용
         self.da_largest_mask_roi = None  # 면적 1위 덩어리(차선책을 썼다면 그 사유가 된, 상한 초과로 버려진 덩어리) — fallback일 때 원래 색으로 같이 그리기용
         self.da_largest_area_px = 0  # 면적 1위 덩어리의 절대 픽셀 면적(채택 여부 무관) — DL_DA_MAX_AREA_PX 실측 튜닝용
         self._prev_da_centroid = None  # [2026-08-07] 직전 프레임에 채택된 da 덩어리의 중심(cx,cy) — _largest_da_component()가 이번 프레임 후보를 "가장 가까운 것"으로 고르는 기준. 무효 프레임 뒤엔 None으로 리셋(옛 위치에 계속 붙잡히지 않도록)
         self.da_chosen_area_px = 0   # 실제로 채택돼 waypoint 추출에 쓰인 덩어리의 면적(무효 프레임엔 0)
-        self._ll_half_width = (DL_LL_WIDTH_MIN_PX + DL_LL_WIDTH_MAX_PX) / 4.0  # [2026-08-07] ll 좌/우 독립 슬라이딩 윈도우의 차로 반폭 러닝 추정치(px) — 양쪽 다 찾은 밴드에서 EMA 갱신, 편측만 찾았을 때 반대쪽 위치 추정에 씀(_ll_slice_centers() 참고)
+        self._ll_half_width = (DL_LL_WIDTH_MIN_PX + DL_LL_WIDTH_MAX_PX) / 4.0  # [2026-08-07] ll 좌/우 독립 슬라이딩 윈도우의 차로 반폭 러닝 추정치(px) — 양쪽 다 찾은 밴드에서 EMA 갱신, 편측만 찾았을 때 반대쪽 위치 추정에 씀(_ll_slice_centers() 참고). _clip_da_by_ll()의 가상경계 최후수단에도 재사용.
+        self._ll_decay_mask = None   # [2026-08-07] ll 잔상(decay) 누적 마스크(float32, roi shape) — detect()가 매 프레임 갱신, _clip_da_by_ll() 전용(centerline 추출엔 안 씀). None이면 첫 프레임이라 detect()에서 새로 할당.
 
         # DL_USE_BEV=True일 때만 쓰는 워프 행렬. 상수라 매 프레임 다시 안 만들고 한 번만 계산.
         self._bev_M = (
@@ -518,27 +529,43 @@ class DLSlideWindow(SlideWindow):
         밴드(_slice_centers와 동일한 n_slices 분할)마다 독립적으로 자른다 — 한 번에 직선
         기준으로 자르면 커브에서 밴드마다 달라지는 ll 위치를 못 따라간다. ref_x는 "내 차선이
         어디쯤인가"의 기준점으로, 근거리(아래) 밴드부터 원거리(위) 밴드로 올라가며 방금
-        잘라낸 da 밴드의 실제 중심으로 갱신한다(커브를 따라 기준점도 같이 휘어지게). 밴드 안에
-        ll이 한쪽만 보이면 그쪽만 자르고, 양쪽 다 안 보이면(가려짐/마모 등) 이번 밴드는 자르지
-        않고 da를 그대로 둔다 — ll이 확실할 때만 개입한다("da를 경로의 주 신호로, ll은 보강" —
-        모듈 상단 주석 참고).
-          ★ cur_ref는 반드시 "이번 밴드에서 ll이 실제로 보여서 클리핑 근거가 있었을 때만"
-          갱신한다(아래 if ll_cols.size 안에서만 재계산) ★ — ll이 안 보이는 밴드(점선 틈 등)는
-          da가 옆 차선까지 안 잘린 채 그대로 남아있을 수 있는데, 그 밴드의 컬럼 평균을 그대로
-          다음(더 먼) 밴드의 기준점으로 넘기면 오염된 기준이 근거리→원거리로 계속 누적(cascade)
-          된다 — 한 프레임 안에서 점선 틈 하나가 그 위 모든 밴드의 좌/우 판정을 연쇄적으로
-          틀어지게 만드는 실패모드가 실측으로 확인됨(여러 밴드가 "같은 방향으로" 같이 밀리면
-          _reject_outliers()의 leave-one-out 추세 검사도 못 잡아낸다 — 이상치 하나가 아니라
-          추세 자체가 휜 것처럼 보이기 때문). ll이 안 보인 밴드는 기준점을 갱신하지 않고 직전
-          확정 기준을 그대로 들고 다음 밴드로 넘어가서 오염 전파를 그 밴드 하나로 막는다.
-          입력 : da_mask, ll_mask — 동일 shape의 (roi_h, roi_w) uint8 이진마스크
-                 ref_x           — 첫(근거리) 밴드의 기준 x좌표. 보통 직전 프레임 lane_center.
-          출력 : da_mask에서 ll 경계 밖 픽셀만 0으로 지운 복사본(shape 동일).
+        잘라낸 da 밴드의 실제 중심으로 갱신한다(커브를 따라 기준점도 같이 휘어지게).
+          ★ cur_ref는 아래 ①(실측 또는 잔상) 클리핑을 실제로 했을 때만 갱신한다 ★
+          — 근거 없이 다음 밴드 기준을 흔들지 않기 위함(오염 전파 방지, 아래 참고).
+
+        [2026-08-07] 실차 캡처(전체 프레임 ll_cov=0.022, ll_bands=0/8)로 확인된 실패모드:
+        ll이 프레임 전체에서 거의 안 보이는 구간에서는 da 자체도 두 차선을 구분하는
+        내부 경계 없이 뭉텅하게 하나로 나온다("얇은 목으로 이어붙는다"는 기존 가정과
+        달리, 침식(erosion)으로 끊을 만한 구조 자체가 da 마스크 안에 없었다 — da 모델이
+        그 프레임에서 애초에 두 차선을 시각적으로 구분 못 한 것). 이 경우 매달릴 수 있는
+        근거가 이 프레임엔 전혀 없으므로, 두 단계 방어를 추가했다:
+        ① `ll_mask` 인자 자체를 호출부(detect())에서 "잔상(decay)" 처리된 마스크로 바꿔
+           받는다 — 최근 몇 프레임 동안 확실했던 ll 픽셀을 감쇠 가중치로 들고 있다가 이번
+           프레임 ll이 비어도 그 잔상을 여기서는 여전히 "보이는 것"처럼 쓴다(자세한 감쇠
+           로직은 DL_LL_DECAY_ALPHA 주석, detect() 참고). 이 함수 자체는 마스크가 이번
+           프레임 실측인지 잔상인지 모르고 그냥 받은 대로 쓴다 — 자연스럽게 재사용된다.
+        ② 잔상마저 없는 밴드(ll_cols가 완전히 빔)는 최후 수단으로 **증거 없이** 기대
+           차로 반폭(self._ll_half_width — _ll_slice_centers()가 관리하는 것과 같은
+           러닝 추정치)만큼 cur_ref 양옆을 강제로 자른다("가상 경계"). 픽셀 근거는 없지만
+           "차로폭은 대략 이 정도"라는 기하학적 사전지식이, 무근거 병합(da가 옆 차선까지
+           안 잘린 채 남는 것)보다는 안전하다는 판단이다. ①(실측/잔상 클리핑)과 달리
+           cur_ref는 갱신하지 않는다 — 실측 근거 없는 추정을 다음 밴드로 계속 누적시키지
+           않기 위해서다.
+        classic_cv 백엔드의 "한쪽 차선만 검출" 폴백(lane_util.SlideWindow.calc_center())과
+        같은 "차로폭 기반 추정" 원칙을 여기 클리핑에도 적용한 것.
+
+          입력 : da_mask — (roi_h, roi_w) uint8 이진마스크
+                 ll_mask — 동일 shape 이진마스크. 호출부가 실측/잔상 어느 쪽을 넣어도 무방.
+                 ref_x   — 첫(근거리) 밴드의 기준 x좌표. 보통 직전 프레임 lane_center.
+          출력 : (clipped, virtual_used) — clipped는 da_mask에서 ll(또는 가상) 경계 밖
+                 픽셀만 0으로 지운 복사본(shape 동일), virtual_used는 이번 호출에서 ②
+                 (가상경계)가 한 밴드라도 발동했는지(bool) — visualize() 디버그 표시용.
         """
         h, w = da_mask.shape
         slice_h = h // self.n_slices
         clipped = da_mask.copy()
         cur_ref = ref_x
+        virtual_used = False  # 이번 호출에서 ②(가상경계)가 한 밴드라도 발동했는지 — visualize() 디버그 표시용
 
         for i in range(self.n_slices):
             y_high = h - i * slice_h
@@ -558,8 +585,16 @@ class DLSlideWindow(SlideWindow):
                 band_da_cols = np.nonzero(np.any(clipped[y_low:y_high, :] > 0, axis=0))[0]
                 if band_da_cols.size:
                     cur_ref = float(np.mean(band_da_cols))
+            else:
+                # ② ll도 잔상도 없음 — 최후 수단: 기대 차로 반폭 기준 가상 경계로 강제 클리핑.
+                lcut = int(np.clip(cur_ref - self._ll_half_width, 0, w))
+                rcut = int(np.clip(cur_ref + self._ll_half_width, 0, w))
+                clipped[y_low:y_high, :lcut] = 0
+                clipped[y_low:y_high, rcut:] = 0
+                virtual_used = True
+                # cur_ref는 갱신하지 않는다 — 실측 근거 없는 추정이라 그대로 다음 밴드로 넘김.
 
-        return clipped
+        return clipped, virtual_used
 
     def _ll_slice_centers(self, ll_mask, ref_x):
         """DL_CENTER_MODE='ll_da' 또는 'll'일 때 호출된다. ll_mask(차선 이진마스크)를
@@ -693,6 +728,22 @@ class DLSlideWindow(SlideWindow):
         ll_mask = (ll_roi >= DL_LL_FG_THRESHOLD).astype(np.uint8) * 255
         self.ll_coverage = float(np.count_nonzero(ll_mask)) / ll_mask.size if ll_mask.size else 0.0
 
+        # [2026-08-07] ll 잔상(decay) — _clip_da_by_ll() 전용 입력. 이번 프레임 ll이
+        # 순간적으로 끊겨도(반사/모션블러 등) 직전까지 확실했던 픽셀을 감쇠 가중치로 몇
+        # 프레임 더 "보이는 것"처럼 들고 있는다 — DL_LL_DECAY_ALPHA(매 프레임 곱해지는
+        # 감쇠율)만큼 값이 줄다가 DL_LL_DECAY_MIN_VALUE 밑으로 내려가면 자연히 "안 보임"
+        # 취급된다(별도 리셋 로직 없이 곱셈 감쇠만으로 N프레임 뒤 자동 소멸). centerline
+        # 추출(_ll_slice_centers)에는 이 잔상을 안 쓴다 — waypoint 자체를 과거 위치로 밀면
+        # 더 위험하고, 클리핑은 "울타리" 역할이라 약간 stale해도 안전하다는 판단
+        # (_clip_da_by_ll() 클래스 docstring 참고). shape이 안 맞으면(첫 프레임/캔버스
+        # 크기 변경 등) 새로 0으로 할당한다.
+        if self._ll_decay_mask is None or self._ll_decay_mask.shape != ll_mask.shape:
+            self._ll_decay_mask = np.zeros(ll_mask.shape, dtype=np.float32)
+        self._ll_decay_mask = np.maximum(
+            ll_mask.astype(np.float32), self._ll_decay_mask * DL_LL_DECAY_ALPHA
+        )
+        ll_mask_for_clip = (self._ll_decay_mask >= DL_LL_DECAY_MIN_VALUE).astype(np.uint8) * 255
+
         da_mask = (da_roi >= DL_FG_THRESHOLD).astype(np.uint8) * 255
         # 덩어리 선택(_largest_da_component)/ll 클리핑 전, 이진화 직후의 da 전체 — 아래에서
         # da_mask가 선택/클리핑된 결과로 재대입되기 전에 따로 남겨둔다(visualize()가 "모델이
@@ -717,11 +768,13 @@ class DLSlideWindow(SlideWindow):
         # 네모난 밴드 하나만 남는 문제가 생긴다(실측으로 확인됨).
         da_mask = self._largest_da_component(da_mask)
 
-        # 옆 차선 침범 대응: ll 라인이 보이는 구간에서는 그 바깥(옆 차선 쪽) da를 잘라낸다
-        # (모듈 상단 주석 참고). ref_x는 직전 프레임 확정 lane_center — 아직 없으면(첫
-        # 프레임) ROI 중앙을 기준으로 시작한다. 이 클리핑이 밴드 간 연결을 끊어도 상관없다
-        # — 아래 _slice_centers()는 밴드별로 독립적으로 moments를 구하므로 전역 연결성이
-        # 필요 없다(그래서 여기선 largest_da_component를 다시 돌리지 않는다).
+        # 옆 차선 침범 대응: ll(잔상 포함) 또는 가상경계로 그 바깥(옆 차선 쪽) da를
+        # 잘라낸다(모듈 상단 주석, _clip_da_by_ll() docstring 참고). ref_x는 직전 프레임
+        # 확정 lane_center — 아직 없으면(첫 프레임) ROI 중앙을 기준으로 시작한다. 이
+        # 클리핑이 밴드 간 연결을 끊어도 상관없다 — 아래 _slice_centers()는 밴드별로
+        # 독립적으로 moments를 구하므로 전역 연결성이 필요 없다(그래서 여기선
+        # largest_da_component를 다시 돌리지 않는다). ll_mask_for_clip(잔상 합성본)을
+        # 넘긴다 — 원본 ll_mask는 아래 centerline 추출(_ll_slice_centers)에만 쓴다.
         #
         # [2026-08-06] 클리핑 결과가 fit 가능한 최소 밴드 수(DL_SLICE_FIT_MIN)에 못
         # 미치면 클리핑을 버리고 클리핑 전 da로 되돌린다("차선책", _largest_da_component()의
@@ -732,7 +785,7 @@ class DLSlideWindow(SlideWindow):
         # 최소한 주행은 하는) da를 쓰는 편이 self.path가 무한정 얼어붙어 완전정지하는
         # 것보다 낫다는 판단. self.da_ll_clip_skipped로 표시해 visualize()가 구분 표시한다.
         ref_x = self._confirmed[3] if self._confirmed is not None else da_mask.shape[1] / 2.0
-        clipped = self._clip_da_by_ll(da_mask, ll_mask, ref_x)
+        clipped, self.da_ll_virtual_clip_used = self._clip_da_by_ll(da_mask, ll_mask_for_clip, ref_x)
         clipped_valid = sum(1 for c in self._slice_centers(clipped, 0, (0, 255, 0)) if c is not None)
         self.da_ll_clip_skipped = clipped_valid < self.slice_fit_min
         da_mask = da_mask if self.da_ll_clip_skipped else clipped
@@ -880,6 +933,8 @@ class DLSlideWindow(SlideWindow):
             tags += ' [FALLBACK]'
         if self.da_ll_clip_skipped:
             tags += ' [LL_CLIP_SKIP]'
+        if self.da_ll_virtual_clip_used:
+            tags += ' [LL_VIRTUAL]'
         cv2.putText(
             self.vis,
             f'offset:{offset:+.1f} center:{lane_center:.1f} ll_cov:{self.ll_coverage:.3f} '
