@@ -39,16 +39,22 @@
 #   있는 위치"만 가리키므로, 밴드마다 좌/우 ll이 둘 다 신뢰할 만큼 보이면 그 중점을
 #   우선 채택하고(DLSlideWindow._ll_slice_centers()), ll이 부족한 밴드만 da 중심으로
 #   개별 폴백한다(프레임 전체 무효화 아님) — config.py DL_CENTER_MODE 주석 참고.
-#   두 모드 공통: 급커브에서 da 마스크가 파편화되는 실패모드에 대응해 ConnectedComponents로
-#   가장 큰 덩어리 하나만 남기고(DL_DA_MIN_COMPONENT_AREA 미만이면 그 프레임은 무효 처리)
-#   나머지 파편에 중심선이 끌려가지 않게 막는다(_largest_da_component() 참고). 또한 da가
-#   점선 틈으로 옆 차선 da와 하나의 덩어리로 이어붙는 실패모드에 대해서는
-#   DLSlideWindow._clip_da_by_ll()이 ll 라인이 보이는 구간에서 그 바깥(옆 차선 쪽) da
-#   픽셀을 밴드별로 잘라내고 나서 _largest_da_component()를 적용한다(da 자체의 방어선 —
-#   'da' 모드에서도 동작). ll은 그 외에 프레임 단위 sanity check로도 쓰인다 — ROI 내
-#   커버리지가 DL_LL_SANITY_MIN_RATIO 미만이면(사실상 차선 신호가 전혀 없는 프레임 —
-#   모션블러 등) da가 뭘 내놓든 이번 프레임을 무효 처리한다. 디버그 시각화(빨강 반투명
-#   오버레이)에도 그대로 쓴다.
+#   두 모드 공통: 급커브 등에서 da 마스크가 여러 덩어리로 파편화되는 실패모드에 대응해
+#   ConnectedComponents로 그중 하나만 골라 남기고(DL_DA_MIN_COMPONENT_AREA 미만인 덩어리는
+#   후보에서 제외 — 전부 미만이면 그 프레임은 무효 처리) 나머지 파편에 중심선이 끌려가지
+#   않게 막는다(_largest_da_component() 참고). [2026-08-07] 어느 덩어리를 고를지는 더 이상
+#   면적이 아니라 "직전 프레임 확정 차로 중심(ref_x)에 근거리 밴드 기준으로 가장 가까운
+#   덩어리"로 고른다 — 옆 차로가 별개 덩어리로 잡히는 프레임에서 면적 비교만으로는 매
+#   프레임 다른 덩어리(내 차로 ↔ 옆 차로)를 오가며 차로를 계속 갈아타는 문제가 실측으로
+#   확인돼서, 위치 연속성 기준으로 바꿨다(§2.8, 아래 함수 docstring 참고). da가 점선 틈으로
+#   옆 차선 da와 아예 하나의 덩어리로 이어붙는 실패모드(이 경우 위치 기준으로 골라도
+#   덩어리 자체에 옆 차선분이 섞여 있음)는 별도로 DLSlideWindow._clip_da_by_ll()이
+#   _largest_da_component() **다음에** ll 라인이 보이는 구간에서 그 바깥(옆 차선 쪽) da
+#   픽셀을 밴드별로 잘라내 대응한다(da 자체의 방어선 — 'da' 모드에서도 동작. 순서가
+#   반대가 아니라 largest→clip 순인 이유는 DLSlideWindow.detect() 안 주석 참고). ll은 그
+#   외에 프레임 단위 sanity check로도 쓰인다 — ROI 내 커버리지가 DL_LL_SANITY_MIN_RATIO
+#   미만이면(사실상 차선 신호가 전혀 없는 프레임 — 모션블러 등) da가 뭘 내놓든 이번
+#   프레임을 무효 처리한다. 디버그 시각화(빨강 반투명 오버레이)에도 그대로 쓴다.
 #=============================================
 import argparse
 import os
@@ -165,7 +171,7 @@ from ..config import (
     DL_N_SLICES, DL_MIN_PIXELS, DL_NEAR_SLICES, DL_FAR_SLICES,
     DL_SLICE_OUTLIER_MAX, DL_SLICE_FIT_MIN,
     DL_STABLE_FRAME_MIN, DL_STABLE_JUMP_MAX,
-    DL_DA_MIN_COMPONENT_AREA, DL_DA_MAX_AREA_PX,
+    DL_DA_MIN_COMPONENT_AREA,
     DL_LL_SANITY_MIN_RATIO, DL_LL_CLIP_MARGIN_PX,
     DL_CENTER_MODE, DL_LL_SIDE_MIN_PIXELS, DL_LL_WIDTH_MIN_PX, DL_LL_WIDTH_MAX_PX,
     DEBUG_VIZ_DL_LANE, YELLOW_LOWER, YELLOW_UPPER, FPS_LOG_PERIOD_SEC,
@@ -336,8 +342,9 @@ class DLSlideWindow(SlideWindow):
         self.da_fallback_used = False  # 이번 프레임 da가 최댓값이 아니라 차선책(2번째 이하) 덩어리인지 — visualize() 색상 구분용
         self.da_ll_clip_skipped = False  # 이번 프레임 ll 클리핑이 유효 밴드를 너무 줄여 건너뛰었는지 — visualize() 구분용
         self.da_largest_mask_roi = None  # 면적 1위 덩어리(차선책을 썼다면 그 사유가 된, 상한 초과로 버려진 덩어리) — fallback일 때 원래 색으로 같이 그리기용
-        self.da_largest_area_px = 0  # 면적 1위 덩어리의 절대 픽셀 면적(채택 여부 무관) — DL_DA_MAX_AREA_PX 실측 튜닝용
+        self.da_largest_area_px = 0  # 면적 1위 덩어리의 절대 픽셀 면적(채택 여부와 무관 — 디버그용, §2.8)
         self.da_chosen_area_px = 0   # 실제로 채택돼 waypoint 추출에 쓰인 덩어리의 면적(무효 프레임엔 0)
+        self.da_chosen_dist_px = 0.0  # 채택된 덩어리의 근거리 밴드 x좌표가 ref_x와 떨어진 거리(px) — 위치 기반 선택 실측 튜닝용(§2.8)
 
         # DL_USE_BEV=True일 때만 쓰는 워프 행렬. 상수라 매 프레임 다시 안 만들고 한 번만 계산.
         self._bev_M = (
@@ -361,73 +368,89 @@ class DLSlideWindow(SlideWindow):
             flags=flags, borderValue=0
         )
 
-    def _largest_da_component(self, da_mask):
+    def _largest_da_component(self, da_mask, ref_x):
         """da 마스크에서 연결 덩어리 하나만 남기고 나머지(급커브 등에서 생기는 파편)는
-        지운다. 덩어리가 DL_DA_MIN_COMPONENT_AREA보다 작으면(사실상 안 보임) 빈 마스크를
-        반환한다.
+        지운다. 덩어리 면적이 DL_DA_MIN_COMPONENT_AREA보다 작으면(사실상 안 보이는
+        파편/노이즈) 그 덩어리는 애초에 후보에서 제외한다 — 이건 "노이즈냐 아니냐"
+        판단이지, 아래에서 설명하는 "여러 후보 중 어느 게 내 차선이냐" 판단과는 별개다.
+        후보가 하나도 안 남으면 빈 마스크(이번 프레임 무효)를 반환한다.
 
-        가장 큰 덩어리가 DL_DA_MAX_AREA_PX(절대 픽셀수)를 넘을 만큼 크면 그 덩어리는
-        outlier로 버린다. 정상적인 자기 차선 폭이라면 이 정도로 넓을 수 없는데, 실측으로
-        확인된 두 실패모드가 여기 해당한다:
-          ① ㅓ교차로 등 분기에서 da가 옆 갈래까지 하나로 이어붙는 경우
-          ② 차선(백선) 자체가 없는 맨바닥을 통째로 주행가능영역으로 오검출하는 경우
-        두 경우 모두 원인은 다르지만 "정상보다 비정상적으로 넓다"는 신호는 공통이라
-        같은 임계값 하나로 같이 걸러낸다.
-        [2026-08-06] 원래는 마스크 전체 대비 비율(DL_DA_MAX_AREA_RATIO=0.6, DL_USE_BEV
-        캔버스 크기가 바뀌어도 재계산 없이 유효하다는 장점)로 잡았는데, 실차에서 직선
-        구간 da 면적을 직접 실측해 절대 픽셀값(DL_DA_MAX_AREA_PX)으로 교체했다 — 비율은
-        "대충 이 정도면 비정상적으로 넓다"는 추정이었지만, 절대값은 "정상 직선 구간에서
-        실제로 관찰되는 면적"에 직접 근거하므로 더 정확하다. 대신 원거리 크롭
-        (DL_BEV_FAR_LIMIT_M, §2.5) 등으로 캔버스 크기 자체가 바뀌면 이 값도 다시
-        실측해야 한다(비율 방식과 달리 자동으로 안 따라감).
+        [2026-08-07] 후보가 여럿일 때 어느 걸 고를지는 더 이상 면적이 아니라 위치
+        연속성으로 정한다: 각 후보 덩어리의 "근거리(차량과 가장 가까운, 즉 맨 아래)
+        밴드에서의 x 무게중심"을 구해서 ref_x(직전 프레임 확정 차로 중심 — 첫 프레임 등
+        아직 없으면 호출부에서 ROI 중앙을 대신 넘긴다)와 가장 가까운 덩어리를 채택한다.
 
-        [2026-08-06] 가장 큰 덩어리를 버린 뒤 곧바로 빈 마스크(=이번 프레임 무효)로
-        처리하지 않고, 그다음으로 큰 덩어리부터 순서대로 [MIN_COMPONENT_AREA,
-        MAX_AREA_PX] 범위 안에 드는 것을 찾아 대신 채택한다("차선책"). S자 연속
-        커브 구간에서 실측으로 확인된 문제: 첫 덩어리가 옆 차로/노면 반사와 붙어
-        면적 상한에 걸리는 프레임이 길게 이어지면, 예전 방식(그냥 무효 처리)은
-        self.path가 몇 프레임짜리 튐이 아니라 사실상 무한정 정지 상태로 얼어붙어
-        조향이 점점 벌어진 stale 경로를 계속 따라가다 turn_for_speed가 포화되어
-        실차 속도가 바닥값까지 떨어지는(=사실상 정지) 결과로 이어졌다. 두 번째로 큰
-        덩어리가 범위 안에 들면 자기 차선일 가능성이 높으므로(같은 프레임에서 옆
-        차로 덩어리와 분리돼 있었다는 뜻) 이걸로 대체하는 편이 "몇 초씩 정지"보다
-        낫다 — self.da_fallback_used로 이번 프레임이 차선책을 썼는지 표시해
-        visualize()가 다른 색으로 구분해 그린다(디버깅용, 실제 판단 로직에는
-        영향 없음). 이때 버려진 면적 1위 덩어리 자체도 self.da_largest_mask_roi에
-        따로 남겨서, visualize()가 "원래(가장 큰) da"와 "실제로 채택한 차선책 da"를
-        동시에(각각 원래색/차선책색으로) 그릴 수 있게 한다."""
-        num, labels, stats, _ = cv2.connectedComponentsWithStats(da_mask, connectivity=8)
+        원래는(~2026-08-06) DL_DA_MAX_AREA_PX(절대 픽셀수 상한)를 넘는 덩어리를
+        "정상 차선 폭이라기엔 비정상적으로 넓다"고 보고 버리는 방식이었다(교차로에서
+        옆 갈래까지 이어붙거나, 차선 없는 맨바닥을 통째로 오검출하는 두 실패모드
+        대응, §2.6). 그런데 이 방식은 옆 차로 덩어리가 내 차로 덩어리와 "떨어진 채"
+        검출되는 경우(즉 상한에 걸리지도 않는 정상 크기 두 덩어리가 나란히 있는 경우)엔
+        무력하다 — 실차에서 이 경우 매 프레임 "그때그때 더 넓은 쪽"이 채택돼 차로를
+        의미 없이 계속 갈아타다가 결국 흰 차선 밖(옆 차로/맨바닥)의 da를 자기 차선으로
+        오인해 이탈하는 문제가 확인됐다(§2.1 "알려진 한계"에서 이미 예견된 바로 그
+        실패모드). 절대 픽셀값 튜닝 자체도 캔버스 크기가 바뀔 때마다 실차 재실측이
+        필요해 유지 비용이 컸다. 위치 연속성 기준은 "진짜 내 차로라면 프레임이 바뀌어도
+        차량 바로 앞 위치는 크게 안 움직인다"는 가정에 기대므로 면적 매직넘버가
+        필요 없고, 크기가 비슷한(또는 더 큰) 옆 차로 덩어리가 있어도 위치가 다르면
+        선택되지 않는다(§2.8).
+
+        이 함수가 막는 건 "여러 별개 덩어리 중 잘못된 걸 고르는" 실패모드뿐이다. da가
+        점선 틈으로 옆 차선 da와 애초에 하나의 덩어리로 이어붙어 있으면(위치 기준으로
+        골라도 그 덩어리 안에 옆 차선분이 섞여 있는 경우) 이 함수만으로는 못 막는다 —
+        DLSlideWindow._clip_da_by_ll()이 이 함수 다음 단계에서 ll 라인을 경계로 그
+        바깥을 잘라내 담당한다(detect() 참고).
+
+        [2026-08-06] 채택된 덩어리가 없을 때(=예전엔 전부 면적 상한 초과 또는 전부 너무
+        작음, 지금은 후보가 하나도 없거나 전부 노이즈 미만) 곧바로 무효 처리하는 대신
+        차선책을 시도하던 로직은, 지금은 "후보 전체 중 위치가 가장 가까운 것 하나"를
+        고르는 방식 자체가 이미 차선책 개념을 포함한다(면적 1위가 아닌 덩어리가 뽑히면
+        self.da_fallback_used=True로 표시 — S자 연속 커브 등에서 self.path가 무한정
+        stale 상태로 얼어붙어 실차가 사실상 정지하던 문제, §2.1 대응). 버려진 면적 1위
+        덩어리는 self.da_largest_mask_roi에 남겨 visualize()가 "면적 1위 da"와 "실제
+        채택한 da"를 동시에(각각 원래색/차선책색으로) 그릴 수 있게 한다."""
+        num, labels, stats, centroids = cv2.connectedComponentsWithStats(da_mask, connectivity=8)
         self.da_fallback_used = False
         self.da_largest_mask_roi = None
         self.da_largest_area_px = 0
         self.da_chosen_area_px = 0
+        self.da_chosen_dist_px = 0.0
         if num <= 1:
             return np.zeros_like(da_mask)
 
         areas = stats[1:, cv2.CC_STAT_AREA]
-        order = np.argsort(areas)[::-1]  # 큰 덩어리부터
-        max_area = DL_DA_MAX_AREA_PX
+        order = np.argsort(areas)[::-1]  # 디버그 표시(면적 1위 확인)용 — 채택 기준과는 무관
 
         largest_label = 1 + int(order[0])
         self.da_largest_mask_roi = np.where(labels == largest_label, np.uint8(255), np.uint8(0))
-        # [2026-08-06] 실측 튜닝용 — 가장 큰 덩어리 면적(채택 여부와 무관)을 항상 기록해둔다.
-        # DEBUG_VIZ_STEER 창(track_drive.py _debug_viz_steer())이 이 값을 그대로 읽어서
-        # "직선 구간 da 면적이 실제로 몇 px인지" 실측하는 용도로 쓴다 — DL_DA_MAX_AREA_PX를
-        # 이 실측값 기반으로 잡기 위함(config.py 주석 참고).
         self.da_largest_area_px = int(areas[order[0]])
 
-        for rank, idx in enumerate(order):
-            area = int(areas[idx])
-            if area < DL_DA_MIN_COMPONENT_AREA:
-                break  # 내림차순 정렬이라 이후는 전부 더 작다 — 더 볼 필요 없음
-            if area <= max_area:
-                self.da_fallback_used = rank > 0
-                self.da_chosen_area_px = area  # 실제로 채택돼 waypoint 추출에 쓰이는 면적
-                label = 1 + int(idx)
-                return np.where(labels == label, np.uint8(255), np.uint8(0))
-            # 이 덩어리는 outlier(면적 상한 초과) — 다음으로 큰 덩어리를 시도
+        candidate_labels = [1 + i for i, area in enumerate(areas) if area >= DL_DA_MIN_COMPONENT_AREA]
+        if not candidate_labels:
+            return np.zeros_like(da_mask)
 
-        return np.zeros_like(da_mask)
+        # 근거리(맨 아래) 밴드 — _slice_centers()의 i=0 밴드와 동일한 행 범위 — 에서
+        # 덩어리별 x 무게중심을 한 번에 구한다(라벨별 픽셀 x좌표 평균).
+        slice_h = self.roi_h // self.n_slices
+        near_band = labels[self.roi_h - slice_h:, :]
+        col_idx = np.broadcast_to(np.arange(near_band.shape[1]), near_band.shape)
+        near_sum_x = np.bincount(near_band.ravel(), weights=col_idx.ravel(), minlength=num)
+        near_count = np.bincount(near_band.ravel(), minlength=num)
+
+        best_label, best_dist = None, None
+        for label in candidate_labels:
+            if near_count[label] > 0:
+                cx = near_sum_x[label] / near_count[label]
+            else:
+                # 이 덩어리가 근거리 밴드엔 아예 안 걸림(먼 파편 등) — 전체 무게중심으로 대체
+                cx = float(centroids[label][0])
+            dist = abs(cx - ref_x)
+            if best_dist is None or dist < best_dist:
+                best_label, best_dist = label, dist
+
+        self.da_fallback_used = best_label != largest_label
+        self.da_chosen_area_px = int(stats[best_label, cv2.CC_STAT_AREA])
+        self.da_chosen_dist_px = float(best_dist)
+        return np.where(labels == best_label, np.uint8(255), np.uint8(0))
 
     def _clip_da_by_ll(self, da_mask, ll_mask, ref_x):
         """da_mask에서 ll(차선) 라인을 경계로 "내 차선 바깥"에 해당하는 픽셀을 지운다.
@@ -594,30 +617,32 @@ class DLSlideWindow(SlideWindow):
         self.vis = vis_roi.copy()
         self.ll_mask_roi = ll_mask
 
-        # 급커브 파편화 대응: 가장 큰 덩어리만 남긴다(모듈 상단 주석 참고). ll 클리핑보다
-        # 먼저 해야 한다 — 이 시점엔 da가 아직 하나의 연결된 덩어리라 "가장 큰 덩어리"가
-        # 곧 도로 전체를 뜻하지만, 클리핑을 먼저 하면 밴드마다 독립적으로 좌우를 잘라
-        # 인접 밴드끼리 남은 x범위가 안 겹치는 경우가 생겨(ll 경계가 밴드마다 조금씩
-        # 다르게 잡히면 흔함) 마스크가 밴드별로 끊기고, 그 뒤 largest_da_component가
-        # "가장 큰 덩어리"로 폭 넓은 밴드 하나만 통째로 골라버려 도로 모양이 아니라
-        # 네모난 밴드 하나만 남는 문제가 생긴다(실측으로 확인됨).
-        da_mask = self._largest_da_component(da_mask)
+        # ref_x — 직전 프레임 확정 lane_center. 아직 없으면(첫 프레임) ROI 중앙을 기준으로
+        # 시작한다. 급커브 파편화 대응(_largest_da_component())의 위치 기반 덩어리 선택과
+        # 옆 차선 침범 클리핑(_clip_da_by_ll()) 둘 다 같은 기준점을 쓴다(§2.8).
+        ref_x = self._confirmed[3] if self._confirmed is not None else da_mask.shape[1] / 2.0
+
+        # 급커브 파편화 대응: 덩어리 하나만 남긴다(모듈 상단 주석 참고). ll 클리핑보다
+        # 먼저 해야 한다 — 클리핑을 먼저 하면 밴드마다 독립적으로 좌우를 잘라 인접 밴드끼리
+        # 남은 x범위가 안 겹치는 경우가 생겨(ll 경계가 밴드마다 조금씩 다르게 잡히면 흔함)
+        # 마스크가 밴드별로 끊기고, 그 뒤 largest_da_component가 폭 넓은 밴드 하나만
+        # 통째로 골라버려 도로 모양이 아니라 네모난 밴드 하나만 남는 문제가 생긴다(실측으로
+        # 확인됨).
+        da_mask = self._largest_da_component(da_mask, ref_x)
 
         # 옆 차선 침범 대응: ll 라인이 보이는 구간에서는 그 바깥(옆 차선 쪽) da를 잘라낸다
-        # (모듈 상단 주석 참고). ref_x는 직전 프레임 확정 lane_center — 아직 없으면(첫
-        # 프레임) ROI 중앙을 기준으로 시작한다. 이 클리핑이 밴드 간 연결을 끊어도 상관없다
-        # — 아래 _slice_centers()는 밴드별로 독립적으로 moments를 구하므로 전역 연결성이
-        # 필요 없다(그래서 여기선 largest_da_component를 다시 돌리지 않는다).
+        # (모듈 상단 주석 참고). 이 클리핑이 밴드 간 연결을 끊어도 상관없다 — 아래
+        # _slice_centers()는 밴드별로 독립적으로 moments를 구하므로 전역 연결성이 필요
+        # 없다(그래서 여기선 largest_da_component를 다시 돌리지 않는다).
         #
         # [2026-08-06] 클리핑 결과가 fit 가능한 최소 밴드 수(DL_SLICE_FIT_MIN)에 못
         # 미치면 클리핑을 버리고 클리핑 전 da로 되돌린다("차선책", _largest_da_component()의
-        # 면적상한 폴백과 같은 원칙). S자 연속 커브에서 원거리 ll이 DL_LL_FG_THRESHOLD를
+        # 위치 기반 폴백과 같은 원칙). S자 연속 커브에서 원거리 ll이 DL_LL_FG_THRESHOLD를
         # 올려도 여전히 두껍게 잡히면 _clip_da_by_ll()이 여러 밴드를 통째로 깎아버려
         # da가 "작게 검출된" 것처럼 보이는 경우가 실측으로 확인됨 — da 자체는 멀쩡한데
         # ll 클리핑이 지워버린 것이므로, 이럴 땐 클리핑 없는(=옆 차선 침범 위험은 있지만
         # 최소한 주행은 하는) da를 쓰는 편이 self.path가 무한정 얼어붙어 완전정지하는
         # 것보다 낫다는 판단. self.da_ll_clip_skipped로 표시해 visualize()가 구분 표시한다.
-        ref_x = self._confirmed[3] if self._confirmed is not None else da_mask.shape[1] / 2.0
         clipped = self._clip_da_by_ll(da_mask, ll_mask, ref_x)
         clipped_valid = sum(1 for c in self._slice_centers(clipped, 0, (0, 255, 0)) if c is not None)
         self.da_ll_clip_skipped = clipped_valid < self.slice_fit_min
