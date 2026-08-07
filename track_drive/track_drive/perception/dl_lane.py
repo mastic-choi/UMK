@@ -333,10 +333,11 @@ class DLSlideWindow(SlideWindow):
         self.ll_mask_roi = None    # 시각화용
         self.centerline = []       # 밴드별 중심점(원본 관측점, 길이 self.n_slices) — DL_CENTER_MODE에 따라 da 단독 또는 ll 우선/da 폴백
         self.ll_band_used = []     # 이번 프레임 각 밴드가 ll 기반으로 채택됐는지(길이 self.n_slices bool, 'da' 모드에선 항상 전부 False) — visualize() 색상 구분용
-        self.da_fallback_used = False  # 이번 프레임 da가 최댓값이 아니라 차선책(2번째 이하) 덩어리인지 — visualize() 색상 구분용
+        self.da_fallback_used = False  # 이번 프레임 da가 직전 채택 덩어리와의 근접성이 아니라 면적순위 차선책으로 골라졌는지 — visualize() 색상 구분용
         self.da_ll_clip_skipped = False  # 이번 프레임 ll 클리핑이 유효 밴드를 너무 줄여 건너뛰었는지 — visualize() 구분용
         self.da_largest_mask_roi = None  # 면적 1위 덩어리(차선책을 썼다면 그 사유가 된, 상한 초과로 버려진 덩어리) — fallback일 때 원래 색으로 같이 그리기용
         self.da_largest_area_px = 0  # 면적 1위 덩어리의 절대 픽셀 면적(채택 여부 무관) — DL_DA_MAX_AREA_PX 실측 튜닝용
+        self._prev_da_centroid = None  # [2026-08-07] 직전 프레임에 채택된 da 덩어리의 중심(cx,cy) — _largest_da_component()가 이번 프레임 후보를 "가장 가까운 것"으로 고르는 기준. 무효 프레임 뒤엔 None으로 리셋(옛 위치에 계속 붙잡히지 않도록)
         self.da_chosen_area_px = 0   # 실제로 채택돼 waypoint 추출에 쓰인 덩어리의 면적(무효 프레임엔 0)
 
         # DL_USE_BEV=True일 때만 쓰는 워프 행렬. 상수라 매 프레임 다시 안 만들고 한 번만 계산.
@@ -395,17 +396,32 @@ class DLSlideWindow(SlideWindow):
         visualize()가 다른 색으로 구분해 그린다(디버깅용, 실제 판단 로직에는
         영향 없음). 이때 버려진 면적 1위 덩어리 자체도 self.da_largest_mask_roi에
         따로 남겨서, visualize()가 "원래(가장 큰) da"와 "실제로 채택한 차선책 da"를
-        동시에(각각 원래색/차선책색으로) 그릴 수 있게 한다."""
-        num, labels, stats, _ = cv2.connectedComponentsWithStats(da_mask, connectivity=8)
+        동시에(각각 원래색/차선책색으로) 그릴 수 있게 한다.
+
+        [2026-08-07] 차선책을 "면적 내림차순"만으로 고르면, 실제로는 계속 같은 차선을
+        보고 있는데도 두 덩어리 크기가 비슷해 프레임마다 순위가 뒤집히는 것만으로
+        채택 대상이 바뀌어 지금 따라가던 경로가 불필요하게 흔들리는 문제가 있었다
+        (실측 재현됨). 그래서 순위보다 "연속성"을 우선한다 — self._prev_da_centroid
+        (직전 프레임에 실제로 채택된 덩어리의 중심)와 가장 가까운 덩어리를 최우선
+        후보로 고정하고, 그 후보의 면적이 [MIN_COMPONENT_AREA, MAX_AREA_PX] 범위
+        안이면 순위와 무관하게 바로 채택한다. 이 근접 후보가 범위를 벗어났을 때만
+        (교차로에서 실제로 다른 갈래로 넘어갔거나, 따라가던 덩어리가 사실상 사라진
+        경우) 기존 면적 내림차순 차선책으로 넘어간다. 무효 프레임(빈 마스크 반환)
+        뒤에는 self._prev_da_centroid를 None으로 리셋해, 한참 뒤에 엉뚱한 위치의
+        덩어리가 "옛 중심과 가장 가깝다"는 이유만으로 잘못 이어붙는 것을 막는다."""
+        num, labels, stats, centroids = cv2.connectedComponentsWithStats(da_mask, connectivity=8)
         self.da_fallback_used = False
         self.da_largest_mask_roi = None
         self.da_largest_area_px = 0
         self.da_chosen_area_px = 0
         if num <= 1:
+            self._prev_da_centroid = None
             return np.zeros_like(da_mask)
 
         areas = stats[1:, cv2.CC_STAT_AREA]
-        order = np.argsort(areas)[::-1]  # 큰 덩어리부터
+        comp_centroids = centroids[1:]  # centroids[0]은 배경 — stats[1:]와 동일하게 인덱스 정렬
+        order = np.argsort(areas)[::-1]  # 큰 덩어리부터 — 차선책(연속성 후보 탈락 시) 폴백용
+        min_area = DL_DA_MIN_COMPONENT_AREA
         max_area = DL_DA_MAX_AREA_PX
 
         largest_label = 1 + int(order[0])
@@ -416,17 +432,37 @@ class DLSlideWindow(SlideWindow):
         # 이 실측값 기반으로 잡기 위함(config.py 주석 참고).
         self.da_largest_area_px = int(areas[order[0]])
 
+        def _choose(idx, fallback):
+            label = 1 + int(idx)
+            self.da_fallback_used = fallback
+            self.da_chosen_area_px = int(areas[idx])  # 실제로 채택돼 waypoint 추출에 쓰이는 면적
+            self._prev_da_centroid = (float(comp_centroids[idx][0]), float(comp_centroids[idx][1]))
+            return np.where(labels == label, np.uint8(255), np.uint8(0))
+
+        # 직전에 채택한 덩어리가 있으면 그 중심과 가장 가까운 덩어리를 최우선 후보로 고정
+        # (연속성 유지) — 범위 안이면 면적 순위와 무관하게 바로 채택한다.
+        if self._prev_da_centroid is not None:
+            px, py = self._prev_da_centroid
+            dists = np.hypot(comp_centroids[:, 0] - px, comp_centroids[:, 1] - py)
+            nearest_idx = int(np.argmin(dists))
+            nearest_area = int(areas[nearest_idx])
+            if min_area <= nearest_area <= max_area:
+                return _choose(nearest_idx, fallback=False)
+            # 근접 후보가 범위를 벗어남(상한 초과/하한 미만) — 아래 면적 순위 차선책으로 이동
+
         for rank, idx in enumerate(order):
             area = int(areas[idx])
-            if area < DL_DA_MIN_COMPONENT_AREA:
+            if area < min_area:
                 break  # 내림차순 정렬이라 이후는 전부 더 작다 — 더 볼 필요 없음
             if area <= max_area:
-                self.da_fallback_used = rank > 0
-                self.da_chosen_area_px = area  # 실제로 채택돼 waypoint 추출에 쓰이는 면적
-                label = 1 + int(idx)
-                return np.where(labels == label, np.uint8(255), np.uint8(0))
+                # 직전 연속 후보가 없어서(첫 프레임 등) 면적 1위를 그대로 쓴 경우만
+                # fallback=False — 그 외(연속 후보가 있었는데 범위를 벗어나 여기로
+                # 온 경우, 또는 1위가 상한에 걸려 2번째 이하를 쓴 경우)는 전부 차선책.
+                fallback = (rank > 0) or (self._prev_da_centroid is not None)
+                return _choose(idx, fallback=fallback)
             # 이 덩어리는 outlier(면적 상한 초과) — 다음으로 큰 덩어리를 시도
 
+        self._prev_da_centroid = None
         return np.zeros_like(da_mask)
 
     def _clip_da_by_ll(self, da_mask, ll_mask, ref_x):
