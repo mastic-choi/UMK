@@ -8,8 +8,8 @@
 #   detect(frame) -> (lane_valid, lane_offset, lane_lookahead, lane_center, path, debug_img)
 # 인터페이스를 구현하므로 track_drive.py의 perc_lane()은 수정 없이 그대로 재사용된다
 # (LANE_DETECTOR_BACKEND 플래그로 세 백엔드 중 하나를 고른다). path는 밴드(row 구간)별
-# 중심점(config.DL_CENTER_MODE='da'면 da 무게중심, 'll_da'면 ll이 확실한 밴드는 ll 좌/우
-# 중점 그 외는 da 무게중심으로 폴백, 'll'이면 ll이 확실한 밴드만 쓰고 그 외는 무효 —
+# 중심점(config.DL_CENTER_MODE='da'면 da 좌우 경계 중점, 'll_da'면 ll이 확실한 밴드는 ll
+# 좌/우 중점 그 외는 da 경계 중점으로 폴백, 'll'이면 ll이 확실한 밴드만 쓰고 그 외는 무효 —
 # 아래 "밴드별 중심 계산" 참고)에
 # lane_util._fit_and_sample_path()로 선형보간해 만든 명시적 경로(ROI 픽셀좌표
 # 웨이포인트, 가까운점→먼점) — controller/pure_pursuit.py가 조향각 계산에 직접 사용한다.
@@ -33,18 +33,21 @@
 #   da(주행가능영역)를 "주행 가능한 영역 하나의 덩어리"로 보고
 #   그 가로 중심을 밴드(행 구간)별로 바로 뽑는다 — 좌/우 ll을 따로 찾아 폭을 추정해
 #   중점을 계산하는 간접적인 방식보다 단순하고, 가는 선 하나가 반사/그림자로 끊기는 것보다
-#   넓은 덩어리가 노이즈에 더 안정적이라는 판단.
-#   DL_CENTER_MODE='ll_da'/'ll': da 무게중심은 "주행 가능한 영역"이지 "차로 중앙"이 아니므로,
-#   갓길 등 여백이 넓은 구간에서 무게중심이 여백 쪽으로 쏠려 경로가 차로 중앙을 벗어나는
-#   문제가 실측으로 확인됐다. ll(차선 자체, 두 백선)은 여백 크기와 무관하게 "선이 실제로
-#   있는 위치"만 가리키므로, 밴드마다 좌/우 ll이 둘 다 신뢰할 만큼 보이면 그 중점을
-#   채택한다(DLSlideWindow._ll_slice_centers()). 'll_da'는 ll이 부족한 밴드만 da 중심으로
-#   개별 폴백하고(프레임 전체 무효화 아님), 'll'은 그 폴백 없이 해당 밴드를 그냥 무효(None)로
-#   둔다 — da가 섞여 여백 쪽으로 쏠리는 걸 완전히 배제하고 싶을 때 쓰는 모드
-#   (config.py DL_CENTER_MODE 주석 참고).
+#   넓은 덩어리가 노이즈에 더 안정적이라는 판단. [2026-08-07] 밴드 중심은 무게중심이 아니라
+#   좌/우 경계 픽셀의 중점이다(_slice_edge_midpoints(), 아래 참고) — 갓길 등 한쪽 여백이
+#   넓어도 무게중심처럼 그쪽으로 쏠리지 않는다.
+#   DL_CENTER_MODE='ll_da'/'ll': da 경계 중점은 여전히 "주행 가능한 영역"이지 "차로 중앙"이
+#   아니므로(여백이 비대칭이면 경계 중점도 약간은 영향을 받을 수 있음), ll(차선 자체, 두
+#   백선)이 "선이 실제로 있는 위치"를 더 직접적으로 가리킨다는 점에서 여전히 우선한다 —
+#   밴드마다 좌/우 ll이 둘 다 신뢰할 만큼 보이면 그 중점을 채택한다
+#   (DLSlideWindow._ll_slice_centers()). 'll_da'는 ll이 부족한 밴드만 da 중심으로 개별
+#   폴백하고(프레임 전체 무효화 아님), 'll'은 그 폴백 없이 해당 밴드를 그냥 무효(None)로
+#   둔다(config.py DL_CENTER_MODE 주석 참고).
 #   세 모드 공통: 급커브에서 da 마스크가 파편화되는 실패모드에 대응해 ConnectedComponents로
 #   가장 큰 덩어리 하나만 남기고(DL_DA_MIN_COMPONENT_AREA 미만이면 그 프레임은 무효 처리)
-#   나머지 파편에 중심선이 끌려가지 않게 막는다(_largest_da_component() 참고). 또한 da가
+#   나머지 파편에 중심선이 끌려가지 않게 막는다 — 이때 "ROI 최하단 중앙(차량 위치)과 실제로
+#   맞닿은 덩어리"를 최우선으로, 그다음 "직전 프레임 채택 덩어리와 가장 가까운 것", 마지막
+#   폴백으로 면적 순위를 본다(_largest_da_component() 참고). 또한 da가
 #   점선 틈으로 옆 차선 da와 하나의 덩어리로 이어붙는 실패모드에 대해서는
 #   DLSlideWindow._clip_da_by_ll()이 ll 라인이 보이는 구간에서 그 바깥(옆 차선 쪽) da
 #   픽셀을 밴드별로 잘라내고 나서 _largest_da_component()를 적용한다(da 자체의 방어선 —
@@ -169,6 +172,7 @@ from ..config import (
     DL_SLICE_OUTLIER_MAX, DL_SLICE_FIT_MIN,
     DL_STABLE_FRAME_MIN, DL_STABLE_JUMP_MAX,
     DL_DA_MIN_COMPONENT_AREA, DL_DA_MAX_AREA_PX,
+    DL_DA_SEED_ROWS_PX, DL_DA_SEED_HALF_WIDTH_PX,
     DL_LL_SANITY_MIN_RATIO, DL_LL_CLIP_MARGIN_PX,
     DL_CENTER_MODE, DL_LL_SIDE_MIN_PIXELS, DL_LL_WIDTH_MIN_PX, DL_LL_WIDTH_MAX_PX,
     DL_LL_SEARCH_HALF_WIDTH_PX,
@@ -312,14 +316,14 @@ class DLSlideWindow(SlideWindow):
     프레임 간 스파이크를 걸러내는(_debounce)" 범용 유틸리티들만 재사용한다.
 
     좌/우 ll(차선) 라인을 따로 찾아 폭을 추정해 중점을 계산하던 옛 4단계 폴백(양쪽→
-    한쪽→노랑→무효, classic_cv용 calc_center() 방식)과 순수 da 무게중심 방식을 거쳐,
-    config.DL_CENTER_MODE로 둘 중 하나를 고른다 — 'da'는 da 무게중심을 밴드별 중심으로
-    바로 쓰고, 'll_da'는 밴드마다 "ll이 확실하면 ll 중점을, 아니면 da 무게중심을" 쓰는
-    하이브리드다(모듈 상단 주석 참고). 어느 모드든 좌/우 두 갈래를 따로 다룰 필요가 없어
-    calc_center()의 프레임 단위 4단계 분기와는 다르고, 그래서 여전히 calc_center()를
-    호출하지 않고 detect() 안에서 직접 조립한다. da는 여백(갓길 등)이 넓으면 무게중심이
-    차로 중앙에서 벗어나는 약점이 있지만 ll보다 끊기지 않는다는 장점이 있어, 'll_da'
-    모드에서 ll이 부족한 밴드(점선 틈, 마모, 반사, 편측 가려짐)의 안전망으로 쓰인다. 그
+    한쪽→노랑→무효, classic_cv용 calc_center() 방식)과 순수 da 경계중점 방식을 거쳐,
+    config.DL_CENTER_MODE로 둘 중 하나를 고른다 — 'da'는 da 좌우 경계 중점(무게중심이
+    아님, _slice_edge_midpoints() 참고)을 밴드별 중심으로 바로 쓰고, 'll_da'는 밴드마다
+    "ll이 확실하면 ll 중점을, 아니면 da 경계 중점을" 쓰는 하이브리드다(모듈 상단 주석
+    참고). 어느 모드든 좌/우 두 갈래를 따로 다룰 필요가 없어 calc_center()의 프레임
+    단위 4단계 분기와는 다르고, 그래서 여전히 calc_center()를 호출하지 않고 detect()
+    안에서 직접 조립한다. da는 ll보다 끊기지 않는다는 장점이 있어, 'll_da' 모드에서
+    ll이 부족한 밴드(점선 틈, 마모, 반사, 편측 가려짐)의 안전망으로 쓰인다. 그
     외에 da가 옆 차선까지 이어붙었을 때 그 경계를 잘라내는 방어선(_clip_da_by_ll())과
     프레임 단위 sanity check로는 모드와 무관하게 항상 ll을 쓴다(모듈 상단 주석 참고).
     """
@@ -412,7 +416,20 @@ class DLSlideWindow(SlideWindow):
         (교차로에서 실제로 다른 갈래로 넘어갔거나, 따라가던 덩어리가 사실상 사라진
         경우) 기존 면적 내림차순 차선책으로 넘어간다. 무효 프레임(빈 마스크 반환)
         뒤에는 self._prev_da_centroid를 None으로 리셋해, 한참 뒤에 엉뚱한 위치의
-        덩어리가 "옛 중심과 가장 가깝다"는 이유만으로 잘못 이어붙는 것을 막는다."""
+        덩어리가 "옛 중심과 가장 가깝다"는 이유만으로 잘못 이어붙는 것을 막는다.
+
+        [2026-08-07] 위 "직전 중심과 가장 가까운 덩어리"는 어디까지나 *과거 판단*에
+        기대는 방식이라, 만약 직전 프레임에 이미 엉뚱한 덩어리를 채택했다면(예:
+        교차로에서 다른 갈래로 잘못 넘어감) 그 뒤로도 "그때 그 위치와 가장 가깝다"는
+        이유만으로 계속 틀린 채로 이어질 수 있다(드리프트가 스스로 교정되지 않음).
+        이를 보강하기 위해 *이번 프레임만 놓고 봐도 검증 가능한* 물리적 신호를
+        최우선으로 추가했다 — "차량이 실제로 서 있는 위치"(ROI 최하단 중앙, 카메라/BEV
+        캔버스가 차량 중심선에 맞춰 캘리브레이션돼 있다는 전제)와 실제로 맞닿은 덩어리가
+        있으면 그걸 무조건 최우선으로 채택한다(`cv2.floodFill`을 새로 돌릴 필요 없이,
+        이미 계산된 `labels`에서 시드 영역의 라벨만 조회하면 된다 — CCL 결과 재사용).
+        이 신호는 매 프레임 독립적으로 "차와 물리적으로 붙어있는가"만 보므로, 직전
+        프레임의 오판에 영향받지 않고 스스로 교정된다. 시드 위치에 유효한 덩어리가
+        없을 때만(근거리가 가려짐 등) 기존 연속성→면적순위 순서로 넘어간다."""
         num, labels, stats, centroids = cv2.connectedComponentsWithStats(da_mask, connectivity=8)
         self.da_fallback_used = False
         self.da_largest_mask_roi = None
@@ -443,8 +460,27 @@ class DLSlideWindow(SlideWindow):
             self._prev_da_centroid = (float(comp_centroids[idx][0]), float(comp_centroids[idx][1]))
             return np.where(labels == label, np.uint8(255), np.uint8(0))
 
-        # 직전에 채택한 덩어리가 있으면 그 중심과 가장 가까운 덩어리를 최우선 후보로 고정
-        # (연속성 유지) — 범위 안이면 면적 순위와 무관하게 바로 채택한다.
+        # ① 시드(seed) 기반 최우선 후보 — ROI 최하단 중앙(차량 위치)과 물리적으로
+        # 맞닿은 덩어리가 있으면 과거 판단(연속성/면적순위)보다 우선 채택한다.
+        h, w = da_mask.shape
+        seed_x = w / 2.0
+        sy0 = max(0, h - DL_DA_SEED_ROWS_PX)
+        sx0 = int(np.clip(seed_x - DL_DA_SEED_HALF_WIDTH_PX, 0, w))
+        sx1 = int(np.clip(seed_x + DL_DA_SEED_HALF_WIDTH_PX, 0, w))
+        if sx1 > sx0:
+            seed_fg = labels[sy0:h, sx0:sx1]
+            seed_fg = seed_fg[seed_fg > 0]
+            if seed_fg.size:
+                seed_vals, seed_counts = np.unique(seed_fg, return_counts=True)
+                seed_idx = int(seed_vals[np.argmax(seed_counts)]) - 1  # 시드 영역에서 가장 많이 나온 라벨
+                seed_area = int(areas[seed_idx])
+                if min_area <= seed_area <= max_area:
+                    return _choose(seed_idx, fallback=False)
+                # 시드 위치 덩어리가 면적 범위를 벗어남(비정상적으로 크거나 작음) —
+                # 아래 ②(연속성)/③(면적순위)로 이동
+
+        # ② 직전에 채택한 덩어리가 있으면 그 중심과 가장 가까운 덩어리를 다음 우선
+        # 후보로 고정(연속성 유지) — 범위 안이면 면적 순위와 무관하게 바로 채택한다.
         if self._prev_da_centroid is not None:
             px, py = self._prev_da_centroid
             dists = np.hypot(comp_centroids[:, 0] - px, comp_centroids[:, 1] - py)
@@ -452,8 +488,9 @@ class DLSlideWindow(SlideWindow):
             nearest_area = int(areas[nearest_idx])
             if min_area <= nearest_area <= max_area:
                 return _choose(nearest_idx, fallback=False)
-            # 근접 후보가 범위를 벗어남(상한 초과/하한 미만) — 아래 면적 순위 차선책으로 이동
+            # 근접 후보가 범위를 벗어남(상한 초과/하한 미만) — 아래 ③(면적순위 차선책)으로 이동
 
+        # ③ 시드/연속성 둘 다 못 쓴 경우의 최후 폴백 — 면적 내림차순
         for rank, idx in enumerate(order):
             area = int(areas[idx])
             if area < min_area:
@@ -684,17 +721,18 @@ class DLSlideWindow(SlideWindow):
 
         self.da_mask_roi = da_mask
 
-        # 밴드별 중심점 — DL_CENTER_MODE='da'면 da 무게중심을 그대로 쓰고(_slice_centers는
-        # 색상/의미에 상관없이 "임의의 이진마스크를 세로로 N등분해 구간별 moments 중심을
-        # 구하는" 범용 로직), 'll_da'면 밴드마다 ll이 신뢰되면 ll 중점을 우선 채택하고
-        # 그 외 밴드만 da 중심으로 폴백하며, 'll'은 그 da 폴백 없이 ll이 신뢰되는 밴드만
-        # 쓰고 나머지는 무효(None)로 둔다(모듈 상단 주석 참고) — None은 이후
+        # 밴드별 중심점 — DL_CENTER_MODE='da'면 da 좌우 경계 중점을 그대로 쓰고
+        # (_slice_edge_midpoints(), 2026-08-07부터 무게중심 대신 이 방식 — da_mask
+        # 위쪽 클래스 docstring/lane_util._slice_edge_midpoints() 주석 참고),
+        # 'll_da'면 밴드마다 ll이 신뢰되면 ll 중점을 우선 채택하고 그 외 밴드만 da
+        # 중심으로 폴백하며, 'll'은 그 da 폴백 없이 ll이 신뢰되는 밴드만 쓰고 나머지는
+        # 무효(None)로 둔다(모듈 상단 주석 참고) — None은 이후
         # _reject_outliers/_fit_and_sample_path가 원래부터 걸러내는 값이라 별도 처리가
         # 필요 없다. ll_mask는 클리핑 전 원본을 쓴다 — _clip_da_by_ll()의 클리핑은 da를
         # 깎아내기 위한 것이지 ll 자체의 좌/우 라인 위치를 바꾸는 게 아니므로 그대로
         # 재사용해도 무방하다. ref_x는 위에서 _clip_da_by_ll()에 쓴 것과 같은 기준점
         # (직전 프레임 확정 lane_center, 없으면 ROI 중앙)을 그대로 재사용한다.
-        raw_da_centers = self._slice_centers(da_mask, 0, (0, 255, 0))
+        raw_da_centers = self._slice_edge_midpoints(da_mask, 0, (0, 255, 0))
         if DL_CENTER_MODE == 'll_da':
             raw_ll_centers, self.ll_band_used = self._ll_slice_centers(ll_mask, ref_x)
             merged_centers = [

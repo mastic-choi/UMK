@@ -402,6 +402,48 @@ class SlideWindow:
 
         return centers
 
+    def _slice_edge_midpoints(self, mask, x_offset, color=None):
+        """_slice_centers()와 같은 밴드 분할이지만, 무게중심(moments) 대신 "밴드 내
+        가장 왼쪽 픽셀 열 + 가장 오른쪽 픽셀 열의 중점"을 밴드 중심으로 쓴다.
+
+        [2026-08-07] da(주행가능영역)처럼 픽셀이 넓게 채워진 마스크는, 갓길 등 한쪽
+        여백이 넓으면 무게중심(픽셀 밀도 가중 평균)이 그 여백 쪽으로 쏠려 실제 도로
+        폭의 "정중앙"에서 벗어나는 문제가 있다 — Voronoi(좌우 경계에서 등거리인 점)
+        아이디어에서 착안했다. 진짜 Voronoi/skeletonization을 계산할 필요 없이,
+        밴드마다 좌/우 끝 픽셀 열의 중점만 써도 같은 효과를 훨씬 싸게 얻는다 — 밀도가
+        아니라 순수 "폭의 중앙"을 잡으므로 여백 크기와 무관하다. da 전용으로 만들었다
+        (ll/좌우차선처럼 원래 얇은 선은 두 방식의 차이가 미미해 그대로 _slice_centers를
+        쓴다).
+          입력/출력 형식은 _slice_centers()와 동일 — centers[i] = (y_center, cx) 또는
+          해당 구간 픽셀수가 self.min_pixels 미만이면 None.
+        """
+        slice_h = self.roi_h // self.n_slices
+        centers = []
+
+        for i in range(self.n_slices):
+            y_high = self.roi_h - i * slice_h
+            y_low = 0 if i == self.n_slices - 1 else self.roi_h - (i + 1) * slice_h
+
+            band = mask[y_low:y_high, :]
+
+            if DEBUG_VIZ_LANE and color is not None:
+                cv2.rectangle(
+                    self.vis,
+                    (x_offset, y_low), (x_offset + mask.shape[1] - 1, max(y_high - 1, y_low)),
+                    color, 1
+                )
+
+            if cv2.countNonZero(band) < self.min_pixels:
+                centers.append(None)
+                continue
+
+            cols = np.nonzero(np.any(band > 0, axis=0))[0]
+            cx = (float(cols[0]) + float(cols[-1])) / 2.0 + x_offset
+            y_center = (y_low + y_high) / 2.0
+            centers.append((y_center, cx))
+
+        return centers
+
     def _reject_outliers(self, centers):
         """
         구간별 무게중심들 사이의 위치 일관성을 체크해서 이상치(반사광 등으로
