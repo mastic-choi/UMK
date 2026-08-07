@@ -84,6 +84,11 @@ class TrackDriverNode(Node):
         # 눌려있는" 문제가 생기므로 반드시 이 타임스탬프로 살아있는지 먼저 확인할 것.
         self.imu_yaw_rate = 0.0
         self._imu_t = None
+        # [2026-08-06] imu_yaw_rate 저역통과 상태 — _imu_curvature_px()가 IMU_YAW_RATE_EMA_ALPHA로
+        # 갱신한다(config.py 주석 참고). IMU/VESC가 죽어 _imu_curvature_px()가 None을 반환하는
+        # 동안엔 갱신을 건너뛰어(아래 함수 참고) 그대로 얼어있는다 — held 프레임에 last_curvature를
+        # 안 건드리는 것과 같은 원칙, 다시 살아나면 몇 프레임 안에 EMA로 자연스럽게 수렴한다.
+        self._imu_yaw_rate_ema = 0.0
         self._img_front_t = 0.0   # 전방 카메라 최근 수신 시각(디버그: 카메라 살아있는지 나이로 판단)
         self._scan_t       = 0.0  # 라이다 최근 수신 시각(디버그용)
 
@@ -1244,6 +1249,13 @@ class TrackDriverNode(Node):
         보강한다(controller/pure_pursuit.py control()의 imu_curvature_px 주석 참고) —
         비전 경로만으로 뽑던 probe_curvature와 달리 픽셀 노이즈에 영향을 안 받는다.
 
+        [2026-08-06] imu_yaw_rate를 그대로 쓰지 않고 IMU_YAW_RATE_EMA_ALPHA로 저역통과한
+        self._imu_yaw_rate_ema를 쓴다 — probe_curvature는 경로 위 여러 점을 누적한 값이라
+        어느 정도 스무딩이 걸려있는데, 자이로 순간값은 그런 스무딩이 없다. curvature
+        damping이 두 값 중 절댓값이 큰 쪽을 그대로 채택하는 구조(controller/pure_pursuit.py
+        control() 참고)라, 스무딩 없는 쪽이 노이즈 스파이크 한 프레임만으로 감쇠를 확
+        눌러버릴 위험이 있었다.
+
         kappa_m = yaw_rate(rad/s) / v_mps(m/s) 는 물리적으로 옳은 실제 curvature(1/m)다.
         이걸 픽셀 curvature로 바꾸려면 DL_PIXELS_PER_METER(BEV 목적캔버스 스케일, =200px/m)로
         나누면 되는데, 이 환산은 dl+BEV 조합(self.lane_path가 그 스케일일 때)에서만 유효하다
@@ -1258,7 +1270,9 @@ class TrackDriverNode(Node):
         imu_live = self._imu_t is not None and (time.time() - self._imu_t) < IMU_STALE_SEC
         if not (imu_live and self._vesc_live()):
             return None
-        kappa_m = self.imu_yaw_rate / self.v_mps
+        self._imu_yaw_rate_ema = (IMU_YAW_RATE_EMA_ALPHA * self.imu_yaw_rate
+                                   + (1.0 - IMU_YAW_RATE_EMA_ALPHA) * self._imu_yaw_rate_ema)
+        kappa_m = self._imu_yaw_rate_ema / self.v_mps
         return kappa_m / DL_PIXELS_PER_METER
 
     def _speed_for_lookahead(self):

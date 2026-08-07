@@ -395,9 +395,17 @@ lookahead가 `PP_LOOKAHEAD_MIN_PX(40px)` 근처에 계속 눌려있어 절대 �
 **구조** (`_imu_curvature_px()`, [track_drive.py:1241](track_drive.py#L1241)):
 1. `cb_imu()`가 `msg.angular_velocity.z`(yaw rate, rad/s)를 `self.imu_yaw_rate`로, 수신 시각을
    `self._imu_t`로 저장합니다(기존엔 `orientation`만 쓰고 각속도는 버리고 있었음).
-2. `kappa_m = imu_yaw_rate / v_mps`(VESC 실측속도, §7)로 실제 curvature(1/m)를 구하고,
+2. `kappa_m = imu_yaw_rate_ema / v_mps`(VESC 실측속도, §7)로 실제 curvature(1/m)를 구하고,
    `DL_PIXELS_PER_METER`(=200px/m)로 나눠 `pure_pursuit`이 쓰는 픽셀 curvature 단위로 맞춥니다 —
    이 환산은 `PP_WHEELBASE_PX`(§6.8)와 동일하게 `dl+BEV` 조합에서만 유효합니다.
+   - **[2026-08-06 같은 날 보완] `imu_yaw_rate` 저역통과 추가.** `probe_curvature`는 경로 위 여러
+     점을 누적한 값이라 어느 정도 스무딩이 걸려있는데, 자이로 순간값(`imu_yaw_rate`)은 그런 스무딩이
+     없었습니다. 바로 아래 3번처럼 두 값 중 절댓값이 큰 쪽을 그대로 채택하는 구조라, 스무딩이 없는
+     쪽이 노이즈 스파이크 한 프레임만으로 감쇠를 확 눌러버릴 위험이 있어서 — `IMU_YAW_RATE_EMA_ALPHA`
+     (=0.3, config.py, `PP_ALPHA`/`CORNER_SIGN_EMA_ALPHA`와 동일한 관례)로 저역통과한
+     `self._imu_yaw_rate_ema`를 대신 씁니다(`_imu_curvature_px()`, [track_drive.py:1246](track_drive.py#L1246)).
+     IMU/VESC가 죽어있는 동안엔 이 EMA도 갱신을 건너뛰고 그대로 얼어있습니다(held 프레임에
+     `last_curvature`를 안 건드리는 것과 같은 원칙) — 다시 살아나면 몇 프레임 안에 자연 수렴합니다.
 3. `controller/pure_pursuit.py`의 `control()`이 `probe_curvature`와 이 `imu_curvature_px` 중
    **절댓값이 더 큰 쪽**으로 감쇠를 겁니다 — 비전이 못 본 코너를 IMU가 잡아내는 경우(또는 그 반대)를
    놓치지 않기 위한 보수적 선택입니다. 부호는 안 맞춥니다(`abs()`로만 쓰여서 실차 미검증인 IMU 부호규약이
@@ -420,8 +428,11 @@ IMU가 죽어있거나(`IMU_STALE_SEC=0.5` 이상 미수신), VESC가 죽어있�
 **알려진 한계:**
 - IMU 각속도 부호규약(z축 +가 좌/우 중 어느 쪽인지)이 실차 미검증입니다. 위에서 설명한 대로 `abs()`로만
   쓰여서 조향 자체엔 영향이 없지만, 나중에 다른 용도로 부호를 쓰게 되면 먼저 검증할 것.
-- `probe_curvature`와 `imu_curvature_px`를 단순 `max(abs, abs)`로만 합칩니다 — 실제로 어느 쪽이 더
-  신뢰할 만한지 가중치를 다르게 주는 것(칼만 필터 등)은 아직 안 함. 실차 데이터 쌓이면 재검토.
+- `probe_curvature`와 (저역통과된) `imu_curvature_px`를 여전히 단순 `max(abs, abs)`로만 합칩니다 —
+  실제로 어느 쪽이 더 신뢰할 만한지 가중치를 다르게 주는 것(칼만 필터 등)은 아직 안 함. 실차 데이터
+  쌓이면 재검토.
+- `IMU_YAW_RATE_EMA_ALPHA=0.3`도 다른 값들처럼 실차 미검증 추정치입니다. VESC 복구 후 `steer_debug`의
+  `IMU curvature` 값이 여전히 프레임마다 들쭉날쭉하면 낮추고, 코너 반응이 눈에 띄게 늦으면 올릴 것.
 
 ---
 

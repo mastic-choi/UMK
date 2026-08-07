@@ -389,6 +389,16 @@ IMU_STALE_SEC = 0.5          # 마지막 /imu 수신 후 이 시간(s)이 지나
                              #   lap 카운트(_update_lap)는 이 가드 없이 imu_yaw를 그대로 쓰므로
                              #   IMU가 죽으면 [LAP] 누적이 0에 멈추는 것으로 바로 티가 난다(의도된 동작).
 
+IMU_YAW_RATE_EMA_ALPHA = 0.3  # [2026-08-06] _imu_curvature_px() 전용 저역통과(1=필터없음, 0=반응없음,
+                             #   PP_ALPHA/CORNER_SIGN_EMA_ALPHA와 동일한 관례). probe_curvature는
+                             #   경로 위 여러 점을 누적한 값인데 imu_yaw_rate는 자이로 순간값을
+                             #   그대로 썼었다 — curvature damping이 두 값 중 "더 큰 쪽"을 그대로
+                             #   쓰는 구조라(controller/pure_pursuit.py control() 참고), 스무딩 없는
+                             #   쪽(IMU)이 노이즈 스파이크 한 프레임만으로도 감쇠를 확 눌러버릴 수
+                             #   있었다. 0.3은 CORNER_SIGN_EMA_ALPHA(0.15)보다 약간 반응성을 준
+                             #   추정치 — 실차 미검증, VESC 복구 후 steer_debug의 IMU curvature
+                             #   값이 진동하는지 보며 조정할 것.
+
 
 # #############################################################
 # 5. 디버깅 ON/OFF
