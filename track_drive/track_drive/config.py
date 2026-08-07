@@ -88,7 +88,7 @@ SPEED_STOP    = 0.0
 #   전진하도록 함. SPEED_NORMAL이 25.0으로 오른 만큼 최고/최저 속도 폭이 넓어졌으니, 코너
 #   진입/탈출 시 속도 급변이 과하게 느껴지면 이 값을 올리는 쪽으로 완화할 것.
 SPEED_CORNER_MIN = 5.0
-ANGLE_MAX     = 100.0  # 조향각 클램프(도)
+ANGLE_MAX     = 80.0  # 조향각 클램프(도)
 ANGLE_RATE_MAX = 12.0  # 조향 변화율 제한(도/주기, 20Hz 기준 12도/주기=240도/초) — drive()에서 모든 명령에 일괄 적용
 SPEED_ACCEL_STEP = 0.85  # 가속 속도제한(주기당 최대 증가량)
 CORNER_HOLD_DECAY_LO = 0.92  # 저속 시 코너 hold 감쇠 (빠른 회복)
@@ -239,7 +239,7 @@ DL_DA_MIN_COMPONENT_AREA = 1560
 #   직선 구간 3프레임): 13349px, 13361px, 12946px(평균 13,219px, 최대 13,361px) — 여기에
 #   여유를 두고 13,700으로 설정. 캔버스 크기가 또 바뀌면(원거리 크롭 값 재조정 등) 비율
 #   방식과 달리 이 값도 같이 재측정해야 한다.
-DL_DA_MAX_AREA_PX = 13700
+DL_DA_MAX_AREA_PX = 16000
 # ll sanity check — ROI 내 ll(차선) foreground 비율이 이 미만이면 da 결과와 무관하게 무효 처리
 DL_LL_SANITY_MIN_RATIO = 0.005
 # da가 옆 차선과 이어붙었을 때 ll 라인 바깥(옆 차선 쪽) 픽셀을 잘라내는 여유폭(px)
