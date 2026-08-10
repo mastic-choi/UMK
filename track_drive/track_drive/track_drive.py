@@ -1226,6 +1226,16 @@ class TrackDriverNode(Node):
         # 코너 진입(회전반경 감소) 시 추가 감속 — 기존 turn_for_speed 기반 감속과는 독립적으로
         # 계산해서 더 낮은 쪽을 쓴다(대체가 아니라 추가 안전판).
         target_speed = max(SPEED_CORNER_MIN, target_speed * self._corner_radius_speed_scale())
+        # [2026-08-10] DL_CENTER_MODE='ll'에서 노란/흰선 중 하나를 저신뢰 추정(간격
+        # 재구성 또는 잔상)으로 메운 프레임은 속도를 SPEED_LL_DEGRADED로 강제 제한한다
+        # (요청 반영). 가/감속 모두 accel_step 램프 없이 즉시 적용 — 기존 코너 감속도
+        # 감속 방향은 램프 없이 즉시 반영되는 관례(가속만 아래 accel_step로 제한)와 동일.
+        # DL 백엔드 + 'll' 모드일 때만 의미 있으므로 getattr로 안전하게 조회한다(다른
+        # 백엔드/모드에선 속성이 없거나 항상 False).
+        slide = getattr(self.lane_detector, '_slide', None)
+        if (LANE_DETECTOR_BACKEND == 'dl' and DL_CENTER_MODE == 'll'
+                and getattr(slide, 'll_degraded', False)):
+            target_speed = min(target_speed, SPEED_LL_DEGRADED)
         speed_ratio = min(1.0, self._prev_speed / SPEED_NORMAL)
         corner_decay = CORNER_HOLD_DECAY_LO + (CORNER_HOLD_DECAY_HI - CORNER_HOLD_DECAY_LO) * speed_ratio
         self._corner_hold = max(turn_now, self._corner_hold * corner_decay)
@@ -1410,6 +1420,20 @@ class TrackDriverNode(Node):
             f'DA seed width:{da_seed_width}px',
             (10, 8 + 32 * len(lines)), (255, 255, 255), 18,
             f'DA seed width:{da_seed_width}px'))
+
+        # [2026-08-10] DL_CENTER_MODE='ll' 전용 — 노란선 기준 현재 차선 판정(lane_side)과
+        # 이번 프레임 저신뢰 추정(간격 재구성/잔상) 사용 여부. 후자가 True면
+        # _lane_drive()가 SPEED_LL_DEGRADED로 속도를 강제 제한 중이라는 뜻이라 빨강으로
+        # 강조 — 요청 반영("디버깅 페이지에도 띄울것").
+        if LANE_DETECTOR_BACKEND == 'dl' and DL_CENTER_MODE == 'll':
+            lane_side = getattr(slide, 'lane_side', None) if slide is not None else None
+            ll_degraded = getattr(slide, 'll_degraded', False) if slide is not None else False
+            degraded_kr = f'저신뢰(속도 {SPEED_LL_DEGRADED:.0f} 제한)' if ll_degraded else '정상'
+            degraded_en = f'DEGRADED (capped {SPEED_LL_DEGRADED:.0f})' if ll_degraded else 'OK'
+            side_color = (0, 0, 220) if ll_degraded else (255, 255, 255)
+            lines.append((
+                f'LL 차선:{lane_side} {degraded_kr}', (10, 8 + 32 * len(lines)), side_color, 18,
+                f'LL side:{lane_side} {degraded_en}'))
 
         canvas = np.full((8 + 32 * len(lines) + 16, 380, 3), 30, dtype=np.uint8)
         put_text_kr_multi(canvas, lines)
