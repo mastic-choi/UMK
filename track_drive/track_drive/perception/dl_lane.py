@@ -169,6 +169,8 @@ from ..config import (
     DL_CENTER_MODE, DL_LL_SIDE_MIN_PIXELS,
     DL_LL_SEARCH_HALF_WIDTH_PX,
     DL_LL_YELLOW_GAP_INIT_PX, DL_LL_YELLOW_GAP_EMA_ALPHA,
+    DL_LL_YELLOW_GAP_MIN_PX, DL_LL_YELLOW_GAP_MAX_PX,
+    DL_LL_NO_YELLOW_SEARCH_HALF_WIDTH_PX,
     DL_CORRIDOR_LINE_MIN_PIXELS, DL_CORRIDOR_LINE_MERGE_PX,
     DL_CORRIDOR_WIDTH_MIN_PX, DL_CORRIDOR_WIDTH_MAX_PX, DL_CORRIDOR_MIN_PASSABLE_PX,
     DL_LL_YELLOW_VOTE_RATIO, DL_LL_YELLOW_MIN_AREA,
@@ -352,6 +354,7 @@ class DLSlideWindow(SlideWindow):
         self.lane_side = None  # [2026-08-10] DL_CENTER_MODE='ll' 전용 — 'left'/'right'/None(아직 미판정). 근거리 노란선이 seed(차량 위치) 기준 왼쪽이면 'right'(우측차선 주행중), 오른쪽이면 'left' — _ll_yellow_white_centers() 참고
         self.ll_degraded = False  # [2026-08-10] 이번 프레임 'll' 모드가 노란/흰선 중 하나를 저신뢰 추정(간격 재구성 또는 잔상)으로 메운 밴드가 하나라도 있었는지 — track_drive.py _lane_drive()가 SPEED_LL_DEGRADED 강제용으로 읽음, _debug_viz_steer()도 표시
         self.ll_band_degraded = []  # [2026-08-10] 밴드별(길이 n_slices) 위 저신뢰 추정 여부 — visualize() 색 구분용
+        self.ll_band_case = []  # [2026-08-10] 밴드별(길이 n_slices) _ll_yellow_white_centers()가 이번 밴드에 실제로 어떤 분기를 탔는지 — 'Y+W'(둘다 정상)/'Y+gap'(노란만, 흰 추정)/'2W'(노란없음, 양쪽흰선)/'1W:L'|'1W:R'(노란없음, 한쪽흰선)/'LOST'(둘다없음, 잔상). visualize()가 밴드별 텍스트로 그려서 "지금 SW가 어느 분기로 주행중인지" 실차에서 바로 보이게 함
 
         # [2026-08-10] DL_CENTER_MODE='ll_da'(corridor 알고리즘) 전용 상태 (모듈 상단
         # "corridor" 주석, config.py DL_CENTER_MODE 주석 참고).
@@ -769,42 +772,63 @@ class DLSlideWindow(SlideWindow):
         DL_LL_YELLOW_GAP_EMA_ALPHA로 EMA)를 갱신한다 — cur_yellow/cur_white는 각자
         실제로 찾았을 때만 갱신(독립 슬라이딩 윈도우 원칙은 유지).
 
-        ③ 노란선만 찾고 흰선을 못 찾으면 → 노란선 위치 + (차선 방향)×gap으로 흰선
-        위치를 추정해서 중점을 계산한다. 근거 없는 추정이므로 이 밴드는
-        self.ll_band_degraded[i]=True로 표시한다.
+        ③ 노란선만 찾고 흰선을 못 찾으면(좁은 창 기준) → 노란선 위치 + (차선 방향)×
+        gap으로 흰선 위치를 추정해서 중점을 계산한다. 근거 없는 추정이므로 이 밴드는
+        self.ll_band_degraded[i]=True로 표시한다. 태그 'Y+gap'.
 
-        ④ 반대로 흰선만 찾고 노란선을 못 찾으면 → 흰선 위치 - (차선 방향)×gap으로
-        노란선 위치를 역으로 추정한다(③의 대칭). 마찬가지로 degraded 표시.
+        ④ [2026-08-10 재설계, README §2.19] 노란선을 이번 밴드에서 못 찾으면 →
+        예전엔 좁은 창(cur_white 중심) 하나로 흰선 하나만 찾아 gap을 역적용했는데,
+        실차 15초 지점에서 gap EMA가 노이즈로 161px까지 부푼 뒤(정상 실측치는
+        80px) 노란선이 아예 안 잡히기 시작해 그 부푼 값이 그대로 얼어붙었고, 그
+        값으로 흰선 위치를 무시한 채 waypoint를 실제 흰선 너머 차선 밖으로 밀어내
+        급조향(우회전)으로 이어지는 게 확인됐다. 이제 넓은 창
+        (DL_LL_NO_YELLOW_SEARCH_HALF_WIDTH_PX)에서 _ll_line_centers()로 흰선
+        컴포넌트를 전부 찾아 개수로 3분기한다:
+          - 케이스1(태그 '2W', 흰선 2개 이상 — 가장 왼쪽/오른쪽을 채택): 두 실측
+            위치의 중점을 그대로 중앙선으로 쓴다. gap 추정치에 안 기대는 가장 신뢰
+            높은 재구성이라, cur_yellow도 이 중점으로 갱신해 다음 밴드 탐색창이
+            따라가게 한다.
+          - 케이스2(태그 '1W:L'/'1W:R', 흰선 1개): 그 흰선이 기준점(cur_yellow)
+            대비 왼쪽/오른쪽인지 **매 밴드 새로 실측 판정**한 뒤(self.lane_side/
+            side_sign은 프레임당 한 번만 고정돼 stale할 수 있어 안 씀), 그 방향
+            으로 gap(클램프됨, DL_LL_YELLOW_GAP_MIN/MAX_PX)만큼 차선 안쪽으로
+            당겨 중앙선을 재구성한다.
+          - 케이스3(태그 'LOST', 흰선 0개): 새로 추정할 근거가 전혀 없으므로 직전
+            까지 추적하던 cur_yellow/cur_white 위치를 그대로 "잔상"으로 써서
+            중점을 만든다(cur_* 갱신 안 함 — 아무 근거 없이 같은 값을 우려먹는
+            것이므로 새 오염원이 되지 않게).
 
-        ⑤ 둘 다 못 찾으면 → 이번 밴드는 새로 추정할 근거가 전혀 없으므로, 직전까지
-        추적하던 cur_yellow/cur_white 위치를 그대로 "잔상"으로 써서 중점을 만든다
-        (cur_yellow/cur_white는 갱신 안 함 — 정말 아무 근거 없이 계속 같은 값을 우려먹는
-        것이므로 새로운 오염원이 되지 않게). degraded 표시.
-
-        ③④⑤ 전부 self.ll_degraded(프레임 단위, 이번 프레임에 degraded 밴드가 하나라도
+        ③④ 전부 self.ll_degraded(프레임 단위, 이번 프레임에 degraded 밴드가 하나라도
         있으면 True)를 세우고, track_drive.py _lane_drive()가 이를 보고 속도를
         SPEED_LL_DEGRADED로 강제 제한한다(요청 반영: "안 보이면 잔상 주행 + 속도 5").
+        밴드별로 어느 분기를 탔는지는 self.ll_band_case(visualize()가 밴드 점 옆
+        텍스트 + 상단 요약 줄로 그림)에 남는다.
 
           입력 : ll_white_mask, ll_yellow_mask — (roi_h, roi_w) uint8 이진마스크(동일 shape)
                  ref_x — 첫(근거리) 밴드의 seed/기준 x좌표. 보통 직전 프레임 lane_center.
           출력 : (results, used) — 둘 다 길이 self.n_slices.
-                 results[i] : 항상 (y_center, cx) — ②~⑤ 중 하나로 채워짐(cur_yellow/
-                              cur_white가 한 번도 안 잡힌 첫 프레임 극초반 제외).
+                 results[i] : 항상 (y_center, cx) — ②~④(케이스1~3 포함) 중 하나로
+                              채워짐(cur_yellow/cur_white가 한 번도 안 잡힌 첫 프레임
+                              극초반 제외).
                  used[i]    : ②(정상 검출)로 채워졌는지(bool) — 디버그 시각화용
-                              (③④⑤=degraded는 False).
+                              (③④=degraded는 False).
 
         알려진 한계:
-        - 탐색창이 좁아서 급커브에서 밴드 간 실제 선 이동량이
+        - 탐색창이 좁아서(②③) 급커브에서 밴드 간 실제 선 이동량이
           DL_LL_SEARCH_HALF_WIDTH_PX보다 크면 추적이 끊길 수 있다(노란/흰 각각 독립).
-        - ⑤(잔상)가 여러 프레임 연속되면 cur_yellow/cur_white가 실제 위치와 점점
-          벌어질 수 있다 — 실차 미검증, 잔상이 몇 프레임까지 안전한지 확인할 것.
-        - lane_side 오판(예: 교차로 등에서 노란선을 반대쪽 것으로 잘못 짝지음) 시
-          흰선 탐색 방향 자체가 틀어진다 — 아직 별도 sanity check 없음."""
+        - 케이스3(LOST)이 여러 프레임 연속되면 cur_yellow/cur_white가 실제 위치와
+          점점 벌어질 수 있다 — 실차 미검증, 잔상이 몇 프레임까지 안전한지 확인할 것.
+        - 케이스1에서 흰선이 3개 이상 잡히면(점선 파편/노이즈) 가장 왼쪽/오른쪽만
+          채택하는데, 그중 하나가 실제로는 옆 차선/노이즈일 경우 중점이 틀어질 수
+          있다 — 아직 폭 sanity check 없음.
+        - ③번(노란선만 찾음)은 여전히 self.lane_side/side_sign(프레임당 한 번 고정)에
+          기대므로, lane_side 오판 시(예: 교차로) 이 분기만 틀어질 수 있다."""
         h, w = ll_white_mask.shape
         slice_h = h // self.n_slices
         results = [None] * self.n_slices
         used = [False] * self.n_slices
         self.ll_band_degraded = [False] * self.n_slices
+        self.ll_band_case = ['?'] * self.n_slices  # visualize()가 밴드별로 그림 — "지금 SW가 어느 분기로 주행중인지"
         # 디버그 시각화용 — 밴드별 노란/흰 탐색창 좌표 + 실제로 찾았는지.
         # 알고리즘 자체엔 전혀 쓰이지 않는 부가 정보.
         self.ll_search_windows = []
@@ -849,24 +873,66 @@ class DLSlideWindow(SlideWindow):
                     cur_white = wx
 
             if yx is not None and wx is not None:
-                # ② 둘 다 찾음 — 정상 검출.
+                # ② 둘 다 찾음 — 정상 검출. gap EMA는 상하한을 클램프한다(아래 참고).
                 results[i] = (y_center, (yx + wx) / 2.0)
                 used[i] = True
+                self.ll_band_case[i] = 'Y+W'
                 alpha = DL_LL_YELLOW_GAP_EMA_ALPHA
-                self._white_yellow_gap_px = (1 - alpha) * self._white_yellow_gap_px + alpha * abs(wx - yx)
+                new_gap = (1 - alpha) * self._white_yellow_gap_px + alpha * abs(wx - yx)
+                self._white_yellow_gap_px = float(
+                    np.clip(new_gap, DL_LL_YELLOW_GAP_MIN_PX, DL_LL_YELLOW_GAP_MAX_PX)
+                )
             elif yx is not None:
                 # ③ 노란선만 찾음 — 간격으로 흰선 위치 추정.
                 est_wx = yx + side_sign * self._white_yellow_gap_px
                 results[i] = (y_center, (yx + est_wx) / 2.0)
                 self.ll_band_degraded[i] = True
-            elif wx is not None:
-                # ④ 흰선만 찾음 — 간격으로 노란선 위치 역추정(③의 대칭).
-                est_yx = wx - side_sign * self._white_yellow_gap_px
-                results[i] = (y_center, (est_yx + wx) / 2.0)
-                self.ll_band_degraded[i] = True
+                self.ll_band_case[i] = 'Y+gap'
             else:
-                # ⑤ 둘 다 못 찾음 — 직전 추적 위치를 잔상으로 사용(cur_yellow/cur_white 갱신 안 함).
-                results[i] = (y_center, (cur_yellow + cur_white) / 2.0)
+                # ④ 노란선을 이번 밴드에서 못 찾음 — [2026-08-10] 좁은 창(cur_white
+                # 중심) 하나로 흰선을 찾아 간격을 역적용하던 옛 방식은, gap EMA가
+                # 부풀면 실제 흰선 위치와 무관하게 waypoint를 차선 밖으로 밀어내는
+                # 문제가 실차에서 확인됐다(config.py DL_LL_YELLOW_GAP_MIN/MAX_PX
+                # 주석 참고). 넓은 창(DL_LL_NO_YELLOW_SEARCH_HALF_WIDTH_PX)에서
+                # 흰선을 몇 개 찾았는지로 3분기한다 — _ll_line_centers()는 로컬
+                # 슬라이스 좌표를 반환하므로 wx0w를 다시 더해 원래 좌표로 되돌린다.
+                wide_win = DL_LL_NO_YELLOW_SEARCH_HALF_WIDTH_PX
+                wx0w = int(np.clip(cur_yellow - wide_win, 0, w))
+                wx1w = int(np.clip(cur_yellow + wide_win, 0, w))
+                lines = []
+                if wx1w > wx0w:
+                    lines = [
+                        wx0w + lx for lx in
+                        self._ll_line_centers(ll_white_mask[y_low:y_high, wx0w:wx1w])
+                    ]
+                gap = float(
+                    np.clip(self._white_yellow_gap_px, DL_LL_YELLOW_GAP_MIN_PX, DL_LL_YELLOW_GAP_MAX_PX)
+                )
+
+                if len(lines) >= 2:
+                    # 케이스1: 양쪽 흰선을 다 찾음 — 두 실측 위치의 중점을 그대로
+                    # 채택한다(간격 추정치에 안 기대는 가장 신뢰도 높은 재구성).
+                    left_x, right_x = lines[0], lines[-1]
+                    center = (left_x + right_x) / 2.0
+                    cur_white = right_x if side_sign > 0 else left_x
+                    cur_yellow = center  # 다음 밴드 탐색창 연속성용(실측 2개 기반이라 신뢰 가능)
+                    results[i] = (y_center, center)
+                    self.ll_band_case[i] = '2W'
+                elif len(lines) == 1:
+                    # 케이스2: 흰선 하나만 찾음 — 어느 쪽인지는 self.lane_side(프레임당
+                    # 한 번 고정, stale할 수 있음) 대신 이번 밴드 실측 위치를 기준점
+                    # (cur_yellow)과 비교해 매 밴드 새로 판정한다.
+                    wx_found = lines[0]
+                    found_sign = 1.0 if wx_found >= cur_yellow else -1.0
+                    center = wx_found - found_sign * gap
+                    cur_white = wx_found
+                    cur_yellow = center
+                    results[i] = (y_center, center)
+                    self.ll_band_case[i] = '1W:R' if found_sign > 0 else '1W:L'
+                else:
+                    # 케이스3: 흰선도 하나도 못 찾음 — 잔상(직전 위치 유지, cur_* 갱신 안 함).
+                    results[i] = (y_center, (cur_yellow + cur_white) / 2.0)
+                    self.ll_band_case[i] = 'LOST'
                 self.ll_band_degraded[i] = True
 
             self.ll_search_windows.append((y_low, y_high, yx0, yx1, yx, wx0, wx1, wx))
@@ -977,6 +1043,7 @@ class DLSlideWindow(SlideWindow):
             self.corridor_bounds = [None] * self.n_slices
             self.ll_search_windows = []
             self.ll_band_degraded = [False] * self.n_slices
+            self.ll_band_case = ['?'] * self.n_slices
             self.ll_degraded = False
             da_mask = self.da_mask_all_roi
             merged_centers, self.ll_band_used = self._corridor_slice_centers(da_mask, ll_mask)
@@ -1040,6 +1107,7 @@ class DLSlideWindow(SlideWindow):
                 self.ll_band_used = [False] * len(merged_centers)
                 self.ll_search_windows = []
                 self.ll_band_degraded = [False] * len(merged_centers)
+                self.ll_band_case = ['?'] * len(merged_centers)
                 self.ll_degraded = False
 
         self.da_mask_roi = da_mask
@@ -1212,6 +1280,14 @@ class DLSlideWindow(SlideWindow):
             pt = (int(np.clip(cx, 0, self.roi_w - 1)), int(y))
             ll_used = i < len(self.ll_band_used) and self.ll_band_used[i]
             cv2.circle(self.vis, pt, 4, (255, 255, 255) if ll_used else (0, 140, 255), -1)
+            # [2026-08-10] "지금 SW가 3분기(2W/1W/LOST) 중 뭘로 주행중인지" 실차에서
+            # 바로 보이게, 밴드별 분기 태그(_ll_yellow_white_centers() 참고)를 점
+            # 옆에 그린다. DL_CENTER_MODE='ll'에서만 의미 있는 값이라 그때만 그림.
+            if DL_CENTER_MODE == 'll' and i < len(self.ll_band_case):
+                cv2.putText(
+                    self.vis, self.ll_band_case[i], (pt[0] + 6, pt[1] - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 140, 255) if not ll_used else (255, 255, 255), 1
+                )
         self.draw_path(self.path)  # 피팅된 최종 경로(자홍색)
 
         cv2.line(self.vis, (self.roi_w // 2, 0), (self.roi_w // 2, self.roi_h), (0, 0, 255), 1)
@@ -1240,6 +1316,19 @@ class DLSlideWindow(SlideWindow):
                 f'degraded:{degraded_count}/{self.n_slices} '
                 f'yellow_bands:{yellow_band_count}/{self.n_slices} '
                 f'gap:{self._white_yellow_gap_px:.0f}px side:{self.lane_side}'
+            )
+            # [2026-08-10] "지금 SW가 어느 분기로 주행중인지" 한눈에 보이게, 노란선
+            # 없을 때의 3분기(케이스1=2W/케이스2=1W:L·1W:R/케이스3=LOST) + 기존
+            # 분기(Y+W/Y+gap) 밴드 수를 따로 한 줄 더 찍는다. 밴드별 태그는 위
+            # centerline 점 옆에도 그려지지만(개별 밴드 확인용), 이건 이번 프레임
+            # 전체가 어느 분기에 몰려있는지 한눈에 보기 위한 요약.
+            case_counts = {}
+            for c in self.ll_band_case:
+                case_counts[c] = case_counts.get(c, 0) + 1
+            case_summary = ' '.join(f'{k}:{v}' for k, v in sorted(case_counts.items()))
+            cv2.putText(
+                self.vis, f'branch: {case_summary}',
+                (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2
             )
         else:
             extra = f'll_bands:{ll_band_count}/{self.n_slices}'
