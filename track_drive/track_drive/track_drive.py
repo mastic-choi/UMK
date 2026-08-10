@@ -1400,6 +1400,17 @@ class TrackDriverNode(Node):
             (10, 8 + 32 * len(lines)), (255, 255, 255), 18,
             f'DA largest:{da_largest}px chosen:{da_chosen}px max:{DL_DA_MAX_AREA_PX}px'))
 
+        # [2026-08-10] 시드 위치(차량 바로 앞) 덩어리의 bounding box 가로폭 실측용 —
+        # 면적 대신 너비로 da 판단 로직을 바꿀지 결정하기 전에 실제 값 분포부터 관찰하려는
+        # 목적. 판단 로직에는 아직 전혀 안 쓰인다(dl_lane.py DLSlideWindow.da_seed_width_px
+        # 주석 참고) — 아직 임계값이 없어 색 구분 없이 그냥 값만 표시한다. 시드 위치에
+        # 아무것도 없었던 프레임(가려짐 등)은 0px으로 뜬다.
+        da_seed_width = getattr(slide, 'da_seed_width_px', 0) if slide is not None else 0
+        lines.append((
+            f'DA seed width:{da_seed_width}px',
+            (10, 8 + 32 * len(lines)), (255, 255, 255), 18,
+            f'DA seed width:{da_seed_width}px'))
+
         canvas = np.full((8 + 32 * len(lines) + 16, 380, 3), 30, dtype=np.uint8)
         put_text_kr_multi(canvas, lines)
         # 한글 폰트가 없어 fallback(영문)만 그려진 경우에도 색 테두리만으로 상태 구분 가능하게.

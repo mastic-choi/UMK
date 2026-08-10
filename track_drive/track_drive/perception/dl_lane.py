@@ -344,6 +344,7 @@ class DLSlideWindow(SlideWindow):
         self.da_largest_area_px = 0  # 면적 1위 덩어리의 절대 픽셀 면적(채택 여부 무관) — DL_DA_MAX_AREA_PX 실측 튜닝용
         self._prev_da_centroid = None  # [2026-08-07] 직전 프레임에 채택된 da 덩어리의 중심(cx,cy) — _largest_da_component()가 이번 프레임 후보를 "가장 가까운 것"으로 고르는 기준. 무효 프레임 뒤엔 None으로 리셋(옛 위치에 계속 붙잡히지 않도록)
         self.da_chosen_area_px = 0   # 실제로 채택돼 waypoint 추출에 쓰인 덩어리의 면적(무효 프레임엔 0)
+        self.da_seed_width_px = 0   # [2026-08-10] 시드 위치(ROI 최하단 중앙, 차량 위치)에서 찾은 덩어리의 bounding box 가로폭(px) — 실제 채택/면적통과 여부와 무관하게 항상 기록(시드 위치에 아무것도 없으면 0). 너비 기반 선택 로직으로 바꿀지 판단하기 위한 실측용 — 아직 판단 로직에는 안 쓰임(_debug_viz_steer() 참고)
         self._ll_half_width = (DL_LL_WIDTH_MIN_PX + DL_LL_WIDTH_MAX_PX) / 4.0  # [2026-08-07] ll 좌/우 독립 슬라이딩 윈도우의 차로 반폭 러닝 추정치(px) — 양쪽 다 찾은 밴드에서 EMA 갱신, 편측만 찾았을 때 반대쪽 위치 추정에 씀(_ll_slice_centers() 참고). _clip_da_by_ll()의 가상경계 최후수단에도 재사용.
         self._ll_decay_mask = None   # [2026-08-07] ll 잔상(decay) 누적 마스크(float32, roi shape) — detect()가 매 프레임 갱신, _clip_da_by_ll() 전용(centerline 추출엔 안 씀). None이면 첫 프레임이라 detect()에서 새로 할당.
 
@@ -437,6 +438,7 @@ class DLSlideWindow(SlideWindow):
         self.da_largest_mask_roi = None
         self.da_largest_area_px = 0
         self.da_chosen_area_px = 0
+        self.da_seed_width_px = 0
         if num <= 1:
             self._prev_da_centroid = None
             return np.zeros_like(da_mask)
@@ -474,6 +476,13 @@ class DLSlideWindow(SlideWindow):
                 seed_vals, seed_counts = np.unique(seed_fg, return_counts=True)
                 seed_idx = int(seed_vals[np.argmax(seed_counts)]) - 1  # 시드 영역에서 가장 많이 나온 라벨
                 seed_area = int(areas[seed_idx])
+                # [2026-08-10] 실측용 — 시드에 걸린 덩어리의 bounding box 가로폭을 채택/면적
+                # 통과 여부와 무관하게 항상 기록해둔다. 너비 기반 판단(면적 대신, 팀원
+                # lrkdms의 4a6bff6 착안 — 면적은 "가로 폭"과 "세로 길이"가 뭉뚱그려져서
+                # 옆 차선 융합 같은 순수 가로 방향 문제를 잘 못 잡는다는 지적)으로 바꿀지
+                # 결정하기 전에, 실제 값 분포부터 관찰하려는 목적 — 아직 선택 로직에는
+                # 전혀 안 쓴다. _debug_viz_steer()(steer_debug 창)가 이 값을 그대로 읽는다.
+                self.da_seed_width_px = int(stats[seed_idx + 1, cv2.CC_STAT_WIDTH])
                 if seed_area >= min_area:
                     return _choose(seed_idx, fallback=False)
                 # 시드 위치 덩어리가 너무 작음(사실상 노이즈) — 아래 ②(연속성)/③(면적순위)로 이동
