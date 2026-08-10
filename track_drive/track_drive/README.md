@@ -991,6 +991,115 @@ da 파이프라인(시드 선택/ll 잔상+가상경계) 위에 이식한 것이
 `DL_LL_YELLOW_VOTE_RATIO`가 여전히 적절한지 재확인이 필요하다. 'da' 모드가 여전히 유일하게 실차에서
 어느 정도 검증된 상태 — main 기본값을 'da'로 유지하는 이유.
 
+### 2.17 `ll` 슬라이딩 윈도우에 적응형 탐색창 + 밴드별 프레임 간 앵커링 추가 (`_ll_slice_centers`, 2026-08-10)
+
+**배경:** 앞으로 `ll` 기반 차선인식으로 완전히 갈아엎을 예정이라, 그 기반이 될
+`_ll_slice_centers()`(§2.13)를 먼저 강화했다. §2.13 docstring에 이미 적혀있던 "알려진 한계" 두
+가지 — ① 탐색창이 좁은 고정폭(`DL_LL_SEARCH_HALF_WIDTH_PX`=60px)이라 급커브에서 밴드 간 실제 선
+이동량이 그보다 크면 창이 선을 놓치고 이후 밴드까지 이전 위치에 멈춰 선다, ② band 0(근거리)만 직전
+프레임 확정 `lane_center`에 앵커링되고 그 위 밴드는 전부 이번 프레임 안에서만 전파되어 band 0의
+오차가 위 밴드로 누적 전파된다 — 를 대응했다.
+
+**수정:**
+- **① 적응형 탐색창** — 두 갈래로 완화.
+  - *속도 예측*: 그 사이드(좌/우 독립)에서 실제로 찾은 밴드들 사이의 x 이동량을 밴드 간격으로 나눈
+    px/밴드 값을 `self._ll_left_velocity`/`_right_velocity`로 EMA 추적(신규
+    `DL_LL_VELOCITY_EMA_ALPHA`=0.3, [config.py](config.py))한다. 다음 밴드 탐색창 중심을 "마지막으로
+    찾은 위치"가 아니라 "그 위치 + 예측 이동량"으로 미리 옮긴다 — 미검출 밴드가 이어지는 동안에도
+    이 속도로 계속 dead-reckoning 이동시켜 창이 멈춰 서 있지 않게 한다. 노이즈로 속도 추정이 튀는
+    걸 막기 위해 `DL_LL_VELOCITY_MAX_PX`(40px)로 클램프한다.
+  - *탐색창 확장*: 그 사이드가 연속으로 못 찾을 때마다 탐색창 반경을
+    `DL_LL_SEARCH_WIDEN_STEP_PX`(15px)씩 넓혀(`DL_LL_SEARCH_WIDEN_MAX_PX`=120px 상한) 재포착
+    기회를 늘리고, 다시 찾으면 기본 반경(60px)으로 리셋한다.
+- **② 밴드별 프레임 간 앵커링** — `self._ll_prev_band_left`/`_prev_band_right`(길이 n_slices)에
+  밴드마다 "직전 프레임에 그 밴드(같은 y위치)에서 실제로 찾은 위치"를 따로 기억해뒀다가, 이번
+  프레임 그 밴드의 탐색창 중심을 (이번 프레임 내 전파값, 직전 프레임 그 밴드 값)의 가중평균
+  (신규 `DL_LL_BAND_ANCHOR_ALPHA`=0.35)으로 잡는다 — 도로 곡률이 프레임 간 급격히 안 변한다는
+  가정에 기대어 band 0의 오차가 위로 그대로 번지지 않게 한다. 밴드값은 실제로 찾았을 때만 갱신하고
+  못 찾은 프레임엔 이전 값을 그대로 들고 있는다(`self._ll_half_width`와 동일한 관례).
+- 속도 EMA(`self._ll_left/right_velocity`)는 프레임 간 영속하지만, "밴드 간 간격" 계산에 쓰는
+  마지막 검출 밴드 인덱스/위치(`last_left_i`/`last_left_x` 등)는 매 호출(=매 프레임)마다 지역변수로
+  새로 시작한다 — 프레임 경계를 넘어 간격을 계산하면 밴드 인덱스가 롤오버돼 음수 gap이 나오기
+  때문.
+- `self.ll_search_windows`(디버그 시각화 튜플 구조)는 그대로 유지해 `show_debug_windows()` 쪽
+  변경은 없다.
+
+**알려진 한계:** 전부 실차 미검증 초기값. 급커브에서 창이 실제로 선을 놓치지 않고 따라가는지,
+확장된 창이 오히려 옆 차선/반사광을 잘못 무는지, 밴드별 앵커링이 급조향/저프레임레이트 상황에서
+오히려 과거 위치로 창을 잘못 당기지는 않는지 확인 필요 — `DL_CENTER_MODE='ll'`로 전환해 A/B 비교할
+것. §2.13 "알려진 한계"에 있던 편측 폴백 시 `self._ll_half_width` 미갱신 문제는 이번 수정 범위 밖
+(아직 미해결).
+
+### 2.18 튜닝 파라미터 패널(`dl_lane_params` 창) + 슬라이딩 윈도우 디버그 보강 (2026-08-10)
+
+**배경:** §2.17 튜닝값을 실차에서 바꿔가며 확인하려면 매번 config.py를 열어 지금 이 모드에서
+실제로 쓰이는 값이 뭔지 찾아야 했다 — 실차 옆에서 노트북으로 여러 파일을 오가는 건 번거롭다.
+"내가 수치를 바꿔가며 성능을 개선할 수 있는 파라미터와 그 수치"를 디버그 창에서 바로 보고 싶다는
+요청.
+
+**수정:**
+- **`dl_lane_params` 창 신규 추가** — `DLSlideWindow._params_panel_lines()`가 지금
+  `DL_CENTER_MODE`에서 실제로 영향을 주는 값만 골라 "이름=현재값" 텍스트로 뽑고
+  (`_build_params_panel()`이 렌더링), `DLLaneDetector.show_debug_windows()`가 기존 `dl_lane`
+  창과 별개로 띄운다. 공용값(모드 무관, `DL_N_SLICES`/`DL_FG_THRESHOLD`/`DL_LL_FG_THRESHOLD`/
+  `DL_DA_MIN_COMPONENT_AREA`/`DL_SLICE_FIT_MIN`/`DL_SLICE_OUTLIER_MAX`/`DL_STABLE_FRAME_MIN`/
+  `DL_STABLE_JUMP_MAX`/`DL_LL_SANITY_MIN_RATIO`) → da/ll 클리핑값('da'/'ll' 공통,
+  `DL_LL_CLIP_MARGIN_PX`/`DL_LL_DECAY_ALPHA`/`DL_LL_DECAY_MIN_VALUE`/`DL_DA_SEED_ROWS_PX`/
+  `DL_DA_SEED_HALF_WIDTH_PX`) → 모드 전용값(`ll`이면 §2.13/§2.17의 `DL_LL_*` 전부,
+  `ll_da`면 `DL_CORRIDOR_*`) → 러닝 추정치(참고용, `self._ll_half_width*2`/`_ll_left_velocity`/
+  `_ll_right_velocity`) 순으로 좁혀서 보여준다 — config.py 전체를 다 보여주면 지금 안 쓰이는
+  값까지 섞여 오히려 헷갈리기 때문. `dl_lane`의 result/da/ll/yellow 패널과 같은 `vconcat`으로
+  합치지 않고 별도 창(고정폭 420px)으로 뒀다 — 텍스트 패널까지 마스크 패널 폭(ROI가 좁은
+  트랙에선 수백 px 미만일 수 있음)에 맞추면 글자가 잘리기 쉬워서다.
+- **슬라이딩 윈도우 디버그 보강**(`DLSlideWindow.visualize()`, `DL_CENTER_MODE='ll'` 전용) —
+  §2.17에서 추가한 새 상태를 시각적으로 확인할 수 있게 세 가지를 더 그린다:
+  ① 탐색창이 기본 반경(`DL_LL_SEARCH_HALF_WIDTH_PX`)보다 넓어진 밴드(연속 미검출로
+  `DL_LL_SEARCH_WIDEN_STEP_PX`만큼 확장된 상태)는 사각형 테두리를 주황으로 강조.
+  ② 밴드별 프레임 간 앵커링(`DL_LL_BAND_ANCHOR_ALPHA`)이 이번 프레임에 실제로 끌어당긴
+  "직전 프레임 그 밴드 위치"를 마젠타 사각 마커로 표시 — 이 점이 실제 검출 위치와 많이
+  벌어지면 앵커링이 창을 엉뚱한 쪽으로 당기고 있다는 신호. ③ result 패널 하단 텍스트에
+  `Lvel`/`Rvel`(좌/우 속도 예측 EMA, px/밴드)을 추가 — 값이 `DL_LL_VELOCITY_MAX_PX` 근처에
+  계속 붙어있으면 클램프가 실제 곡률을 못 따라간다는 뜻.
+
+**후속 수정(같은 날, 사용자 피드백 반영):**
+- **밴드별 채택 근거 태그** (`self.ll_band_reason`, `_ll_slice_centers()`가 채움) —
+  `DL_CENTER_MODE='ll'`에서 밴드마다 왜 그 결과가 나왔는지를 왼쪽 탐색창 옆에 한 글자로
+  찍는다: `B`=양쪽 검출+채택(초록), `X`=양쪽 다 검출됐지만 폭이 `DL_LL_WIDTH_MIN~MAX_PX`
+  밖이라 거부(빨강), `L`/`R`=편측만 검출해 `self._ll_half_width`로 반대쪽 추정(청록),
+  `-`=양쪽 다 못 찾음(회색). 기존엔 사각형 색(초록/회색 테두리)만으로 "찾았는지"는
+  보였지만 "왜 이 색인지"(특히 X — 양쪽 다 찾았는데 거부된 경우)는 구분이 안 됐다.
+- **da/ll 클리핑 밴드별 틱** (`self.da_clip_band_virtual`, `_clip_da_by_ll()`가 채움) —
+  §2.14에서 추가한 ①실측/잔상 클리핑과 ②가상경계(증거 없이 `self._ll_half_width`로 강제
+  클리핑) 중 이번 프레임에 어느 밴드가 어느 쪽이었는지를 화면 왼쪽 끝 세로 띠에 초록(①)/
+  주황(②) 틱으로 표시한다. 기존 `[LL_VIRTUAL]` 태그는 "이번 프레임에 한 번이라도 가상경계가
+  발동했는지"만 알려줘서 정확히 몇 번째(=어느 높이) 밴드인지는 알 수 없었다. 클리핑 자체가
+  통째로 버려진 프레임(`da_ll_clip_skipped`, `[LL_CLIP_SKIP]`)에는 `detect()`가 이 리스트를
+  전부 `None`으로 비워서 틱이 안 그려지게 했다 — 실제로 적용 안 된 클리핑 시도 결과를
+  보여주면 오해를 살 수 있어서다.
+- **offset 스파크라인** (`DLSlideWindow._build_offset_sparkline()`) — 최근
+  `DL_DEBUG_HISTORY_LEN`(신규 config.py, 기본 90프레임) 프레임의 디바운스 이후 최종
+  offset을 `self._offset_history`(`deque(maxlen=...)`)에 쌓아 `dl_lane_params` 창 하단에
+  선 그래프로 이어붙인다. §2.12 "S자로 좌우 왔다갔다" 같은 프레임 간 흔들림은 순간값
+  텍스트만으론 "지금 떨고 있다"를 알아채기 어려운데, 최근 추세를 그래프로 보면 진폭이
+  바로 보인다. y축 스케일은 고정하지 않고 창(window) 안 `|offset|` 최댓값에 맞춰 자동
+  조정(우측 하단 `max|.|` 텍스트로 지금 스케일이 몇 px인지 항상 같이 표시) — 고정
+  스케일이면 조용한 구간에서 그래프가 납작해져 미세한 흔들림을 놓치기 쉬워서다.
+- **모드 배너** — `dl_lane`의 result 패널 맨 위와 `dl_lane_params` 맨 위에 지금
+  `DL_CENTER_MODE`를 색 배너("MODE: DA"/"MODE: LL"/"MODE: LL_DA")로 크게 표시한다.
+  모듈 상단 `DL_MODE_COLORS`(da=파랑/ll=초록/ll_da=자홍) 딕셔너리를 두 곳이 공유해서 색이
+  항상 일치한다 — 기존엔 하단 텍스트 줄 안에 `mode:xx`로만 섞여 있어 다른 정보 사이에서
+  놓치기 쉬웠고, 앞으로 `da`/`ll`/`ll_da`를 실차에서 계속 바꿔가며 A/B 테스트할 예정이라
+  지금 뭘 보고 있는지 착각하면 튜닝값을 엉뚱한 모드에 반영하는 사고로 이어질 수 있다는
+  우려에서 추가했다. `visualize()`에서는 다른 모든 오버레이보다 나중에(맨 위에) 그려서
+  절대 가려지지 않게 했다.
+
+**알려진 한계:** 파라미터 패널은 현재 프레임 기준 스냅샷이라, config.py를 고치고 노드를
+재시작하기 전까지는 반영되지 않는다(런타임 hot-reload 아님) — 원래 이 저장소 파라미터들이 다
+그렇다(모듈 로드 시 상수로 import). 마젠타 앵커 마커는 밴드별 위치라 화면이 복잡한 트랙에서는
+사각형/텍스트와 겹쳐 잘 안 보일 수 있다 — 실차 확인 필요. offset 스파크라인의 y축 자동
+스케일은 순간적인 이상치(outlier) 한 프레임 때문에 나머지 구간이 납작해 보이게 만들 수 있다
+— 실차 확인 후 필요하면 고정 스케일이나 percentile 클램프로 바꿀 것.
+
 ---
 
 ## 3. 라바콘 (B1_LAVACON)

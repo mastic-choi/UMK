@@ -394,6 +394,32 @@ DL_LL_SEARCH_HALF_WIDTH_PX = 60.0
 #   hough_lane.py)와 동일한 관례 — 실차 미검증 초기값.
 DL_LL_WIDTH_EMA_ALPHA = 0.1
 
+# [2026-08-10] _ll_slice_centers() 적응형 탐색창 — 밴드 간 실제 선 이동량이
+#   DL_LL_SEARCH_HALF_WIDTH_PX보다 크면 창이 선을 놓치는 문제(위 주석 "급커브에서...
+#   추적이 끊길 수 있으니" 참고) 대응. 두 갈래로 완화한다:
+#   ①속도 예측 — 그 사이드에서 실제로 찾은 밴드들 사이의 x 이동량(밴드 간 간격으로
+#     나눈 px/밴드)을 EMA로 추적해뒀다가, 다음 밴드 탐색창 중심을 "마지막으로 찾은
+#     위치"가 아니라 "그 위치 + 예측 이동량"으로 미리 옮긴다(창이 곡선을 따라 먼저
+#     움직임).
+#   ②탐색창 확장 — 그 사이드가 연속으로 못 찾으면 매 실패마다 창 반경을 넓혀 다음
+#     기회에 더 넓은 범위에서 재포착을 시도하고, 다시 찾으면 원래 반경으로 리셋한다.
+#   실차 미검증 초기값.
+DL_LL_VELOCITY_EMA_ALPHA = 0.3     # 밴드 간 이동 속도(px/밴드) EMA 계수
+DL_LL_VELOCITY_MAX_PX = 40.0       # 예측 이동량 클램프 — 노이즈로 속도 추정이 튀어도 창이 한번에 너무 멀리 안 튀도록
+DL_LL_SEARCH_WIDEN_STEP_PX = 15.0  # 연속 미검출 1회당 탐색창 반경 증가폭
+DL_LL_SEARCH_WIDEN_MAX_PX = 120.0  # 탐색창 반경 상한(기본 반경 DL_LL_SEARCH_HALF_WIDTH_PX=60의 2배)
+
+# [2026-08-10] _ll_slice_centers() 밴드별 프레임 간 앵커링 — 기존에는 band 0(근거리)
+#   만 직전 프레임 전체 확정 lane_center(ref_x)에 앵커링되고, 그 위 밴드는 전부 "같은
+#   프레임 안에서" 아래 밴드 결과를 이어받는 식으로만 전파됐다. band 0 검출이 노이즈로
+#   살짝 틀어지면 그 오차가 위 밴드들까지 누적되어 번져나가는 문제가 있다. 밴드마다
+#   "직전 프레임에 그 밴드(같은 y위치)에서 실제로 찾은 위치"를 따로 기억해뒀다가,
+#   이번 프레임 그 밴드의 탐색창 중심을 (이번 프레임 내 전파값, 직전 프레임 그 밴드
+#   값)의 가중평균으로 잡는다 — 도로 곡률이 프레임 간 급격히 안 변한다는 가정에 기대어,
+#   band 0의 오차가 위로 그대로 번지지 않고 각 밴드 고유의 과거 위치 쪽으로 당겨지게
+#   한다. 실차 미검증 초기값.
+DL_LL_BAND_ANCHOR_ALPHA = 0.35     # 밴드별 탐색창 중심 계산 시 "직전 프레임 그 밴드 위치"에 주는 가중치(0=무시, 1=전적으로 그 값만 사용)
+
 # ── 색상기반 노란 중앙선 보조 검출 (lane_side 판정용, hough_lane.py와 공유) ──
 #   TwinLiteNet의 ll 출력은 흰/노랑을 구분하지 않아 HSV로 별도 검출한다.
 YELLOW_LOWER = np.array([15, 80, 80])
@@ -554,6 +580,12 @@ DEBUG_VIZ_VESC     = True   # VESC 실측속도(/vesc_speed_erpm) 연동 상태(
                              #   (track_drive.py, 2026-08-06 LQR 브랜치에서 이식)
 
 DEBUG_VIZ_DL_LANE    = True   # 차선 — 기본 백엔드('dl') 디버그 창 (perception/dl_lane.py)
+# [2026-08-10] 'dl_lane_params' 창(파라미터 패널) 하단에 붙는 offset 스파크라인이 몇
+#   프레임을 보여줄지. 주행 성능에 영향 없는 순수 디버그 표시 설정이라 driving 튜닝값
+#   묶음이 아니라 여기 DEBUG_VIZ_* 옆에 둔다. 너무 크면(예: 수백) 그래프가 납작해져
+#   최근 흔들림이 잘 안 보이고, 너무 작으면 추세를 못 봄 — 90(대략 3~6초, FPS별로 다름)
+#   으로 시작.
+DL_DEBUG_HISTORY_LEN = 90
 DEBUG_VIZ_HOUGH_LANE = True   # 차선 — 대안 백엔드('hough') 디버그 창 (perception/hough_lane.py)
 DEBUG_VIZ_LANE       = True   # 차선 — 대안 백엔드('classic_cv') 디버그 창 (perception/lane_util.py)
 DEBUG_VIZ_STOPLINE   = False  # 정지선 디버그 창, 백엔드 무관 항상 동작 (perception/perc_floor.py)
