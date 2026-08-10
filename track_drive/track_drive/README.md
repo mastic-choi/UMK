@@ -360,6 +360,19 @@ lookahead가 `PP_LOOKAHEAD_MIN_PX(40px)` 근처에 계속 눌려있어 절대 �
   덜 민감해지는 것"이지 진동 자체(pure_pursuit의 근본 특성)를 없애지 않습니다. 진동 자체를 줄이려면
   `PP_ALPHA`/`PATH_EMA_ALPHA`/`PP_DX_DEADZONE_PX`(전부 config.py) 쪽을 볼 것.
 
+**[2026-08-10] 회귀(regression) 발견 및 복원:** 사용자가 "조향이 30도 이상 바뀌었다 직진으로
+돌아오면 차선인식이 흔들리며 잘 안 되는 경향"을 보고해 원인을 조사하던 중, 바로 이 수정이
+같은 날 뒤에 올라온 커밋 `80aefe3`("디버그창 적용" — 커밋 메시지상 조향 로직과 무관, `_debug_viz_steer()`
+캔버스 레이아웃 변경이 주 목적)에서 **`self._corner_signal`/`turn_now`/`_corner_radius_speed_scale()`
+세 군데가 전부 이 절의 "수정" 이전 상태(순간값 `abs(ctrl_angle)`/`self.pure_pursuit.last_curvature`)로
+조용히 되돌아가 있는 걸 발견했다** — `git show 80aefe3 -- track_drive.py`로 확인, 디버그 캔버스
+작업과 무관한 diff가 같은 커밋에 실수로 섞여 들어간 것으로 보인다. `track_drive.py`(`__init__`의
+`self._corner_signal` 초기화, `_corner_radius_speed_scale()`, `_lane_drive()`)를 이 절에 기록된
+원래 수정대로 복원했다 — 코드 자체는 이 절의 diff와 동일, 새로 설계한 건 아님. 급조향 후 진동이
+매 스윙마다 급코너로 오인돼 속도가 흔들리고, 그 흔들림이 차선인식 쪽 흔들림(§2.17/§2.18의 탐색창
+민감도)과 겹쳐 보였을 가능성이 있다 — **아직 실차 재검증 전**이니 복원 후 급조향→직진 복귀 구간에서
+개선 여부를 확인할 것.
+
 ### 0.5.4 VESC 실측속도를 lookahead 계산에 반영 (`pure_pursuit` 전용, 2026-08-06)
 
 `pure_pursuit`의 속도 적응형 lookahead(`PP_LOOKAHEAD_SPEED_GAIN`)는 원래 "실제로 얼마나 빨리 달리고

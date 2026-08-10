@@ -175,6 +175,7 @@ class TrackDriverNode(Node):
         self._shortcut_ref_yaw = None # S3 진입 1초 후 기록한 기준 yaw (탈출 좌회전 전 보정용)
         self._prev_speed     = 0.0    # 가속 속도제한용(직전 출력 속도)
         self._corner_hold    = 0.0    # 코너 활성도(감쇠 peak-hold)
+        self._corner_signal  = 0.0    # 코너 감속 판단용 조향각 signed EMA(부호 유지, _lane_drive() 참고)
         self._last_debug_t   = 0.0
 
         # ── 바퀴 카운트 상태 ──
@@ -1204,10 +1205,17 @@ class TrackDriverNode(Node):
         CORNER_MIN_RADIUS_PX보다 작아지면 그 비율만큼 속도를 깎는다. 반경이 0에 가까워져도
         속도가 0으로 죽지 않게 CORNER_MIN_SPEED_SCALE로 하한을 둔다.
         STEERING_CONTROLLER가 'pure_pursuit'일 때만 적용한다 — lqr.py는 curvature가 아니라
-        횡오차/헤딩오차 상태로 도는 별개 모델이라 이 반경 개념이 안 맞는다."""
+        횡오차/헤딩오차 상태로 도는 별개 모델이라 이 반경 개념이 안 맞는다.
+
+        [2026-08-06, 2026-08-10 복원] curvature는 self.pure_pursuit.last_curvature(이번 틱의
+        순간값)가 아니라 _lane_drive()가 매 틱 갱신하는 self._corner_signal(조향각의 signed
+        EMA)에서 역산한다 — 이유는 _lane_drive() 상단 주석 참고(진동을 매번 급코너로 오인해
+        감속하는 문제). [2026-08-10] 이 신호 전환이 커밋 80aefe3("디버그창 적용", 조향과 무관한
+        디버그 캔버스 레이아웃 변경)에서 실수로 되돌려져 있던 걸 발견해 복원함 — README §0.5.3
+        참고."""
         if STEERING_CONTROLLER != 'pure_pursuit':
             return 1.0
-        curvature = self.pure_pursuit.last_curvature
+        curvature = math.tan(math.radians(self._corner_signal)) / self.pure_pursuit.wheelbase_px
         if curvature == 0.0:
             return 1.0
         radius = abs(1.0 / curvature)
@@ -1218,7 +1226,24 @@ class TrackDriverNode(Node):
     def _lane_drive(self):
         """S1/S3 공통 차선 조향+감속 로직. ctrl_angle·ctrl_speed·_prev_speed·_corner_hold 갱신."""
         self.ctrl_angle = self._lane_steer()
-        turn_now     = min(1.0, abs(self.ctrl_angle) / ANGLE_MAX)
+
+        # [2026-08-06, 2026-08-10 복원] 코너 감속 판단은 "지금 순간 조향각이 얼마나 큰가"가
+        # 아니라 "최근 한동안 같은 방향으로 얼마나 꺾여 있었는가"를 봐야 한다. pure_pursuit은
+        # 구조상 좌우로 조금씩 진동("와리가리")하는데, turn_now를 매 틱 abs(ctrl_angle)로 그대로
+        # 계산하면 진동의 절반(방향이 바뀌는 쪽)마다 급코너로 오인해 아래 3제곱 감속식과
+        # _corner_radius_speed_scale()이 실제 코너가 아닌데도 속도를 깎는다(실차에서 재현:
+        # 진동할 때마다 속도가 팍팍 줄었다 늘었다 함). self._corner_signal은 ctrl_angle을
+        # signed(부호 유지) EMA로 누적한 값이다 — 진동처럼 부호가 계속 바뀌면 서로 상쇄돼 0
+        # 근처로 수렴하고, 실제 코너처럼 한 방향으로 계속 꺾이면 EMA가 실제 각도로 수렴한다.
+        # abs()는 반드시 이 EMA를 취한 "이후"에 적용해야 한다 — abs(ctrl_angle)을 먼저 평균내면
+        # 부호 정보가 지워져서 진동도 그대로 다 더해져 상쇄 효과가 없어진다.
+        # [2026-08-10] 이 로직이 커밋 80aefe3("디버그창 적용")에서 실수로 되돌려져 순간값
+        # abs(ctrl_angle) 방식으로 퇴행해 있던 걸 발견해 복원함(README §0.5.3 참고) — 급조향
+        # (30도 이상) 후 직진 복귀 구간에서 차선인식/조향이 흔들린다는 실차 보고의 유력한
+        # 원인 중 하나로 지목됨.
+        self._corner_signal = (CORNER_SIGN_EMA_ALPHA * self.ctrl_angle
+                                + (1.0 - CORNER_SIGN_EMA_ALPHA) * self._corner_signal)
+        turn_now     = min(1.0, abs(self._corner_signal) / ANGLE_MAX)
         turn_preview = min(1.0, abs(self.lane_lookahead) / LANE_LOOKAHEAD_REF)
         turn_for_speed = max(turn_now, turn_preview * 0.3)
         target_speed = max(SPEED_CORNER_MIN,
