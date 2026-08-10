@@ -878,6 +878,21 @@ class DLSlideWindow(SlideWindow):
         밴드별로 어느 분기를 탔는지는 self.ll_band_case(visualize()가 밴드 점 옆
         텍스트 + 상단 요약 줄로 그림)에 남는다.
 
+        [2026-08-10] ②의 노란/흰 탐색창(DL_LL_SEARCH_HALF_WIDTH_PX)에 _ll_slice_centers()
+        (DL_LL_ALGO='lr')에서 쓰던 "연속 미검출 시 반경 확장" 메커니즘을 이식했다 —
+        급조향 후 직진 복귀 구간에서 ref_x(탐색창 seed)가 디바운스로 지연돼 있는 동안
+        실제 위치가 좁은 창 밖으로 나가 계속 놓치는 문제(README §2.20/§2.22, 사용자
+        보고) 대응. 노란/흰 각각 독립적으로 연속 미검출 횟수(yellow_miss_streak/
+        white_miss_streak)를 세서 그 사이드의 탐색창 반경을 DL_LL_SEARCH_WIDEN_STEP_PX
+        씩 넓히고(DL_LL_SEARCH_WIDEN_MAX_PX 상한), 다시 찾으면 기본 반경으로 리셋한다.
+        특히 **흰선 쪽에 실질적 효과**가 크다 — 노란선은 이미 못 찾으면 곧바로 ④(150px
+        광역 3분기)로 넘어가지만, 흰선은 노란선이 계속 잡히는 동안(②/③ 경로)
+        `cur_white`가 실제로 찾았을 때만 갱신되고 못 찾으면 그 자리에 멈춰 있어서
+        (③ "Y+gap" 근거 없는 추정으로 계속 빠짐) 재포착 수단이 전혀 없었다 — 이제는
+        흰선 탐색창도 넓어지며 실제 위치를 다시 잡을 기회를 얻는다. 노란선 쪽은 ④가
+        이미 훨씬 넓은(150px) 안전망이라 이 확장의 실효는 "아주 살짝 벗어나서 ④까지
+        갈 필요 없는" 경우를 줄이는 정도다.
+
           입력 : ll_white_mask, ll_yellow_mask — (roi_h, roi_w) uint8 이진마스크(동일 shape)
                  ref_x — 첫(근거리) 밴드의 seed/기준 x좌표. 보통 직전 프레임 lane_center.
           출력 : (results, used) — 둘 다 길이 self.n_slices.
@@ -888,8 +903,11 @@ class DLSlideWindow(SlideWindow):
                               (③④=degraded는 False).
 
         알려진 한계:
-        - 탐색창이 좁아서(②③) 급커브에서 밴드 간 실제 선 이동량이
-          DL_LL_SEARCH_HALF_WIDTH_PX보다 크면 추적이 끊길 수 있다(노란/흰 각각 독립).
+        - [2026-08-10 일부 완화] 탐색창이 좁아서(②③) 급커브에서 밴드 간 실제 선
+          이동량이 반경보다 크면 추적이 끊길 수 있다(노란/흰 각각 독립) — 위 확장
+          메커니즘으로 연속 미검출 시 반경이 넓어지긴 하지만, 실차 미검증이라 급커브에서
+          실제로 놓치지 않고 따라가는지, 넓어진 창이 오히려 옆 차선/반사광을 잘못
+          무는지는 확인 필요.
         - 케이스3(LOST)이 여러 프레임 연속되면 cur_yellow/cur_white가 실제 위치와
           점점 벌어질 수 있다 — 실차 미검증, 잔상이 몇 프레임까지 안전한지 확인할 것.
         - 케이스1에서 흰선이 3개 이상 잡히면(점선 파편/노이즈) 가장 왼쪽/오른쪽만
@@ -907,7 +925,7 @@ class DLSlideWindow(SlideWindow):
         # 알고리즘 자체엔 전혀 쓰이지 않는 부가 정보.
         self.ll_search_windows = []
 
-        win = DL_LL_SEARCH_HALF_WIDTH_PX
+        base_win = DL_LL_SEARCH_HALF_WIDTH_PX
         cur_yellow = ref_x
         # side_sign: +1이면 흰 경계선이 노란선보다 오른쪽(=나는 우측차선 주행중),
         # -1이면 왼쪽(=좌측차선). 직전 프레임 확정값을 시작점으로 쓰고, 이번 프레임
@@ -915,19 +933,28 @@ class DLSlideWindow(SlideWindow):
         side_sign = -1.0 if self.lane_side == 'left' else 1.0
         cur_white = ref_x + side_sign * self._white_yellow_gap_px
         lane_side_locked = False
+        # [2026-08-10] 탐색창 확장(위 docstring 참고) — 노란/흰 각각 독립적으로 연속
+        # 미검출 횟수를 센다. 찾으면 0으로 리셋, 못 찾으면 +1 → 다음 밴드 그 사이드
+        # 탐색창 반경이 그만큼 넓어진다.
+        yellow_miss_streak = 0
+        white_miss_streak = 0
 
         for i in range(self.n_slices):
             y_high = h - i * slice_h
             y_low = 0 if i == self.n_slices - 1 else h - (i + 1) * slice_h
             y_center = (y_low + y_high) / 2.0
 
+            win_y = min(base_win + yellow_miss_streak * DL_LL_SEARCH_WIDEN_STEP_PX, DL_LL_SEARCH_WIDEN_MAX_PX)
+            win_w = min(base_win + white_miss_streak * DL_LL_SEARCH_WIDEN_STEP_PX, DL_LL_SEARCH_WIDEN_MAX_PX)
+
             yx = None
-            yx0, yx1 = int(np.clip(cur_yellow - win, 0, w)), int(np.clip(cur_yellow + win, 0, w))
+            yx0, yx1 = int(np.clip(cur_yellow - win_y, 0, w)), int(np.clip(cur_yellow + win_y, 0, w))
             if yx1 > yx0:
                 M_y = cv2.moments(ll_yellow_mask[y_low:y_high, yx0:yx1], binaryImage=True)
                 if M_y['m00'] >= DL_LL_SIDE_MIN_PIXELS:
                     yx = yx0 + M_y['m10'] / M_y['m00']
                     cur_yellow = yx
+            yellow_miss_streak = 0 if yx is not None else yellow_miss_streak + 1
 
             # ① 이번 프레임 첫(근거리) 유효 노란선으로 차선 판정을 확정한다.
             if yx is not None and not lane_side_locked:
@@ -939,12 +966,13 @@ class DLSlideWindow(SlideWindow):
                 lane_side_locked = True
 
             wx = None
-            wx0, wx1 = int(np.clip(cur_white - win, 0, w)), int(np.clip(cur_white + win, 0, w))
+            wx0, wx1 = int(np.clip(cur_white - win_w, 0, w)), int(np.clip(cur_white + win_w, 0, w))
             if wx1 > wx0:
                 M_w = cv2.moments(ll_white_mask[y_low:y_high, wx0:wx1], binaryImage=True)
                 if M_w['m00'] >= DL_LL_SIDE_MIN_PIXELS:
                     wx = wx0 + M_w['m10'] / M_w['m00']
                     cur_white = wx
+            white_miss_streak = 0 if wx is not None else white_miss_streak + 1
 
             if yx is not None and wx is not None:
                 # ② 둘 다 찾음 — 정상 검출. gap EMA는 상하한을 클램프한다(아래 참고).
@@ -1606,13 +1634,20 @@ class DLSlideWindow(SlideWindow):
             else:
                 # 노란선/흰선 탐색창(_ll_yellow_white_centers()가 이번 프레임에 훑은 범위)
                 # — 노란 창은 노란색, 흰 창은 흰색 테두리로 찾았을 때 표시하고, 못
-                # 찾았으면(창 안에 픽셀 부족) 회색으로 구분. 두 창 사이의 실측 간격(px,
-                # self._white_yellow_gap_px 실측/재구성용) 텍스트를 같이 찍는다.
+                # 찾았으면(창 안에 픽셀 부족) 회색으로 구분. [2026-08-10] 연속 미검출로
+                # 그 사이드 반경이 기본값(DL_LL_SEARCH_HALF_WIDTH_PX)보다 넓어진 상태면
+                # ('lr' 모드와 동일한 표시 관례) 주황 테두리로 강조한다 — 특히 흰 창이
+                # 자주 주황으로 뜨면 급조향 복귀 구간에서 확장이 실제로 발동하고 있다는
+                # 뜻. 두 창 사이의 실측 간격(px, self._white_yellow_gap_px 실측/재구성용)
+                # 텍스트를 같이 찍는다.
+                widen_epsilon = 1.0  # np.clip 반올림 오차 흡수용 여유
                 for (y_low, y_high, yx0, yx1, yx, wx0, wx1, wx) in self.ll_search_windows:
-                    cv2.rectangle(self.vis, (yx0, y_low), (yx1, max(y_high - 1, y_low)),
-                                  (0, 255, 255) if yx is not None else (120, 120, 120), 1)
-                    cv2.rectangle(self.vis, (wx0, y_low), (wx1, max(y_high - 1, y_low)),
-                                  (255, 255, 255) if wx is not None else (120, 120, 120), 1)
+                    y_widened = (yx1 - yx0) > 2 * DL_LL_SEARCH_HALF_WIDTH_PX + widen_epsilon
+                    w_widened = (wx1 - wx0) > 2 * DL_LL_SEARCH_HALF_WIDTH_PX + widen_epsilon
+                    y_color = (0, 140, 255) if y_widened else ((0, 255, 255) if yx is not None else (120, 120, 120))
+                    w_color = (0, 140, 255) if w_widened else ((255, 255, 255) if wx is not None else (120, 120, 120))
+                    cv2.rectangle(self.vis, (yx0, y_low), (yx1, max(y_high - 1, y_low)), y_color, 1)
+                    cv2.rectangle(self.vis, (wx0, y_low), (wx1, max(y_high - 1, y_low)), w_color, 1)
                     if yx is not None and wx is not None:
                         gap = abs(wx - yx)
                         cv2.putText(
@@ -1781,6 +1816,10 @@ class DLSlideWindow(SlideWindow):
             lines.append(f"DL_LL_ALGO = {DL_LL_ALGO}")
             lines.append(f'DL_LL_SIDE_MIN_PIXELS = {DL_LL_SIDE_MIN_PIXELS}')
             lines.append(f'DL_LL_SEARCH_HALF_WIDTH_PX = {DL_LL_SEARCH_HALF_WIDTH_PX}')
+            # [2026-08-10] 연속 미검출 시 탐색창 확장 — 원래 'lr' 전용이었는데
+            # _ll_yellow_white_centers()(노란/흰 각각)에도 이식해서 이제 두 알고리즘
+            # 공통값이다(둘 다 "찾았을 때만 갱신되는 좁은 탐색창" 뼈대를 공유하므로).
+            lines.append(f'DL_LL_SEARCH_WIDEN_STEP/MAX_PX = {DL_LL_SEARCH_WIDEN_STEP_PX}/{DL_LL_SEARCH_WIDEN_MAX_PX}')
             lines.append(f'DL_LL_YELLOW_VOTE_RATIO = {DL_LL_YELLOW_VOTE_RATIO}')
             lines.append(f'DL_LL_YELLOW_MIN_AREA = {DL_LL_YELLOW_MIN_AREA}')
 
@@ -1790,7 +1829,6 @@ class DLSlideWindow(SlideWindow):
                 lines.append(f'DL_LL_WIDTH_EMA_ALPHA = {DL_LL_WIDTH_EMA_ALPHA}')
                 lines.append(f'DL_LL_VELOCITY_EMA_ALPHA = {DL_LL_VELOCITY_EMA_ALPHA}')
                 lines.append(f'DL_LL_VELOCITY_MAX_PX = {DL_LL_VELOCITY_MAX_PX}')
-                lines.append(f'DL_LL_SEARCH_WIDEN_STEP/MAX_PX = {DL_LL_SEARCH_WIDEN_STEP_PX}/{DL_LL_SEARCH_WIDEN_MAX_PX}')
                 lines.append(f'DL_LL_BAND_ANCHOR_ALPHA = {DL_LL_BAND_ANCHOR_ALPHA}')
                 lines.append('-- 러닝 추정치(참고용, config 아님) --')
                 lines.append(f'_ll_half_width*2 (lane_w_est) = {self._ll_half_width * 2:.1f}px')

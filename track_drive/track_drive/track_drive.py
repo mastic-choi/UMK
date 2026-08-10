@@ -414,9 +414,17 @@ class TrackDriverNode(Node):
             # 기존 제어 코드와 호환되도록 필터링 적용
             self.lane_offset = 0.7 * self.lane_offset + 0.3 * offset
             self.lane_lookahead = 0.5 * self.lane_lookahead + 0.5 * lookahead
-        if path:
-            # path가 빈 리스트면(이번 프레임 유효 슬라이스 2개 미만) 갱신하지 않고
-            # 직전 경로를 유지한다 — lane_offset의 "무효 프레임엔 직전 값 유지" 폴백과 동일.
+        # [2026-08-10] `if path:`만 보던 예전 조건은 주석상으론 "lane_offset의 '무효
+        # 프레임엔 직전 값 유지' 폴백과 동일"이라 적혀있었지만 실제로는 그렇지 않았다 —
+        # lane_offset은 위에서 `valid`(디바운스: DL_STABLE_FRAME_MIN=3 프레임 연속 안정돼야
+        # 갱신, lane_util._debounce() 참고)로 보호되는데, path는 "이번 프레임에 fit이
+        # 됐는지"(유효 슬라이스 2개 이상)만 봐서 디바운스를 완전히 건너뛰고 있었다. 그
+        # 결과 offset/lane_center는 안정화돼 보여도, 실제 조향에 쓰이는 self.lane_path는
+        # 밴드 판정이 프레임마다 흔들릴 때(예: 급조향 후 직진 복귀 구간, ②-1의 탐색창
+        # 지연 문제와 겹치면 특히) 그 흔들림을 거의 그대로 흡수해 조향에 전달했다.
+        # `valid`도 같이 요구해서 path 갱신에 lane_offset과 동일한 3프레임 안정성 검증을
+        # 적용한다 — 무효/불안정 구간엔 주석 원래 의도대로 직전 경로를 그대로 유지한다.
+        if valid and path:
             self.lane_path = path
 
         self._update_lane_side()
