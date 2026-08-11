@@ -831,6 +831,13 @@ OVERTAKE_TRIGGER = 6.5        # B3(방해차량) 발동 거리(m)
 VEHICLE_TRIGGER_FRAMES = 5    # 라이다 단독검출 연속 N프레임이면 B3_VEHICLE 진입 확정
 SIG_CONFIRM_FRAMES = 3        # 신호등(직진/좌회전) 판정이 연속 N프레임 유지돼야 확정(20Hz→0.15s)
 
+# [2026-08-11] 정적/동적 분류는 여전히 Phase(순차 미션 설계)가 기준이다 — 실시간으로
+#   바꿔타지 않는다(대회 규정상 라바콘→고정장애물→방해차량이 트랙 위 고정 순서/구간이라
+#   원래 이걸로 충분하다는 전제). 대신 self.obstacle_rate(라이다 접근율, 이미 계산됨)로
+#   Phase 가정과 실측이 어긋나는지 로그만 남긴다(_cross_check_obstacle_motion()) — 실차
+#   미검증 임계값이라 처음엔 느슨하게 잡음.
+OBSTACLE_STATIC_SPEED_TH_MPS = 0.3   # |v_mps + obstacle_rate|가 이 미만이면 '정지'로 봄
+
 # ── 장애물회피(TargetPassing, controller/obstacle_avoidance.py) ──
 # [2026-08-11] PASS_OFFSET 실측값 반영: 기존 100px는 "차선 폭 실측 후 교체 예정"이라 주석 붙어있던
 #   placeholder였다. LANE_WIDTH_M=0.4m(실측, §6.1)를 DL_PIXELS_PER_METER=200px/m로 환산 —
