@@ -1581,10 +1581,41 @@ class TrackDriverNode(Node):
         if self.behavior_state == BehaviorState.B1_LAVACON:
             self._handle_lavacon()
         elif self.behavior_state == BehaviorState.B2_OBSTACLE:
+            self._cross_check_obstacle_motion('B2')
             self._handle_fixed_obstacle()
         elif self.behavior_state == BehaviorState.B3_VEHICLE:
+            self._cross_check_obstacle_motion('B3')
             self._handle_overtake()
         # B0_NORMAL: 아무것도 안 함(Mission 출력 그대로)
+
+    # [2026-08-11] 정적/동적 분류는 여전히 Phase(B2=고정장애물, B3=방해차량, 순차 미션
+    #   설계)가 기준이고 이 함수가 그걸 바꿔타지는 않는다 — 실시간 속도추정을 판단
+    #   기준으로 승격하면 라이다 노이즈에 더 취약해질 위험이 있고, 대회 규정상 미션이
+    #   고정 순서/구간으로 보장되므로 Phase 기준으로 충분하다는 판단(사용자 확인,
+    #   controller/obstacle_avoidance.py 상단 주석과 동일 전제). 여기서는 실측
+    #   (self.obstacle_rate, self.v_mps)이 그 전제와 어긋날 때 로그만 남긴다 —
+    #   README §5 "알려진 한계"의 "콘이 남아있는데 B3로 오인 진입" 같은 케이스를
+    #   실차 로그로 잡아내기 위함.
+    def _cross_check_obstacle_motion(self, tag):
+        """target_speed_est ≈ v_mps + obstacle_rate. 타겟이 정지해 있으면 자차가
+        다가가는 속도만큼 obstacle_rate가 음수라 합이 0에 가깝고, 자차와 같은 속도로
+        달리면 obstacle_rate≈0이라 합이 v_mps에 가깝다(perc_obstacle() 주석 참고)."""
+        if not (self.obstacle_front and self._vesc_live()):
+            return
+
+        target_speed_est = self.v_mps + self.obstacle_rate
+        looks_static = abs(target_speed_est) < OBSTACLE_STATIC_SPEED_TH_MPS
+
+        if tag == 'B2' and not looks_static:
+            self.get_logger().warn(
+                f'[B2] Phase는 고정장애물인데 obstacle_rate 기준 타겟이 움직이는 것처럼 '
+                f'보임(추정 속도={target_speed_est:+.2f}m/s) — 오검출/오판 의심',
+                throttle_duration_sec=1.0)
+        elif tag == 'B3' and looks_static:
+            self.get_logger().warn(
+                f'[B3] Phase는 방해차량인데 obstacle_rate 기준 타겟이 정지해있는 것처럼 '
+                f'보임(추정 속도={target_speed_est:+.2f}m/s) — 오검출/오판 의심',
+                throttle_duration_sec=1.0)
 
     # ── B1-라바콘: 보로노이 편차 기반 P제어 ──
     def _handle_lavacon(self):
