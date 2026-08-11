@@ -40,6 +40,7 @@ from .perception.perc_floor import check_stopline, LaneDetector as ClassicLaneDe
 from .perception.lane_util import CameraProcessor, SlideWindow
 from .perception.dl_lane import DLLaneDetector
 from .perception.traffic_signal import SignalDetector
+from .perception.yolo_cone import YoloConeDetector
 from .controller.obstacle_avoidance import ObstacleAvoidance, AvoidPhase
 # vehicle_overtake.py 의 구 VehicleOvertake 는 더 이상 쓰지 않는다.
 #   추월/회피가 규정상 같은 기동("타겟이 없는 차선으로 지나간다")이라
@@ -133,12 +134,15 @@ class TrackDriverNode(Node):
         self._obstacle_prev_dist = None
         self._obstacle_prev_t    = 0.0
         # [2-4 라바콘]
-        self.lavacon_offset = 0.0
+        self.lavacon_offset = 0.0    # 디버그/로깅용(중심선 y평균) — 조향엔 더 이상 안 씀
         self.lavacon_done   = False
+        self.lavacon_path   = []     # _lane_steer()에 그대로 태우는 px 스케일 경로(perc_lavacon() 참고)
+        self._lavacon_path_m = []    # 위와 같은 경로의 원본(라이다 미터 좌표) — DEBUG_VIZ_LAVACON 시각화용
         self._lavacon_empty_cnt = 0   # 우측콘 연속 미검출 프레임 수(Phase 전환 디바운스)
         self.lavacon_left_detected  = False  # 좌측 라이다 클러스터 검출 여부(B1 진입 트리거용)
         self.lavacon_right_detected = False  # 우측 라이다 클러스터 검출 여부(B1 진입 트리거용)
-        self.lavacon_trigger        = False  # 좌우 동시검출이 디바운스 프레임수만큼 유지되면 True
+        self.cone_detected_yolo     = False  # YOLO 카메라 콘 검출 여부(B1 진입 트리거 이중확인용)
+        self.lavacon_trigger        = False  # (YOLO 검출 AND 좌우 라이다 동시검출)이 디바운스 프레임수만큼 유지되면 True
         self._lavacon_trigger_cnt   = 0      # 동시검출 연속 프레임 수(디바운스 카운터)
         self._lavacon_dbg = (0, 0, 0, 0)     # 디버그용 (좌ROI점수, 좌최대연속묶음, 우ROI점수, 우최대연속묶음)
         self._lavacon_mask_dbg = (0, -1.0)   # 디버그용 (BODY_LO~HI 마스킹 구간 원본 점수, 최소거리)
@@ -151,6 +155,18 @@ class TrackDriverNode(Node):
         # ── 외부 차선 인식 모듈 초기화 (LANE_DETECTOR_BACKEND로 선택, 인터페이스는 셋 다 동일) ──
         self.lane_detector = self._build_lane_detector(LANE_DETECTOR_BACKEND)
         self.signal_detector = SignalDetector()          # 신호등(3구/4구) Hough Circle 인식기
+
+        # 라바콘 카메라 이중확인용 YOLO 콘 검출기. onnxruntime 미설치/모델 파일 부재 등으로
+        # 초기화가 실패하면 _build_lane_detector()의 dl→hough 폴백과 달리 대체 백엔드가
+        # 없으므로(카메라 이중확인 자체가 선택사항), None으로 두고 perc_lavacon_trigger()가
+        # "카메라 확인 불가 시 라이다 단독 판정으로 폴백"하도록 한다 — 원인은 에러 로그로 남긴다.
+        try:
+            self.yolo_cone_detector = YoloConeDetector(logger=self.get_logger())
+        except Exception as e:
+            self.get_logger().error(
+                f'YOLO 콘 검출기 초기화 실패, 라바콘 트리거는 라이다 단독 판정으로 폴백합니다: {e}'
+            )
+            self.yolo_cone_detector = None
 
         # ── 판단/제어 상태 ──
         self.mission_state  = START_STATE
@@ -381,9 +397,25 @@ class TrackDriverNode(Node):
         self.perc_signal()      # 비전
         self.perc_obstacle()    # 라이다
         self.perc_lavacon()     # 라이다
-        self.perc_lavacon_trigger()  # 라이다 (좌우 클러스터 동시검출 → B1_LAVACON 진입 트리거)
+        self.perc_yolo_cone()   # 비전 (YOLO, perc_lavacon_trigger()가 라이다와 AND 결합해서 씀)
+        self.perc_lavacon_trigger()  # 라이다+비전 (YOLO 콘 검출 AND 좌우 클러스터 동시검출 → B1_LAVACON 진입 트리거)
         self.perc_vehicle_trigger()  # 라이다 (전방 장애물 근접 → B3_VEHICLE 진입 트리거)
         self.perc_stopline()    # 비전
+
+    # [2-4a] 라바콘 카메라 이중확인 (YOLO)
+    #   입력 self.img_front → 출력 self.cone_detected_yolo
+    #   yolo_cone.py가 별도 스레드에서 자기 페이스로 추론하므로 여기선 논블로킹으로
+    #   최신 결과만 받아온다(dl_lane.py의 perc_lane()과 동일한 패턴).
+    def perc_yolo_cone(self):
+        if self.yolo_cone_detector is None:
+            # 초기화 실패 상태 — perc_lavacon_trigger()가 이 경우 라이다 단독 판정으로
+            # 폴백하므로 여기선 그냥 False로 둔다(카메라 확인 "안 됨"이 아니라 "못 함").
+            self.cone_detected_yolo = False
+            return
+        if self.img_front is None:
+            return
+        self.cone_detected_yolo = self.yolo_cone_detector.detect(self.img_front)
+        self.yolo_cone_detector.show_debug_windows()  # 메인 스레드에서만 호출(yolo_cone.py 주석 참고)
 
     # [2-1] 차선
     #   입력 self.img_front → 출력 self.lane_offset(우측+), self.lane_valid
@@ -590,12 +622,16 @@ class TrackDriverNode(Node):
         self.right_clear = int(np.count_nonzero(right_mask)) < RIGHT_BLOCK_TH
 
         if DEBUG_VIZ_LIDAR:
-            PPM = 125         # 1m = 125px (표시 범위 2m)
+            # [2026-08-11] PPM=125(표시 범위 2m)였을 때는 실제 장애물 감지 ROI(FRONT_X_MAX=5.0m,
+            #   SIDE_X_MAX=5.5m)의 대부분이 캔버스 밖으로 잘려서 안 보였다(예: to_px(5.0, 1.5)의
+            #   y픽셀이 음수) — "감지 범위가 안 보인다"는 요청으로 ROI 전체가 들어오도록 축척을
+            #   낮춤. PPM=40 → 반경 250px/40=6.25m까지 표시되어 5.0/5.5m ROI 박스가 온전히 보인다.
+            PPM = 40          # 1m = 40px (표시 범위 약 6.25m — 장애물 감지 ROI 전체 포함)
             W, H = 500, 500
             EX, EY = 250, 250  # 자차 위치(캔버스 정중앙 — 전/후/좌/우 전체 360도가 다 보이도록)
             bev = np.zeros((H, W, 3), dtype=np.uint8)
 
-            for d in range(1, 3):
+            for d in range(1, 7):
                 cv2.circle(bev, (EX, EY), d * PPM, (50, 50, 50), 1)
                 cv2.putText(bev, f'{d}m', (EX + 4, EY - d*PPM + 12),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.35, (80, 80, 80), 1)
@@ -622,9 +658,15 @@ class TrackDriverNode(Node):
                 cv2.putText(bev, f'MASK_{body_tag}(i{body_idx})', (bx_ - 20, by_),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 0, 200), 1, cv2.LINE_AA)
 
+            # 세 ROI 박스 = 지금 실제로 장애물을 감지하는 범위(perc_obstacle() 상단 튜닝 파라미터와 동일).
+            #   청록 = 전방(FRONT_X_MIN~MAX × ±FRONT_Y_HALF, B2/B3 공용 obstacle_dist 산출 범위)
+            #   초록 = 좌측 차선공간(SIDE_X_MIN~MAX × LEFT_Y_MIN~MAX, 추월 이동/복귀 판단용)
+            #   주황 = 우측 차선공간(SIDE_X_MIN~MAX × RIGHT_Y_MIN~MAX)
             cv2.rectangle(bev, to_px(FRONT_X_MIN, FRONT_Y_HALF), to_px(FRONT_X_MAX, -FRONT_Y_HALF), (0, 220, 220), 1)
-            cv2.rectangle(bev, to_px(0.8, 1.5),  to_px(5.5,  0.7), (0, 220, 0),   1)
-            cv2.rectangle(bev, to_px(0.8, -0.7), to_px(5.5, -1.5), (0, 140, 255), 1)
+            cv2.putText(bev, f'FRONT ROI ({FRONT_X_MIN:.1f}~{FRONT_X_MAX:.1f}m)',
+                        to_px(FRONT_X_MAX, FRONT_Y_HALF - 0.15), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 220, 220), 1, cv2.LINE_AA)
+            cv2.rectangle(bev, to_px(SIDE_X_MIN, LEFT_Y_MAX),  to_px(SIDE_X_MAX,  LEFT_Y_MIN), (0, 220, 0),   1)
+            cv2.rectangle(bev, to_px(SIDE_X_MIN, -RIGHT_Y_MIN), to_px(SIDE_X_MAX, -RIGHT_Y_MAX), (0, 140, 255), 1)
 
             for i in range(len(r)):
                 if not valid[i]: continue
@@ -652,17 +694,42 @@ class TrackDriverNode(Node):
             cv2.waitKey(1)
 
     # [2-4] 라바콘
+    #   출력 lavacon_offset(디버그용)/lavacon_done, lavacon_path(조향용 — _handle_lavacon() 참고)
     def perc_lavacon(self):
-        self.lavacon_offset, self.lavacon_done = process_lavacon(self.lidar_ranges)
+        self.lavacon_offset, self.lavacon_done, path_m = process_lavacon(self.lidar_ranges)
+        # [2026-08-11] 라바콘 조향 파라미터를 라인주행(_lane_steer())과 완전히 일치시키기로
+        # 한 결정 — LAVACON_KP 같은 라바콘 전용 P게인 대신, self.lane_path와 동일하게
+        # self.pure_pursuit/self.lqr(STEERING_CONTROLLER로 선택되는 바로 그 컨트롤러
+        # 인스턴스, 같은 PP_*/LQR_* 게인)에 태운다. 두 컨트롤러 모두 "1m=DL_PIXELS_PER_METER
+        # px, x=오른쪽+, 전방=이미지 위쪽(y 감소)" 스케일로 실측 축거(PP_WHEELBASE_PX/
+        # LQR_WHEELBASE_M)를 캘리브레이션해뒀으므로(controller/pure_pursuit.py,
+        # controller/lqr.py 상단 주석 참고), 라이다 미터 좌표(x=전방+, y=좌측+)를 그
+        # 스케일로 그대로 변환하면 물리적으로 일관된 입력이 된다 — 차량 기준점은 원점
+        # (0,0)으로 두고(_handle_lavacon()이 vehicle_x=0.0으로 호출), 좌측(+y_m)은
+        # 이미지 왼쪽(-col_px)에 대응한다.
+        #   ★주의★ LQR은 LANE_DETECTOR_BACKEND=='dl' and DL_USE_BEV일 때만 이 px 스케일로
+        #   실제 캘리브레이션되고(track_drive.py __init__ 참고), 그 외 조합에서는 레거시
+        #   픽셀 게인 모드로 폴백해 이 변환과 스케일이 안 맞을 수 있다 — 라인주행 쪽도
+        #   동일하게 겪는 기존 제약이라 여기서 새로 생기는 문제는 아니다.
+        self.lavacon_path = [(-y * DL_PIXELS_PER_METER, -x * DL_PIXELS_PER_METER) for x, y in path_m]
+        # 위 px 변환 전 원본(라이다 미터 좌표) — _draw_lavacon_bev()가 DEBUG_VIZ_LAVACON일 때
+        # 그대로 그려서 "실제로 조향에 쓰이는 경로"를 시각적으로 보여준다.
+        self._lavacon_path_m = path_m
 
-    # [2-4b] 라바콘 좌우 클러스터 검출 → B1_LAVACON 진입 트리거
-    #   입력 self.lidar_ranges
+    # [2-4b] 라바콘 좌우 클러스터 검출 + YOLO 카메라 이중확인 → B1_LAVACON 진입 트리거
+    #   입력 self.lidar_ranges, self.cone_detected_yolo(perc_yolo_cone()이 먼저 채워둠)
     #   출력 lavacon_left_detected/right_detected, lavacon_trigger
     #   설계 의도: 라이다 포인트가 "존재"하는 것만으로는 벽·바닥 잡음과 구분이 안 되므로,
     #     인접 인덱스(=인접 각도)로 붙어있는 포인트 묶음(클러스터)이 좌/우 각각 최소 1개씩
     #     동시에 있어야 "라바콘 구간 진입"으로 인정한다. perc_obstacle()과 동일한 차체 마스킹/
     #     극좌표 변환 방식을 사용하되, ROI와 목적은 별개(장애물 회피용이 아니라 콘 게이트 진입 판단용)이므로
-    #     여기서 독립적으로 계산한다. 좌우 동시검출이 LAVACON_TRIGGER_FRAMES 연속 유지되면 진입 확정(디바운스).
+    #     여기서 독립적으로 계산한다.
+    #   [2026-08-07] 라이다 클러스터 판정 단독으로는 벽 모서리 등에서 오검출 여지가 있어,
+    #     YOLO(perception/yolo_cone.py)로 카메라에도 실제 cone 클래스가 보이는지 AND 조건을
+    #     추가했다. YOLO 콘 검출 AND 좌우 라이다 동시검출이 LAVACON_TRIGGER_FRAMES 연속
+    #     유지되면 진입 확정(디바운스). YOLO 검출기 초기화 실패(self.yolo_cone_detector is
+    #     None)로 카메라 확인 자체가 불가능하면, 카메라 이중확인 없이 라이다 단독 판정으로
+    #     폴백한다(전체가 영영 안 켜지는 것보다 낫다는 판단).
     def perc_lavacon_trigger(self):
         # ── 튜닝 파라미터 (실측 라바콘 간격 기준 추정치, 실차 튜닝 필요) ──
         LON_MIN, LON_MAX = 0.3, 0.5   # 트리거 ROI 전방 종방향(m) — 너무 가깝거나(차체 반사) 먼 점 배제
@@ -732,8 +799,11 @@ class TrackDriverNode(Node):
                                     left_pts, left_run, right_pts, right_run,
                                     r_raw, deg, BODY_LO, body_hi_eff)
 
-        # 좌우 클러스터 동시검출이 연속 프레임 유지되면 진입 확정(디바운스)
-        if self.lavacon_left_detected and self.lavacon_right_detected:
+        # YOLO 콘 검출 AND 좌우 라이다 클러스터 동시검출이 연속 프레임 유지되면 진입 확정(디바운스).
+        # yolo_cone_detector 초기화 실패 시엔 카메라 조건을 무조건 통과(True)시켜 라이다
+        # 단독 판정으로 자연스럽게 폴백한다.
+        cone_confirmed_cam = self.cone_detected_yolo if self.yolo_cone_detector is not None else True
+        if cone_confirmed_cam and self.lavacon_left_detected and self.lavacon_right_detected:
             self._lavacon_trigger_cnt += 1
         else:
             self._lavacon_trigger_cnt = 0
@@ -784,6 +854,21 @@ class TrackDriverNode(Node):
             else:                col = (60, 60, 60)
             cv2.circle(bev, (sx, sy), 3, col, -1)
 
+        # [2026-08-11] 실제 조향에 쓰이는 경로(self._lavacon_path_m, perc_lavacon()이 채운
+        # 보로노이 정점 → x오름차순 정렬 결과) 시각화. 노란 선분이 Pure Pursuit/LQR이
+        # _target_point()에서 그대로 걷는 꺾은선이다 — 차량(원점)에서 시작해 정점을 순서대로
+        # 잇는다. 원은 정점 하나하나(§질문 답변: "영역"이 아니라 점 하나씩).
+        path_m = self._lavacon_path_m
+        if path_m:
+            prev_px = (EX, EY)
+            for wx, wy in path_m:
+                cur_px = to_px(wx, wy)
+                cv2.line(bev, prev_px, cur_px, (0, 255, 255), 2)
+                prev_px = cur_px
+            for wx, wy in path_m:
+                cv2.circle(bev, to_px(wx, wy), 5, (0, 255, 255), -1)
+                cv2.circle(bev, to_px(wx, wy), 5, (0, 0, 0), 1)
+
         cv2.circle(bev, (EX, EY), 6, (255, 220, 0), -1)
         cv2.line(bev, (EX, EY), (EX, EY - 18), (255, 220, 0), 2)
 
@@ -793,12 +878,17 @@ class TrackDriverNode(Node):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, l_col, 1, cv2.LINE_AA)
         cv2.putText(bev, f'R pts={right_pts} run={right_run} (need run>=2)', (8, 44),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, r_col, 1, cv2.LINE_AA)
+        cone_col = (0, 255, 0) if self.cone_detected_yolo else (0, 0, 255)
+        cv2.putText(bev, f'YOLO cone={self.cone_detected_yolo}', (8, 66),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, cone_col, 1, cv2.LINE_AA)
         cv2.putText(bev, f'trig={self._lavacon_trigger_cnt}/{LAVACON_TRIGGER_FRAMES}',
-                    (8, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
+                    (8, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
         masked_pts, masked_min = self._lavacon_mask_dbg
         masked_min_s = f'{masked_min:.2f}m' if masked_min >= 0 else 'N/A'
         cv2.putText(bev, f'masked(magenta) pts={masked_pts} min={masked_min_s}',
-                    (8, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1, cv2.LINE_AA)
+                    (8, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1, cv2.LINE_AA)
+        cv2.putText(bev, f'yellow=lavacon_path(voronoi vertex, n={len(path_m)})',
+                    (8, 132), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
         cv2.imshow('lavacon_bev', bev)
         cv2.waitKey(1)
 
@@ -1337,12 +1427,18 @@ class TrackDriverNode(Node):
             return abs(self.v_mps) / METERS_PER_SPEED_UNIT
         return self._prev_speed
 
-    def _lane_steer(self):
-        """self.lane_path(DL/classic_cv/hough 백엔드가 만든 ROI 픽셀좌표 경로, 가까운점→
-        먼점)를 STEERING_CONTROLLER로 고른 컨트롤러(pure_pursuit.py 또는 lqr.py)로
-        추종해 조향각(도)을 계산한다. 차량 기준점은 항상 ROI 하단 중앙(roi_w/2, path의
-        가장 가까운 점의 y좌표)으로 둔다 — path[0].y는 lane_util._fit_and_sample_path()가
+    def _lane_steer(self, path=None, vehicle_x=None):
+        """path(ROI 픽셀좌표 경로, 가까운점→먼점)를 STEERING_CONTROLLER로 고른 컨트롤러
+        (pure_pursuit.py 또는 lqr.py)로 추종해 조향각(도)을 계산한다. 차량 기준점은
+        (vehicle_x, path[0]의 y좌표)로 둔다.
+
+        인자를 생략하면(기본 호출부인 _lane_drive() 등) 기존과 동일하게 self.lane_path와
+        ROI 하단 중앙(roi_w/2)을 쓴다 — path[0].y는 lane_util._fit_and_sample_path()가
         self.roi_h로 샘플링해둔 값이라 별도로 백엔드별 roi_h를 조회할 필요가 없다.
+        [2026-08-11] _handle_lavacon()이 self.lavacon_path/vehicle_x=0.0을 명시적으로
+        넘겨 호출한다 — 라바콘 조향 파라미터를 라인주행과 완전히 일치시키기 위해, 별도
+        게인을 두지 않고 이 함수를 그대로 재사용하기로 한 결정(perc_lavacon() 주석 참고).
+
         경로가 비어있으면(첫 프레임, 혹은 roi_w를 아직 모르는 백엔드) 직전 조향각을
         그대로 유지한다 — 두 컨트롤러의 control()이 내부적으로 동일하게 처리.
         (구 이름 _pure_pursuit_steer — STEERING_CONTROLLER로 lqr도 고를 수 있게 되며
@@ -1352,13 +1448,16 @@ class TrackDriverNode(Node):
         (controller/lqr.py 참고) — 그래서 여기서 컨트롤러별로 분기해서 호출한다(공통
         kwarg로 합칠 수 없음)."""
         controller = self.lqr if STEERING_CONTROLLER == 'lqr' else self.pure_pursuit
-        roi_w = getattr(self.lane_detector, 'roi_w', 0) or 0
-        if not self.lane_path or not roi_w:
+        if path is None:
+            path = self.lane_path
+            roi_w = getattr(self.lane_detector, 'roi_w', 0) or 0
+            vehicle_x = roi_w / 2.0
+        if not path or vehicle_x is None:
             return controller.prev_steer_deg
-        vehicle_xy = (roi_w / 2.0, self.lane_path[0][1])
+        vehicle_xy = (vehicle_x, path[0][1])
         if STEERING_CONTROLLER == 'lqr':
-            return self.lqr.control(self.lane_path, vehicle_xy)
-        return self.pure_pursuit.control(self.lane_path, vehicle_xy, speed=self._speed_for_lookahead(),
+            return self.lqr.control(path, vehicle_xy)
+        return self.pure_pursuit.control(path, vehicle_xy, speed=self._speed_for_lookahead(),
                                           imu_curvature_px=self._imu_curvature_px())
 
     # [DEBUG_VIZ_STEER] 조향 컨트롤러가 이번 주기에 "새로 계산"했는지(초록/현재값 반영)
@@ -1552,8 +1651,15 @@ class TrackDriverNode(Node):
         """
         Phase.LAVACON 동안 항상 활성(트리거 조건 없음).
         우측 콘이 연속 LAVACON_DONE_FRAMES 프레임 미검출되면 고정장애물 구간으로 전환.
+
+        [2026-08-11] 조향은 라바콘 전용 P게인(LAVACON_KP, 폐기) 대신 _lane_steer()를
+        그대로 재사용한다 — 라인주행(_lane_drive())과 조향 파라미터(STEERING_CONTROLLER로
+        고른 컨트롤러 인스턴스, PP_*/LQR_* 게인, ANGLE_MAX/ANGLE_RATE_MAX)를 완전히
+        일치시키기로 한 결정. self.lavacon_path는 perc_lavacon()이 라이다 미터 좌표를
+        self.lane_path와 같은 px 스케일로 변환해둔 것이고, 차량 기준점은 그 변환의
+        원점인 (0.0, path[0].y)다.
         """
-        self.ctrl_angle = self.lavacon_offset * LAVACON_KP
+        self.ctrl_angle = self._lane_steer(path=self.lavacon_path, vehicle_x=0.0)
         self.ctrl_speed = SPEED_LAVACON
 
         if self.lavacon_done:
@@ -1830,7 +1936,8 @@ class TrackDriverNode(Node):
             f'obs={self.obstacle_front}({self.obstacle_dist:.1f}m,w={self.obstacle_width:.2f}m,{self.obstacle_type}) '
             f'lava={self.lavacon_offset:+.2f}(done={int(self.lavacon_done)})\n'
             f'  [TRIG] trigL={self._lavacon_trigger_cnt}/{LAVACON_TRIGGER_FRAMES}'
-            f'(L{int(self.lavacon_left_detected)}R{int(self.lavacon_right_detected)}) '
+            f'(L{int(self.lavacon_left_detected)}R{int(self.lavacon_right_detected)}'
+            f'Y{int(self.cone_detected_yolo)}) '
             f'trigV={self._vehicle_trigger_cnt}/{VEHICLE_TRIGGER_FRAMES}\n'
             f'  [LAVA-ROI] L pts={lava_lp} run={lava_lrun}(need>=2) '
             f'R pts={lava_rp} run={lava_rrun}(need>=2) '

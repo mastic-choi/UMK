@@ -3,7 +3,7 @@
 #
 # [사용법] track_drive.py 에서 import 하여 호출:
 #     from perc_lavacon import process_lavacon
-#     offset, done = process_lavacon(self.lidar_ranges)
+#     offset, done, path_m = process_lavacon(self.lidar_ranges)
 #
 # [알고리즘 개요]
 #   곡선 구간에서는 안쪽 콘과 바깥쪽 콘의 개수가 크게 비대칭이라
@@ -11,8 +11,12 @@
 #   보로노이 다이어그램(scipy.spatial.Voronoi)은 점군 사이의
 #   '위상학적 골격(topological skeleton)'을 자연스럽게 추출하므로,
 #   좌/우 콘 개수가 달라도 두 경계 사이의 안전 중심선이
-#   보로노이 정점(vertex)들로 나타난다. 이 정점들의 y좌표 평균을
-#   횡방향 편차(lavacon_offset)로 사용한다.
+#   보로노이 정점(vertex)들로 나타난다. lavacon_offset은(디버그/로깅용으로만 계속
+#   계산되는) 이 정점들의 y좌표 평균이고, [2026-08-11] 이후로는 그 정점들을 x(전방)
+#   오름차순으로 정렬한 좌표 목록(path_m)도 함께 반환한다 — track_drive.py가 이걸
+#   차선주행(_lane_steer())과 동일한 Pure Pursuit/LQR 컨트롤러에 그대로 태워서
+#   조향각을 계산한다(라바콘 전용 LAVACON_KP P제어 게인 대신, 조향 파라미터를
+#   라인주행 상태와 완전히 일치시키기 위한 결정 — track_drive.py _handle_lavacon() 참고).
 #
 # [라이다 좌표 약속] (track_drive.py 재실측 기준, 2026-07-22 확정)
 #   · 360칸, 인덱스 = 각도(도), 반시계 방향
@@ -34,12 +38,20 @@
 import math
 import numpy as np
 from scipy.spatial import Voronoi, QhullError   # 보로노이 다이어그램 + 퇴화 예외
- 
+
+# [2026-08-07] LIDAR_ANGLE_OFFSET_DEG를 이 파일에 별도 상수로 하드코딩해뒀던 게
+#   config.py와 값이 어긋날 수 있는 위험이었다(위 "2026-06-19 구 규약" 버그가 정확히
+#   이 종류의 비동기화로 생겼었음) — config.py를 단일 소스로 삼아 여기서도 그대로
+#   가져다 쓰도록 고쳤다. 값 자체(80.0)는 바뀌지 않았다.
+from ..config import LIDAR_ANGLE_OFFSET_DEG
+
 # ─────────────────────────────────────────────
 # 튜닝 상수 (track_drive.py 의 실측 ROI 값과 일치시킴)
 # ─────────────────────────────────────────────
-LIDAR_ANGLE_OFFSET_DEG = 80.0   # 라이다 장착 각도 보정(track_drive.py와 동일값 유지)
 BODY_LO, BODY_HI = 215, 305     # 차체 가림 인덱스 구간 [215, 304] 마스킹 경계 (305는 미포함)
+                                 # (config.py엔 중앙화돼 있지 않음 — perc_obstacle()/
+                                 #  perc_lavacon_trigger()도 각 함수 안에 동일 값을 로컬로
+                                 #  들고 있는 게 이 프로젝트의 기존 관례라 그대로 따름)
 LON_MIN, LON_MAX = 0.0, 4.0     # 보로노이 정점 종방향(전방) 관심영역 (m)
 LAT_LIMIT        = 2.5          # 보로노이 정점 횡방향(좌우) 관심영역 한계 (m)
 CONE_LON_MAX     = 4.0          # 콘 후보 점의 전방 최대거리 (m) — 벽/원거리 잡음 배제
@@ -55,19 +67,22 @@ def process_lavacon(lidar_ranges):
  
     입력 : lidar_ranges — 길이 360의 거리 배열 (list 또는 np.ndarray)
                           인덱스 0 = 정면, 인덱스 = 각도(도), 반시계
-    출력 : (lavacon_offset, lavacon_done) 튜플
-           · lavacon_offset (float) : 중심 편차 [-0.8, +0.8], 양수 = 우조향
+    출력 : (lavacon_offset, lavacon_done, path_m) 튜플
+           · lavacon_offset (float) : 중심 편차 [-0.8, +0.8], 양수 = 우조향(디버그/로깅용)
            · lavacon_done   (bool)  : 우측(y<0) 콘 미검출 = 라바콘 구간 종료 신호
+           · path_m (list[(float,float)]) : 채택된 중심선 정점들, x(전방) 오름차순,
+             (x, y) 라이다 미터 좌표(x=전방+, y=좌측+). 조향 실계산은 이걸 쓴다.
+             정점이 하나도 없으면 빈 리스트.
     """
     # ── 0) 입력 유효성 검사 : None 이거나 비어 있으면 즉시 안전 폴백 ──
     if lidar_ranges is None:
-        return (0.0, True)
- 
+        return (0.0, True, [])
+
     # ── 1) 전처리 : NumPy 배열화 + 무효값(inf/nan/음수/0) 제거 + 차체 마스킹 ──
     ranges = np.asarray(lidar_ranges, dtype=np.float32).copy()  # 원본 훼손 방지 복사
     n = len(ranges)
     if n == 0:
-        return (0.0, True)
+        return (0.0, True, [])
  
     ranges[~np.isfinite(ranges)] = 0.0     # inf / nan → 0.0 (무효 표시)
     ranges[ranges <= 0.0] = 0.0            # 0 이하 거리 → 무효
@@ -102,8 +117,8 @@ def process_lavacon(lidar_ranges):
     # 종료 신호는 위에서 구한 실제 콘 유무를 그대로 쓴다. 여기서 무조건 True를
     # 돌려주면 "점이 잠깐 적게 잡힌 것"과 "구간이 끝난 것"이 구분되지 않는다.
     if len(px) < MIN_POINTS:
-        return (0.0, lavacon_done)
- 
+        return (0.0, lavacon_done, [])
+
     # ── 6) 보로노이 다이어그램 계산 ──
     # 콘 점군을 시드로 하면, 좌/우 콘 경계 '사이의 등거리 능선'이
     # 보로노이 간선/정점으로 나타난다 = 트랙의 안전 중심선(골격).
@@ -114,8 +129,8 @@ def process_lavacon(lidar_ranges):
     except (QhullError, ValueError):
         # 점들이 일직선상에 놓이는 등 퇴화(degenerate) 입력이면 Qhull이 실패함
         # → 편차 0(직진) 유지, 구간은 계속(False)으로 두어 다음 프레임에 재시도
-        return (0.0, False)
- 
+        return (0.0, False, [])
+
     # ── 7) 보로노이 정점 필터링 : 차량 전방의 주행 가능 영역 내 정점만 채택 ──
     # 보로노이 정점은 트랙 바깥 먼 곳에도 생기므로(무한 간선 근처),
     # '지금 따라가야 할 중심선' 조각만 남긴다:
@@ -123,27 +138,36 @@ def process_lavacon(lidar_ranges):
     #   · 좌우 ±2.5 m (|vy| < LAT_LIMIT)
     verts = vor.vertices                    # (M, 2) 보로노이 정점 배열
     if len(verts) == 0:
-        return (0.0, lavacon_done)          # 정점이 아예 없으면 직진 유지
- 
+        return (0.0, lavacon_done, [])       # 정점이 아예 없으면 직진 유지
+
     vx = verts[:, 0]
     vy = verts[:, 1]
     keep = (vx > LON_MIN) & (vx < LON_MAX) & (np.abs(vy) < LAT_LIMIT)
+    sel_x = vx[keep]                        # 채택된 중심선 정점들의 x좌표(전방+)
     sel_y = vy[keep]                        # 채택된 중심선 정점들의 y좌표(좌측+)
- 
+
     if len(sel_y) == 0:
         # ROI 안에 중심선 정점이 하나도 없음 → 이번 프레임은 조향 판단 보류(직진)
-        return (0.0, lavacon_done)
- 
-    # ── 8) 편차 계산 : 중심선 정점 y좌표 평균 → 부호 반전 → 클램프 ──
+        return (0.0, lavacon_done, [])
+
+    # ── 8) 편차 계산 : 중심선 정점 y좌표 평균 → 부호 반전 → 클램프 (디버그/로깅용) ──
     # y는 좌측+ 이므로, 중심선이 우측(y평균 < 0)에 있으면
     # 우조향(+)이 필요 → offset = -mean(y) 로 부호를 뒤집는다.
     mean_y = float(np.mean(sel_y))
     lavacon_offset = -mean_y * OFFSET_GAIN
- 
+
     # 물리한계 클램프 : 콘 사이 폭을 넘는 값은 오검출(벽 등)로 보고 잘라냄
     lavacon_offset = float(np.clip(lavacon_offset, -OFFSET_CLAMP, OFFSET_CLAMP))
- 
-    return (lavacon_offset, lavacon_done)
+
+    # ── 9) 조향용 경로 : 채택된 정점을 x(전방) 오름차순으로 정렬 ──
+    # Voronoi 정점은 순서가 없으므로, Pure Pursuit/LQR의 _target_point()가 "가까운
+    # 점→먼 점" 순으로 누적 호길이를 재는 것과 호환되도록 전방거리 기준 정렬만 해준다
+    # (점들을 잇는 매끄러운 스플라인은 아니라 지그재그 트랙에서는 근사가 거칠 수 있음 —
+    # 실차 미검증).
+    order = np.argsort(sel_x)
+    path_m = list(zip(sel_x[order].tolist(), sel_y[order].tolist()))
+
+    return (lavacon_offset, lavacon_done, path_m)
  
  
 # ─────────────────────────────────────────────
@@ -165,5 +189,5 @@ if __name__ == '__main__':
     for t in (-20, -35, -50):   # 우측 줄 (y = -1.0)
         put(t, -1.0)
 
-    off, done = process_lavacon(test)
-    print(f'offset={off:+.3f} (음수=좌조향 기대), done={done} (False 기대)')
+    off, done, path_m = process_lavacon(test)
+    print(f'offset={off:+.3f} (음수=좌조향 기대), done={done} (False 기대), path_m={path_m}')

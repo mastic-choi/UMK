@@ -174,7 +174,12 @@ ros2 launch track_drive track_drive.launch.py
 
 > **(2026-08-06)** `DEBUG_VIZ_LIDAR` 기본값을 `True`→`False`로 변경했습니다. 필요할 때만 켜서 쓰세요.
 
-> 이 프로젝트는 YOLO(yolo_ros)를 사용하지 않습니다 — 모든 인지는 카메라(차선/신호등)와 라이다(장애물/라바콘)만으로 수행합니다.
+> **(2026-08-11 수정)** 이전엔 "이 프로젝트는 YOLO를 사용하지 않는다"고 적혀 있었는데, 부분적으로만
+> 맞습니다 — 신호등/차선/고정장애물(B2)/방해차량(B3)은 여전히 YOLO 없이 카메라+라이다만 씁니다.
+> 다만 라바콘(B1) 진입 트리거만은 `perception/yolo_cone.py`(YOLOv8n, `yolo_ros/cone_best_n.onnx`)로
+> 카메라 이중확인을 추가했습니다(§3 참고). 이 작업은 원래 `smooth-imu-yaw-rate` 브랜치(커밋
+> `0c0d88b`)에 있었는데 그 브랜치가 메인 라인에 머지되지 않아 한동안 "없는 것"처럼 보였을 뿐,
+> 이번에 현재 브랜치로 수동 포팅했습니다.
 
 ---
 
@@ -1359,18 +1364,47 @@ TEST_FORCE_BEHAVIOR = True    # S2를 거치지 않고 시작부터 Behavior(라
 `TEST_DISABLE_B2_B3 = True`(기본값)면 라바콘 구간이 끝나도 B2/B3로 안 넘어가고 그냥 일반 차선주행으로
 돌아오니, 라바콘만 격리 테스트하기 좋습니다.
 
-라바콘 진입은 **라이다 좌우 클러스터 동시검출**이 `LAVACON_TRIGGER_FRAMES(5프레임)` 연속 유지돼야
-확정됩니다(`perc_lavacon_trigger()`, 라이다 단독 판단 — 카메라/YOLO 이중확인 없음).
+라바콘 진입은 **(YOLO 카메라 콘 검출 AND 라이다 좌우 클러스터 동시검출)**이
+`LAVACON_TRIGGER_FRAMES(5프레임)` 연속 유지돼야 확정됩니다(`perc_lavacon_trigger()`).
+`perception/yolo_cone.py`(YOLOv8n ONNX, `yolo_ros/cone_best_n.onnx`)가 별도 스레드에서
+카메라 프레임에 실제 cone 클래스가 보이는지 확인하고, 라이다 단독 클러스터 판정(벽 모서리
+등에서 오검출 여지가 있음)에 AND 조건으로 얹습니다. **YOLO 검출기 초기화 실패**(onnxruntime
+미설치, onnx 파일 없음 등, `self.yolo_cone_detector is None`)**시엔 자동으로 라이다 단독
+판정으로 폴백**합니다 — 카메라 이중확인이 안 되는 게 라바콘 전체가 안 켜지는 것보다 낫다는
+판단입니다.
+
+**[2026-08-11] 조향도 라인주행과 완전히 동일한 파라미터/컨트롤러를 씁니다.** 예전엔
+`ctrl_angle = lavacon_offset * LAVACON_KP`(라바콘 전용 P게인, 라이다 offset 평균 하나만
+보고 계산)였는데, 이제는 `perc_lavacon()`이 채택된 보로노이 중심선 정점들을 x(전방)
+오름차순으로 정렬한 뒤 `self.lane_path`와 동일한 픽셀 스케일(`DL_PIXELS_PER_METER=200px/m`)로
+변환해 `self.lavacon_path`에 담아두고, `_handle_lavacon()`이 `_lane_steer(path=self.lavacon_path,
+vehicle_x=0.0)`로 라인주행(`_lane_drive()`)과 **완전히 같은 함수**(`STEERING_CONTROLLER`로
+고른 Pure Pursuit/LQR 컨트롤러 인스턴스, 같은 `PP_*`/`LQR_*` 게인)를 그대로 호출합니다.
+`LAVACON_KP`는 이제 안 쓰여서 config.py에서 삭제했습니다. Pure Pursuit/LQR 둘 다
+"1m=200px, x=오른쪽+, 전방=이미지 위쪽" 스케일로 실측 축거를 캘리브레이션해뒀기 때문에
+(controller/pure_pursuit.py·lqr.py 상단 주석 참고) 이 변환이 물리적으로 맞지만, **Voronoi
+정점을 그냥 x순으로 정렬만 한 것이라 매끄러운 스플라인이 아니고, 지그재그가 심한 구간에서는
+경로가 거칠 수 있습니다 — 실차 미검증.**
 
 **디버그 방법:**
-- CLI 로그: `trigL=본선카운트/기준(L{좌클러스터}R{우클러스터})` — 좌/우 중 어느 쪽을 못 잡는지 바로 구분됨.
-  추가로 `[LAVA-ROI] L pts=... run=... R pts=... run=...` 줄에서 ROI 안에 잡힌 점 개수(pts)와 그중 최대
-  연속 묶음 길이(run, 2 이상이어야 클러스터로 인정)까지 확인 가능.
-- 창: `DEBUG_VIZ_LAVACON = True`([config.py:216](config.py#L216)) → `lavacon_bev` 창(트리거 ROI와 좌/우 클러스터를
-  시각으로 확인).
+- CLI 로그: `trigL=본선카운트/기준(L{좌클러스터}R{우클러스터}Y{YOLO검출})` — 좌/우/카메라 중 어느
+  쪽을 못 잡는지 바로 구분됨. 추가로 `[LAVA-ROI] L pts=... run=... R pts=... run=...` 줄에서 ROI
+  안에 잡힌 점 개수(pts)와 그중 최대 연속 묶음 길이(run, 2 이상이어야 클러스터로 인정)까지 확인 가능.
+- 창: `DEBUG_VIZ_LAVACON = True`([config.py:216](config.py#L216)) → `lavacon_bev` 창(트리거 ROI,
+  좌/우 클러스터, `YOLO cone=` 검출 상태를 시각으로 확인). **[2026-08-11]** 조향에 실제로 쓰이는
+  경로(`self._lavacon_path_m`, `perc_lavacon()`이 채운 보로노이 정점 → x오름차순 정렬 결과)도
+  노란 점(정점 하나하나)+선(Pure Pursuit/LQR이 그대로 걷는 꺾은선)으로 같은 창에 겹쳐 그림 —
+  트리거 판정용 ROI(좁은 0.3~0.5m)와는 별개로, 조향 경로 계산용 ROI(0~4m)에서 나온 결과라는
+  점에 주의(`perception/perc_lavacon.py` 참고).
+- 창: `DEBUG_VIZ_YOLO_CONE = True` → `yolo_cone_result` 창(카메라 프레임 위에 콘 검출 박스/신뢰도
+  표시, `perception/yolo_cone.py`).
 
 **알려진 한계:**
 - `LAVACON_DONE_FRAMES=80`(우측 콘 연속 미검출 시 구간 종료 판정)이 실차 미검증 값.
+- `YOLO_CONE_CONF_THRESHOLD=0.5`/`YOLO_CONE_INPUT_SIZE=640`이 실차 미검증 초기값.
+- 조향에 쓰는 `self.lavacon_path`가 Voronoi 정점을 단순 정렬한 것이라 스플라인 피팅된
+  `self.lane_path`보다 거칠 수 있음 — Pure Pursuit/LQR 자체는 라인주행에서 검증됐지만, 이
+  입력(라바콘 경로)과의 조합은 실차 미검증.
 
 ---
 

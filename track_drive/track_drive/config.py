@@ -116,7 +116,9 @@ CORNER_HOLD_DECAY_HI = 0.97  # 고속 시 코너 hold 감쇠 (느린 회복, 연
 #   실차에서 진동 주기/코너 반응 둘 다 보며 조정할 것.
 CORNER_SIGN_EMA_ALPHA = 0.15
 LANE_LOOKAHEAD_REF = 220.0   # 예측감속 최대가 되는 lookahead 편차(px) — _lane_drive() 속도계획용
-LAVACON_KP = 210.0           # 라바콘 조향 게인
+# [2026-08-11] LAVACON_KP(라바콘 전용 P게인, 210.0) 삭제 — 라바콘 조향이 이제
+# _lane_steer()(Pure Pursuit/LQR)를 그대로 재사용해서(track_drive.py _handle_lavacon()/
+# perc_lavacon() 참고) 더 이상 쓰이지 않는다.
 
 # ── 코너 진입 시 회전반경 기반 감속 (ROS2 Nav2 Regulated Pure Pursuit 방식) ──
 #   회전반경(1/curvature)이 CORNER_MIN_RADIUS_PX보다 작아지면 그 비율만큼 목표속도를
@@ -664,31 +666,40 @@ IMU_YAW_RATE_EMA_ALPHA = 0.3  # [2026-08-06] _imu_curvature_px() 전용 저역�
 DEBUG_LOG    = True   # 0.5초마다 CLI에 [LAP]/[SENS]/[LANE]/[TRIG]/[SIG]/[LAVA-ROI] 로그
 DEBUG_PERIOD = 0.5     # 위 로그 주기(s)
 
-DEBUG_VIZ_LIDAR    = False  # 라이다 BEV 장애물 감지 디버그 창 (track_drive.py)
+# [2026-08-11] 라바콘 실차 테스트 중엔 라이다 창만 보고 싶다는 요청으로, 아래 DEBUG_VIZ_LIDAR만
+#   켜고 나머지는 전부 잠시 끔. 다른 디버그창이 다시 필요하면(예: 차선 인식 디버깅) 개별적으로
+#   다시 True로 되돌릴 것 — 서로 독립적인 스위치라 다른 항목엔 영향 없음.
+DEBUG_VIZ_LIDAR    = True   # 라이다 BEV 장애물 감지 디버그 창 (track_drive.py)
 DEBUG_VIZ_LAVACON  = False  # 라바콘 트리거 좌우 클러스터 BEV 디버그 창 (track_drive.py)
 DEBUG_PLANNER      = False  # Hybrid A* OccupancyGrid 디버그 창 (track_drive.py, USE_HYBRID_ASTAR_FOR_B2=True일 때만 의미있음)
-DEBUG_VIZ_STEER    = True   # 조향 컨트롤러(직전값유지/현재값반영) 한글 디버그 창 (track_drive.py)
-DEBUG_VIZ_VESC     = True   # VESC 실측속도(/vesc_speed_erpm) 연동 상태(수신중/끊김/미수신) 디버그 창
+DEBUG_VIZ_STEER    = False  # 조향 컨트롤러(직전값유지/현재값반영) 한글 디버그 창 (track_drive.py)
+DEBUG_VIZ_VESC     = False  # VESC 실측속도(/vesc_speed_erpm) 연동 상태(수신중/끊김/미수신) 디버그 창
                              #   (track_drive.py, 2026-08-06 LQR 브랜치에서 이식)
 
-DEBUG_VIZ_DL_LANE    = True   # 차선 — 기본 백엔드('dl') 디버그 창 (perception/dl_lane.py)
+DEBUG_VIZ_DL_LANE    = False  # 차선 — 기본 백엔드('dl') 디버그 창 (perception/dl_lane.py)
 # [2026-08-10] 'dl_lane_params' 창(파라미터 패널) 하단에 붙는 offset 스파크라인이 몇
 #   프레임을 보여줄지. 주행 성능에 영향 없는 순수 디버그 표시 설정이라 driving 튜닝값
 #   묶음이 아니라 여기 DEBUG_VIZ_* 옆에 둔다. 너무 크면(예: 수백) 그래프가 납작해져
 #   최근 흔들림이 잘 안 보이고, 너무 작으면 추세를 못 봄 — 90(대략 3~6초, FPS별로 다름)
 #   으로 시작.
 DL_DEBUG_HISTORY_LEN = 90
-DEBUG_VIZ_HOUGH_LANE = True   # 차선 — 대안 백엔드('hough') 디버그 창 (perception/hough_lane.py)
-DEBUG_VIZ_LANE       = True   # 차선 — 대안 백엔드('classic_cv') 디버그 창 (perception/lane_util.py)
+DEBUG_VIZ_HOUGH_LANE = False  # 차선 — 대안 백엔드('hough') 디버그 창 (perception/hough_lane.py)
+DEBUG_VIZ_LANE       = False  # 차선 — 대안 백엔드('classic_cv') 디버그 창 (perception/lane_util.py)
 DEBUG_VIZ_STOPLINE   = False  # 정지선 디버그 창, 백엔드 무관 항상 동작 (perception/perc_floor.py)
 DEBUG_VIZ_SIGNAL     = False  # 신호등(S0/S2 공용) 디버그 창 (perception/traffic_signal.py)
+DEBUG_VIZ_YOLO_CONE  = True   # 라바콘 YOLO 검출 박스 디버그 창 (perception/yolo_cone.py)
+#   [2026-08-11] smooth-imu-yaw-rate 브랜치(0c0d88b)에서 수동 포팅 — 라바콘 실차 테스트 중
+#   라이다 창과 함께 켜 두고 나머지는 꺼둔 상태(요청 반영).
 
 
 # #############################################################
 # 6. 미션 State / 실차 테스트 범위 제한
 # #############################################################
 START_STATE     = MissionState.S1_LANE_FOLLOW
-ENABLE_BEHAVIOR = False   # S1에서 라바콘/장애물/추월 Behavior를 켤지 여부(최상위 스위치)
+ENABLE_BEHAVIOR = True   # S1에서 라바콘/장애물/추월 Behavior를 켤지 여부(최상위 스위치)
+#   [2026-08-11] 라바콘(B1) 실차 테스트를 위해 True로 켬. TEST_FORCE_BEHAVIOR=True와 함께
+#   있으면 S2 교차로 없이도 시작부터 라바콘 단독 테스트 가능. B2/B3까지 실차 테스트 범위를
+#   넓힐 준비가 되기 전까지는 TEST_DISABLE_B2_B3=True로 B2/B3 발동 자체는 계속 막아둔 상태.
 
 # ── 실차 테스트 범위 제한 ──
 #   지금 단계에서 실차로 검증 가능한 건 딱 세 가지: ①신호등 인식 후 출발(S0)
@@ -771,7 +782,19 @@ PATH_EMA_ALPHA = 0.4   # 새 프레임에 줄 가중치(작을수록 더 부드�
 
 # ── 라바콘/장애물/방해차량/신호등 트리거 ──
 LAVACON_DONE_FRAMES = 80      # 우측콘 미검출이 연속 N프레임(20Hz→약 4초) 쌓이면 Phase 전환(디바운스)
-LAVACON_TRIGGER_FRAMES = 5    # 좌우 클러스터 동시검출이 연속 N프레임 쌓이면 B1_LAVACON 진입 확정
+LAVACON_TRIGGER_FRAMES = 5    # (YOLO 콘 검출 AND 좌우 라이다 클러스터 동시검출)이 연속 N프레임
+                               #   쌓이면 B1_LAVACON 진입 확정. [2026-08-07] 카메라(YOLO)+라이다
+                               #   이중확인으로 강화 — 값 자체는 기존 그대로 유지.
+
+# ── 라바콘 카메라 이중확인 (perception/yolo_cone.py, YOLOv8n ONNX) ──
+#   perc_lavacon_trigger()가 기존 라이다 좌우 클러스터 판정에 "카메라로도 콘이 보이는가"를
+#   AND로 추가한다 — 라이다 단독 클러스터 판정은 벽 모서리 등에서 오검출 여지가 있어서,
+#   실제로 콘(cone) 클래스가 화면에 잡힐 때만 진입을 인정하도록 이중화한다.
+#   [2026-08-11] smooth-imu-yaw-rate 브랜치(0c0d88b)에서 수동 포팅.
+YOLO_CONE_INPUT_SIZE = 640     # cone_best_n.onnx export 시 imgsz와 반드시 일치시킬 것
+YOLO_CONE_CONF_THRESHOLD = 0.5 # 이 신뢰도 이상인 검출만 인정(모델이 nms=True로 export돼 좌표 디코딩은 불필요)
+YOLO_CONE_MODEL_PATH = None    # None이면 yolo_ros/cone_best_n.onnx(형제 디렉터리)를 자동으로 찾음(perception/yolo_cone.py 참고)
+
 SAFETY_DIST      = 5.0        # B2(고정장애물) 발동 거리(m)
 OVERTAKE_TRIGGER = 6.5        # B3(방해차량) 발동 거리(m)
 VEHICLE_TRIGGER_FRAMES = 5    # 라이다 단독검출 연속 N프레임이면 B3_VEHICLE 진입 확정
