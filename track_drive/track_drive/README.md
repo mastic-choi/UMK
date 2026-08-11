@@ -1351,6 +1351,55 @@ mode전환으로 바꿀 수 있게" 요청받아 아래처럼 병합했다.
 가 노란/흰 양쪽에 그대로 적용된다 — 노란선은 원래도 ④ 안전망이 있어 확장 자체의 한계 노출은
 제한적이지만, 흰선 쪽은 이번에 새로 생긴 경로라 실차에서 오탐 여부를 특히 확인할 것.
 
+### 2.24 control_loop(20Hz)와 DL 추론 스레드 주기 불일치 대응 — `result_seq` + `LANE_STALE_SEC` (2026-08-11)
+
+**배경:** `dl_lane.py` 모듈 상단 주석에 적힌 대로 `DLLaneDetector.detect()`는 항상 논블로킹으로
+`self._latest_result`를 즉시 반환한다(추론이 별도 스레드에서 자기 페이스껏 도는 설계 — 동기
+호출로 바꾸면 추론 지연이 조향 발행 주기에 그대로 전파되므로 의도적으로 피함). 그런데 이
+"최신값 재사용" 구조에는 결과 자체에 타임스탬프/버전이 없어서, **추론이 20Hz보다 느려 몇 틱
+동안 같은 값을 재사용하는 정상 상황**과 **추론 스레드가 예외로 멎었거나 카메라 토픽이
+끊겨서 몇 초씩 아예 안 갱신되는 고장 상황**을 구분할 방법이 없었다. VESC(`_vesc_t`/
+`VESC_STALE_SEC`)·IMU(`_imu_t`/`IMU_STALE_SEC`)엔 이미 있는 "죽으면 감지" 가드가 차선인식
+쪽엔 없었던 것 — CLAUDE.md에 적힌 "센서 죽음은 크래시가 아니라 조용한 고정값" 패턴이 비전
+파이프라인에도 그대로 적용되는데 방어가 없는 상태였다.
+
+**수정:**
+- `DLLaneDetector`에 `result_seq`(int) 카운터를 추가([dl_lane.py](perception/dl_lane.py) `__init__`).
+  `_worker()`가 예외 없이 추론을 끝내고 `_latest_result`를 갱신할 때마다만 1 증가한다 —
+  `detect()` 호출 횟수가 아니라 "실제로 새 결과가 몇 번 나왔는지"를 센다.
+- `track_drive.py`의 `perc_lane()`이 매 틱 이 값을 직전 틱과 비교해서, 값이 안 바뀐 채로
+  `LANE_STALE_SEC`(config.py, VESC/IMU와 동일하게 기본 0.5) 이상 지속되면 `self.lane_stale
+  = True`로 표시한다. `result_seq`가 없는 백엔드(hough/classic_cv — 매 틱 동기 계산이라
+  애초에 "재사용"이 없음)는 `getattr` 폴백으로 이 판정 자체를 건너뛰고 항상 fresh 취급한다.
+- `_lane_drive()`가 `lane_stale`이면 목표속도를 `SPEED_LANE_STALE`(config.py, 기본 5.0)로
+  제한한다. **속도를 서서히 깎는 방식이 아니라, "코너가 아닌데도 이 정도로 감속됐다"는
+  부자연스러움 자체를 사람이 알아챌 수 있는 신호로 쓰려는 의도**(요청 반영) — `SPEED_CORNER_MIN`
+  보다 낮추지 않아서 일반적인 코너 감속과 감속량이 비슷하게 겹치지만, `[LANE]` 디버그
+  로그(`_print_debug()`)에 `stale=1`이 같이 찍히므로 "코너 감속인지 stale 감속인지"는
+  로그로 바로 구분된다.
+- 조향(`self.ctrl_angle`)은 이 수정과 무관하게 그대로 둔다 — `self.lane_path`가 멈춰있어도
+  `pure_pursuit.control()`이 같은 입력에 같은 출력을 내는 안정된 고정점이라(EMA도
+  `0.7*x+0.3*x=x`로 안 움직임) 발산 위험이 없고, 굳이 조향까지 건드릴 이유가 없다는 판단.
+
+**알려진 한계:**
+- `LANE_STALE_SEC`는 처음 VESC/IMU와 값만 맞춰 0.5로 넣었으나, DL 추론 1회가 20Hz 주기(0.05s)
+  안에 못 끝나는 게 오히려 정상인 데다 TensorRT provider 최초 실행 시 엔진 빌드에 수십초~
+  수분이 걸릴 수 있다는 경고까지 있어(`TwinLiteNetEngine.__init__` 참고) 근거가 약했다 —
+  **[2026-08-11 후속] 2.0으로 상향.** 일반적인 세그멘테이션 프레임타임의 10배 이상 여유를
+  두어 정상 지연을 고장으로 오판할 위험을 줄이면서도, 실제 고장 시 2초 안에는 감지되게 한
+  절충점(여전히 실차 미검증). 실차에서 `FPS_LOG_PERIOD_SEC` 로그로 실제 추론 주기를 확인한
+  뒤 그 주기의 몇 배 정도로 더 정밀하게 재조정할 것 — 너무 크게 두면 진짜 고장 감지가
+  그만큼 늦어진다는 트레이드오프는 여전히 남아있다.
+- `SPEED_LANE_STALE=5.0`이 `SPEED_CORNER_MIN`과 같은 값이라, 연속 코너 구간에서 우연히
+  이 상태에 들어가면 로그를 안 보는 이상 코너 감속과 육안으로는 구분이 안 될 수 있다 —
+  값을 더 낮춰 구분을 뚜렷하게 할지는 실차에서 stale이 실제로 얼마나 자주 발동하는지
+  보고 판단할 것.
+- `img_front is None`(카메라 프레임이 아예 한 번도 안 온 경우)도 `lane_stale=True`로
+  잡지만, 카메라 토픽이 "받았다가 끊긴" 경우는 `self.img_front`가 마지막 프레임을 계속
+  들고 있어 `None`이 되지 않는다 — 이 경우는 `result_seq`가 안 늘어나는 것으로만 잡힌다
+  (DL 추론이 같은 정지 프레임을 계속 새로 돌더라도 입력이 똑같으면 출력도 똑같을 것이므로
+  실질적으로는 문제없이 잡히지만, 엄밀히 "카메라 나이"를 직접 보는 방식은 아니다).
+
 ---
 
 ## 3. 라바콘 (B1_LAVACON)
@@ -1426,29 +1475,47 @@ self.phase = Phase.FIXED_OBSTACLE   # __init__ 안의 self.phase 초기값을 �
 정상 흐름은 라바콘(B1) 완료 후 자동으로 `Phase.FIXED_OBSTACLE`로 넘어가는 것이라, 이 기능만 격리
 테스트하려면 `__init__`의 `self.phase = Phase.LAVACON`을 위처럼 임시로 바꾸면 됩니다.
 
-**동작 방식** (`TargetPassing`, [controller/obstacle_avoidance.py:49](controller/obstacle_avoidance.py#L49)):
+**진입 게이트 — `_da_avoidance_failed()` (2026-08-11 추가):** B2 트리거가 걸렸다고 바로
+`TargetPassing`이 켜지지 않고 먼저 `_da_avoidance_failed()`를 봅니다. `False`면(= da 기반 경로가
+알아서 피하고 있다고 믿을 수 있으면) 개입 없이 Mission의 lane-follow 출력을 그대로 둡니다.
+`True`(회피 실패)일 때만 아래 `TargetPassing`이 override합니다. 실패 조건은 OR로 두 개:
+1. **경로 끊김/불안정** — `self.lane_valid`/`self.lane_stale`(오늘도 실제로 동작하는 신호).
+2. **da가 장애물을 반영했다는 근거 없음** — da 세그멘테이션이 아직 차선표시만 학습돼 있고 장애물
+   인지가 전혀 없어서, 지금은 이 조건이 **항상 참**입니다(`track_drive.py` `_da_avoidance_failed()`의
+   `da_unaware_of_obstacle` 참고). 그래서 오늘 기준 실질 동작은 이 게이트를 넣기 전과 동일하게
+   "B2 트리거만 걸리면 매번 TargetPassing"입니다 — da가 장애물 인지형으로 바뀌는 날 그 한 줄만
+   실제 판단 로직으로 바꾸면 자동으로 전환되도록 미리 분리해둔 것입니다.
+
+**동작 방식** (`TargetPassing`, [controller/obstacle_avoidance.py:49](controller/obstacle_avoidance.py#L49)) —
+"실측 기반 하드코딩" 폴백입니다(위 게이트가 열렸을 때만 동작). Hybrid A*(검색 기반)를 여기 쓰지 않기로
+한 이유는 구조화된 2차선 환경에서 검색은 과한 방식이라는 결론(§5.1과 동일)과 같습니다:
 1. **IDLE** — 전방 장애물이 감지되면 `choose_side()`로 통과 방향을 정합니다: ①타겟이 없는 차선 쪽(규정
    1순위) ②정면이라 못 가리면 비어있는 쪽(`left_clear`/`right_clear`) ③둘 다 비었으면 노란선 건너편.
    양쪽 다 막히면 `status='blocked'`(흰 실선 밖으로 안 나가고 서행하며 재시도).
-2. **SHIFT** — 목표 횡오프셋(`PASS_OFFSET=100px`)까지 서서히 이동(`LATERAL_ALPHA_OUT`).
+2. **SHIFT** — 목표 횡오프셋(`PASS_OFFSET=80px`, 실측 `LANE_WIDTH_M` 기반)까지 서서히 이동(`LATERAL_ALPHA_OUT`).
 3. **ALONGSIDE** — 장애물이 안 보이는 상태가 `CLEAR_FRAMES_TO_RETURN`(6프레임) 유지되면 RETURN으로.
 4. **RETURN** — 원 차선으로 복귀(`LATERAL_ALPHA_BACK`, SHIFT보다 빠르게) — 목표 오프셋이 5px 미만이면 완료.
 
-`USE_HYBRID_ASTAR_FOR_B2 = True`([config.py:256](config.py#L256))로 바꾸면 위 방식 대신
-Hybrid A* + OccupancyGrid + Stanley(`planner/`, `_handle_fixed_obstacle_astar()`) 경로계획 대안을 씁니다
-— 비교/보존용이며 기본은 `False`.
+> **[2026-08-11] Hybrid A* 대안(`USE_HYBRID_ASTAR_FOR_B2`) 삭제됨.** 위 게이트로 이미 "da가
+> 알아서 처리 vs 하드코딩 폴백" 구조로 정리됐기 때문에, 검색 기반 경로계획을 B2에 따로
+> 남겨둘 이유가 없어졌습니다. 동적 장애물(B3)엔 Hybrid A*가 여전히 남아있습니다 — §5.1 참고.
 
 **디버그 방법:**
 - CLI 로그: `obs=검출여부(거리m,폭m,fixed/vehicle)`. `status='blocked'`가 되면 `[B2] 양쪽 통과 불가 —
   서행 후 재시도` 경고 로그가 뜹니다.
 
 **알려진 한계:**
-- `PASS_OFFSET=100px`(config.py)가 실측 차선 폭 대신 쓰는 자리표시값입니다(차선 폭 실측 후 교체 예정,
-  [controller/obstacle_avoidance.py:31](controller/obstacle_avoidance.py#L31) 주석 참고).
+- ~~`PASS_OFFSET=100px`가 실측 차선 폭 대신 쓰는 자리표시값~~ → **2026-08-11 해결**: `LANE_WIDTH_M=0.4m`
+  (§6.1 실측) × `DL_PIXELS_PER_METER=200px/m` = `80px`로 교체했습니다(config.py). 수렴 속도·차선 내
+  실제 여유폭까지 반영된 값은 아니라 실차에서 미세조정은 필요할 수 있습니다.
 - `LATERAL_ALPHA_OUT/BACK`, `MIN_GAP_M`, `CENTER_DEADZONE_M` 등 수렴 속도·안전거리 파라미터 다수가
   실차 미검증 튜닝값입니다.
 - 좌우 선택은 카메라/YOLO 이중확인 없이 라이다 `obstacle_y` + `lane_side`만으로 판단 — 콘·차량 구분이 없어
   고정장애물(콘/박스류)도 동일한 로직으로 회피 방향이 잡힙니다.
+- `_da_avoidance_failed()`의 `da_unaware_of_obstacle` 조건이 아직 하드코딩 `True`입니다 — da 세그멘테이션
+  모델이 장애물을 인지하도록 바뀌기 전까지는 게이트가 사실상 항상 열려 있는 상태(=매번 TargetPassing)라는
+  뜻입니다. 실차 동작엔 영향 없지만, da가 장애물 인지형이 됐는데 이 줄을 안 바꾸면 계속 옛 동작(TargetPassing
+  상시개입)으로 남아있다는 점을 잊지 말 것.
 
 ---
 
@@ -1480,6 +1547,58 @@ SHIFT 단계에서 타겟이 내가 지나가려는 쪽으로 넘어오는 상�
   라바콘 구간을 먼저 통과한 뒤라 위험이 적지만, 격리 테스트 시에는 주의).
 - `SWITCH_FRAMES`로 조절하는 방향 재전환 로직도 실차 미검증.
 
+### 5.1 Hybrid A* 대안 — 동적 장애물용 (`USE_HYBRID_ASTAR_FOR_B3`, 2026-08-11)
+
+B2에도 원래 같은 자리에 Hybrid A* 대안(`_handle_fixed_obstacle_astar()`, `USE_HYBRID_ASTAR_FOR_B2`)이
+있었지만 2026-08-11에 삭제했습니다(§4 참고 — `_da_avoidance_failed()` 게이트 + `TargetPassing`
+하드코딩 폴백으로 대체). B3는 그 방식을 그대로 재사용할 수 없어서 애초에 다르게 설계했습니다 — B2
+방식은 "replan 시점에 그리드/goal을 딱 한 번 만들고 최대 20제어주기(1초) 또는 goal 도달까지 재사용"하는
+구조인데, 방해차량은 그 1초 사이에 차선을 넘어올 수 있어 그대로 쓰면 위험합니다. 그래서 B3 전용으로
+"그리드/충돌검사는 매틱, 전체 재탐색(A* 실행)은 트리거 기반"으로 설계했습니다
+(`track_drive.py` `_handle_overtake_astar()`).
+
+**재탐색 트리거 (하나라도 걸리면 발동, `_handle_overtake_astar()`):**
+1. **경로 무효화** — 남은 waypoint를 매틱 최신 그리드로 재검사(`_path_blocked()`, `collision()` 5점
+   투영이라 그리드 생성보다도 쌈)해서 걸리면 주기 무시하고 즉시.
+2. **타겟 진입** — `TargetPassing._target_cuts_in()`과 동일 조건(통과중인 방향으로 타겟이
+   `SWITCH_FRAMES` 연속 넘어옴)이면 즉시.
+3. **주기적** — `ASTAR_B3_REPLAN_TICKS`(기본 4틱=0.2s)마다 최소 한 번.
+
+goal의 좌우 방향은 `make_goal()`을 새로 손대지 않고, 이미 검증 방향성이 있는
+`TargetPassing.choose_side()`를 그대로 호출해서 받습니다(`planner/hybrid_astar.py`
+`make_goal_by_side()`) — 방향 우선순위(①타겟 없는 차선 ②비어있는 쪽 ③노란선 건너편) 로직을
+두 곳에 중복 구현하지 않기 위함입니다.
+
+**탐색 실패 시 — TargetPassing 폴백:** ①②(무효화/진입)로 강제 재탐색했는데도 빈 경로가 나오면
+그 프레임은 감속만 하고 재시도하다가, `ASTAR_B3_FAIL_GRACE_TICKS`(기본 3틱)를 넘기면 이미 검증된
+`TargetPassing.update()`로 그 통과가 끝날 때까지 위임합니다(`_b3_using_fallback` 래치 — 매틱
+astar/TargetPassing을 오가면 진행 중이던 SHIFT/ALONGSIDE 기동이 중간에 끊기기 때문에, 한 번
+폴백하면 `_run_passing()`의 `done` 처리에서 통과가 완료될 때까지 풀어주지 않습니다). ③(주기적)만으로
+트리거된 재탐색이 실패한 경우는 기존 경로가 아직 안전하다는 뜻(무효화 검사를 이미 통과)이라 그대로
+유지합니다.
+
+**로컬 pose:** yaw는 B2와 동일하게 IMU 실측(`self.imu_yaw`) 기준입니다. x/y 적분 속도는 B2가 쓰는
+명령속도(`self.ctrl_speed`, 미측정) 대신 VESC 실측(`self.v_mps`, `_vesc_live()`로 생존 가드)이
+살아있으면 그걸 우선 씁니다 — B3는 재탐색이 잦아 적분 구간이 B2보다 짧아 드리프트 영향 자체는
+작지만, 이미 있는 실측 인프라를 안 쓸 이유가 없습니다.
+
+**차량 풋프린트:** `planner/hybrid_astar.py`의 충돌검사(`collision()`)가 그동안 `vehicle_width=0.45`/
+`vehicle_length=0.70`을 하드코딩하고 있었는데, xycar 실측값(`VEHICLE_WIDTH_M=0.31`,
+`VEHICLE_LENGTH_M=0.64`, §6.1)과 달랐습니다. 이번에 실측값 + `ASTAR_VEHICLE_MARGIN_M`(설계값,
+0.05m 편도 여유)로 교체했고, B2/B3 둘 다 이 값을 공유합니다.
+
+**디버그 방법:**
+- `DEBUG_PLANNER=True`(config.py) → `Occupancy_B3` 창(B2의 `Occupancy` 창과 별도 이름 — 두 Phase가
+  같은 세션에서 순차로 격리 테스트될 때 헷갈리지 않게 하려고 분리).
+
+**알려진 한계:**
+- 시간축을 갖는 진짜 동적 충돌검사가 아닙니다 — 매틱 최신 스냅샷을 트리거 기반으로 재탐색하는
+  반응형 근사(receding horizon)입니다. 장애물의 미래 위치를 예측하지 않습니다.
+- `ASTAR_B3_REPLAN_TICKS`/`ASTAR_B3_FAIL_GRACE_TICKS`/`ASTAR_VEHICLE_MARGIN_M` 모두 실차 미검증
+  설계값입니다.
+- 기본값은 `False`(B2와 동일하게 비교/보존용) — B2조차 아직 기본 비활성인 상태라, 이쪽을 실차에서
+  켜기 전에 B2부터 검증하는 게 순서상 맞습니다.
+
 ---
 
 ## 6. 실측값 기록 (캘리브레이션)
@@ -1494,6 +1613,7 @@ SHIFT 단계에서 타겟이 내가 지나가려는 쪽으로 넘어오는 상�
 |---|---|---|
 | `LANE_WIDTH_M` (config.py) | 0.4m | 흰선~흰선(도로 전체폭) 80cm 실측, 노란 중앙선이 정중앙임을 확인 → 차선 1개 폭 = 80/2 = 40cm |
 | `VEHICLE_WIDTH_M` (config.py) | 0.31m | xycar 본체 실측: 세로64cm × 가로31cm × 높이20cm |
+| `VEHICLE_LENGTH_M` (config.py) | 0.64m | 위와 동일 실측(세로=전후 길이). 2026-08-11까지 config 상수로는 안 쓰이고 있었음 — `planner/hybrid_astar.py`의 충돌검사 풋프린트(`vehicle_width`/`vehicle_length`)가 실측 대신 0.45/0.70 하드코딩 추정치를 쓰고 있던 걸 이번에 이 값 + `ASTAR_VEHICLE_MARGIN_M`(설계값, 0.05m)으로 교체 |
 | 고정장애물(고장난 차량) 실측 크기 | 가로20cm×세로41cm×높이16cm | 방해차량과의 라이다 폭 분류 기준(`OBSTACLE_VEHICLE_WIDTH_M=0.24`, config.py) 산출 근거 |
 | 방해차량 실측 크기 | 가로28cm×세로54cm×높이19cm | 위와 동일. `OBSTACLE_VEHICLE_WIDTH_M = (0.20+0.28)/2 = 0.24` |
 
@@ -1745,8 +1865,8 @@ IMU 하드웨어를 고치고 `xycar_imu` 패키지를 빌드해도 이 줄을 �
 ### 8.3 `track_drive.py`가 IMU를 쓰는 곳
 
 `cb_imu()`가 `/imu`(`sensor_msgs/Imu`) 메시지에서 두 값을 뽑습니다:
-- `self.imu_yaw` (orientation 쿼터니언 → yaw, 원래부터 있던 값) — 바퀴 카운트(아래 8.4)와 S3 지름길
-  `_handle_fixed_obstacle_astar()`의 Stanley 헤딩(`_yaw_delta()`)이 씁니다.
+- `self.imu_yaw` (orientation 쿼터니언 → yaw, 원래부터 있던 값) — 바퀴 카운트(아래 8.4)와 S3 지름길,
+  B3(방해차량) Hybrid A* 대안 `_handle_overtake_astar()`의 Stanley 헤딩(`_yaw_delta()`)이 씁니다.
 - `self.imu_yaw_rate` (`angular_velocity.z`, 이번에 추가) + `self._imu_t`(수신 시각) — §0.5.5
   `pure_pursuit` 코너 감쇠 보강 전용. `IMU_STALE_SEC=0.5`(config.py) 이상 안 들어오면 죽었다고 봅니다.
 

@@ -28,7 +28,8 @@ from enum import Enum
 
 # 튜닝값은 전부 config.py에 있다 — 실차 테스트 중 값을 바꿔야 하면 이 파일이
 # 아니라 config.py를 고칠 것.
-#   PASS_OFFSET: 반대 차선으로 이동할 목표 횡편차(px). ★B-1(차선 폭 실측) 후 실제 차선 폭으로 대체
+#   PASS_OFFSET: 반대 차선으로 이동할 목표 횡편차(px). [2026-08-11] LANE_WIDTH_M(실측)
+#     기반 80px로 교체 완료 — 더 이상 placeholder 아님(README §4 "알려진 한계" 참고)
 #   CENTER_DEADZONE_M: 타겟 횡중심이 이 값(m) 이내면 '정면'으로 보고 방향을 다른 근거로 정한다
 #   CLEAR_FRAMES_TO_RETURN/SWITCH_FRAMES: 진입/이탈 히스테리시스 (Apollo lane_borrow 패턴)
 #   LATERAL_ALPHA_OUT/BACK/DONE_PX: 횡이동 수렴 (★3단계에서 5차 다항식·거리 매개변수로 교체 예정)

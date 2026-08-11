@@ -100,6 +100,13 @@ class TrackDriverNode(Node):
         self.lane_lookahead = 0.0   # 원거리(앞쪽) 편차 → 코너 진입 전 예측감속용
         self.lane_path = []         # 명시적 경로(ROI 픽셀좌표 웨이포인트, 가까운점→먼점)
                                      #   perc_lane()이 갱신, _lane_steer()가 조향각 계산에 사용
+        # [2026-08-11] DL 추론 워커의 result_seq(perception/dl_lane.py) 기반 "새 결과 없음"
+        # 판정 — perc_lane() 참고. _lane_seq_seen=None은 "아직 한 번도 안 비교함"(백엔드가
+        # result_seq를 안 가진 hough/classic_cv에서는 계속 None으로 남아 아래 로직 자체가
+        # 스킵된다 — 그 백엔드들은 매 틱 동기 계산이라 애초에 이 문제가 없음).
+        self._lane_seq_seen = None
+        self._lane_fresh_t = time.time()  # 마지막으로 result_seq가 바뀐 걸 확인한 시각
+        self.lane_stale = False     # LANE_STALE_SEC 이상 새 추론 결과가 안 나온 상태 — _lane_drive()가 SPEED_LANE_STALE로 강제 감속
         self._lane_prev_width = 448.0  # 도로폭 직전값(px, EMA)
         self.lane_side   = LANE_SIDE   # 현재 주행 차선: +1=우측차선(노란선이 왼쪽) / -1=좌측차선
                                         #   노란 중앙선 위치로 매 프레임 갱신(_update_lane_side)
@@ -265,8 +272,16 @@ class TrackDriverNode(Node):
 
         self.path = None
         self.grid = None
-        self.replan_count = 0
         self.goal = None
+
+        # ── B3(방해차량) hybrid A* 대안 전용 상태 (USE_HYBRID_ASTAR_FOR_B3=True일 때만 의미있음) ──
+        #   self.path/self.goal은 B2와 공유(두 Phase가 동시에 활성화되지 않으므로 안전).
+        #   아래는 B3만의 재계획 트리거/폴백 상태라 별도로 둔다 — _handle_overtake_astar() 참고.
+        self._b3_tick = 0          # 마지막 전체 재탐색 후 경과 틱 (ASTAR_B3_REPLAN_TICKS 주기용)
+        self._b3_switch_cnt = 0    # 타겟이 통과방향쪽으로 넘어온 연속 프레임 (SWITCH_FRAMES 트리거용)
+        self._b3_fail_cnt = 0      # 연속 탐색실패 프레임 (ASTAR_B3_FAIL_GRACE_TICKS 초과시 폴백)
+        self._b3_side = 0          # 현재 채택된 통과방향(-1/0/+1), TargetPassing.side와 동일 부호규약
+        self._b3_using_fallback = False  # True면 이번 통과가 끝날 때까지 TargetPassing으로 고정 위임
 
 
         # pose 변수 - 추후 수정(정식 오도메트리 연동 전까지는 _handle_fixed_obstacle에서
@@ -422,6 +437,7 @@ class TrackDriverNode(Node):
     def perc_lane(self):
         if self.img_front is None:
             self.lane_valid = False
+            self.lane_stale = True   # 카메라 프레임 자체가 아직/더 이상 없음 — 당연히 신선하지 않음
             return
 
         # hough_lane.py의 HoughLaneDetector를 사용하여 차선 인식 수행
@@ -439,6 +455,21 @@ class TrackDriverNode(Node):
             lookahead_xy = self.pure_pursuit.last_target_xy
             lookahead_px = self.pure_pursuit.last_lookahead_px
         getattr(self.lane_detector, 'show_debug_windows', lambda *a, **k: None)(lookahead_xy, lookahead_px)
+
+        # [2026-08-11] "재사용된 최신값"과 "완전히 안 갱신됨"을 구분 — DLLaneDetector가
+        # 추론 1회 끝날 때마다 올리는 result_seq(dl_lane.py 참고)가 직전 틱에서 본 값과
+        # 같으면 이번 틱도 같은 결과를 다시 받았다는 뜻이다. 그게 LANE_STALE_SEC 넘게
+        # 계속되면(=추론 워커가 죽었거나 카메라가 끊겼거나) lane_stale=True로 표시한다.
+        # hough/classic_cv처럼 result_seq가 없는(=매 틱 동기 계산이라 항상 새 값인) 백엔드는
+        # getattr가 None을 반환해 이 판정 자체를 건너뛰고 항상 fresh로 취급한다.
+        seq = getattr(self.lane_detector, 'result_seq', None)
+        if seq is not None:
+            if seq != self._lane_seq_seen:
+                self._lane_seq_seen = seq
+                self._lane_fresh_t = time.time()
+            self.lane_stale = (time.time() - self._lane_fresh_t) >= LANE_STALE_SEC
+        else:
+            self.lane_stale = False
 
         self.lane_center = lane_center
         self.lane_valid = valid
@@ -926,8 +957,6 @@ class TrackDriverNode(Node):
     @property
     def _obstacle_active(self):
         """B2(고정장애물): 회피 기동이 진행 중인가."""
-        if USE_HYBRID_ASTAR_FOR_B2:
-            return self.path is not None
         return self.obstacle_controller.phase != AvoidPhase.IDLE
 
     @property
@@ -1359,6 +1388,16 @@ class TrackDriverNode(Node):
         if (LANE_DETECTOR_BACKEND == 'dl' and DL_CENTER_MODE == 'll'
                 and getattr(slide, 'll_degraded', False)):
             target_speed = min(target_speed, SPEED_LL_DEGRADED)
+        # [2026-08-11] LANE_STALE_SEC 이상 새 차선인식 결과가 안 나온 상태(perc_lane()의
+        # lane_stale, config.py LANE_STALE_SEC 주석 참고) — 조향 자체는 이미 self.lane_path가
+        # 고정돼 있어 안전하게(발산 없이) 마지막 판단을 유지하지만, 그것만으론 "지금 인지가
+        # 죽어있다"는 걸 아무도 모른다. 코너가 아닌데도 이 속도로 깎이면 그 부자연스러움
+        # 자체가 사람이 알아챌 수 있는 신호가 되도록 일부러 감속으로 표시한다(요청 반영).
+        # 정상적인 프레임 재사용(추론이 20Hz보다 느려 몇 틱 같은 값을 재사용하는 것,
+        # dl_lane.py 모듈 상단 주석의 의도된 동작)은 result_seq가 계속 바뀌므로 여기 안 걸림 —
+        # 진짜로 갱신이 멈춘 경우에만 발동한다.
+        if self.lane_stale:
+            target_speed = min(target_speed, SPEED_LANE_STALE)
         speed_ratio = min(1.0, self._prev_speed / SPEED_NORMAL)
         corner_decay = CORNER_HOLD_DECAY_LO + (CORNER_HOLD_DECAY_HI - CORNER_HOLD_DECAY_LO) * speed_ratio
         self._corner_hold = max(turn_now, self._corner_hold * corner_decay)
@@ -1678,103 +1717,36 @@ class TrackDriverNode(Node):
     #   차선 2개 + 넘어도 되는 노란 중앙선 구조라, 방향은 '반대편 차선' 하나로 정해진다.
     #   좌우 선택 로직은 ObstacleAvoidance.decide_lane() 이 lane_side 로 처리한다.
     def _handle_fixed_obstacle(self):
-        if USE_HYBRID_ASTAR_FOR_B2:
-            self._handle_fixed_obstacle_astar()
+        if not self._da_avoidance_failed():
+            # da 기반 경로(Mission의 lane-follow 출력)가 알아서 피하고 있다고 신뢰 —
+            # TargetPassing으로 덮어쓰지 않고 이번 틱은 그냥 둔다.
             return
 
         self._run_passing(self.obstacle_controller, 'B2',
                           done_next_phase=Phase.VEHICLE)
 
-    # ── B2 대안: Hybrid A* 경로계획 방식 (USE_HYBRID_ASTAR_FOR_B2=True 일 때만) ──
-    #   구조화된 2차선 환경에는 과한 방식이라 기본은 비활성. 비교/보존용으로 남겨둔다.
-    #   ※ 이 경로는 아직 명령속도(모터단위)를 m/s 로 적분하는 단위 불일치가 남아있다
-    #     — B-2(METERS_PER_SPEED_UNIT) 실측 후에 정리할 것.
-    def _handle_fixed_obstacle_astar(self):
+    # [2026-08-11] da 기반 회피가 이 정지 장애물을 알아서 피하고 있다고 믿을 수 있는지
+    #   판단한다. False면 TargetPassing 개입 없이 da 경로 그대로, True면 위
+    #   _handle_fixed_obstacle()이 TargetPassing(실측 기반 하드코딩 SHIFT/ALONGSIDE/
+    #   RETURN)으로 override한다. Hybrid A*(검색 기반) 대신 이 하드코딩 방식을 폴백으로
+    #   쓰기로 함 — 구조화된 2차선 환경에서 검색은 과한 방식이라는 기존 결론(§4)과 같은
+    #   이유.
+    #
+    #   실패로 보는 조건 두 가지(OR):
+    #     ① 경로 끊김/불안정 — self.lane_valid/self.lane_stale. 이건 지금도 실제로
+    #        동작하는 신호다(perc_lane(), §2.24 LANE_STALE_SEC).
+    #     ② da가 장애물을 반영해서 회피했다는 근거가 없음 — da 세그멘테이션
+    #        (perception/dl_lane.py)은 아직 차선표시만 학습돼 있고 장애물 인지가
+    #        전혀 없다(2026-08-11 기준). 그래서 지금은 이 조건이 항상 참이고, 결과적으로
+    #        B2 트리거만 걸리면 매번 TargetPassing이 켜진다 — 오늘 기준 동작은 이 함수를
+    #        넣기 전과 동일하다. da가 장애물 인지형으로 바뀌는 날 이 한 줄(da_unaware_
+    #        of_obstacle)만 실제 판단 로직으로 교체하면 되고, TargetPassing 쪽은 손댈
+    #        필요가 없다 — 그게 이 함수를 분리해둔 이유다.
+    def _da_avoidance_failed(self):
+        path_broken = (not self.lane_valid) or self.lane_stale
+        da_unaware_of_obstacle = True  # ★da가 장애물 인지형이 되면 실제 조건으로 교체
 
-        if self.path is None:
-            # Local Occupancy 생성
-            self.grid = self.occupancy.build(
-                self.lidar_ranges
-            )
-            # Local Frame 시작점 — 이번 replan 시점을 로컬 pose 원점으로 리셋
-            start = PlannerNode(0.0,0.0,0.0)
-            self.vehicle_x = 0.0
-            self.vehicle_y = 0.0
-            self.vehicle_yaw = 0.0
-            self._plan_ref_yaw = self.imu_yaw
-            self._plan_last_t = time.time()
-            # Goal 생성
-            if self.goal is None:
-                self.goal = self.planner.make_goal(
-                    self.obstacle_dist,
-                    self.left_clear,
-                    self.right_clear
-                )
-            # Hybrid A*
-            self.path = self.planner.plan(start,self.goal,self.grid)
-
-        if not self.path:
-            self.path = None
-            self.goal = None
-            self.ctrl_speed = 0
-            return
-
-        # 로컬 pose 갱신 — yaw는 IMU 실측값 기준(_yaw_delta), x/y는 명령속도(ctrl_speed,
-        # 미보정 단위) 적분 근사치. 정식 오도메트리가 생기기 전까지의 임시 추정값이다.
-        now = time.time()
-        dt = now - self._plan_last_t
-        self._plan_last_t = now
-
-        self.vehicle_yaw = self._yaw_delta(self._plan_ref_yaw)
-        self.vehicle_speed = self.ctrl_speed
-        self.vehicle_x += self.vehicle_speed * math.cos(self.vehicle_yaw) * dt
-        self.vehicle_y += self.vehicle_speed * math.sin(self.vehicle_yaw) * dt
-
-        # Stanley
-        steer, speed = self.stanley.control(
-            self.vehicle_x,
-            self.vehicle_y,
-            self.vehicle_yaw,
-            self.vehicle_speed,
-            self.path
-        )
-
-        self.ctrl_angle = math.degrees(steer)
-        self.ctrl_speed = speed
-
-        self.replan_count += 1
-        if self.replan_count >= 20:
-            self.path = None
-            self.goal = None
-            self.replan_count = 0
-            return
-
-        if self.stanley.goal_reached(self.vehicle_x, self.vehicle_y, self.path):
-            self.path = None
-            self.goal = None
-            self.replan_count = 0
-
-            self.stanley.reset()
-
-            self.phase = Phase.VEHICLE
-            self.behavior_state = BehaviorState.B0_NORMAL
-
-            self._pid_prev_error = 0.0
-            self._pid_integral = 0.0
-
-        
-
-        if DEBUG_PLANNER:
-            cv2.imshow(
-                "Occupancy",
-                cv2.resize(self.grid,None,
-                           fx=4,
-                           fy=4)
-                )
-
-            cv2.waitKey(1)
-
-    
+        return path_broken or da_unaware_of_obstacle
 
     # ── B3-방해차량 추월 ──★재설계 예정(임시 placeholder) ──
     # target_lane 반영 수정
@@ -1782,9 +1754,161 @@ class TrackDriverNode(Node):
     def _handle_overtake(self):
         """방해차량 추월. 규정상 '방해차량이 주행하지 않는 차선'으로 지나가야 하고,
         그 차량이 1·2차선을 오가므로 매 프레임 타겟 횡위치를 다시 보고 필요하면
-        진행 방향을 바꾼다(moving=True 로 생성된 컨트롤러가 이걸 처리)."""
+        진행 방향을 바꾼다(moving=True 로 생성된 컨트롤러가 이걸 처리).
+
+        USE_HYBRID_ASTAR_FOR_B3=True면 _handle_overtake_astar()를 대신 쓰되, 그쪽이
+        탐색실패로 TargetPassing에 폴백한 뒤(_b3_using_fallback)엔 이번 통과가 끝날
+        때까지 계속 TargetPassing에 맡긴다 — 매틱 astar/TargetPassing을 오가면 진행
+        중이던 SHIFT/ALONGSIDE 기동이 중간에 끊기기 때문(_run_passing()의 done 처리에서
+        다음 통과를 위해 다시 풀어준다)."""
+        if USE_HYBRID_ASTAR_FOR_B3 and not self._b3_using_fallback:
+            self._handle_overtake_astar()
+            return
+
         self._run_passing(self.vehicle_controller, 'B3',
                           done_next_phase=Phase.DONE)
+
+    # ── B3 대안: Hybrid A* 경로계획 방식 (USE_HYBRID_ASTAR_FOR_B3=True 일 때만) ──
+    #   [2026-08-11] B2 쪽 Hybrid A* 대안(_handle_fixed_obstacle_astar)은 삭제됐다 —
+    #   그 방식("1회 계획 후 최대 1초 재사용")은 애초에 정지 장애물 전제라 여기(타겟이
+    #   움직이는 B3)엔 그대로 못 쓴다. 그래서 "그리드/충돌검사는 매틱, 전체 재탐색은
+    #   트리거 기반"으로 별도 설계했다.
+    #   재탐색 트리거 3가지(하나라도 걸리면 발동):
+    #     ① 경로 무효화 — 남은 waypoint가 최신 그리드와 충돌 (즉시, 주기 무시)
+    #     ② 타겟 진입 — 통과중인 방향으로 타겟이 SWITCH_FRAMES 연속 넘어옴 (즉시)
+    #     ③ 주기적 — ASTAR_B3_REPLAN_TICKS 틱마다 최소 한 번
+    #   ①②로 강제된 재탐색이 실패하면(빈 경로) 그 프레임은 이전 경로를 버리고 감속하며
+    #   유예(ASTAR_B3_FAIL_GRACE_TICKS)를 준다 — 넘기면 TargetPassing으로 폴백한다.
+    #   ③(주기적)만으로 트리거됐는데 새 탐색이 실패한 경우는 기존 경로가 아직 안전하다는
+    #   뜻이므로(무효화 검사를 통과했으니) 그냥 기존 경로를 계속 따라간다.
+    def _handle_overtake_astar(self):
+        self.grid = self.occupancy.build(self.lidar_ranges)
+
+        replan = self.path is None
+        force = False  # True면 기존 경로를 더 못 믿는다는 뜻 — 재탐색 실패시 바로 폴백 카운트
+
+        if not replan:
+            if self._path_blocked(self.path, self.grid):
+                replan = True
+                force = True
+
+            if self._b3_side < 0:
+                cuts_in = self.obstacle_y > CENTER_DEADZONE_M
+            elif self._b3_side > 0:
+                cuts_in = self.obstacle_y < -CENTER_DEADZONE_M
+            else:
+                cuts_in = False
+
+            if cuts_in:
+                self._b3_switch_cnt += 1
+                if self._b3_switch_cnt >= SWITCH_FRAMES:
+                    replan = True
+                    force = True
+                    self._b3_switch_cnt = 0
+            else:
+                self._b3_switch_cnt = 0
+
+            self._b3_tick += 1
+            if self._b3_tick >= ASTAR_B3_REPLAN_TICKS:
+                replan = True
+                self._b3_tick = 0
+
+        if replan:
+            side = self.vehicle_controller.choose_side(
+                self.obstacle_y, self.left_clear, self.right_clear, self.lane_side)
+
+            if side == 0:
+                # 양쪽 다 막혔다 — TargetPassing의 'blocked' 서행재시도 동작을 그대로 재사용.
+                self._b3_astar_reset()
+                self._b3_using_fallback = True
+                self._run_passing(self.vehicle_controller, 'B3', done_next_phase=Phase.DONE)
+                return
+
+            goal = self.planner.make_goal_by_side(self.obstacle_dist, side)
+            start = PlannerNode(0.0, 0.0, 0.0)
+            new_path = self.planner.plan(start, goal, self.grid)
+
+            if new_path:
+                self.path = new_path
+                self.goal = goal
+                self._b3_side = side
+                self._b3_fail_cnt = 0
+                self._b3_tick = 0
+                # 로컬 pose 원점 리셋 (재계획 시점을 (0,0,0)으로 잡는 패턴) — target_idx도 같이 리셋해야
+                # 한다. 안 하면 새 경로(짧을 수 있음)에 옛 인덱스가 그대로 남아
+                # nearest_index()가 범위를 벗어나 다음 control()에서 인덱스 에러가 난다.
+                self.vehicle_x = 0.0
+                self.vehicle_y = 0.0
+                self.vehicle_yaw = 0.0
+                self._plan_ref_yaw = self.imu_yaw
+                self._plan_last_t = time.time()
+                self.stanley.reset()
+            elif force or self.path is None:
+                # 기존 경로를 더 못 믿는데(무효화/진입) 새 탐색도 실패했거나, 애초에
+                # 경로가 아예 없었다 — 유예 프레임 소진 전까지는 감속만 하고 재시도.
+                self._b3_fail_cnt += 1
+                if self._b3_fail_cnt >= ASTAR_B3_FAIL_GRACE_TICKS:
+                    self._b3_astar_reset()
+                    self._b3_using_fallback = True
+                    self._run_passing(self.vehicle_controller, 'B3', done_next_phase=Phase.DONE)
+                    return
+                self.path = None
+                self.ctrl_speed = max(SPEED_NORMAL * 0.15, 0.5)
+                return
+            # else: 주기적 트리거만으로 재탐색했는데 실패 — 기존 경로가 여전히 안전하다는
+            #   뜻이므로(위에서 무효화 검사를 이미 통과) self.path를 그대로 유지하고 계속 추종.
+
+        now = time.time()
+        dt = now - self._plan_last_t
+        self._plan_last_t = now
+
+        # yaw는 IMU 실측 기준(B2와 동일). 속도는 B2와 달리 VESC 실측(self.v_mps)이 살아있으면
+        # 그걸 우선 쓴다 — B3는 재탐색이 잦아 적분 구간(dt 누적)이 훨씬 짧아지므로 드리프트
+        # 영향은 작지만, 이미 있는 실측 인프라(_vesc_live())를 쓰지 않을 이유가 없다.
+        self.vehicle_yaw = self._yaw_delta(self._plan_ref_yaw)
+        self.vehicle_speed = self.v_mps if self._vesc_live() else self.ctrl_speed
+        self.vehicle_x += self.vehicle_speed * math.cos(self.vehicle_yaw) * dt
+        self.vehicle_y += self.vehicle_speed * math.sin(self.vehicle_yaw) * dt
+
+        steer, speed = self.stanley.control(
+            self.vehicle_x, self.vehicle_y, self.vehicle_yaw, self.vehicle_speed, self.path
+        )
+
+        self.ctrl_angle = math.degrees(steer)
+        self.ctrl_speed = speed
+
+        if self.stanley.goal_reached(self.vehicle_x, self.vehicle_y, self.path):
+            self._b3_astar_reset()
+            self.stanley.reset()
+
+            self.phase = Phase.DONE
+            self.behavior_state = BehaviorState.B0_NORMAL
+
+            self._pid_prev_error = 0.0
+            self._pid_integral = 0.0
+
+        if DEBUG_PLANNER:
+            cv2.imshow(
+                "Occupancy_B3",
+                cv2.resize(self.grid, None, fx=4, fy=4)
+            )
+            cv2.waitKey(1)
+
+    def _path_blocked(self, path, grid):
+        """남은 경로 waypoint가 최신 그리드와 충돌하는지 저렴하게 재검사.
+        collision()은 5점 투영뿐이라 그리드 생성보다도 훨씬 싸다 — 매틱 돌려도 된다."""
+        for x, y, yaw in path[self.stanley.target_idx:]:
+            if self.planner.collision(PlannerNode(x, y, yaw), grid):
+                return True
+        return False
+
+    def _b3_astar_reset(self):
+        self.path = None
+        self.goal = None
+        self._b3_tick = 0
+        self._b3_switch_cnt = 0
+        self._b3_fail_cnt = 0
+        self._b3_side = 0
 
     # ── B2/B3 공통 실행부 ──
     def _run_passing(self, controller, tag, done_next_phase):
@@ -1817,6 +1941,10 @@ class TrackDriverNode(Node):
             self.phase = done_next_phase
             self._pid_prev_error = 0.0
             self._pid_integral = 0.0
+            if tag == 'B3':
+                # astar가 실패해서 여기로 폴백해 있던 상태였다면, 이번 통과가 끝났으니
+                # 다음 방해차량 조우 때는 다시 astar부터 시도할 수 있게 풀어준다.
+                self._b3_using_fallback = False
             self.get_logger().info(f'[{tag}] 통과 완료 → {done_next_phase.name}')
 
 
@@ -1874,7 +2002,9 @@ class TrackDriverNode(Node):
                  sig = 신호등 상태. 앞 R/L/S(0/1)는 이번 프레임 순간값, confirmS/L는 디바운스
                        통과 후 FSM이 실제로 보는 확정값(카운터/기준 SIG_CONFIRM_FRAMES 같이 표시)
                  lidar = 유효포인트수(min거리m, 나이s)
-          [LANE] 차선편차px(검출여부) / obs = 라이다 전방장애물(거리m,좌우,타입)
+          [LANE] 차선편차px(검출여부) stale=LANE_STALE_SEC 이상 새 추론결과 없음(1) 여부
+                 (SPEED_LANE_STALE로 강제감속 중이라는 뜻 — 코너 아닌데 감속되면 이거 확인)
+                 / obs = 라이다 전방장애물(거리m,좌우,타입)
           lava   = 라바콘 보로노이 편차(구간종료 판정)
           trigL  = 라바콘 진입: 본선카운트/기준 (좌클러스터,우클러스터 검출여부)
           trigV  = 차량 진입:   본선카운트/기준
@@ -1931,7 +2061,7 @@ class TrackDriverNode(Node):
             f'누적={math.degrees(self._yaw_accum):+.0f}도/{math.degrees(LAP_YAW_FULL):.0f} '
             f'경과={time.time() - self._lap_t0:.0f}s\n'
             f'  [SENS] cam={cam_age:.1f}s sig={sig_flags} lidar={lidar_desc}\n'
-            f'  [LANE] lane={self.lane_offset:+.1f}({int(self.lane_valid)}) '
+            f'  [LANE] lane={self.lane_offset:+.1f}({int(self.lane_valid)}) stale={int(self.lane_stale)} '
             f'side={"R" if self.lane_side >= 0 else "L"}차선 '
             f'obs={self.obstacle_front}({self.obstacle_dist:.1f}m,w={self.obstacle_width:.2f}m,{self.obstacle_type}) '
             f'lava={self.lavacon_offset:+.2f}(done={int(self.lavacon_done)})\n'

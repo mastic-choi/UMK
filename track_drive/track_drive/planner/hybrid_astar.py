@@ -2,6 +2,10 @@ import math, heapq, time
 import numpy as np
 
 from .node import Node
+# [2026-08-11] 차량 풋프린트를 실측값으로 — 예전엔 vehicle_width=0.45/vehicle_length=0.70을
+#   하드코딩했는데 xycar 실측(VEHICLE_WIDTH_M=0.31, VEHICLE_LENGTH_M=0.64, config.py §6.1)과
+#   다른 추정치였다. ASTAR_VEHICLE_MARGIN_M은 실측 풋프린트에 더하는 편도 여유(설계값).
+from ..config import VEHICLE_WIDTH_M, VEHICLE_LENGTH_M, ASTAR_VEHICLE_MARGIN_M
 
 class HybridAStar:
 
@@ -27,8 +31,8 @@ class HybridAStar:
         self.reverse_weight = 3.0
         self.steer_weight = 0.02
 
-        self.vehicle_width = 0.45
-        self.vehicle_length = 0.70
+        self.vehicle_width = VEHICLE_WIDTH_M + 2 * ASTAR_VEHICLE_MARGIN_M
+        self.vehicle_length = VEHICLE_LENGTH_M + 2 * ASTAR_VEHICLE_MARGIN_M
 
     def make_goal(self, obstacle_dist, left_clear, right_clear):
 
@@ -44,7 +48,27 @@ class HybridAStar:
             lateral = 0.0
 
         return Node(forward, lateral,0.0)
-    
+
+    # B3(방해차량, 동적) 전용 — TargetPassing.choose_side()가 이미 정한 통과방향(side)을
+    # 그대로 받는다. make_goal()처럼 left_clear/right_clear만으로 방향을 다시 정하지 않는
+    # 이유: choose_side()는 타겟 횡위치 우선순위(규정상 "타겟 없는 차선")까지 반영하는데
+    # 그 판단을 여기서 중복 구현하면 두 로직이 따로 놀 위험이 있다.
+    #   side 부호는 TargetPassing과 동일: -1=왼쪽 통과(lateral +), +1=오른쪽 통과(lateral -).
+    def make_goal_by_side(self, obstacle_dist, side):
+
+        forward = min(
+            obstacle_dist + 2.5, 6.0
+        )
+
+        if side < 0:
+            lateral = 1.5
+        elif side > 0:
+            lateral = -1.5
+        else:
+            lateral = 0.0
+
+        return Node(forward, lateral, 0.0)
+
     # Heuristic
     def heuristic(self, node, goal):
         return math.hypot(

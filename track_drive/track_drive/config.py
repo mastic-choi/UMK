@@ -95,6 +95,13 @@ SPEED_CORNER_MIN = 5.0
 #   다른 별도 상수 — 코너 감속과 ll 저신뢰 감속은 서로 다른 이유라 독립적으로 튜닝할
 #   수 있어야 한다. 실차 미검증 초기값.
 SPEED_LL_DEGRADED = 5.0
+# [2026-08-11] DL 추론 워커(별도 스레드, dl_lane.py)가 LANE_STALE_SEC 이상 새 결과를 못
+#   내놓았을 때(카메라/추론 죽음 등, perc_lane()의 lane_stale 판정) 강제하는 속도 상한 —
+#   SPEED_LL_DEGRADED와 동일한 값이지만 사유가 다른 별도 상수(저신뢰 추정 vs 완전 정지된
+#   인지). 일부러 SPEED_CORNER_MIN(5.0)보다 낮추지 않았다 — "코너가 아닌데도 이 속도로
+#   깎였다"는 부자연스러움 자체가 사람이 알아챌 수 있는 신호가 되도록, 급정지가 아니라
+#   코너 감속과 비슷한 수준으로만 눈에 띄게 낮춘다는 설계(요청 반영). 실차 미검증.
+SPEED_LANE_STALE = 5.0
 ANGLE_MAX     = 80.0  # 조향각 클램프(도)
 ANGLE_RATE_MAX = 12.0  # 조향 변화율 제한(도/주기, 20Hz 기준 12도/주기=240도/초) — drive()에서 모든 명령에 일괄 적용
 #   [2026-08-07] 0.85 → 0.4. 실차에서 ros2 run 직후(정지→출발)와 가속 도중 차량이 갑자기
@@ -659,6 +666,29 @@ IMU_YAW_RATE_EMA_ALPHA = 0.3  # [2026-08-06] _imu_curvature_px() 전용 저역�
                              #   추정치 — 실차 미검증, VESC 복구 후 steer_debug의 IMU curvature
                              #   값이 진동하는지 보며 조정할 것.
 
+# [2026-08-11] 차선인식 "새 결과 없음" 생존 체크 — VESC_STALE_SEC/IMU_STALE_SEC과 동일 철학.
+#   DL 백엔드(perception/dl_lane.py)는 20Hz control_loop()과 분리된 별도 스레드에서 자기
+#   페이스껏 추론하고, perc_lane()은 매 틱 그 시점의 최신 결과를 논블로킹으로 재사용한다
+#   (dl_lane.py 모듈 상단 주석 — 추론 지연을 조향 발행 주기에 안 실으려는 의도된 설계).
+#   문제는 "재사용"과 "완전히 죽어서 안 갱신됨"을 구분할 방법이 없었다는 것 — 추론
+#   스레드가 예외로 죽거나 카메라가 끊겨도 self.lane_path/offset은 마지막 값에 조용히
+#   얼어붙을 뿐 에러가 안 난다(IMU/VESC와 같은 "센서 죽음=조용한 고정값" 패턴이 비전
+#   파이프라인에도 그대로 적용됨). DLLaneDetector.result_seq(추론 1회 끝날 때마다
+#   증가하는 카운터)가 몇 틱 동안 그대로면 "새 데이터 없음" 상태 지속시간을
+#   perc_lane()이 재고, 그게 이 값(초) 이상이면 lane_stale=True로 판정한다.
+#   [2026-08-11 후속] 처음엔 VESC_STALE_SEC/IMU_STALE_SEC과 같은 0.5였는데, 그 둘은
+#   원래 초당 수십~백 회 들어오는 고빈도 토픽 콜백이라 0.5초 무응답이면 거의 확실히
+#   죽은 것이지만, DL 추론(TwinLiteNet 세그멘테이션)은 프레임 하나 처리가 정상적으로도
+#   수십~수백ms 걸리는 무거운 연산이고, TensorRT provider는 최초 실행 시 엔진 빌드에
+#   수십초~수분이 걸릴 수 있다는 경고까지 dl_lane.py에 있다(TwinLiteNetEngine.__init__
+#   TensorRT 캐시 주석 참고) — 즉 "정상 상황에서도 순간적으로 훨씬 오래 걸리는 구간"이
+#   VESC/IMU보다 훨씬 흔하다. 실측 FPS(FPS_LOG_PERIOD_SEC 로그) 없이 0.5를 그대로 갖다
+#   쓴 건 근거가 약해서, 일반적인 세그멘테이션 프레임타임의 10배 이상 여유를 두는 2.0으로
+#   올렸다 — 정상 지연을 고장으로 오판할 위험을 크게 줄이면서도, 실제 고장 시 2초 안에는
+#   감지되도록 하는 절충점. 실차에서 FPS 로그를 실제로 보고 나면 그 주기의 몇 배 정도로
+#   더 정확하게(너무 크면 진짜 고장 감지가 늦어짐) 재조정할 것.
+LANE_STALE_SEC = 2.0
+
 
 # #############################################################
 # 5. 디버깅 ON/OFF
@@ -671,7 +701,7 @@ DEBUG_PERIOD = 0.5     # 위 로그 주기(s)
 #   다시 True로 되돌릴 것 — 서로 독립적인 스위치라 다른 항목엔 영향 없음.
 DEBUG_VIZ_LIDAR    = True   # 라이다 BEV 장애물 감지 디버그 창 (track_drive.py)
 DEBUG_VIZ_LAVACON  = False  # 라바콘 트리거 좌우 클러스터 BEV 디버그 창 (track_drive.py)
-DEBUG_PLANNER      = False  # Hybrid A* OccupancyGrid 디버그 창 (track_drive.py, USE_HYBRID_ASTAR_FOR_B2=True일 때만 의미있음)
+DEBUG_PLANNER      = False  # Hybrid A* OccupancyGrid 디버그 창 (track_drive.py, USE_HYBRID_ASTAR_FOR_B3=True일 때만 의미있음)
 DEBUG_VIZ_STEER    = False  # 조향 컨트롤러(직전값유지/현재값반영) 한글 디버그 창 (track_drive.py)
 DEBUG_VIZ_VESC     = False  # VESC 실측속도(/vesc_speed_erpm) 연동 상태(수신중/끊김/미수신) 디버그 창
                              #   (track_drive.py, 2026-08-06 LQR 브랜치에서 이식)
@@ -721,10 +751,11 @@ TEST_FORCE_BEHAVIOR = True
 #   → 전체 미션 테스트로 넘어갈 때는 TEST_DISABLE_INTERSECTION=False와 함께
 #     이것도 False로 되돌릴 것(둘 다 켜두면 시나리오 순서가 어긋난다).
 
-# ── B2 회피 방식 선택 ──
-#   False = ObstacleAvoidance(차선 기반 횡이동, 기본값)
-#   True  = Hybrid A* + OccupancyGrid + Stanley (비교/보존용) — planner/ 참고
-USE_HYBRID_ASTAR_FOR_B2 = False
+# [2026-08-11] B2(정지 장애물) Hybrid A* 대안(USE_HYBRID_ASTAR_FOR_B2) 삭제.
+#   대신 _da_avoidance_failed() 게이트 + TargetPassing(실측 기반 하드코딩)로 대체
+#   — 구조화된 2차선 환경에서 검색 기반 계획은 과한 방식이라는 결론(README §4/§5.1)에
+#   따름. B3(방해차량, 동적)는 여전히 USE_HYBRID_ASTAR_FOR_B3로 Hybrid A* 대안을 쓴다
+#   (아래, 819행 부근).
 
 # ── 바퀴(Lap) 카운트 — 트랙은 닫힌 곡선이라 한 바퀴 돌면 누적 yaw가 정확히 360도 ──
 TOTAL_LAPS = 3
@@ -801,7 +832,11 @@ VEHICLE_TRIGGER_FRAMES = 5    # 라이다 단독검출 연속 N프레임이면 B
 SIG_CONFIRM_FRAMES = 3        # 신호등(직진/좌회전) 판정이 연속 N프레임 유지돼야 확정(20Hz→0.15s)
 
 # ── 장애물회피(TargetPassing, controller/obstacle_avoidance.py) ──
-PASS_OFFSET = 100.0          # 반대 차선으로 이동할 목표 횡편차(px)
+# [2026-08-11] PASS_OFFSET 실측값 반영: 기존 100px는 "차선 폭 실측 후 교체 예정"이라 주석 붙어있던
+#   placeholder였다. LANE_WIDTH_M=0.4m(실측, §6.1)를 DL_PIXELS_PER_METER=200px/m로 환산 —
+#   PP_WHEELBASE_PX(config.py 위쪽)가 같은 방식으로 "계산은 오프라인에서 해두고 리터럴을 남기는"
+#   패턴이라 그걸 따랐다(런타임에 다른 상수를 참조하면 이 파일 안에서 정의 순서에 묶이게 됨).
+PASS_OFFSET = 80.0            # = LANE_WIDTH_M(0.4m) * DL_PIXELS_PER_METER(200px/m), 실측 기반
 CENTER_DEADZONE_M = 0.12     # 타겟 횡중심이 이 값(m) 이내면 '정면'으로 보고 방향을 다른 근거로 정함
 CLEAR_FRAMES_TO_RETURN = 6   # 타겟이 안 보이는 상태가 이만큼 연속되면 복귀 시작
 SWITCH_FRAMES = 8            # 주행 타겟이 내 진행쪽으로 넘어온 상태가 이만큼 지속되면 방향 전환
@@ -809,6 +844,20 @@ LATERAL_ALPHA_OUT = 0.12     # 옆차선 이동 수렴 속도
 LATERAL_ALPHA_BACK = 0.16    # 복귀 수렴 속도 — 90cm 규정 때문에 늑장 부리면 차선이탈, OUT보다 빠르게
 LATERAL_DONE_PX = 8.0        # 이 이하로 좁혀지면 이동 완료로 판정
 MIN_GAP_M = 0.6              # 추돌 방지 종방향 간격(m) — 이보다 가까우면 횡이동 끝날 때까지 속도를 죽임
+
+# ── Hybrid A*(planner/) B2/B3 공용 — 차량 풋프린트 ──
+#   [2026-08-11] 기존 planner/hybrid_astar.py는 vehicle_width=0.45/vehicle_length=0.70을
+#   하드코딩하고 있었는데, 실측값(VEHICLE_WIDTH_M=0.31, 아래 VEHICLE_LENGTH_M=0.64)과
+#   다른 추정치였다 — 충돌검사가 실제 차체보다 큰 여유를 이미 넣은 셈이라 위험하진
+#   않았지만, "실측했다"는 착각을 막기 위해 실측값 + 명시적 마진으로 교체한다.
+ASTAR_VEHICLE_MARGIN_M = 0.05  # 설계값(미검증) — 실측 풋프린트에 더할 편도 여유(각 변)
+
+# ── Hybrid A* B3(방해차량, 동적) 대안 (USE_HYBRID_ASTAR_FOR_B3=True일 때만) ──
+#   B2와 달리 타겟이 움직이므로 "1회 계획 후 재사용"이 아니라 "그리드는 매틱, 전체
+#   재탐색은 트리거 기반"으로 다르게 설계했다 — track_drive.py _handle_overtake_astar() 참고.
+USE_HYBRID_ASTAR_FOR_B3 = False
+ASTAR_B3_REPLAN_TICKS = 4       # 20Hz 기준 0.2s — 이 주기마다 최소 한 번은 전체 재탐색
+ASTAR_B3_FAIL_GRACE_TICKS = 3   # 탐색 실패가 이 틱 연속되면 TargetPassing으로 폴백
 
 # ── 신호등(S0/S2 공용 4구, perception/traffic_signal.py) ──
 SIG4_ROI_T, SIG4_ROI_B = 0.08, 0.28
@@ -854,6 +903,7 @@ METERS_PER_SPEED_UNIT = 0.1347   # 모터 속도단위 1당 m/s(정속구간 기
 LANE_WIDTH_M          = 0.4   # 실측(2026-08-04): 흰선-흰선(도로 전체폭) 80cm, 노란선 정중앙 확인 → 차선 1개 폭 = 40cm
 PIXELS_PER_METER      = 0.0   # BEV 픽셀 ↔ 미터 환산(전역) — 미실측. DL_USE_BEV가 검증돼 기본 전환되면 DL_PIXELS_PER_METER로 채울 것
 VEHICLE_WIDTH_M       = 0.31  # 실측(2026-08-04): xycar 본체 가로 31cm (세로64cm×가로31cm×높이20cm)
+VEHICLE_LENGTH_M      = 0.64  # 실측(2026-08-04): xycar 본체 세로(전후) 64cm — 위와 동일 실측, 그동안 config 상수로는 안 쓰였음
 # 각폭 분류 임계 — 이 폭 이상이면 '차량', 미만이면 '고정장애물'.
 #   실측(2026-08-04): 고정장애물(고장난 차량) 가로20cm×세로41cm×높이16cm,
 #   방해차량 가로28cm×세로54cm×높이19cm → (0.20+0.28)/2 = 0.24

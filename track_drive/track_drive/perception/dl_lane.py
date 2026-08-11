@@ -1948,6 +1948,18 @@ class DLLaneDetector:
         # 메인 스레드에서만 호출한다(스레드 간 GUI 호출 혼용 방지 — 아래 _worker()/
         # show_debug_windows() 주석 참고).
         self._latest_debug = (None, None, None, None, None)   # (vis, da_mask_roi, ll_mask_roi, ll_yellow_mask_roi, params_panel_img)
+        # [2026-08-11] "이번 틱이 새로 나온 추론 결과인지" 구분용 카운터 — _worker()가 추론
+        # 한 번을 끝내고 _latest_result를 갱신할 때마다만 1씩 증가한다(detect()가 몇 번
+        # 호출됐는지가 아니라 "실제로 새 결과가 몇 번 나왔는지"를 센다). track_drive.py의
+        # perc_lane()이 매 틱 이 값을 직전 틱 값과 비교해서, 변화가 없는 상태가 얼마나
+        # 오래(초 단위) 지속되는지로 LANE_STALE_SEC 초과 여부(lane_stale)를 판정한다 —
+        # detect()가 항상 논블로킹으로 최신 결과를 즉시 반환하는 구조라(모듈 상단 주석),
+        # 추론이 20Hz control_loop()보다 느려 매 틱 같은 결과가 재사용되는 "정상" 상황과
+        # 추론/카메라가 완전히 죽어 몇 초씩 안 갱신되는 "고장" 상황을 이 카운터 없이는
+        # 구분할 방법이 없었다(둘 다 겉으로는 "같은 값이 계속 나옴"으로 동일하게 보임).
+        # 단순 파이썬 int라 GIL 하에서 단일 읽기/증가가 원자적이므로 별도 락 없이
+        # self.yellow_centers/self.roi_w와 동일한 관례로 읽는다.
+        self.result_seq = 0
         self._stopped = False
         self._last_fps_log_t = time.time()
 
@@ -1993,6 +2005,9 @@ class DLLaneDetector:
                     self._slide.vis, self._slide.da_mask_roi, self._slide.ll_mask_roi,
                     self._slide.ll_yellow_mask_roi, self._slide.params_panel_img,
                 )
+                # 이번 while 루프 반복이 예외 없이 여기까지 왔다 = 실제로 새 추론 결과가
+                # 나왔다는 뜻이므로 여기서만 올린다(위 except: continue 경로는 못 지나감).
+                self.result_seq += 1
 
             now = time.time()
             if now - self._last_fps_log_t >= FPS_LOG_PERIOD_SEC:
