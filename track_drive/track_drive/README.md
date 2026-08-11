@@ -174,6 +174,12 @@ ros2 launch track_drive track_drive.launch.py
 
 > **(2026-08-06)** `DEBUG_VIZ_LIDAR` 기본값을 `True`→`False`로 변경했습니다. 필요할 때만 켜서 쓰세요.
 
+> **(2026-08-11)** `DEBUG_VIZ_LIDAR`(`lidar_bev` 창) 정리 — 각도 컴퍼스(8방향 i-라벨)/자기가림
+> 경계선(MASK_LO/HI)/포인트별 인덱스 숫자를 지웠습니다. 셋 다 `LIDAR_ANGLE_OFFSET_DEG`(§6.2)·
+> `BODY_LO`/`BODY_HI` 값을 맞추던 캘리브레이션용이었는데 둘 다 2026-07-22 최종 확정된 뒤로는
+> 실차 테스트 화면에 노이즈만 더했습니다. 지금은 거리 링 + 감지 ROI 박스(청록/초록/주황) + 포인트
+> + 좌상단 상태 텍스트만 남아있습니다.
+
 > **(2026-08-11 수정)** 이전엔 "이 프로젝트는 YOLO를 사용하지 않는다"고 적혀 있었는데, 부분적으로만
 > 맞습니다 — 신호등/차선/고정장애물(B2)/방해차량(B3)은 여전히 YOLO 없이 카메라+라이다만 씁니다.
 > 다만 라바콘(B1) 진입 트리거만은 `perception/yolo_cone.py`(YOLOv8n, `yolo_ros/cone_best_n.onnx`)로
@@ -1282,6 +1288,15 @@ mode전환으로 바꿀 수 있게" 요청받아 아래처럼 병합했다.
 사각형/텍스트와 겹쳐 잘 안 보일 수 있다 — 실차 확인 필요. offset 스파크라인의 y축 자동
 스케일은 순간적인 이상치(outlier) 한 프레임 때문에 나머지 구간이 납작해 보이게 만들 수 있다
 — 실차 확인 후 필요하면 고정 스케일이나 percentile 클램프로 바꿀 것.
+
+**[2026-08-11 후속] `dl_lane_params` 창 자체는 삭제했습니다.** 실차 테스트 중 매 프레임 실제로
+봐야 하는 건 offset 스파크라인(차선이 흔들리고 있는가)뿐이고, 나머지 텍스트 목록은 대부분 config
+고정값(일부 러닝 추정치 포함)이라 코드/config.py를 보면 알 수 있는데 화면만 차지한다는 판단이었습니다.
+`DLSlideWindow._params_panel_lines()`/`_build_params_panel()`을 지우고, `_build_offset_sparkline()`
+결과만 `dl_lane` 창(result/da/ll/yellow) 맨 아래에 같은 폭(`self.roi_w`)으로 이어붙이도록
+`show_debug_windows()`를 바꿨습니다 — 창 하나가 줄어서 `DEBUG_VIZ_DL_LANE` 하나로 스파크라인까지
+같이 켜지고 꺼집니다. 모드 배너는 `dl_lane`의 result 패널에만 남아있고(`dl_lane_params` 쪽 배너는
+그 창과 함께 사라짐), `DL_MODE_COLORS`는 이제 그 한 곳에서만 참조합니다.
 
 ### 2.22 조향 경로(`self.lane_path`)가 디바운스를 우회하던 비대칭 수정 (`perc_lane`, 2026-08-10)
 

@@ -707,8 +707,10 @@ DEBUG_VIZ_VESC     = False  # VESC 실측속도(/vesc_speed_erpm) 연동 상태(
                              #   (track_drive.py, 2026-08-06 LQR 브랜치에서 이식)
 
 DEBUG_VIZ_DL_LANE    = False  # 차선 — 기본 백엔드('dl') 디버그 창 (perception/dl_lane.py)
-# [2026-08-10] 'dl_lane_params' 창(파라미터 패널) 하단에 붙는 offset 스파크라인이 몇
-#   프레임을 보여줄지. 주행 성능에 영향 없는 순수 디버그 표시 설정이라 driving 튜닝값
+# [2026-08-10] offset 스파크라인이 몇 프레임을 보여줄지 — [2026-08-11] 원래 별도
+#   'dl_lane_params' 창 하단에 붙었으나, 그 창의 파라미터 텍스트 목록(대부분 config
+#   고정값)을 지우면서 스파크라인만 'dl_lane' 창 맨 아래로 옮겼다(DEBUG_VIZ_DL_LANE
+#   하나로 통합 제어). 주행 성능에 영향 없는 순수 디버그 표시 설정이라 driving 튜닝값
 #   묶음이 아니라 여기 DEBUG_VIZ_* 옆에 둔다. 너무 크면(예: 수백) 그래프가 납작해져
 #   최근 흔들림이 잘 안 보이고, 너무 작으면 추세를 못 봄 — 90(대략 3~6초, FPS별로 다름)
 #   으로 시작.

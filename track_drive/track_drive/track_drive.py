@@ -657,6 +657,12 @@ class TrackDriverNode(Node):
             #   SIDE_X_MAX=5.5m)의 대부분이 캔버스 밖으로 잘려서 안 보였다(예: to_px(5.0, 1.5)의
             #   y픽셀이 음수) — "감지 범위가 안 보인다"는 요청으로 ROI 전체가 들어오도록 축척을
             #   낮춤. PPM=40 → 반경 250px/40=6.25m까지 표시되어 5.0/5.5m ROI 박스가 온전히 보인다.
+            # [2026-08-11] 각도 컴퍼스(8방향 i-라벨)/자기가림 경계선(MASK_LO/HI)/포인트별 인덱스
+            #   숫자를 지웠다 — 셋 다 LIDAR_ANGLE_OFFSET_DEG(§6.2)·BODY_LO/HI(§0 공통주의) 값을
+            #   맞추던 캘리브레이션용이었는데 두 값 다 2026-07-22 최종 확정됐다. 지금 실차
+            #   테스트에서 매 프레임 봐야 하는 건 "지금 뭘 장애물로 잡았고 좌우가 비었는지"뿐이라
+            #   ROI 박스/포인트/상태텍스트만 남기고 나머지는 지웠다 — 각도 재검증이 다시 필요해지면
+            #   git 이력에서 이 줄 이전 버전을 복원할 것.
             PPM = 40          # 1m = 40px (표시 범위 약 6.25m — 장애물 감지 ROI 전체 포함)
             W, H = 500, 500
             EX, EY = 250, 250  # 자차 위치(캔버스 정중앙 — 전/후/좌/우 전체 360도가 다 보이도록)
@@ -668,26 +674,6 @@ class TrackDriverNode(Node):
                             cv2.FONT_HERSHEY_SIMPLEX, 0.35, (80, 80, 80), 1)
 
             def to_px(wx, wy): return (int(EX - wy*PPM), int(EY - wx*PPM))
-
-            # 각도/인덱스 컴퍼스 (보정후 각도 기준, 0°=정면=위쪽, 반시계 방향)
-            # 각 스포크의 'i라벨'은 현재 LIDAR_ANGLE_OFFSET_DEG 가정하에 그 방향이어야 할 원본 인덱스.
-            for a_deg in range(0, 360, 45):
-                raw_idx = int(round((a_deg + LIDAR_ANGLE_OFFSET_DEG) % 360))
-                px_, py_ = to_px(1.9 * math.cos(math.radians(a_deg)), 1.9 * math.sin(math.radians(a_deg)))
-                is_front = (a_deg == 0)
-                spoke_col = (255, 220, 0) if is_front else (70, 70, 70)
-                cv2.line(bev, (EX, EY), (px_, py_), spoke_col, 2 if is_front else 1)
-                cv2.putText(bev, f'i{raw_idx}', (px_ - 14, py_),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, spoke_col, 1, cv2.LINE_AA)
-
-            # 자기가림 마스킹 경계(BODY_LO~BODY_HI) — 이 두 스포크 사이 구간은 ranges가
-            # 무조건 0으로 지워져서 안 찍힘(왼쪽이 안 보이는 원인).
-            for body_idx, body_tag in ((BODY_LO, 'LO'), (BODY_HI, 'HI')):
-                body_ang = body_idx - LIDAR_ANGLE_OFFSET_DEG
-                bx_, by_ = to_px(1.9 * math.cos(math.radians(body_ang)), 1.9 * math.sin(math.radians(body_ang)))
-                cv2.line(bev, (EX, EY), (bx_, by_), (200, 0, 200), 1)
-                cv2.putText(bev, f'MASK_{body_tag}(i{body_idx})', (bx_ - 20, by_),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 0, 200), 1, cv2.LINE_AA)
 
             # 세 ROI 박스 = 지금 실제로 장애물을 감지하는 범위(perc_obstacle() 상단 튜닝 파라미터와 동일).
             #   청록 = 전방(FRONT_X_MIN~MAX × ±FRONT_Y_HALF, B2/B3 공용 obstacle_dist 산출 범위)
@@ -709,9 +695,6 @@ class TrackDriverNode(Node):
                 elif right_mask[i]: col = (0, 140, 255)
                 else:               col = (60, 60, 60)
                 cv2.circle(bev, (sx, sy), 2, col, -1)
-                if i % 10 == 0:   # 실제 원본 인덱스 번호(참값) — 컴퍼스 가정과 대조용
-                    cv2.putText(bev, str(i), (sx + 3, sy - 3),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1, cv2.LINE_AA)
 
             cv2.circle(bev, (EX, EY), 7, (255, 220, 0), -1)
             cv2.line(bev, (EX, EY), (EX, EY - 18), (255, 220, 0), 2)

@@ -184,9 +184,10 @@ from ..config import (
     DL_DEBUG_HISTORY_LEN,
 )
 
-# [2026-08-10] visualize()의 모드 배너 + _build_params_panel()의 배너 색을 한곳에서
-# 관리 — 두 군데가 서로 다른 색을 쓰면 "지금 결과 화면에 보이는 게 파라미터 패널의
-# 어느 모드 설정과 짝인지" 헷갈리므로 반드시 이 딕셔너리 하나만 참조하게 한다.
+# [2026-08-10] visualize()가 result 패널 맨 위에 그리는 모드 배너 색을 한곳에서 관리.
+# [2026-08-11] 원래는 여기 색을 _build_params_panel()의 배너와도 맞췄었는데, 그 함수를
+# 지우면서(파라미터 텍스트 목록이 config.py를 보면 알 수 있는 고정값 위주라 화면만
+# 차지했음, show_debug_windows() 주석 참고) 지금은 참조하는 곳이 이 하나뿐이다.
 DL_MODE_COLORS = {
     'da':    (170, 60, 0),    # 진한 파랑
     'll':    (0, 130, 0),     # 진한 초록
@@ -412,7 +413,7 @@ class DLSlideWindow(SlideWindow):
         self._ll_prev_band_right = [None] * self.n_slices
         self.ll_band_anchor_left = [None] * self.n_slices   # 디버그 시각화 전용 스냅샷(_ll_slice_centers() 참고)
         self.ll_band_anchor_right = [None] * self.n_slices
-        self.params_panel_img = None  # [2026-08-10] show_debug_windows()가 'dl_lane_params' 창으로 띄우는, 현재 DL_CENTER_MODE에서 실제로 쓰이는 튜닝값 텍스트 패널(visualize()가 매 프레임 다시 그림)
+        self.offset_sparkline_img = None  # [2026-08-11] show_debug_windows()가 'dl_lane' 창 맨 아래에 같이 붙이는 offset 스파크라인(visualize()가 매 프레임 다시 그림). 예전엔 여기에 파라미터 텍스트 패널도 같이 들어있었으나 삭제(아래 _offset_history 주석 참고)
 
         # [2026-08-10] 디버그 전용 — "이 밴드가 왜 이렇게 채택/거부됐는지" 근거를 그때
         # 그때 계산만 하고 버리지 않고 남겨서 visualize()가 사람이 읽을 수 있는 태그로
@@ -422,7 +423,8 @@ class DLSlideWindow(SlideWindow):
         self.da_clip_band_virtual = [None] * self.n_slices  # True=이 밴드는 _clip_da_by_ll()이 가상경계(②)로 잘랐음, False=실측/잔상 ll(①)로 잘랐음. 'da'/'ll' 공통(_clip_da_by_ll()이 채움, 'll_da'=corridor는 클리핑을 안 하므로 항상 None)
 
         # [2026-08-10] 최근 DL_DEBUG_HISTORY_LEN 프레임의 offset(디바운스 이후 최종값)을
-        # 들고 있다가 'dl_lane_params' 창 하단에 스파크라인으로 그린다 — README §2.12에서
+        # 들고 있다가 [2026-08-11] 'dl_lane' 창 맨 아래에 스파크라인으로 그린다(예전엔
+        # 별도 'dl_lane_params' 창이었음) — README §2.12에서
         # 문제됐던 "S자로 좌우 왔다갔다" 같은 프레임 간 흔들림은 순간값 텍스트만으론
         # 눈으로 판단하기 어려워서, 최근 추세를 한눈에 보려는 목적. deque(maxlen=...)라
         # 오래된 값은 자동으로 밀려나 별도 정리 로직이 필요 없다.
@@ -1757,8 +1759,7 @@ class DLSlideWindow(SlideWindow):
         # 다른 정보 사이에서 놓치기 쉬웠다(da/ll/ll_da를 실차에서 A/B로 계속 바꿔가며
         # 테스트할 예정이라 지금 뭘 보고 있는지 착각하면 튜닝값을 엉뚱한 모드에 반영하는
         # 사고로 이어짐). 모든 다른 오버레이보다 나중에(맨 위에) 그려서 절대 안 가려지게
-        # 한다 — DL_MODE_COLORS(모듈 상단)를 _build_params_panel()과 공유해 두 창의 색이
-        # 항상 일치한다.
+        # 한다.
         mode_color = DL_MODE_COLORS.get(DL_CENTER_MODE, DL_MODE_COLOR_DEFAULT)
         cv2.rectangle(self.vis, (0, 0), (self.roi_w - 1, 22), mode_color, -1)
         cv2.putText(
@@ -1780,111 +1781,15 @@ class DLSlideWindow(SlideWindow):
                 (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2
             )
 
-        self.params_panel_img = self._build_params_panel()
-
-    def _params_panel_lines(self):
-        """[2026-08-10] 지금 DL_CENTER_MODE로 실제 주행 중 영향을 주는 튜닝값만 골라
-        "이름=현재값" 줄로 뽑는다. config.py 전체를 다 보여주면 지금 안 쓰이는 값까지
-        섞여 어느 걸 만져야 할지 헷갈리므로, 모드에 안 걸리는 공용값 → 모드 전용값 →
-        (참고용) 러닝 추정치 순으로 좁혀서 보여준다. show_debug_windows()가 이 줄들을
-        'dl_lane_params' 창에 그대로 그린다 — 텍스트만이라 다른 마스크 패널과 폭을 맞출
-        필요가 없어 별도 창으로 뒀다. 맨 위 모드 이름은 _build_params_panel()이 색 배너로
-        따로 그리므로(visualize()의 MODE 배너와 색을 맞춤) 여기 텍스트 목록에서는
-        중복해서 넣지 않는다."""
-        lines = ['-- 공용 --']
-        lines.append(f'DL_N_SLICES = {DL_N_SLICES}')
-        lines.append(f'DL_FG_THRESHOLD (da) = {DL_FG_THRESHOLD}')
-        lines.append(f'DL_LL_FG_THRESHOLD = {DL_LL_FG_THRESHOLD}')
-        lines.append(f'DL_DA_MIN_COMPONENT_AREA = {DL_DA_MIN_COMPONENT_AREA}')
-        lines.append(f'DL_SLICE_FIT_MIN = {DL_SLICE_FIT_MIN}')
-        lines.append(f'DL_SLICE_OUTLIER_MAX = {DL_SLICE_OUTLIER_MAX}')
-        lines.append(f'DL_STABLE_FRAME_MIN = {DL_STABLE_FRAME_MIN}')
-        lines.append(f'DL_STABLE_JUMP_MAX = {DL_STABLE_JUMP_MAX}')
-        lines.append(f'DL_LL_SANITY_MIN_RATIO = {DL_LL_SANITY_MIN_RATIO}')
-
-        if DL_CENTER_MODE in ('da', 'll'):
-            # ll 잔상+가상경계로 da를 클리핑하는 값들 — 'll_da'(corridor)는 클리핑 자체를
-            # 건너뛰므로(모듈 상단 주석 참고) 이 모드에선 표시 안 함.
-            lines.append('-- da/ll 클리핑 (_clip_da_by_ll) --')
-            lines.append(f'DL_LL_CLIP_MARGIN_PX = {DL_LL_CLIP_MARGIN_PX}')
-            lines.append(f'DL_LL_DECAY_ALPHA = {DL_LL_DECAY_ALPHA}')
-            lines.append(f'DL_LL_DECAY_MIN_VALUE = {DL_LL_DECAY_MIN_VALUE}')
-            lines.append(f'DL_DA_SEED_ROWS_PX = {DL_DA_SEED_ROWS_PX}')
-            lines.append(f'DL_DA_SEED_HALF_WIDTH_PX = {DL_DA_SEED_HALF_WIDTH_PX}')
-
-        if DL_CENTER_MODE == 'll':
-            lines.append(f"DL_LL_ALGO = {DL_LL_ALGO}")
-            lines.append(f'DL_LL_SIDE_MIN_PIXELS = {DL_LL_SIDE_MIN_PIXELS}')
-            lines.append(f'DL_LL_SEARCH_HALF_WIDTH_PX = {DL_LL_SEARCH_HALF_WIDTH_PX}')
-            # [2026-08-10] 연속 미검출 시 탐색창 확장 — 원래 'lr' 전용이었는데
-            # _ll_yellow_white_centers()(노란/흰 각각)에도 이식해서 이제 두 알고리즘
-            # 공통값이다(둘 다 "찾았을 때만 갱신되는 좁은 탐색창" 뼈대를 공유하므로).
-            lines.append(f'DL_LL_SEARCH_WIDEN_STEP/MAX_PX = {DL_LL_SEARCH_WIDEN_STEP_PX}/{DL_LL_SEARCH_WIDEN_MAX_PX}')
-            lines.append(f'DL_LL_YELLOW_VOTE_RATIO = {DL_LL_YELLOW_VOTE_RATIO}')
-            lines.append(f'DL_LL_YELLOW_MIN_AREA = {DL_LL_YELLOW_MIN_AREA}')
-
-            if DL_LL_ALGO == 'lr':
-                lines.append('-- lr: 좌우 독립 슬라이딩 윈도우 (_ll_slice_centers) --')
-                lines.append(f'DL_LL_WIDTH_MIN/MAX_PX = {DL_LL_WIDTH_MIN_PX}~{DL_LL_WIDTH_MAX_PX}')
-                lines.append(f'DL_LL_WIDTH_EMA_ALPHA = {DL_LL_WIDTH_EMA_ALPHA}')
-                lines.append(f'DL_LL_VELOCITY_EMA_ALPHA = {DL_LL_VELOCITY_EMA_ALPHA}')
-                lines.append(f'DL_LL_VELOCITY_MAX_PX = {DL_LL_VELOCITY_MAX_PX}')
-                lines.append(f'DL_LL_BAND_ANCHOR_ALPHA = {DL_LL_BAND_ANCHOR_ALPHA}')
-                lines.append('-- 러닝 추정치(참고용, config 아님) --')
-                lines.append(f'_ll_half_width*2 (lane_w_est) = {self._ll_half_width * 2:.1f}px')
-                lines.append(f'_ll_left_velocity = {self._ll_left_velocity:+.2f}px/band')
-                lines.append(f'_ll_right_velocity = {self._ll_right_velocity:+.2f}px/band')
-            else:
-                lines.append('-- yw: 노란+흰선 짝짓기 (_ll_yellow_white_centers) --')
-                lines.append(f'DL_LL_YELLOW_GAP_INIT_PX = {DL_LL_YELLOW_GAP_INIT_PX}')
-                lines.append(f'DL_LL_YELLOW_GAP_EMA_ALPHA = {DL_LL_YELLOW_GAP_EMA_ALPHA}')
-                lines.append(f'DL_LL_YELLOW_GAP_MIN/MAX_PX = {DL_LL_YELLOW_GAP_MIN_PX}~{DL_LL_YELLOW_GAP_MAX_PX}')
-                lines.append(f'DL_LL_NO_YELLOW_SEARCH_HALF_WIDTH_PX = {DL_LL_NO_YELLOW_SEARCH_HALF_WIDTH_PX}')
-                lines.append('-- 러닝 추정치(참고용, config 아님) --')
-                lines.append(f'_white_yellow_gap_px = {self._white_yellow_gap_px:.1f}px')
-                lines.append(f'lane_side = {self.lane_side}')
-
-        if DL_CENTER_MODE == 'll_da':
-            lines.append('-- corridor (_corridor_slice_centers) --')
-            lines.append(f'DL_CORRIDOR_LINE_MIN_PIXELS = {DL_CORRIDOR_LINE_MIN_PIXELS}')
-            lines.append(f'DL_CORRIDOR_LINE_MERGE_PX = {DL_CORRIDOR_LINE_MERGE_PX}')
-            lines.append(f'DL_CORRIDOR_WIDTH_MIN/MAX_PX = {DL_CORRIDOR_WIDTH_MIN_PX}~{DL_CORRIDOR_WIDTH_MAX_PX}')
-            lines.append(f'DL_CORRIDOR_MIN_PASSABLE_PX = {DL_CORRIDOR_MIN_PASSABLE_PX}')
-
-        return lines
-
-    def _build_params_panel(self):
-        """_params_panel_lines()를 고정폭 텍스트 이미지(BGR)로 렌더링하고, 그 아래 최근
-        offset 추세 스파크라인을 이어붙인다. da/ll 마스크 패널(self.roi_w, 트랙 폭에 따라
-        좁을 수 있음)과 폭을 맞추지 않고 읽기 편한 고정폭(420px)을 쓴다 — 글자가 잘리는
-        것보다 별도 창(dl_lane_params)이 낫다는 판단.
-        [2026-08-10] 맨 위에 DL_MODE_COLORS 색으로 "MODE: XX" 배너를 깔아 visualize()의
-        result 패널 배너와 짝이 맞게 했다 — 두 창을 나란히 띄워두면 색만 보고도 지금
-        같은 모드를 보고 있는 게 맞는지 바로 확인 가능."""
-        panel_w = 420
-        line_h = 16
-        lines = self._params_panel_lines()
-        text_h = 8 + line_h * len(lines) + 8
-        banner_h = 26
-        panel = np.zeros((banner_h + text_h, panel_w, 3), dtype=np.uint8)
-
-        mode_color = DL_MODE_COLORS.get(DL_CENTER_MODE, DL_MODE_COLOR_DEFAULT)
-        panel[:banner_h] = mode_color
-        cv2.putText(
-            panel, f'MODE: {DL_CENTER_MODE.upper()}', (8, 18),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA
-        )
-
-        panel[banner_h:] = (40, 40, 40)
-        for i, line in enumerate(lines):
-            is_header = line.startswith('--')
-            color = (0, 220, 220) if is_header else (255, 255, 255)
-            cv2.putText(
-                panel, line, (8, banner_h + 8 + line_h * i + 12),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.38, color, 1, cv2.LINE_AA
-            )
-
-        return cv2.vconcat([panel, self._build_offset_sparkline(panel_w)])
+        # [2026-08-11] 예전엔 여기서 _build_params_panel()이 'dl_lane_params'라는 별도
+        # 창을 만들어 지금 DL_CENTER_MODE의 튜닝값(대부분 config 고정값, 일부만 런닝
+        # 추정치)을 텍스트로 늘어놓고 그 아래 offset 스파크라인을 붙였다 — 그런데 실차
+        # 테스트 중 매 프레임 봐야 하는 건 "차선이 흔들리고 있는가"(스파크라인)뿐이고
+        # 나머지 텍스트는 코드/config.py를 보면 알 수 있는 값이라 화면만 차지했다.
+        # 텍스트 목록은 통째로 지우고, 스파크라인만 'dl_lane' 창(result/da/ll/yellow
+        # vconcat) 맨 아래에 같이 붙이도록 show_debug_windows()로 넘긴다 — 폭은 그
+        # 패널들과 같은 self.vis.shape[1](= self.roi_w)로 맞춘다.
+        self.offset_sparkline_img = self._build_offset_sparkline(self.vis.shape[1])
 
     def _build_offset_sparkline(self, width, height=70):
         """[2026-08-10] 최근 self._offset_history(최대 DL_DEBUG_HISTORY_LEN프레임, 디바운스
@@ -1947,7 +1852,7 @@ class DLLaneDetector:
         # 워커 스레드가 여기 값만 갱신하고, 실제 cv2.imshow()는 show_debug_windows()가
         # 메인 스레드에서만 호출한다(스레드 간 GUI 호출 혼용 방지 — 아래 _worker()/
         # show_debug_windows() 주석 참고).
-        self._latest_debug = (None, None, None, None, None)   # (vis, da_mask_roi, ll_mask_roi, ll_yellow_mask_roi, params_panel_img)
+        self._latest_debug = (None, None, None, None, None)   # (vis, da_mask_roi, ll_mask_roi, ll_yellow_mask_roi, offset_sparkline_img)
         # [2026-08-11] "이번 틱이 새로 나온 추론 결과인지" 구분용 카운터 — _worker()가 추론
         # 한 번을 끝내고 _latest_result를 갱신할 때마다만 1씩 증가한다(detect()가 몇 번
         # 호출됐는지가 아니라 "실제로 새 결과가 몇 번 나왔는지"를 센다). track_drive.py의
@@ -2003,7 +1908,7 @@ class DLLaneDetector:
                 self._latest_result = (lane_valid, offset, lookahead, lane_center, path, debug_img)
                 self._latest_debug = (
                     self._slide.vis, self._slide.da_mask_roi, self._slide.ll_mask_roi,
-                    self._slide.ll_yellow_mask_roi, self._slide.params_panel_img,
+                    self._slide.ll_yellow_mask_roi, self._slide.offset_sparkline_img,
                 )
                 # 이번 while 루프 반복이 예외 없이 여기까지 왔다 = 실제로 새 추론 결과가
                 # 나왔다는 뜻이므로 여기서만 올린다(위 except: continue 경로는 못 지나감).
@@ -2032,11 +1937,11 @@ class DLLaneDetector:
         da/ll 전체 위에 옅게 깔린 것보다 노란선만 100% 불투명하게 보이는 게 dash가 끊기는지
         확인하기 더 쉽다). da/ll/yellow는 원래 1채널 이진마스크라 result(3채널 BGR)와 그대로
         못 이어붙이므로 BGR로 변환 후 vconcat한다 — 넷 다 같은 ROI에서 나온 동일 shape(BEV
-        캔버스 크기)이라 폭이 항상 맞는다. [2026-08-10] 지금 DL_CENTER_MODE에서 실제로
-        영향을 주는 튜닝값 목록(`DLSlideWindow._params_panel_lines()`)은 별도의
-        `dl_lane_params` 창으로 띄운다 — result/da/ll/yellow는 전부 같은 ROI 폭(수백 px)
-        인 이미지 패널이라 vconcat이 자연스럽지만, 텍스트 패널까지 그 폭에 맞추면(ROI가
-        좁은 트랙에서는 특히) 글자가 잘리기 쉬워 굳이 하나로 합치지 않았다.
+        캔버스 크기)이라 폭이 항상 맞는다. [2026-08-10 도입, 2026-08-11 정리] 맨 아래에
+        offset 디바운스 스파크라인(`DLSlideWindow._build_offset_sparkline()`, 폭을 이
+        패널들과 같은 self.roi_w로 맞춰서 만듦)을 한 장 더 붙인다 — 원래 여기 붙던 config
+        튜닝값 텍스트 목록(대부분 고정값이라 코드/config.py를 보면 알 수 있음)은 화면만
+        차지해서 지웠고, 실제로 매 프레임 눈으로 봐야 하는 스파크라인만 남겼다.
 
         lookahead_xy(있으면) : pure_pursuit.PurePursuitController가 직전에 계산한 look-ahead
         목표점, (x, y) — self.lane_path와 같은 da ROI 픽셀좌표계라 result 패널에 좌표 변환
@@ -2053,7 +1958,7 @@ class DLLaneDetector:
         if not DEBUG_VIZ_DL_LANE:
             return
         with self._lock:
-            vis, da_mask, ll_mask, ll_yellow_mask, params_panel = self._latest_debug
+            vis, da_mask, ll_mask, ll_yellow_mask, sparkline = self._latest_debug
         if vis is None:
             return
         if lookahead_xy is not None:
@@ -2075,9 +1980,10 @@ class DLLaneDetector:
         yellow_bgr[ll_yellow_mask > 0] = (0, 255, 255)
         for label, panel in (('result', vis), ('da', da_bgr), ('ll', ll_bgr), ('yellow', yellow_bgr)):
             cv2.putText(panel, label, (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-        cv2.imshow('dl_lane', cv2.vconcat([vis, da_bgr, ll_bgr, yellow_bgr]))
-        if params_panel is not None:
-            cv2.imshow('dl_lane_params', params_panel)
+        stack = [vis, da_bgr, ll_bgr, yellow_bgr]
+        if sparkline is not None:
+            stack.append(sparkline)
+        cv2.imshow('dl_lane', cv2.vconcat(stack))
         cv2.waitKey(1)
 
     def stop(self):
