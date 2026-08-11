@@ -256,7 +256,6 @@ class TrackDriverNode(Node):
 
         self.path = None
         self.grid = None
-        self.replan_count = 0
         self.goal = None
 
         # ── B3(방해차량) hybrid A* 대안 전용 상태 (USE_HYBRID_ASTAR_FOR_B3=True일 때만 의미있음) ──
@@ -868,8 +867,6 @@ class TrackDriverNode(Node):
     @property
     def _obstacle_active(self):
         """B2(고정장애물): 회피 기동이 진행 중인가."""
-        if USE_HYBRID_ASTAR_FOR_B2:
-            return self.path is not None
         return self.obstacle_controller.phase != AvoidPhase.IDLE
 
     @property
@@ -1614,10 +1611,6 @@ class TrackDriverNode(Node):
     #   차선 2개 + 넘어도 되는 노란 중앙선 구조라, 방향은 '반대편 차선' 하나로 정해진다.
     #   좌우 선택 로직은 ObstacleAvoidance.decide_lane() 이 lane_side 로 처리한다.
     def _handle_fixed_obstacle(self):
-        if USE_HYBRID_ASTAR_FOR_B2:
-            self._handle_fixed_obstacle_astar()
-            return
-
         if not self._da_avoidance_failed():
             # da 기반 경로(Mission의 lane-follow 출력)가 알아서 피하고 있다고 신뢰 —
             # TargetPassing으로 덮어쓰지 않고 이번 틱은 그냥 둔다.
@@ -1649,97 +1642,6 @@ class TrackDriverNode(Node):
 
         return path_broken or da_unaware_of_obstacle
 
-    # ── B2 대안: Hybrid A* 경로계획 방식 (USE_HYBRID_ASTAR_FOR_B2=True 일 때만) ──
-    #   구조화된 2차선 환경에는 과한 방식이라 기본은 비활성. 비교/보존용으로 남겨둔다.
-    #   ※ 이 경로는 아직 명령속도(모터단위)를 m/s 로 적분하는 단위 불일치가 남아있다
-    #     — B-2(METERS_PER_SPEED_UNIT) 실측 후에 정리할 것.
-    def _handle_fixed_obstacle_astar(self):
-
-        if self.path is None:
-            # Local Occupancy 생성
-            self.grid = self.occupancy.build(
-                self.lidar_ranges
-            )
-            # Local Frame 시작점 — 이번 replan 시점을 로컬 pose 원점으로 리셋
-            start = PlannerNode(0.0,0.0,0.0)
-            self.vehicle_x = 0.0
-            self.vehicle_y = 0.0
-            self.vehicle_yaw = 0.0
-            self._plan_ref_yaw = self.imu_yaw
-            self._plan_last_t = time.time()
-            # Goal 생성
-            if self.goal is None:
-                self.goal = self.planner.make_goal(
-                    self.obstacle_dist,
-                    self.left_clear,
-                    self.right_clear
-                )
-            # Hybrid A*
-            self.path = self.planner.plan(start,self.goal,self.grid)
-
-        if not self.path:
-            self.path = None
-            self.goal = None
-            self.ctrl_speed = 0
-            return
-
-        # 로컬 pose 갱신 — yaw는 IMU 실측값 기준(_yaw_delta), x/y는 명령속도(ctrl_speed,
-        # 미보정 단위) 적분 근사치. 정식 오도메트리가 생기기 전까지의 임시 추정값이다.
-        now = time.time()
-        dt = now - self._plan_last_t
-        self._plan_last_t = now
-
-        self.vehicle_yaw = self._yaw_delta(self._plan_ref_yaw)
-        self.vehicle_speed = self.ctrl_speed
-        self.vehicle_x += self.vehicle_speed * math.cos(self.vehicle_yaw) * dt
-        self.vehicle_y += self.vehicle_speed * math.sin(self.vehicle_yaw) * dt
-
-        # Stanley
-        steer, speed = self.stanley.control(
-            self.vehicle_x,
-            self.vehicle_y,
-            self.vehicle_yaw,
-            self.vehicle_speed,
-            self.path
-        )
-
-        self.ctrl_angle = math.degrees(steer)
-        self.ctrl_speed = speed
-
-        self.replan_count += 1
-        if self.replan_count >= 20:
-            self.path = None
-            self.goal = None
-            self.replan_count = 0
-            return
-
-        if self.stanley.goal_reached(self.vehicle_x, self.vehicle_y, self.path):
-            self.path = None
-            self.goal = None
-            self.replan_count = 0
-
-            self.stanley.reset()
-
-            self.phase = Phase.VEHICLE
-            self.behavior_state = BehaviorState.B0_NORMAL
-
-            self._pid_prev_error = 0.0
-            self._pid_integral = 0.0
-
-        
-
-        if DEBUG_PLANNER:
-            cv2.imshow(
-                "Occupancy",
-                cv2.resize(self.grid,None,
-                           fx=4,
-                           fy=4)
-                )
-
-            cv2.waitKey(1)
-
-    
-
     # ── B3-방해차량 추월 ──★재설계 예정(임시 placeholder) ──
     # target_lane 반영 수정
     # 회피 후 복귀하는 로직 추가 : idle -> avoid -> idle+Phase.VEHICLE => idel -> avoid -> return -> idle
@@ -1761,8 +1663,10 @@ class TrackDriverNode(Node):
                           done_next_phase=Phase.DONE)
 
     # ── B3 대안: Hybrid A* 경로계획 방식 (USE_HYBRID_ASTAR_FOR_B3=True 일 때만) ──
-    #   B2 astar(_handle_fixed_obstacle_astar)와 다른 점: 타겟이 움직이므로 "1회 계획 후
-    #   재사용"이 아니라 "그리드/충돌검사는 매틱, 전체 재탐색은 트리거 기반"으로 동작한다.
+    #   [2026-08-11] B2 쪽 Hybrid A* 대안(_handle_fixed_obstacle_astar)은 삭제됐다 —
+    #   그 방식("1회 계획 후 최대 1초 재사용")은 애초에 정지 장애물 전제라 여기(타겟이
+    #   움직이는 B3)엔 그대로 못 쓴다. 그래서 "그리드/충돌검사는 매틱, 전체 재탐색은
+    #   트리거 기반"으로 별도 설계했다.
     #   재탐색 트리거 3가지(하나라도 걸리면 발동):
     #     ① 경로 무효화 — 남은 waypoint가 최신 그리드와 충돌 (즉시, 주기 무시)
     #     ② 타겟 진입 — 통과중인 방향으로 타겟이 SWITCH_FRAMES 연속 넘어옴 (즉시)
@@ -1824,7 +1728,7 @@ class TrackDriverNode(Node):
                 self._b3_side = side
                 self._b3_fail_cnt = 0
                 self._b3_tick = 0
-                # 로컬 pose 원점 리셋 (B2 astar와 동일 패턴) — target_idx도 같이 리셋해야
+                # 로컬 pose 원점 리셋 (재계획 시점을 (0,0,0)으로 잡는 패턴) — target_idx도 같이 리셋해야
                 # 한다. 안 하면 새 경로(짧을 수 있음)에 옛 인덱스가 그대로 남아
                 # nearest_index()가 범위를 벗어나 다음 control()에서 인덱스 에러가 난다.
                 self.vehicle_x = 0.0

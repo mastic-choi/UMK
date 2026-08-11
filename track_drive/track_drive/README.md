@@ -1441,11 +1441,10 @@ self.phase = Phase.FIXED_OBSTACLE   # __init__ 안의 self.phase 초기값을 �
 정상 흐름은 라바콘(B1) 완료 후 자동으로 `Phase.FIXED_OBSTACLE`로 넘어가는 것이라, 이 기능만 격리
 테스트하려면 `__init__`의 `self.phase = Phase.LAVACON`을 위처럼 임시로 바꾸면 됩니다.
 
-**진입 게이트 — `_da_avoidance_failed()` (2026-08-11 추가):** `USE_HYBRID_ASTAR_FOR_B2=False`(기본)일
-때, B2 트리거가 걸렸다고 바로 `TargetPassing`이 켜지지 않고 먼저 `_da_avoidance_failed()`를 봅니다.
-`False`면(= da 기반 경로가 알아서 피하고 있다고 믿을 수 있으면) 개입 없이 Mission의 lane-follow
-출력을 그대로 둡니다. `True`(회피 실패)일 때만 아래 `TargetPassing`이 override합니다. 실패 조건은
-OR로 두 개:
+**진입 게이트 — `_da_avoidance_failed()` (2026-08-11 추가):** B2 트리거가 걸렸다고 바로
+`TargetPassing`이 켜지지 않고 먼저 `_da_avoidance_failed()`를 봅니다. `False`면(= da 기반 경로가
+알아서 피하고 있다고 믿을 수 있으면) 개입 없이 Mission의 lane-follow 출력을 그대로 둡니다.
+`True`(회피 실패)일 때만 아래 `TargetPassing`이 override합니다. 실패 조건은 OR로 두 개:
 1. **경로 끊김/불안정** — `self.lane_valid`/`self.lane_stale`(오늘도 실제로 동작하는 신호).
 2. **da가 장애물을 반영했다는 근거 없음** — da 세그멘테이션이 아직 차선표시만 학습돼 있고 장애물
    인지가 전혀 없어서, 지금은 이 조건이 **항상 참**입니다(`track_drive.py` `_da_avoidance_failed()`의
@@ -1463,9 +1462,9 @@ OR로 두 개:
 3. **ALONGSIDE** — 장애물이 안 보이는 상태가 `CLEAR_FRAMES_TO_RETURN`(6프레임) 유지되면 RETURN으로.
 4. **RETURN** — 원 차선으로 복귀(`LATERAL_ALPHA_BACK`, SHIFT보다 빠르게) — 목표 오프셋이 5px 미만이면 완료.
 
-`USE_HYBRID_ASTAR_FOR_B2 = True`([config.py:256](config.py#L256))로 바꾸면 위 게이트/`TargetPassing` 대신
-Hybrid A* + OccupancyGrid + Stanley(`planner/`, `_handle_fixed_obstacle_astar()`) 경로계획 대안을 씁니다
-— 비교/보존용이며 기본은 `False`.
+> **[2026-08-11] Hybrid A* 대안(`USE_HYBRID_ASTAR_FOR_B2`) 삭제됨.** 위 게이트로 이미 "da가
+> 알아서 처리 vs 하드코딩 폴백" 구조로 정리됐기 때문에, 검색 기반 경로계획을 B2에 따로
+> 남겨둘 이유가 없어졌습니다. 동적 장애물(B3)엔 Hybrid A*가 여전히 남아있습니다 — §5.1 참고.
 
 **디버그 방법:**
 - CLI 로그: `obs=검출여부(거리m,폭m,fixed/vehicle)`. `status='blocked'`가 되면 `[B2] 양쪽 통과 불가 —
@@ -1516,10 +1515,12 @@ SHIFT 단계에서 타겟이 내가 지나가려는 쪽으로 넘어오는 상�
 
 ### 5.1 Hybrid A* 대안 — 동적 장애물용 (`USE_HYBRID_ASTAR_FOR_B3`, 2026-08-11)
 
-B2의 `USE_HYBRID_ASTAR_FOR_B2`(§4)와 같은 자리지만 그대로 재사용할 수 없었습니다 — B2 방식은
-"replan 시점에 그리드/goal을 딱 한 번 만들고 최대 20제어주기(1초) 또는 goal 도달까지 재사용"하는
+B2에도 원래 같은 자리에 Hybrid A* 대안(`_handle_fixed_obstacle_astar()`, `USE_HYBRID_ASTAR_FOR_B2`)이
+있었지만 2026-08-11에 삭제했습니다(§4 참고 — `_da_avoidance_failed()` 게이트 + `TargetPassing`
+하드코딩 폴백으로 대체). B3는 그 방식을 그대로 재사용할 수 없어서 애초에 다르게 설계했습니다 — B2
+방식은 "replan 시점에 그리드/goal을 딱 한 번 만들고 최대 20제어주기(1초) 또는 goal 도달까지 재사용"하는
 구조인데, 방해차량은 그 1초 사이에 차선을 넘어올 수 있어 그대로 쓰면 위험합니다. 그래서 B3 전용으로
-"그리드/충돌검사는 매틱, 전체 재탐색(A* 실행)은 트리거 기반"으로 다시 설계했습니다
+"그리드/충돌검사는 매틱, 전체 재탐색(A* 실행)은 트리거 기반"으로 설계했습니다
 (`track_drive.py` `_handle_overtake_astar()`).
 
 **재탐색 트리거 (하나라도 걸리면 발동, `_handle_overtake_astar()`):**
@@ -1830,8 +1831,8 @@ IMU 하드웨어를 고치고 `xycar_imu` 패키지를 빌드해도 이 줄을 �
 ### 8.3 `track_drive.py`가 IMU를 쓰는 곳
 
 `cb_imu()`가 `/imu`(`sensor_msgs/Imu`) 메시지에서 두 값을 뽑습니다:
-- `self.imu_yaw` (orientation 쿼터니언 → yaw, 원래부터 있던 값) — 바퀴 카운트(아래 8.4)와 S3 지름길
-  `_handle_fixed_obstacle_astar()`의 Stanley 헤딩(`_yaw_delta()`)이 씁니다.
+- `self.imu_yaw` (orientation 쿼터니언 → yaw, 원래부터 있던 값) — 바퀴 카운트(아래 8.4)와 S3 지름길,
+  B3(방해차량) Hybrid A* 대안 `_handle_overtake_astar()`의 Stanley 헤딩(`_yaw_delta()`)이 씁니다.
 - `self.imu_yaw_rate` (`angular_velocity.z`, 이번에 추가) + `self._imu_t`(수신 시각) — §0.5.5
   `pure_pursuit` 코너 감쇠 보강 전용. `IMU_STALE_SEC=0.5`(config.py) 이상 안 들어오면 죽었다고 봅니다.
 
