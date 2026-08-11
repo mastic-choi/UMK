@@ -1458,8 +1458,9 @@ Hybrid A* + OccupancyGrid + Stanley(`planner/`, `_handle_fixed_obstacle_astar()`
   서행 후 재시도` 경고 로그가 뜹니다.
 
 **알려진 한계:**
-- `PASS_OFFSET=100px`(config.py)가 실측 차선 폭 대신 쓰는 자리표시값입니다(차선 폭 실측 후 교체 예정,
-  [controller/obstacle_avoidance.py:31](controller/obstacle_avoidance.py#L31) 주석 참고).
+- ~~`PASS_OFFSET=100px`가 실측 차선 폭 대신 쓰는 자리표시값~~ → **2026-08-11 해결**: `LANE_WIDTH_M=0.4m`
+  (§6.1 실측) × `DL_PIXELS_PER_METER=200px/m` = `80px`로 교체했습니다(config.py). 수렴 속도·차선 내
+  실제 여유폭까지 반영된 값은 아니라 실차에서 미세조정은 필요할 수 있습니다.
 - `LATERAL_ALPHA_OUT/BACK`, `MIN_GAP_M`, `CENTER_DEADZONE_M` 등 수렴 속도·안전거리 파라미터 다수가
   실차 미검증 튜닝값입니다.
 - 좌우 선택은 카메라/YOLO 이중확인 없이 라이다 `obstacle_y` + `lane_side`만으로 판단 — 콘·차량 구분이 없어
@@ -1495,6 +1496,56 @@ SHIFT 단계에서 타겟이 내가 지나가려는 쪽으로 넘어오는 상�
   라바콘 구간을 먼저 통과한 뒤라 위험이 적지만, 격리 테스트 시에는 주의).
 - `SWITCH_FRAMES`로 조절하는 방향 재전환 로직도 실차 미검증.
 
+### 5.1 Hybrid A* 대안 — 동적 장애물용 (`USE_HYBRID_ASTAR_FOR_B3`, 2026-08-11)
+
+B2의 `USE_HYBRID_ASTAR_FOR_B2`(§4)와 같은 자리지만 그대로 재사용할 수 없었습니다 — B2 방식은
+"replan 시점에 그리드/goal을 딱 한 번 만들고 최대 20제어주기(1초) 또는 goal 도달까지 재사용"하는
+구조인데, 방해차량은 그 1초 사이에 차선을 넘어올 수 있어 그대로 쓰면 위험합니다. 그래서 B3 전용으로
+"그리드/충돌검사는 매틱, 전체 재탐색(A* 실행)은 트리거 기반"으로 다시 설계했습니다
+(`track_drive.py` `_handle_overtake_astar()`).
+
+**재탐색 트리거 (하나라도 걸리면 발동, `_handle_overtake_astar()`):**
+1. **경로 무효화** — 남은 waypoint를 매틱 최신 그리드로 재검사(`_path_blocked()`, `collision()` 5점
+   투영이라 그리드 생성보다도 쌈)해서 걸리면 주기 무시하고 즉시.
+2. **타겟 진입** — `TargetPassing._target_cuts_in()`과 동일 조건(통과중인 방향으로 타겟이
+   `SWITCH_FRAMES` 연속 넘어옴)이면 즉시.
+3. **주기적** — `ASTAR_B3_REPLAN_TICKS`(기본 4틱=0.2s)마다 최소 한 번.
+
+goal의 좌우 방향은 `make_goal()`을 새로 손대지 않고, 이미 검증 방향성이 있는
+`TargetPassing.choose_side()`를 그대로 호출해서 받습니다(`planner/hybrid_astar.py`
+`make_goal_by_side()`) — 방향 우선순위(①타겟 없는 차선 ②비어있는 쪽 ③노란선 건너편) 로직을
+두 곳에 중복 구현하지 않기 위함입니다.
+
+**탐색 실패 시 — TargetPassing 폴백:** ①②(무효화/진입)로 강제 재탐색했는데도 빈 경로가 나오면
+그 프레임은 감속만 하고 재시도하다가, `ASTAR_B3_FAIL_GRACE_TICKS`(기본 3틱)를 넘기면 이미 검증된
+`TargetPassing.update()`로 그 통과가 끝날 때까지 위임합니다(`_b3_using_fallback` 래치 — 매틱
+astar/TargetPassing을 오가면 진행 중이던 SHIFT/ALONGSIDE 기동이 중간에 끊기기 때문에, 한 번
+폴백하면 `_run_passing()`의 `done` 처리에서 통과가 완료될 때까지 풀어주지 않습니다). ③(주기적)만으로
+트리거된 재탐색이 실패한 경우는 기존 경로가 아직 안전하다는 뜻(무효화 검사를 이미 통과)이라 그대로
+유지합니다.
+
+**로컬 pose:** yaw는 B2와 동일하게 IMU 실측(`self.imu_yaw`) 기준입니다. x/y 적분 속도는 B2가 쓰는
+명령속도(`self.ctrl_speed`, 미측정) 대신 VESC 실측(`self.v_mps`, `_vesc_live()`로 생존 가드)이
+살아있으면 그걸 우선 씁니다 — B3는 재탐색이 잦아 적분 구간이 B2보다 짧아 드리프트 영향 자체는
+작지만, 이미 있는 실측 인프라를 안 쓸 이유가 없습니다.
+
+**차량 풋프린트:** `planner/hybrid_astar.py`의 충돌검사(`collision()`)가 그동안 `vehicle_width=0.45`/
+`vehicle_length=0.70`을 하드코딩하고 있었는데, xycar 실측값(`VEHICLE_WIDTH_M=0.31`,
+`VEHICLE_LENGTH_M=0.64`, §6.1)과 달랐습니다. 이번에 실측값 + `ASTAR_VEHICLE_MARGIN_M`(설계값,
+0.05m 편도 여유)로 교체했고, B2/B3 둘 다 이 값을 공유합니다.
+
+**디버그 방법:**
+- `DEBUG_PLANNER=True`(config.py) → `Occupancy_B3` 창(B2의 `Occupancy` 창과 별도 이름 — 두 Phase가
+  같은 세션에서 순차로 격리 테스트될 때 헷갈리지 않게 하려고 분리).
+
+**알려진 한계:**
+- 시간축을 갖는 진짜 동적 충돌검사가 아닙니다 — 매틱 최신 스냅샷을 트리거 기반으로 재탐색하는
+  반응형 근사(receding horizon)입니다. 장애물의 미래 위치를 예측하지 않습니다.
+- `ASTAR_B3_REPLAN_TICKS`/`ASTAR_B3_FAIL_GRACE_TICKS`/`ASTAR_VEHICLE_MARGIN_M` 모두 실차 미검증
+  설계값입니다.
+- 기본값은 `False`(B2와 동일하게 비교/보존용) — B2조차 아직 기본 비활성인 상태라, 이쪽을 실차에서
+  켜기 전에 B2부터 검증하는 게 순서상 맞습니다.
+
 ---
 
 ## 6. 실측값 기록 (캘리브레이션)
@@ -1509,6 +1560,7 @@ SHIFT 단계에서 타겟이 내가 지나가려는 쪽으로 넘어오는 상�
 |---|---|---|
 | `LANE_WIDTH_M` (config.py) | 0.4m | 흰선~흰선(도로 전체폭) 80cm 실측, 노란 중앙선이 정중앙임을 확인 → 차선 1개 폭 = 80/2 = 40cm |
 | `VEHICLE_WIDTH_M` (config.py) | 0.31m | xycar 본체 실측: 세로64cm × 가로31cm × 높이20cm |
+| `VEHICLE_LENGTH_M` (config.py) | 0.64m | 위와 동일 실측(세로=전후 길이). 2026-08-11까지 config 상수로는 안 쓰이고 있었음 — `planner/hybrid_astar.py`의 충돌검사 풋프린트(`vehicle_width`/`vehicle_length`)가 실측 대신 0.45/0.70 하드코딩 추정치를 쓰고 있던 걸 이번에 이 값 + `ASTAR_VEHICLE_MARGIN_M`(설계값, 0.05m)으로 교체 |
 | 고정장애물(고장난 차량) 실측 크기 | 가로20cm×세로41cm×높이16cm | 방해차량과의 라이다 폭 분류 기준(`OBSTACLE_VEHICLE_WIDTH_M=0.24`, config.py) 산출 근거 |
 | 방해차량 실측 크기 | 가로28cm×세로54cm×높이19cm | 위와 동일. `OBSTACLE_VEHICLE_WIDTH_M = (0.20+0.28)/2 = 0.24` |
 
