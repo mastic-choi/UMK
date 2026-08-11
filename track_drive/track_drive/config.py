@@ -733,14 +733,16 @@ ENABLE_BEHAVIOR = True   # S1에서 라바콘/장애물/추월 Behavior를 켤�
 
 # ── 실차 테스트 범위 제한 ──
 #   지금 단계에서 실차로 검증 가능한 건 딱 세 가지: ①신호등 인식 후 출발(S0)
-#   ②차선주행(S1) ③라바콘 주행(B1). 나머지(S2 교차로/S3 지름길, B2 고정장애물/
-#   B3 방해차량)는 아직 실차 미검증(좌회전 각도·속도 placeholder)이라 테스트 중
-#   의도치 않게 발동하면 위험할 수 있어 아래 두 플래그로 강제로 꺼둔다.
-#   → 전체 미션을 테스트할 준비가 되면(좌회전 튜닝 끝) 둘 다 False로 되돌릴 것.
+#   ②차선주행(S1) ③라바콘 주행(B1). 나머지(S2 교차로/S3 지름길)는 아직 실차
+#   미검증(좌회전 각도·속도 placeholder)이라 테스트 중 의도치 않게 발동하면 위험할
+#   수 있어 아래 플래그로 강제로 꺼둔다. → 좌회전 튜닝 끝나면 False로 되돌릴 것.
 TEST_DISABLE_INTERSECTION = True
 #   True: 정지선을 감지해도 감속→S2_INTERSECTION 전환을 아예 안 함(차선주행만 계속).
 #   False: 원래대로 정지선 감지 시 감속 후 S2로 정상 전환.
-TEST_DISABLE_B2_B3 = True
+# [2026-08-11] B2/B3 실차 테스트 시작 — True → False. 라바콘(B1) 격리 테스트는 이 값과
+#   무관(B1엔 트리거 조건이 없음, apply_behavior_override() 참고)하니 그대로 True 둬도
+#   B1은 계속 검증 가능하다.
+TEST_DISABLE_B2_B3 = False
 #   True: Phase가 FIXED_OBSTACLE/VEHICLE로 넘어가도 트리거 검사를 건너뛰고
 #         B0_NORMAL로 고정(B1 끝난 뒤 계속 일반 차선주행만 함).
 #   False: 원래대로 SAFETY_DIST/OVERTAKE_TRIGGER 트리거 검사해서 B2/B3 정상 발동.
