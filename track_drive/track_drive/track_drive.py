@@ -99,6 +99,13 @@ class TrackDriverNode(Node):
         self.lane_lookahead = 0.0   # 원거리(앞쪽) 편차 → 코너 진입 전 예측감속용
         self.lane_path = []         # 명시적 경로(ROI 픽셀좌표 웨이포인트, 가까운점→먼점)
                                      #   perc_lane()이 갱신, _lane_steer()가 조향각 계산에 사용
+        # [2026-08-11] DL 추론 워커의 result_seq(perception/dl_lane.py) 기반 "새 결과 없음"
+        # 판정 — perc_lane() 참고. _lane_seq_seen=None은 "아직 한 번도 안 비교함"(백엔드가
+        # result_seq를 안 가진 hough/classic_cv에서는 계속 None으로 남아 아래 로직 자체가
+        # 스킵된다 — 그 백엔드들은 매 틱 동기 계산이라 애초에 이 문제가 없음).
+        self._lane_seq_seen = None
+        self._lane_fresh_t = time.time()  # 마지막으로 result_seq가 바뀐 걸 확인한 시각
+        self.lane_stale = False     # LANE_STALE_SEC 이상 새 추론 결과가 안 나온 상태 — _lane_drive()가 SPEED_LANE_STALE로 강제 감속
         self._lane_prev_width = 448.0  # 도로폭 직전값(px, EMA)
         self.lane_side   = LANE_SIDE   # 현재 주행 차선: +1=우측차선(노란선이 왼쪽) / -1=좌측차선
                                         #   노란 중앙선 위치로 매 프레임 갱신(_update_lane_side)
@@ -390,6 +397,7 @@ class TrackDriverNode(Node):
     def perc_lane(self):
         if self.img_front is None:
             self.lane_valid = False
+            self.lane_stale = True   # 카메라 프레임 자체가 아직/더 이상 없음 — 당연히 신선하지 않음
             return
 
         # hough_lane.py의 HoughLaneDetector를 사용하여 차선 인식 수행
@@ -407,6 +415,21 @@ class TrackDriverNode(Node):
             lookahead_xy = self.pure_pursuit.last_target_xy
             lookahead_px = self.pure_pursuit.last_lookahead_px
         getattr(self.lane_detector, 'show_debug_windows', lambda *a, **k: None)(lookahead_xy, lookahead_px)
+
+        # [2026-08-11] "재사용된 최신값"과 "완전히 안 갱신됨"을 구분 — DLLaneDetector가
+        # 추론 1회 끝날 때마다 올리는 result_seq(dl_lane.py 참고)가 직전 틱에서 본 값과
+        # 같으면 이번 틱도 같은 결과를 다시 받았다는 뜻이다. 그게 LANE_STALE_SEC 넘게
+        # 계속되면(=추론 워커가 죽었거나 카메라가 끊겼거나) lane_stale=True로 표시한다.
+        # hough/classic_cv처럼 result_seq가 없는(=매 틱 동기 계산이라 항상 새 값인) 백엔드는
+        # getattr가 None을 반환해 이 판정 자체를 건너뛰고 항상 fresh로 취급한다.
+        seq = getattr(self.lane_detector, 'result_seq', None)
+        if seq is not None:
+            if seq != self._lane_seq_seen:
+                self._lane_seq_seen = seq
+                self._lane_fresh_t = time.time()
+            self.lane_stale = (time.time() - self._lane_fresh_t) >= LANE_STALE_SEC
+        else:
+            self.lane_stale = False
 
         self.lane_center = lane_center
         self.lane_valid = valid
@@ -1269,6 +1292,16 @@ class TrackDriverNode(Node):
         if (LANE_DETECTOR_BACKEND == 'dl' and DL_CENTER_MODE == 'll'
                 and getattr(slide, 'll_degraded', False)):
             target_speed = min(target_speed, SPEED_LL_DEGRADED)
+        # [2026-08-11] LANE_STALE_SEC 이상 새 차선인식 결과가 안 나온 상태(perc_lane()의
+        # lane_stale, config.py LANE_STALE_SEC 주석 참고) — 조향 자체는 이미 self.lane_path가
+        # 고정돼 있어 안전하게(발산 없이) 마지막 판단을 유지하지만, 그것만으론 "지금 인지가
+        # 죽어있다"는 걸 아무도 모른다. 코너가 아닌데도 이 속도로 깎이면 그 부자연스러움
+        # 자체가 사람이 알아챌 수 있는 신호가 되도록 일부러 감속으로 표시한다(요청 반영).
+        # 정상적인 프레임 재사용(추론이 20Hz보다 느려 몇 틱 같은 값을 재사용하는 것,
+        # dl_lane.py 모듈 상단 주석의 의도된 동작)은 result_seq가 계속 바뀌므로 여기 안 걸림 —
+        # 진짜로 갱신이 멈춘 경우에만 발동한다.
+        if self.lane_stale:
+            target_speed = min(target_speed, SPEED_LANE_STALE)
         speed_ratio = min(1.0, self._prev_speed / SPEED_NORMAL)
         corner_decay = CORNER_HOLD_DECAY_LO + (CORNER_HOLD_DECAY_HI - CORNER_HOLD_DECAY_LO) * speed_ratio
         self._corner_hold = max(turn_now, self._corner_hold * corner_decay)
@@ -1768,7 +1801,9 @@ class TrackDriverNode(Node):
                  sig = 신호등 상태. 앞 R/L/S(0/1)는 이번 프레임 순간값, confirmS/L는 디바운스
                        통과 후 FSM이 실제로 보는 확정값(카운터/기준 SIG_CONFIRM_FRAMES 같이 표시)
                  lidar = 유효포인트수(min거리m, 나이s)
-          [LANE] 차선편차px(검출여부) / obs = 라이다 전방장애물(거리m,좌우,타입)
+          [LANE] 차선편차px(검출여부) stale=LANE_STALE_SEC 이상 새 추론결과 없음(1) 여부
+                 (SPEED_LANE_STALE로 강제감속 중이라는 뜻 — 코너 아닌데 감속되면 이거 확인)
+                 / obs = 라이다 전방장애물(거리m,좌우,타입)
           lava   = 라바콘 보로노이 편차(구간종료 판정)
           trigL  = 라바콘 진입: 본선카운트/기준 (좌클러스터,우클러스터 검출여부)
           trigV  = 차량 진입:   본선카운트/기준
@@ -1825,7 +1860,7 @@ class TrackDriverNode(Node):
             f'누적={math.degrees(self._yaw_accum):+.0f}도/{math.degrees(LAP_YAW_FULL):.0f} '
             f'경과={time.time() - self._lap_t0:.0f}s\n'
             f'  [SENS] cam={cam_age:.1f}s sig={sig_flags} lidar={lidar_desc}\n'
-            f'  [LANE] lane={self.lane_offset:+.1f}({int(self.lane_valid)}) '
+            f'  [LANE] lane={self.lane_offset:+.1f}({int(self.lane_valid)}) stale={int(self.lane_stale)} '
             f'side={"R" if self.lane_side >= 0 else "L"}차선 '
             f'obs={self.obstacle_front}({self.obstacle_dist:.1f}m,w={self.obstacle_width:.2f}m,{self.obstacle_type}) '
             f'lava={self.lavacon_offset:+.2f}(done={int(self.lavacon_done)})\n'
