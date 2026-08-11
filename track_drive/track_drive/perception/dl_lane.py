@@ -3,8 +3,18 @@
 #=============================================
 # dl_lane.py — TwinLiteNet(ONNX Runtime) 기반 딥러닝 차선인식 백엔드.
 #
-# https://github.com/harrylal/TwinLiteNet-onnxruntime 의 사전학습 가중치(models/best.onnx)를
-# 그대로 사용한다. hough_lane.HoughLaneDetector / perc_floor.LaneDetector와 동일하게
+# [2026-08-11] 모델을 harrylal/TwinLiteNet-onnxruntime 사전학습 가중치(best.onnx)에서
+# 자체 fine-tune 결과물인 TwinLiteNetPlus(small, bootstrap_v2 학습셋)
+# `models/twinlitenetplus_small_bootstrap_v2.onnx`로 교체했다 — fine-tune 저장소
+# scripts/compare_bootstrap_v2_da.py의 74장 사람 GT 정량비교에서 구모델 대비 da 과다포함
+# (커브 구간 편향, §2.12 기존 이슈)이 줄어든 게 확인됨. 입출력 텐서 이름('images'/'da'/'ll'),
+# 전처리(letterbox 없이 리사이즈 → BGR→RGB → /255, mean/std 정규화 없음), 출력 형식((1,2,H,W)
+# raw logit, softmax 후 채널1=foreground)은 기존 모델과 동일 — 모델 입력 해상도만
+# 360x640 → 384x640으로 바뀌었다(아래 DL_INPUT_H). 이 .onnx는 가중치를 외부 데이터 파일
+# (`twinlitenetplus_small_bootstrap_v2.onnx.data`, 같은 디렉터리에 있어야 함 — onnx 파일
+# 내부에 상대경로로 박혀 있어 파일명을 바꾸면 로드가 깨진다)로 분리해 export됐다.
+# best.onnx는 롤백/비교용으로 그대로 남겨뒀다(이제 기본 경로로는 안 쓰임).
+# hough_lane.HoughLaneDetector / perc_floor.LaneDetector와 동일하게
 #   detect(frame) -> (lane_valid, lane_offset, lane_lookahead, lane_center, path, debug_img)
 # 인터페이스를 구현하므로 track_drive.py의 perc_lane()은 수정 없이 그대로 재사용된다
 # (LANE_DETECTOR_BACKEND 플래그로 세 백엔드 중 하나를 고른다). path는 밴드(row 구간)별
@@ -72,21 +82,23 @@ except ImportError:
     get_package_share_directory = None
 
 
-# ── 모델 입출력 스펙 (harrylal/TwinLiteNet-onnxruntime 리포 기준 — 이미 검증됨, 재검증 불필요) ──
-#   images 텐서 (1,3,360,640) float32 NCHW. 전처리는 letterbox 없이 640x360으로 그냥
-#   리사이즈(원본 리포의 blobFromImage와 동일) → BGR→RGB → /255.0 (mean/std 정규화 없음).
+# ── 모델 입출력 스펙 (fine-tune 저장소 twinlitenetplus_small_bootstrap_v2.onnx 기준 —
+#   onnxruntime InferenceSession.get_inputs()/get_outputs()로 직접 확인함, 2026-08-11) ──
+#   images 텐서 (batch,3,384,640) float32 NCHW. 전처리는 letterbox 없이 640x384로 그냥
+#   리사이즈(harrylal 원본 blobFromImage 방식 그대로 유지) → BGR→RGB → /255.0
+#   (mean/std 정규화 없음, fine-tune/scripts/compare_bootstrap_v2_da.py의 infer_new()와 동일).
 DL_INPUT_W = 640
-DL_INPUT_H = 360
+DL_INPUT_H = 384
 DL_INPUT_NAME = 'images'
 DL_OUTPUT_NAMES = ('da', 'll')
 
 # ── 세그멘테이션 입력은 절대 자르지 않는다 ──
-#   원본 리포(blobFromImage)와 동일하게 raw 프레임 전체를 그대로 640x360으로 리사이즈해서
+#   원본 리포(blobFromImage)와 동일하게 raw 프레임 전체를 그대로 640x384로 리사이즈해서
 #   모델에 넣는다(추가 크롭 없음). 관심영역은 "모델에 들어가기 전"이 아니라 "모델에서 나온
 #   세그멘테이션 결과(da/ll)를 원본 프레임 크기로 되돌린 뒤" 잘라서 쓴다 — 아래
 #   DL_ROI_Y0/Y1 참고.
 #
-# da/ll 둘 다 (1,2,360,640) raw logit. 채널축 softmax 후 채널1이 foreground 확률.
+# da/ll 둘 다 (batch,2,384,640) raw logit. 채널축 softmax 후 채널1이 foreground 확률.
 # DL_FG_THRESHOLD(이진화 임계값), DL_ROI_Y0/Y1(원본 480행 기준 절대 픽셀, 실차 실측값)는
 # config.py에 있다 — 실차 테스트 중 값을 바꾸려면 이 파일이 아니라 config.py를 고칠 것.
 from ..config import DL_FG_THRESHOLD, DL_LL_FG_THRESHOLD, DL_ROI_Y0, DL_ROI_Y1
@@ -196,21 +208,26 @@ DL_MODE_COLORS = {
 DL_MODE_COLOR_DEFAULT = (60, 60, 60)  # 위 셋에 없는 값(오타 등) 대비 폴백
 
 
+DL_MODEL_FILENAME = 'twinlitenetplus_small_bootstrap_v2.onnx'
+
+
 def _default_model_path():
-    """모델 가중치 파일(best.onnx) 기본 경로.
-    1순위: colcon install된 share 디렉터리(share/track_drive/models/best.onnx)
+    """모델 가중치 파일(twinlitenetplus_small_bootstrap_v2.onnx) 기본 경로.
+    1순위: colcon install된 share 디렉터리(share/track_drive/models/<파일명>)
     2순위: 소스트리에서 직접 실행 중일 때(개발 중, colcon build 전) — track_drive 패키지 디렉터리 기준 상대경로
+    같은 디렉터리의 <파일명>.data(외부 데이터 파일)도 같이 있어야 한다 — onnx 파일 안에
+    상대경로로 박혀 있어 둘 중 하나만 옮기면 로드가 깨진다.
     """
     if get_package_share_directory is not None:
         try:
             share_dir = get_package_share_directory('track_drive')
-            candidate = os.path.join(share_dir, 'models', 'best.onnx')
+            candidate = os.path.join(share_dir, 'models', DL_MODEL_FILENAME)
             if os.path.isfile(candidate):
                 return candidate
         except Exception:
             pass
     package_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(package_dir, 'models', 'best.onnx')
+    return os.path.join(package_dir, 'models', DL_MODEL_FILENAME)
 
 
 class TwinLiteNetEngine:
@@ -227,9 +244,9 @@ class TwinLiteNetEngine:
         self.model_path = model_path or _default_model_path()
         if not os.path.isfile(self.model_path):
             raise FileNotFoundError(
-                f'TwinLiteNet 가중치 파일을 찾을 수 없습니다: {self.model_path}\n'
-                'https://github.com/harrylal/TwinLiteNet-onnxruntime 의 models/best.onnx를 '
-                '내려받아 이 경로에 두세요.'
+                f'TwinLiteNetPlus 가중치 파일을 찾을 수 없습니다: {self.model_path}\n'
+                'fine-tune 저장소의 outputs/onnx/twinlitenetplus_small_bootstrap_v2.onnx와 '
+                '동일 파일명의 .onnx.data(외부 데이터)를 함께 이 경로에 두세요.'
             )
         self._logger = logger
 

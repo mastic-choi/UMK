@@ -201,7 +201,8 @@ ros2 launch track_drive track_drive.launch.py
 | `'hough'` | `perception/hough_lane.py`의 `HoughLaneDetector` | 대안, 실차 라바콘 테스트까지 검증됨. `'dl'` 초기화 실패 시 자동 폴백 |
 | `'classic_cv'` | `perception/lane_util.py`(`CameraProcessor`+`SlideWindow`) + `perception/perc_floor.py`(`LaneDetector`) 조립 | 보존용, 현재 라이브 미검증 |
 
-`'dl'` 선택 시 `onnxruntime` 미설치나 `models/best.onnx` 부재 등으로 초기화가 실패하면 `_build_lane_detector()`
+`'dl'` 선택 시 `onnxruntime` 미설치나 `models/twinlitenetplus_small_bootstrap_v2.onnx`(.data)
+부재 등으로 초기화가 실패하면 `_build_lane_detector()`
 ([track_drive.py:303-323](track_drive.py#L303))가 에러를 로깅하고 자동으로 `'hough'`로 폴백합니다(조용히
 무시하지 않음) — 노드 시작 로그에 `DL 차선인식 백엔드 초기화 실패, hough로 폴백합니다` 가 찍혔는지 꼭 확인하세요.
 
@@ -1414,6 +1415,39 @@ mode전환으로 바꿀 수 있게" 요청받아 아래처럼 병합했다.
   들고 있어 `None`이 되지 않는다 — 이 경우는 `result_seq`가 안 늘어나는 것으로만 잡힌다
   (DL 추론이 같은 정지 프레임을 계속 새로 돌더라도 입력이 똑같으면 출력도 똑같을 것이므로
   실질적으로는 문제없이 잡히지만, 엄밀히 "카메라 나이"를 직접 보는 방식은 아니다).
+
+---
+
+### 2.25 DL 세그멘테이션 모델을 자체 fine-tune 결과물로 교체 (`twinlitenetplus_small_bootstrap_v2.onnx`, 2026-08-11)
+
+**배경:** 지금까지 `'dl'` 백엔드는 harrylal/TwinLiteNet-onnxruntime의 사전학습 가중치
+(`models/best.onnx`)를 그대로 썼다. `fine-tune` 저장소(별도 작업 디렉터리)에서 TwinLiteNetPlus
+(small)를 bootstrap_v2 데이터셋(사람 라벨 134장 기반)으로 fine-tune한 결과물이 나왔고,
+`fine-tune/scripts/compare_bootstrap_v2_da.py`의 74장 사람 GT 정량비교에서 구모델 대비
+da 과다포함(§2.12에서 확인된 커브 구간 편향)이 줄어든 것으로 확인됨.
+
+**수정:**
+- `fine-tune/outputs/onnx/twinlitenetplus_small_bootstrap_v2.onnx` + 외부 데이터 파일
+  `twinlitenetplus_small_bootstrap_v2.onnx.data`를 이 저장소의
+  `track_drive/track_drive/models/`로 복사해 커밋함 — 실차에 올리려면 저장소를 pull하면
+  같이 딸려온다. 두 파일 다 같은 디렉터리에 있어야 로드된다(onnx 파일 내부에 데이터
+  파일명이 상대경로로 박혀 있음, `strings`로 확인).
+- `perception/dl_lane.py`: `_default_model_path()`가 가리키는 파일명을 `best.onnx` →
+  `twinlitenetplus_small_bootstrap_v2.onnx`로 변경. `DL_INPUT_H`를 360 → 384로 변경
+  (onnxruntime `get_inputs()/get_outputs()`로 새 모델의 입력이 `(batch,3,384,640)`,
+  출력이 `(batch,2,384,640)`×2(`da`,`ll`)임을 직접 확인함 — 폭(640)·텐서 이름(`images`/
+  `da`/`ll`)·전처리(letterbox 없이 리사이즈 → BGR→RGB → /255, mean/std 정규화 없음)는
+  구모델과 동일해서 그 외 코드는 손 안 댐).
+- `best.onnx`는 롤백/비교용으로 저장소에 그대로 남겨뒀다(기본 경로로는 더 이상 안 쓰임).
+
+**알려진 한계:**
+- 이 교체는 아직 **실차 미검증**이다 — `compare_bootstrap_v2_da.py`의 정량비교는 개발
+  머신에서 정적 이미지 74장 기준으로만 확인됐고, 실제 트랙 주행(다른 조명/각도/속도)에서
+  da/ll 품질이 실제로 개선됐는지는 실차 테스트로 확인해야 한다.
+- `DL_INPUT_H`가 360→384로 늘어 프레임당 추론 연산량이 소폭(약 6.7%) 늘었다 — Jetson에서
+  FPS가 유의미하게 떨어지면 `FPS_LOG_PERIOD_SEC` 로그로 확인 후 판단할 것.
+- ll(차선) 출력의 정량비교는 위 스크립트에 없다(da만 비교함) — ll 품질도 구모델과 같거나
+  나은지는 별도로 실차/육안 확인이 필요하다.
 
 ---
 
