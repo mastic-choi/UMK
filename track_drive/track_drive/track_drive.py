@@ -1618,8 +1618,36 @@ class TrackDriverNode(Node):
             self._handle_fixed_obstacle_astar()
             return
 
+        if not self._da_avoidance_failed():
+            # da 기반 경로(Mission의 lane-follow 출력)가 알아서 피하고 있다고 신뢰 —
+            # TargetPassing으로 덮어쓰지 않고 이번 틱은 그냥 둔다.
+            return
+
         self._run_passing(self.obstacle_controller, 'B2',
                           done_next_phase=Phase.VEHICLE)
+
+    # [2026-08-11] da 기반 회피가 이 정지 장애물을 알아서 피하고 있다고 믿을 수 있는지
+    #   판단한다. False면 TargetPassing 개입 없이 da 경로 그대로, True면 위
+    #   _handle_fixed_obstacle()이 TargetPassing(실측 기반 하드코딩 SHIFT/ALONGSIDE/
+    #   RETURN)으로 override한다. Hybrid A*(검색 기반) 대신 이 하드코딩 방식을 폴백으로
+    #   쓰기로 함 — 구조화된 2차선 환경에서 검색은 과한 방식이라는 기존 결론(§4)과 같은
+    #   이유.
+    #
+    #   실패로 보는 조건 두 가지(OR):
+    #     ① 경로 끊김/불안정 — self.lane_valid/self.lane_stale. 이건 지금도 실제로
+    #        동작하는 신호다(perc_lane(), §2.24 LANE_STALE_SEC).
+    #     ② da가 장애물을 반영해서 회피했다는 근거가 없음 — da 세그멘테이션
+    #        (perception/dl_lane.py)은 아직 차선표시만 학습돼 있고 장애물 인지가
+    #        전혀 없다(2026-08-11 기준). 그래서 지금은 이 조건이 항상 참이고, 결과적으로
+    #        B2 트리거만 걸리면 매번 TargetPassing이 켜진다 — 오늘 기준 동작은 이 함수를
+    #        넣기 전과 동일하다. da가 장애물 인지형으로 바뀌는 날 이 한 줄(da_unaware_
+    #        of_obstacle)만 실제 판단 로직으로 교체하면 되고, TargetPassing 쪽은 손댈
+    #        필요가 없다 — 그게 이 함수를 분리해둔 이유다.
+    def _da_avoidance_failed(self):
+        path_broken = (not self.lane_valid) or self.lane_stale
+        da_unaware_of_obstacle = True  # ★da가 장애물 인지형이 되면 실제 조건으로 교체
+
+        return path_broken or da_unaware_of_obstacle
 
     # ── B2 대안: Hybrid A* 경로계획 방식 (USE_HYBRID_ASTAR_FOR_B2=True 일 때만) ──
     #   구조화된 2차선 환경에는 과한 방식이라 기본은 비활성. 비교/보존용으로 남겨둔다.

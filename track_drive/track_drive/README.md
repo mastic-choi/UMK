@@ -1441,15 +1441,29 @@ self.phase = Phase.FIXED_OBSTACLE   # __init__ 안의 self.phase 초기값을 �
 정상 흐름은 라바콘(B1) 완료 후 자동으로 `Phase.FIXED_OBSTACLE`로 넘어가는 것이라, 이 기능만 격리
 테스트하려면 `__init__`의 `self.phase = Phase.LAVACON`을 위처럼 임시로 바꾸면 됩니다.
 
-**동작 방식** (`TargetPassing`, [controller/obstacle_avoidance.py:49](controller/obstacle_avoidance.py#L49)):
+**진입 게이트 — `_da_avoidance_failed()` (2026-08-11 추가):** `USE_HYBRID_ASTAR_FOR_B2=False`(기본)일
+때, B2 트리거가 걸렸다고 바로 `TargetPassing`이 켜지지 않고 먼저 `_da_avoidance_failed()`를 봅니다.
+`False`면(= da 기반 경로가 알아서 피하고 있다고 믿을 수 있으면) 개입 없이 Mission의 lane-follow
+출력을 그대로 둡니다. `True`(회피 실패)일 때만 아래 `TargetPassing`이 override합니다. 실패 조건은
+OR로 두 개:
+1. **경로 끊김/불안정** — `self.lane_valid`/`self.lane_stale`(오늘도 실제로 동작하는 신호).
+2. **da가 장애물을 반영했다는 근거 없음** — da 세그멘테이션이 아직 차선표시만 학습돼 있고 장애물
+   인지가 전혀 없어서, 지금은 이 조건이 **항상 참**입니다(`track_drive.py` `_da_avoidance_failed()`의
+   `da_unaware_of_obstacle` 참고). 그래서 오늘 기준 실질 동작은 이 게이트를 넣기 전과 동일하게
+   "B2 트리거만 걸리면 매번 TargetPassing"입니다 — da가 장애물 인지형으로 바뀌는 날 그 한 줄만
+   실제 판단 로직으로 바꾸면 자동으로 전환되도록 미리 분리해둔 것입니다.
+
+**동작 방식** (`TargetPassing`, [controller/obstacle_avoidance.py:49](controller/obstacle_avoidance.py#L49)) —
+"실측 기반 하드코딩" 폴백입니다(위 게이트가 열렸을 때만 동작). Hybrid A*(검색 기반)를 여기 쓰지 않기로
+한 이유는 구조화된 2차선 환경에서 검색은 과한 방식이라는 결론(§5.1과 동일)과 같습니다:
 1. **IDLE** — 전방 장애물이 감지되면 `choose_side()`로 통과 방향을 정합니다: ①타겟이 없는 차선 쪽(규정
    1순위) ②정면이라 못 가리면 비어있는 쪽(`left_clear`/`right_clear`) ③둘 다 비었으면 노란선 건너편.
    양쪽 다 막히면 `status='blocked'`(흰 실선 밖으로 안 나가고 서행하며 재시도).
-2. **SHIFT** — 목표 횡오프셋(`PASS_OFFSET=100px`)까지 서서히 이동(`LATERAL_ALPHA_OUT`).
+2. **SHIFT** — 목표 횡오프셋(`PASS_OFFSET=80px`, 실측 `LANE_WIDTH_M` 기반)까지 서서히 이동(`LATERAL_ALPHA_OUT`).
 3. **ALONGSIDE** — 장애물이 안 보이는 상태가 `CLEAR_FRAMES_TO_RETURN`(6프레임) 유지되면 RETURN으로.
 4. **RETURN** — 원 차선으로 복귀(`LATERAL_ALPHA_BACK`, SHIFT보다 빠르게) — 목표 오프셋이 5px 미만이면 완료.
 
-`USE_HYBRID_ASTAR_FOR_B2 = True`([config.py:256](config.py#L256))로 바꾸면 위 방식 대신
+`USE_HYBRID_ASTAR_FOR_B2 = True`([config.py:256](config.py#L256))로 바꾸면 위 게이트/`TargetPassing` 대신
 Hybrid A* + OccupancyGrid + Stanley(`planner/`, `_handle_fixed_obstacle_astar()`) 경로계획 대안을 씁니다
 — 비교/보존용이며 기본은 `False`.
 
@@ -1465,6 +1479,10 @@ Hybrid A* + OccupancyGrid + Stanley(`planner/`, `_handle_fixed_obstacle_astar()`
   실차 미검증 튜닝값입니다.
 - 좌우 선택은 카메라/YOLO 이중확인 없이 라이다 `obstacle_y` + `lane_side`만으로 판단 — 콘·차량 구분이 없어
   고정장애물(콘/박스류)도 동일한 로직으로 회피 방향이 잡힙니다.
+- `_da_avoidance_failed()`의 `da_unaware_of_obstacle` 조건이 아직 하드코딩 `True`입니다 — da 세그멘테이션
+  모델이 장애물을 인지하도록 바뀌기 전까지는 게이트가 사실상 항상 열려 있는 상태(=매번 TargetPassing)라는
+  뜻입니다. 실차 동작엔 영향 없지만, da가 장애물 인지형이 됐는데 이 줄을 안 바꾸면 계속 옛 동작(TargetPassing
+  상시개입)으로 남아있다는 점을 잊지 말 것.
 
 ---
 
