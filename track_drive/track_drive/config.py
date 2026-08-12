@@ -294,6 +294,28 @@ DL_DA_MAX_AREA_PX = 16000
 DL_DA_SEED_ROWS_PX = 10
 DL_DA_SEED_HALF_WIDTH_PX = 70.0
 
+# [2026-08-12] DL_CENTER_MODE='da' 밴드 중심 계산 — 탐색창(prior) + 밴드 간 속도예측 +
+#   프레임 간 앵커링. 원래 _slice_centers()(무보정 cv2.moments, 밴드 전체 폭)를 그대로
+#   썼는데, da가 옆 차선/여백까지 과검출(S자 커브에서 특히)되면 그 넓어진 영역 전체가
+#   무게중심 계산에 그대로 들어가 중심이 쏠린다 — da 선택 단계(_largest_da_component,
+#   시드/연속성)는 "어느 덩어리를 볼지"만 정하고, 그 덩어리 *안에서* 밴드 중심을 어떻게
+#   뽑을지에는 아무 방어가 없었다. Mobileye(클로소이드+칼만 — 과거 상태로 예측/추적),
+#   openpilot(프레임 간 hidden state), drivable-area 연구(공간 prior로 억제)에서 공통된
+#   "탐색을 예측 위치 근방으로 제한" 아이디어를 _ll_slice_centers()(DL_LL_ALGO='lr',
+#   §2.20 README)가 이미 쓰던 패턴 그대로 da에도 적용한다 —
+#   DLSlideWindow._da_slice_centers_windowed() 참고. da는 좌/우 두 갈래가 아니라
+#   중심선 "한 갈래"라 ll보다 단순한 단일-트랙 버전.
+#   DL_DA_SEARCH_HALF_WIDTH_PX가 DL_LL_SEARCH_HALF_WIDTH_PX(60, 선 하나 전용)보다 넓은
+#   이유 — da는 폭 있는 영역이라 반차로폭(LANE_WIDTH_M=0.4m=80px) 이상은 창 안에 들어와야
+#   정상 시야까지 잘라내지 않는다. 전부 실차 미검증 초기값 — 처음 켤 때 창이 너무 좁아
+#   정상 코너까지 놓치지 않는지(=검출 밴드 수가 줄지 않는지) DEBUG_VIZ_DL_LANE으로 확인할 것.
+DL_DA_SEARCH_HALF_WIDTH_PX = 100.0
+DL_DA_SEARCH_WIDEN_STEP_PX = 20.0
+DL_DA_SEARCH_WIDEN_MAX_PX = 200.0
+DL_DA_VELOCITY_EMA_ALPHA = 0.3      # 밴드 간 이동 속도(px/밴드) EMA 계수 — DL_LL_VELOCITY_EMA_ALPHA와 동일 관례
+DL_DA_VELOCITY_MAX_PX = 40.0        # 예측 이동량 클램프
+DL_DA_BAND_ANCHOR_ALPHA = 0.35      # 밴드별 탐색창 중심 계산 시 "직전 프레임 그 밴드 위치"에 주는 가중치
+
 # ll sanity check — ROI 내 ll(차선) foreground 비율이 이 미만이면 da 결과와 무관하게 무효 처리
 DL_LL_SANITY_MIN_RATIO = 0.005
 # da가 옆 차선과 이어붙었을 때 ll 라인 바깥(옆 차선 쪽) 픽셀을 잘라내는 여유폭(px)
@@ -401,6 +423,13 @@ DL_CENTER_MODE = 'll'  # 'da' | 'll_da' | 'll'
 #   두 알고리즘 다 DL_LL_SEARCH_HALF_WIDTH_PX/DL_LL_SIDE_MIN_PIXELS는 공유한다(둘 다
 #   "좁은 탐색창 + 최소 픽셀수" 기본 뼈대는 같아서). 실차에서 A/B 비교할 때 이 값만
 #   바꾸면 된다 — DL_CENTER_MODE는 그대로 'll' 유지.
+#   [2026-08-12] DL_LL_VELOCITY_EMA_ALPHA/DL_LL_VELOCITY_MAX_PX/DL_LL_BAND_ANCHOR_ALPHA
+#   (아래 'lr' 섹션에 있음)도 이제 'yw'가 같이 쓴다 — main 기본값인 'yw'
+#   (_ll_yellow_white_centers())엔 원래 §2.23 탐색창 확장(widen)만 있고 'lr'
+#   (_ll_slice_centers())의 속도예측+프레임간 앵커링이 빠져 있던 공백을 메웠다
+#   (README §2.27). 새 상수를 따로 만들지 않고 재사용한 이유는 둘 다 "밴드 간
+#   이동 속도를 추적해 탐색창을 미리 옮기고, 직전 프레임 그 밴드 위치로 당긴다"는
+#   동일한 물리적 개념이라서다.
 DL_LL_ALGO = 'yw'  # 'yw'(노란+흰선 짝짓기, main 기본) | 'lr'(좌우 흰선 독립 슬라이딩 윈도우)
 
 # ── DL_CENTER_MODE='ll_da'(corridor 알고리즘) 전용 튜닝값 (전부 실차 미검증 초기값) ──
@@ -422,6 +451,15 @@ DL_CORRIDOR_WIDTH_MAX_PX = 450
 # 안전마진을 곱해 px로 환산한 추정치(약 0.31m*1.3≈0.40m=80px@200px/m). 실측 아님 —
 # 좁은 틈으로 무리하게 끼어들지 않는지 실차에서 확인 후 조정할 것.
 DL_CORRIDOR_MIN_PASSABLE_PX = 80
+
+# [2026-08-12] _pick_open_run()의 프레임 간 히스테리시스(직전 프레임 채택 위치와 가장
+#   가까운 open run을 우선)는 정적이라, 빠른 S자에서 실제 열린 구간 위치가 그 사이 크게
+#   이동하면 뒤처질 수 있다. da/ll 모드에 적용한 것과 동일한 원리로 밴드 간 이동 속도를
+#   EMA 추적해(_corridor_slice_centers()) prefer_x를 "직전 위치 + 예측 이동량"으로
+#   미리 옮긴다(README §2.27). corridor는 좌/우 두 갈래가 아니라 "열린 구간 하나"만
+#   추적하므로 da처럼 스칼라 하나면 된다. 실차 미검증 초기값.
+DL_CORRIDOR_VELOCITY_EMA_ALPHA = 0.3
+DL_CORRIDOR_VELOCITY_MAX_PX = 40.0
 
 # DL_CENTER_MODE='ll'일 때 쓰는 ll 중점 채택 임계값.
 # 밴드 내 ll 픽셀수가 이 미만이면(노란선/흰선 각각 판정) "이 밴드는 그게 안 보임" 처리.
@@ -585,9 +623,18 @@ PP_LOOKAHEAD_MIN_PX = 40.0         # 코너에서 lookahead가 줄어들 수 있
 #   같은 curvature에도 조향각이 더 작게(atan 인자가 작아짐) 나와 코너링이 더 완만해질 수
 #   있다 — 너무 밋밋하게 느껴지면 이 값을 다시 올릴 것(단, 그때는 "튜닝값"임을 주석에 남길 것).
 PP_WHEELBASE_PX = 67.0             # = LQR_WHEELBASE_M(0.335) * DL_PIXELS_PER_METER(200) 실측 기반 계산값
-PP_ALPHA = 0.5                     # 프레임간 조향각 저역통과 필터(1=필터없음, 0=반응없음)
+# [2026-08-12] 직진 구간에서도 계속 진동("와리가리")한다는 보고 대응 — §0.5.3 "알려진
+#   한계"에서 이미 "PP_ALPHA를 낮춰 조향각 저역통과를 더 강하게 거는 쪽을 다음으로 볼 것"
+#   이라고 못박아뒀던 그 다음 단계. 0.5 → 0.35로 낮춰 프레임간 저역통과를 더 세게 건다
+#   (README §0.5.7). 실차 미검증 — 너무 낮추면 실제 코너 진입 반응이 느려지니 같이 볼 것.
+PP_ALPHA = 0.35                    # 프레임간 조향각 저역통과 필터(1=필터없음, 0=반응없음)
 PP_MIN_LOOKAHEAD_PX = 90.0         # curvature 분모(ld) 바닥값 — 노이즈 증폭 방지용. PP_LOOKAHEAD_MIN_PX와 다른 값이니 헷갈리지 말 것
-PP_DX_DEADZONE_PX = 6.0            # 이 이하 픽셀오차는 0으로 죽여 중앙 부근 잔떨림 제거
+# [2026-08-12] 6.0 → 15.0. 직진 진동 대응 세 번째 레버 — 원래 값이 중앙 부근 잔떨림을
+#   죽이기엔 너무 작아서(픽셀 몇 개짜리 노이즈도 그대로 통과) 직진에서도 매 프레임 미세한
+#   조향이 나갔던 것으로 추정. LANE_DEADZONE(구 PID 전용, 40px)보다는 여전히 훨씬 작게
+#   유지 — Pure Pursuit 목표점은 이미 lookahead 앞 실제 경로점이라 그만큼 크게 죽이면
+#   완만한 커브 진입까지 무시하게 된다(pure_pursuit.py 상단 주석 참고). 실차 미검증.
+PP_DX_DEADZONE_PX = 15.0           # 이 이하 픽셀오차는 0으로 죽여 중앙 부근 잔떨림 제거
 
 # ── LQR 튜닝값 (controller/lqr.py LQRController) — 전부 실차 미검증 ──
 #   speed_gain: 클수록 반응 커짐. r_steer: 올릴수록 조향 억제(지그재그 완화,
@@ -813,7 +860,11 @@ STABLE_JUMP_MAX = 15   # 이 이상(px) 차이나면 "같은 흐름"이 아닌 �
 #   curvature 기반 lookahead 축소로 "중심선이 waypoint에서 벗어나면 되돌아오는 반응이
 #   한 박자 늦다"는 문제를 제어 단계에서 어느 정도 잡았으니, 인지 단계 경로 스무딩도
 #   새 프레임 비중을 높여 지연 자체를 줄여본다. 오실레이션 재발 시 0.2~0.3으로 낮출 것.
-PATH_EMA_ALPHA = 0.4   # 새 프레임에 줄 가중치(작을수록 더 부드럽고, 더 느리게 반응)
+#   [2026-08-12] 바로 그 "재발" 상황 — 직진 구간에서도 계속 진동한다는 보고로 0.4→0.25로
+#   다시 낮췄다(위에서 예고한 0.2~0.3 범위 안). README §0.5.7 참고. A1/A2/A3(같은 날
+#   추가된 da/ll/corridor 밴드 간 속도예측+앵커링)이 경로 자체의 프레임간 흔들림을
+#   줄이는 근본 대응이고, 이 값은 그 위에 남는 잔여 흔들림을 한 번 더 죽이는 보강이다.
+PATH_EMA_ALPHA = 0.25   # 새 프레임에 줄 가중치(작을수록 더 부드럽고, 더 느리게 반응)
 
 # ── 라바콘/장애물/방해차량/신호등 트리거 ──
 LAVACON_DONE_FRAMES = 80      # 우측콘 미검출이 연속 N프레임(20Hz→약 4초) 쌓이면 Phase 전환(디바운스)

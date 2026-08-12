@@ -182,6 +182,9 @@ from ..config import (
     DL_STABLE_FRAME_MIN, DL_STABLE_JUMP_MAX,
     DL_DA_MIN_COMPONENT_AREA,
     DL_DA_SEED_ROWS_PX, DL_DA_SEED_HALF_WIDTH_PX,
+    # [2026-08-12] DL_CENTER_MODE='da' 밴드 중심 탐색창(prior)+속도예측+앵커링 — README §2.27
+    DL_DA_SEARCH_HALF_WIDTH_PX, DL_DA_SEARCH_WIDEN_STEP_PX, DL_DA_SEARCH_WIDEN_MAX_PX,
+    DL_DA_VELOCITY_EMA_ALPHA, DL_DA_VELOCITY_MAX_PX, DL_DA_BAND_ANCHOR_ALPHA,
     DL_LL_SANITY_MIN_RATIO, DL_LL_CLIP_MARGIN_PX,
     DL_LL_DECAY_ALPHA, DL_LL_DECAY_MIN_VALUE,
     DL_CENTER_MODE, DL_LL_ALGO, DL_LL_SIDE_MIN_PIXELS,
@@ -192,10 +195,12 @@ from ..config import (
     DL_LL_NO_YELLOW_SEARCH_HALF_WIDTH_PX,
     # DL_LL_ALGO='lr'(이지유 작성) 전용
     DL_LL_WIDTH_MIN_PX, DL_LL_WIDTH_MAX_PX, DL_LL_WIDTH_EMA_ALPHA,
+    # [2026-08-12] 아래 셋은 이제 'yw'/'lr' 둘 다 쓴다(config.py DL_LL_ALGO 주석 참고)
     DL_LL_VELOCITY_EMA_ALPHA, DL_LL_VELOCITY_MAX_PX,
     DL_LL_SEARCH_WIDEN_STEP_PX, DL_LL_SEARCH_WIDEN_MAX_PX, DL_LL_BAND_ANCHOR_ALPHA,
     DL_CORRIDOR_LINE_MIN_PIXELS, DL_CORRIDOR_LINE_MERGE_PX,
     DL_CORRIDOR_WIDTH_MIN_PX, DL_CORRIDOR_WIDTH_MAX_PX, DL_CORRIDOR_MIN_PASSABLE_PX,
+    DL_CORRIDOR_VELOCITY_EMA_ALPHA, DL_CORRIDOR_VELOCITY_MAX_PX,
     DL_LL_YELLOW_VOTE_RATIO, DL_LL_YELLOW_MIN_AREA,
     DEBUG_VIZ_DL_LANE, YELLOW_LOWER, YELLOW_UPPER, FPS_LOG_PERIOD_SEC,
     DL_DEBUG_HISTORY_LEN,
@@ -389,7 +394,22 @@ class DLSlideWindow(SlideWindow):
         self._prev_da_centroid = None  # [2026-08-07] 직전 프레임에 채택된 da 덩어리의 중심(cx,cy) — _largest_da_component()가 이번 프레임 후보를 "가장 가까운 것"으로 고르는 기준. 무효 프레임 뒤엔 None으로 리셋(옛 위치에 계속 붙잡히지 않도록)
         self.da_chosen_area_px = 0   # 실제로 채택돼 waypoint 추출에 쓰인 덩어리의 면적(무효 프레임엔 0)
         self.da_seed_width_px = 0   # [2026-08-10] 시드 위치(ROI 최하단 중앙, 차량 위치)에서 찾은 덩어리의 bounding box 가로폭(px) — 실제 채택/면적통과 여부와 무관하게 항상 기록(시드 위치에 아무것도 없으면 0). 너비 기반 선택 로직으로 바꿀지 판단하기 위한 실측용 — 아직 판단 로직에는 안 쓰임(_debug_viz_steer() 참고)
+        # [2026-08-12] DL_CENTER_MODE='da' 밴드 중심 탐색창(_da_slice_centers_windowed())
+        # 전용 상태 — _ll_left/right_velocity와 동일한 원리(밴드 간 이동 속도 EMA로
+        # 다음 밴드 탐색창을 미리 옮기고, 못 찾은 밴드는 그 속도로 dead-reckoning),
+        # da는 좌/우 두 갈래가 아니라 중심선 "한 갈래"라 값이 하나씩만 필요하다.
+        # README §2.27 참고.
+        self._da_velocity = 0.0
+        self._da_prev_band_x = [None] * self.n_slices
         self._white_yellow_gap_px = DL_LL_YELLOW_GAP_INIT_PX  # [2026-08-10] 노란 중앙선-흰색 경계선 간격 러닝 추정치(px, DL_LL_ALGO='yw' 전용) — 둘 다 찾은 밴드에서 EMA 갱신, 한쪽만 찾았을 때 반대쪽 위치 추정에 씀(_ll_yellow_white_centers() 참고).
+        # [2026-08-12] _ll_yellow_white_centers()(DL_LL_ALGO='yw') 밴드 간 속도예측 +
+        # 프레임 간 앵커링 상태 — 아래 _ll_left/right_velocity(DL_LL_ALGO='lr')와 동일한
+        # 원리를 노란선/흰선 각각에 적용한다(원래 'lr'에만 있고 'yw'엔 §2.23 탐색창
+        # 확장만 있던 공백을 메움, README §2.27).
+        self._yw_yellow_velocity = 0.0
+        self._yw_white_velocity = 0.0
+        self._yw_prev_band_yellow = [None] * self.n_slices
+        self._yw_prev_band_white = [None] * self.n_slices
         self._ll_half_width = (DL_LL_WIDTH_MIN_PX + DL_LL_WIDTH_MAX_PX) / 4.0  # [2026-08-07] ll 좌/우 독립 슬라이딩 윈도우의 차로 반폭 러닝 추정치(px, DL_LL_ALGO='lr' 전용) — 양쪽 다 찾은 밴드에서 EMA 갱신, 편측만 찾았을 때 반대쪽 위치 추정에 씀(_ll_slice_centers() 참고).
         # [2026-08-10 병합] _clip_da_by_ll()의 가상경계 최후수단은 DL_LL_ALGO에 맞는 반폭
         # 추정치를 써야 하므로(위 두 값 중 어느 쪽이 실제로 갱신되고 있는지는 DL_LL_ALGO가
@@ -411,6 +431,12 @@ class DLSlideWindow(SlideWindow):
         #     채워지고 나머지는 None.
         self._corridor_prev_open_x = [None] * self.n_slices
         self.corridor_bounds = [None] * self.n_slices
+        # [2026-08-12] 밴드 간 열린구간 이동 속도(px/밴드) EMA — _pick_open_run()의
+        # prefer_x를 "직전 프레임 위치 그대로"가 아니라 "그 위치 + 예측 이동량"으로
+        # 미리 옮겨서, 빠른 S자에서 정적 히스테리시스가 뒤처지는 걸 완화한다(da/ll에
+        # 적용한 것과 동일한 원리 — README §2.27). corridor는 좌/우 두 갈래가 아니라
+        # "열린 구간 하나"만 추적하므로 스칼라 하나면 된다.
+        self._corridor_velocity = 0.0
 
         # [2026-08-10] DL_CENTER_MODE='ll'(흰선/노란선 분리) 전용 부가 정보 — 전부
         # visualize()용이고 경로/조향 계산에는 안 쓰인다(노란선은 아직 stateless 디버그
@@ -590,6 +616,95 @@ class DLSlideWindow(SlideWindow):
         self._prev_da_centroid = None
         return np.zeros_like(da_mask)
 
+    def _da_slice_centers_windowed(self, da_mask, ref_x):
+        """[2026-08-12] DL_CENTER_MODE='da' 밴드 중심 계산 — 탐색창(prior) + 밴드 간
+        속도예측 + 프레임 간 앵커링. `_slice_centers()`(무보정 cv2.moments, 밴드 전체
+        폭)를 대체한다.
+
+        **왜 필요한가**: `_largest_da_component()`(시드/연속성, 위)는 "어느 덩어리를
+        볼지"만 정한다 — 그 덩어리가 옆 차선/여백까지 과검출로 넓어져도(S자 커브에서
+        특히 잦음, README §2.1/§2.2) 막지 않는다(§2.16에서 면적 상한 자체를 없앴으므로
+        더더욱). `_slice_centers()`는 그 넓은 덩어리의 밴드 전체 폭을 그대로
+        `cv2.moments`에 넣으므로, 과검출된 영역이 무게중심을 그쪽으로 끌어당긴다.
+        Mobileye(클로소이드+칼만 — 과거 상태로 예측/추적), openpilot(프레임 간 hidden
+        state), drivable-area 연구(공간 prior로 억제)가 공통으로 쓰는 "탐색을 예측
+        위치 근방으로 제한" 아이디어를, 이미 `_ll_slice_centers()`(DL_LL_ALGO='lr',
+        §2.20)가 검증 방향을 잡아둔 그대로 da에도 적용한다 — da는 좌/우 두 갈래가
+        아니라 중심선 "한 갈래"라 더 단순하다.
+
+        밴드마다: ①직전 프레임 그 밴드 위치(`self._da_prev_band_x[i]`)와 이번 프레임
+        전파값을 `DL_DA_BAND_ANCHOR_ALPHA`로 가중평균해 탐색창 중심(anchor)을 잡고,
+        ②`DL_DA_SEARCH_HALF_WIDTH_PX`(연속 미검출 시 `DL_DA_SEARCH_WIDEN_STEP_PX`씩
+        확장, 상한 `DL_DA_SEARCH_WIDEN_MAX_PX`) 반경 안에서만 `cv2.moments`를 구한다
+        — 창 밖(과검출된 옆차선 등) 픽셀은 애초에 무게중심 계산에 안 들어간다.
+        찾으면 밴드 간 이동량으로 속도 EMA(`DL_DA_VELOCITY_EMA_ALPHA`, 클램프
+        `DL_DA_VELOCITY_MAX_PX`)를 갱신하고 다음 밴드 기준을 "찾은 위치+속도"로 미리
+        옮긴다. 못 찾으면 그 속도로 dead-reckoning만 하고 그 밴드는 무효.
+        픽셀수 임계값은 da 전용 `DL_MIN_PIXELS`를 그대로 재사용한다(da 전체 밴드에
+        쓰던 것과 동일 기준 — 창이 좁아졌다고 임계값 자체를 낮추면 안 됨).
+
+          입력 : da_mask — (roi_h, roi_w) uint8 이진마스크(_largest_da_component() 통과 후,
+                 옆 차선 클리핑 전/후 무관하게 동일 인터페이스)
+                 ref_x   — 첫(근거리) 밴드의 탐색 기준 x좌표. 보통 직전 프레임 lane_center.
+          출력 : centers — 길이 self.n_slices. 채택되면 (y_center, cx), 아니면 None
+                 (`_reject_outliers()`가 그대로 이어받을 수 있게 `_slice_centers()`와
+                 동일한 반환 형식).
+
+        알려진 한계(실차 미검증):
+        - 초기 창(`DL_DA_SEARCH_HALF_WIDTH_PX=100`)이 실제 도로 폭보다 좁으면 정상
+          코너까지 놓칠 수 있다 — `DEBUG_VIZ_DL_LANE`에서 검출 밴드 수(`ll_bands`류와
+          별개로, `centerline`에서 None이 아닌 개수)가 이전보다 줄면 이 값을 키울 것.
+        - `DL_DA_BAND_ANCHOR_ALPHA`가 "도로 곡률이 프레임 간 급격히 안 변한다"는
+          가정에 기대므로, 급조향 중이거나 프레임레이트가 낮으면 과거 위치로 창을
+          잘못 당길 수 있다(`_ll_slice_centers()`와 동일한 한계).
+        - `_largest_da_component()`가 매 프레임 다른 덩어리를 고르면(연속성이 깨지는
+          경우) 이 창의 앵커/속도도 같이 흔들릴 수 있다 — 덩어리 선택 자체의 안정성이
+          이 창의 안정성의 전제 조건이다."""
+        h, w = da_mask.shape
+        slice_h = h // self.n_slices
+        centers = [None] * self.n_slices
+
+        cur_x = ref_x
+        base_win = DL_DA_SEARCH_HALF_WIDTH_PX
+        miss_streak = 0
+        last_i = last_x = None
+
+        for i in range(self.n_slices):
+            y_high = h - i * slice_h
+            y_low = 0 if i == self.n_slices - 1 else h - (i + 1) * slice_h
+            y_center = (y_low + y_high) / 2.0
+
+            prev_x = self._da_prev_band_x[i]
+            anchor_x = (
+                cur_x if prev_x is None else
+                (1 - DL_DA_BAND_ANCHOR_ALPHA) * cur_x + DL_DA_BAND_ANCHOR_ALPHA * prev_x
+            )
+            win = min(base_win + miss_streak * DL_DA_SEARCH_WIDEN_STEP_PX, DL_DA_SEARCH_WIDEN_MAX_PX)
+            x0, x1 = int(np.clip(anchor_x - win, 0, w)), int(np.clip(anchor_x + win, 0, w))
+
+            cx = None
+            if x1 > x0:
+                M = cv2.moments(da_mask[y_low:y_high, x0:x1], binaryImage=True)
+                if M['m00'] >= self.min_pixels:
+                    cx = x0 + M['m10'] / M['m00']
+
+            if cx is not None:
+                if last_i is not None and i > last_i:
+                    raw_v = (cx - last_x) / (i - last_i)
+                    raw_v = float(np.clip(raw_v, -DL_DA_VELOCITY_MAX_PX, DL_DA_VELOCITY_MAX_PX))
+                    a = DL_DA_VELOCITY_EMA_ALPHA
+                    self._da_velocity = (1 - a) * self._da_velocity + a * raw_v
+                last_i, last_x = i, cx
+                self._da_prev_band_x[i] = cx
+                centers[i] = (y_center, cx)
+                cur_x = cx + self._da_velocity
+                miss_streak = 0
+            else:
+                cur_x = cur_x + self._da_velocity
+                miss_streak += 1
+
+        return centers
+
     def _ll_active_half_width(self):
         """[2026-08-10 병합] DL_LL_ALGO에 따라 실제로 갱신되고 있는 차로 반폭 러닝
         추정치를 골라 반환한다 — 'yw'(팀원 작성)는 self._white_yellow_gap_px를,
@@ -753,12 +868,14 @@ class DLSlideWindow(SlideWindow):
     def _pick_open_run(self, open_cols, prefer_x):
         """open_cols(1D bool 배열, corridor 폭만큼의 컬럼별 "da가 있는가")에서 연속 True
         구간(run)들을 찾아 DL_CORRIDOR_MIN_PASSABLE_PX(차량 실폭 기반) 이상인 것만 후보로
-        삼는다. prefer_x(band-local 좌표, 직전 프레임에 이 밴드에서 채택했던 위치 — 없으면
-        None)가 있으면 그 값에 가장 가까운 run을 고른다 — 이게 "장애물을 피해간 방향을
-        다음 프레임도 유지"하는 히스테리시스라, 폭이 비슷한 두 열린 구간(예: 장애물 좌/우)
-        사이를 매 프레임 오가는 flip-flop을 막는다. prefer_x가 없으면(첫 프레임 등) 가장
-        넓은 run을 고른다. 통과 가능한 run이 하나도 없으면 None(이 밴드는 완전히 막힘 —
-        무효 처리).
+        삼는다. prefer_x(band-local 좌표 — 없으면 None)가 있으면 그 값에 가장 가까운 run을
+        고른다 — 이게 "장애물을 피해간 방향을 다음 프레임도 유지"하는 히스테리시스라, 폭이
+        비슷한 두 열린 구간(예: 장애물 좌/우) 사이를 매 프레임 오가는 flip-flop을 막는다.
+        [2026-08-12] prefer_x는 이제 호출부(_corridor_slice_centers())가 "직전 프레임 이
+        밴드 값"과 "이번 프레임 밴드 간 속도예측 값"을 블렌드해서 넘긴다(README §2.27) —
+        이 함수 자체는 여전히 "받은 좌표에 가장 가까운 run"만 고르는 순수 선택 로직이라
+        바뀐 게 없다. prefer_x가 없으면(첫 프레임 등) 가장 넓은 run을 고른다. 통과 가능한
+        run이 하나도 없으면 None(이 밴드는 완전히 막힘 — 무효 처리).
         """
         n = len(open_cols)
         runs = []
@@ -809,6 +926,15 @@ class DLSlideWindow(SlideWindow):
         results = [None] * self.n_slices
         used = [False] * self.n_slices
 
+        # [2026-08-12] 밴드 간 속도예측(README §2.27) — 정적 히스테리시스(직전 프레임
+        # 그 밴드의 값만 봄)만으로는 빠른 S자에서 실제 열린구간 위치가 그 사이 크게
+        # 이동하면 뒤처진다. cur_x는 "이번 프레임 안에서 여기까지 채택해온 위치를
+        # 속도만큼 앞서 예측한 값"(da/ll의 cur_x와 동일 원리), last_i/last_x는 이번
+        # 프레임에서만 유효한 속도 계산용 지역 상태 — 프레임 경계를 넘어 재사용하면
+        # 밴드 인덱스가 롤오버돼 음수 gap이 나온다.
+        cur_x = None
+        last_i = last_x = None
+
         for i in range(self.n_slices):
             y_high = h - i * slice_h
             y_low = 0 if i == self.n_slices - 1 else h - (i + 1) * slice_h
@@ -833,8 +959,19 @@ class DLSlideWindow(SlideWindow):
             da_band = da_mask[y_low:y_high, lb:rb]
             open_cols = np.any(da_band > 0, axis=0)
 
+            # [2026-08-12] prefer_x = "직전 프레임 이 밴드 값"과 "이번 프레임 속도예측
+            # 값"을 blend — 하나만 있으면 그거 그대로, 둘 다 없으면(첫 프레임 등) None
+            # (기존과 동일하게 _pick_open_run()이 가장 넓은 run을 고른다). 직전 프레임
+            # 값만 쓰던 예전 방식은 그 밴드가 한 번도 채택된 적 없으면(cur_x도 없는
+            # 첫 시도) 방향 힌트가 전혀 없어 flip-flop에 더 취약했다.
             prev_x = self._corridor_prev_open_x[i]
-            prefer_x = (prev_x - lb) if prev_x is not None else None
+            if prev_x is not None and cur_x is not None:
+                predicted_x = 0.5 * prev_x + 0.5 * cur_x
+            elif prev_x is not None:
+                predicted_x = prev_x
+            else:
+                predicted_x = cur_x
+            prefer_x = (predicted_x - lb) if predicted_x is not None else None
             run = self._pick_open_run(open_cols, prefer_x)
             if run is None:
                 continue  # corridor 안에 지나갈 폭이 있는 열린 구간이 없음 — 완전히 막힘
@@ -843,6 +980,14 @@ class DLSlideWindow(SlideWindow):
             results[i] = (y_center, cx)
             used[i] = True
             self._corridor_prev_open_x[i] = cx
+
+            if last_i is not None and i > last_i:
+                raw_v = (cx - last_x) / (i - last_i)
+                raw_v = float(np.clip(raw_v, -DL_CORRIDOR_VELOCITY_MAX_PX, DL_CORRIDOR_VELOCITY_MAX_PX))
+                a = DL_CORRIDOR_VELOCITY_EMA_ALPHA
+                self._corridor_velocity = (1 - a) * self._corridor_velocity + a * raw_v
+            last_i, last_x = i, cx
+            cur_x = cx + self._corridor_velocity
 
         return results, used
 
@@ -962,6 +1107,12 @@ class DLSlideWindow(SlideWindow):
         # 탐색창 반경이 그만큼 넓어진다.
         yellow_miss_streak = 0
         white_miss_streak = 0
+        # [2026-08-12] 밴드 간 속도예측용 — 이번 프레임 안에서만 유효한 "마지막으로
+        # 실제 찾은 밴드" 기록(_ll_slice_centers()와 동일 원리, README §2.27). 매
+        # 호출(=매 프레임)마다 새로 시작해야 밴드 인덱스가 프레임 경계를 넘어 롤오버되는
+        # 걸 막는다.
+        last_yellow_i = last_yellow_x = None
+        last_white_i = last_white_x = None
 
         for i in range(self.n_slices):
             y_high = h - i * slice_h
@@ -971,32 +1122,75 @@ class DLSlideWindow(SlideWindow):
             win_y = min(base_win + yellow_miss_streak * DL_LL_SEARCH_WIDEN_STEP_PX, DL_LL_SEARCH_WIDEN_MAX_PX)
             win_w = min(base_win + white_miss_streak * DL_LL_SEARCH_WIDEN_STEP_PX, DL_LL_SEARCH_WIDEN_MAX_PX)
 
+            # [2026-08-12] 밴드별 프레임 간 앵커링 — 직전 프레임에 이 밴드(같은
+            # y위치)에서 실제로 찾았던 위치가 있으면 이번 프레임 내 전파값과 가중평균해
+            # 탐색창 중심으로 쓴다(_ll_slice_centers()와 동일 원리, README §2.27) — band 0
+            # 검출 오차가 위 밴드로 그대로 누적 전파되는 걸 막는다.
+            prev_y = self._yw_prev_band_yellow[i]
+            anchor_yellow = (
+                cur_yellow if prev_y is None else
+                (1 - DL_LL_BAND_ANCHOR_ALPHA) * cur_yellow + DL_LL_BAND_ANCHOR_ALPHA * prev_y
+            )
+            prev_w = self._yw_prev_band_white[i]
+            anchor_white = (
+                cur_white if prev_w is None else
+                (1 - DL_LL_BAND_ANCHOR_ALPHA) * cur_white + DL_LL_BAND_ANCHOR_ALPHA * prev_w
+            )
+
             yx = None
-            yx0, yx1 = int(np.clip(cur_yellow - win_y, 0, w)), int(np.clip(cur_yellow + win_y, 0, w))
+            yx0, yx1 = int(np.clip(anchor_yellow - win_y, 0, w)), int(np.clip(anchor_yellow + win_y, 0, w))
             if yx1 > yx0:
                 M_y = cv2.moments(ll_yellow_mask[y_low:y_high, yx0:yx1], binaryImage=True)
                 if M_y['m00'] >= DL_LL_SIDE_MIN_PIXELS:
                     yx = yx0 + M_y['m10'] / M_y['m00']
-                    cur_yellow = yx
-            yellow_miss_streak = 0 if yx is not None else yellow_miss_streak + 1
+            if yx is not None:
+                # [2026-08-12] 속도예측 — 밴드 간 이동량(px/밴드)을 EMA로 추적해뒀다가
+                # 다음 밴드 탐색창을 "찾은 위치" 그대로가 아니라 "그 위치 + 예측 이동량"
+                # 으로 미리 옮긴다(미검출 밴드가 이어지는 동안엔 이 속도로 계속
+                # dead-reckoning, 아래 else 분기 참고).
+                if last_yellow_i is not None and i > last_yellow_i:
+                    raw_v = (yx - last_yellow_x) / (i - last_yellow_i)
+                    raw_v = float(np.clip(raw_v, -DL_LL_VELOCITY_MAX_PX, DL_LL_VELOCITY_MAX_PX))
+                    a = DL_LL_VELOCITY_EMA_ALPHA
+                    self._yw_yellow_velocity = (1 - a) * self._yw_yellow_velocity + a * raw_v
+                last_yellow_i, last_yellow_x = i, yx
+                self._yw_prev_band_yellow[i] = yx
+                cur_yellow = yx + self._yw_yellow_velocity
+                yellow_miss_streak = 0
+            else:
+                cur_yellow = cur_yellow + self._yw_yellow_velocity
+                yellow_miss_streak += 1
 
-            # ① 이번 프레임 첫(근거리) 유효 노란선으로 차선 판정을 확정한다.
+            # ① 이번 프레임 첫(근거리) 유효 노란선으로 차선 판정을 확정한다. yx(이번
+            # 밴드 실측값)를 기준으로 판정한다 — cur_yellow는 위에서 이미 다음 밴드용
+            # 속도 예측이 더해진 값이라 "이번 밴드의 실제 위치"로 쓰면 안 된다.
             if yx is not None and not lane_side_locked:
                 new_sign = 1.0 if yx < ref_x else -1.0
                 if new_sign != side_sign:
                     side_sign = new_sign
-                    cur_white = cur_yellow + side_sign * self._white_yellow_gap_px
+                    cur_white = yx + side_sign * self._white_yellow_gap_px
                 self.lane_side = 'right' if side_sign > 0 else 'left'
                 lane_side_locked = True
 
             wx = None
-            wx0, wx1 = int(np.clip(cur_white - win_w, 0, w)), int(np.clip(cur_white + win_w, 0, w))
+            wx0, wx1 = int(np.clip(anchor_white - win_w, 0, w)), int(np.clip(anchor_white + win_w, 0, w))
             if wx1 > wx0:
                 M_w = cv2.moments(ll_white_mask[y_low:y_high, wx0:wx1], binaryImage=True)
                 if M_w['m00'] >= DL_LL_SIDE_MIN_PIXELS:
                     wx = wx0 + M_w['m10'] / M_w['m00']
-                    cur_white = wx
-            white_miss_streak = 0 if wx is not None else white_miss_streak + 1
+            if wx is not None:
+                if last_white_i is not None and i > last_white_i:
+                    raw_v = (wx - last_white_x) / (i - last_white_i)
+                    raw_v = float(np.clip(raw_v, -DL_LL_VELOCITY_MAX_PX, DL_LL_VELOCITY_MAX_PX))
+                    a = DL_LL_VELOCITY_EMA_ALPHA
+                    self._yw_white_velocity = (1 - a) * self._yw_white_velocity + a * raw_v
+                last_white_i, last_white_x = i, wx
+                self._yw_prev_band_white[i] = wx
+                cur_white = wx + self._yw_white_velocity
+                white_miss_streak = 0
+            else:
+                cur_white = cur_white + self._yw_white_velocity
+                white_miss_streak += 1
 
             if yx is not None and wx is not None:
                 # ② 둘 다 찾음 — 정상 검출. gap EMA는 상하한을 클램프한다(아래 참고).
@@ -1426,6 +1620,13 @@ class DLSlideWindow(SlideWindow):
             # 쪽을 "안 쏠리지만 흔들리는" 쪽보다 우선한 것. 여백 쏠림 자체는
             # ①시드/②연속성(위 _largest_da_component() 참고)이 어느 정도 완화해준다는
             # 판단도 있다.
+            # [2026-08-12] 무보정 전체 밴드 폭 무게중심(_slice_centers())을 탐색창
+            # 버전(_da_slice_centers_windowed())으로 교체 — S자 커브에서 da가 과검출돼도
+            # (§2.1/§2.2, §2.16에서 면적 상한 자체를 없앤 뒤로는 더욱) 창 밖 픽셀은
+            # 애초에 무게중심 계산에 안 들어가게 한다. 무게중심(moments) 자체는 그대로
+            # 쓴다 — 위에서 이미 "여백 쏠림보다 안정성 우선"이라고 정리한 결론은 바뀌지
+            # 않았고, 이번 변경은 "그 무게중심을 볼 범위를 예측 위치 근방으로 좁힌다"는
+            # 별개의 축이다(README §2.27).
             # 'll'이면 DL_LL_ALGO로 실제 추적 알고리즘을 고른다(둘 다 da 폴백 없음 —
             # 모듈 상단/config.py DL_CENTER_MODE/DL_LL_ALGO 주석, README §2.19 참고).
             #   'yw'(main 기본) : 노란 중앙선 + 한쪽 흰색 경계선을 _ll_yellow_white_centers()로.
@@ -1445,7 +1646,7 @@ class DLSlideWindow(SlideWindow):
                     )
                     self.ll_band_reason = [None] * self.n_slices
             else:
-                merged_centers = self._slice_centers(da_mask, 0, (0, 255, 0))
+                merged_centers = self._da_slice_centers_windowed(da_mask, ref_x)
                 self.ll_band_used = [False] * len(merged_centers)
                 self.ll_search_windows = []
                 self.ll_band_reason = [None] * self.n_slices
