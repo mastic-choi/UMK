@@ -395,7 +395,7 @@ class TrackDriverNode(Node):
             try:
                 return DLLaneDetector(logger=self.get_logger())
             except Exception as e:
-                # onnxruntime 미설치, models/twinlitenetplus_small_bootstrap_v2.onnx(.data) 부재 등으로 초기화가 실패하면
+                # onnxruntime 미설치, models/twinlitenetplus_medium_v2.onnx(.data) 부재 등으로 초기화가 실패하면
                 # 원인을 명확히 남기고 검증된 백엔드(hough)로 폴백한다 — 조용히 무시하지 않는다.
                 self.get_logger().error(
                     f'DL 차선인식 백엔드 초기화 실패, hough로 폴백합니다: {e}'

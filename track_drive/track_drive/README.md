@@ -201,7 +201,7 @@ ros2 launch track_drive track_drive.launch.py
 | `'hough'` | `perception/hough_lane.py`의 `HoughLaneDetector` | 대안, 실차 라바콘 테스트까지 검증됨. `'dl'` 초기화 실패 시 자동 폴백 |
 | `'classic_cv'` | `perception/lane_util.py`(`CameraProcessor`+`SlideWindow`) + `perception/perc_floor.py`(`LaneDetector`) 조립 | 보존용, 현재 라이브 미검증 |
 
-`'dl'` 선택 시 `onnxruntime` 미설치나 `models/twinlitenetplus_small_bootstrap_v2.onnx`(.data)
+`'dl'` 선택 시 `onnxruntime` 미설치나 `models/twinlitenetplus_medium_v2.onnx`(.data)
 부재 등으로 초기화가 실패하면 `_build_lane_detector()`
 ([track_drive.py:303-323](track_drive.py#L303))가 에러를 로깅하고 자동으로 `'hough'`로 폴백합니다(조용히
 무시하지 않음) — 노드 시작 로그에 `DL 차선인식 백엔드 초기화 실패, hough로 폴백합니다` 가 찍혔는지 꼭 확인하세요.
@@ -1448,6 +1448,40 @@ da 과다포함(§2.12에서 확인된 커브 구간 편향)이 줄어든 것으
   FPS가 유의미하게 떨어지면 `FPS_LOG_PERIOD_SEC` 로그로 확인 후 판단할 것.
 - ll(차선) 출력의 정량비교는 위 스크립트에 없다(da만 비교함) — ll 품질도 구모델과 같거나
   나은지는 별도로 실차/육안 확인이 필요하다.
+
+---
+
+### 2.26 DL 세그멘테이션 모델을 medium config(1068장) 결과물로 재교체 (`twinlitenetplus_medium_v2.onnx`, 2026-08-12)
+
+**배경:** §2.25의 `twinlitenetplus_small_bootstrap_v2.onnx`(small, 사람검증 134장) 이후,
+`fine-tune` 저장소에서 다음이 추가로 진행됨:
+1. **letterbox vs plain resize 좌표 불일치 버그**를 발견/수정(학습 파이프라인 이미지는
+   letterbox, 라벨은 plain resize로 서로 다르게 리사이즈돼서 좌표가 어긋나 있었음 —
+   실차 코드(이 파일)는 원래부터 plain resize라 문제없었음).
+2. 사람 검증 라벨은 CVAT 라벨링이 병목이 아니게 되면서(da/ll 둘 다 완전 자동 pseudo-label
+   파이프라인 확립) 데이터셋을 **1068장**(사람검증 134 + 자동생성 934)까지 확장.
+3. `CONFIG='medium'`으로 로컬(WSL2/ROCm, RX 9070 XT) 40epoch 재학습 — **da mIoU 0.937,
+   ll IOU 0.567**(둘 다 §2.25의 small,134장 모델보다 개선). 자세한 경위는 fine-tune
+   저장소 `PROGRESS.md` §2.11~§2.14 참고.
+
+**수정:**
+- `fine-tune/outputs/models/best.onnx`(+`.onnx.data`)를 `twinlitenetplus_medium_v2.onnx`
+  (+`.onnx.data`)로 재export(`onnx` 파이썬 라이브러리로 외부 데이터 파일명만 다시
+  지정 — 가중치 자체는 원본과 bit-exact 동일함을 onnxruntime 추론 결과로 확인)해서
+  `track_drive/track_drive/models/`에 커밋함.
+- `perception/dl_lane.py`: `DL_MODEL_FILENAME`을 `twinlitenetplus_small_bootstrap_v2.onnx`
+  → `twinlitenetplus_medium_v2.onnx`로 변경. 입출력 텐서 이름/전처리/입력 해상도
+  (640×384)는 §2.25 모델과 동일해서 `DL_INPUT_H` 등 다른 값은 그대로 둠.
+- `best.onnx`(원조)와 `twinlitenetplus_small_bootstrap_v2.onnx`(이전 fine-tune)는
+  롤백/비교용으로 저장소에 그대로 남겨뒀다(기본 경로로는 더 이상 안 쓰임).
+
+**알려진 한계:**
+- §2.25와 마찬가지로 **실차 미검증**이다 — fine-tune 저장소 쪽 검증은 정적 이미지/ROI
+  커버리지 비교까지만 마쳤다.
+- 팀 피드백(2026-08-11)으로 **차선-차량이 비평행(각도 있는 상황)일 때 da가 흔들리는
+  문제**가 보고됨 — 이 모델은 아직 그 케이스를 겨냥한 데이터로 학습되지 않았다(다음
+  fine-tune 세션에서 지그재그 주행 데이터를 추가해 재학습 예정, fine-tune 저장소
+  `PROGRESS.md` §3 참고). 실차 테스트 시 특히 이 상황을 주의 깊게 볼 것.
 
 ---
 

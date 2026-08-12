@@ -3,17 +3,21 @@
 #=============================================
 # dl_lane.py — TwinLiteNet(ONNX Runtime) 기반 딥러닝 차선인식 백엔드.
 #
-# [2026-08-11] 모델을 harrylal/TwinLiteNet-onnxruntime 사전학습 가중치(best.onnx)에서
-# 자체 fine-tune 결과물인 TwinLiteNetPlus(small, bootstrap_v2 학습셋)
-# `models/twinlitenetplus_small_bootstrap_v2.onnx`로 교체했다 — fine-tune 저장소
-# scripts/compare_bootstrap_v2_da.py의 74장 사람 GT 정량비교에서 구모델 대비 da 과다포함
-# (커브 구간 편향, §2.12 기존 이슈)이 줄어든 게 확인됨. 입출력 텐서 이름('images'/'da'/'ll'),
-# 전처리(letterbox 없이 리사이즈 → BGR→RGB → /255, mean/std 정규화 없음), 출력 형식((1,2,H,W)
-# raw logit, softmax 후 채널1=foreground)은 기존 모델과 동일 — 모델 입력 해상도만
-# 360x640 → 384x640으로 바뀌었다(아래 DL_INPUT_H). 이 .onnx는 가중치를 외부 데이터 파일
-# (`twinlitenetplus_small_bootstrap_v2.onnx.data`, 같은 디렉터리에 있어야 함 — onnx 파일
-# 내부에 상대경로로 박혀 있어 파일명을 바꾸면 로드가 깨진다)로 분리해 export됐다.
-# best.onnx는 롤백/비교용으로 그대로 남겨뒀다(이제 기본 경로로는 안 쓰임).
+# [2026-08-12] 모델을 bootstrap_v2(small, 사람검증 134장)에서 자체 fine-tune 최신
+# 결과물인 TwinLiteNetPlus(medium, pseudo_dataset_v2 — 사람검증 134장+자동생성 934장=
+# 1068장, letterbox 버그 수정 후 재학습, ll IOU 기준 best 체크포인트)
+# `models/twinlitenetplus_medium_v2.onnx`로 교체했다 — fine-tune 저장소 PROGRESS.md
+# §2.14 기준 da mIoU 0.937 / ll IOU 0.567(둘 다 bootstrap_v2보다 개선). 입출력 텐서
+# 이름('images'/'da'/'ll'), 전처리(letterbox 없이 리사이즈 → BGR→RGB → /255, mean/std
+# 정규화 없음), 출력 형식((1,2,H,W) raw logit, softmax 후 채널1=foreground), 입력
+# 해상도(640x384)는 bootstrap_v2와 동일 — DL_INPUT_H 변경 없음. 이 .onnx도 가중치를
+# 외부 데이터 파일(`twinlitenetplus_medium_v2.onnx.data`, 같은 디렉터리에 있어야 함 —
+# onnx 파일 내부에 상대경로로 박혀 있어 파일명을 바꾸면 로드가 깨진다)로 분리해
+# export됐다. best.onnx(원조)/twinlitenetplus_small_bootstrap_v2.onnx(이전 fine-tune)는
+# 롤백/비교용으로 그대로 남겨뒀다(이제 기본 경로로는 안 쓰임).
+# ⚠️ 이 모델은 정적 이미지/ROI 커버리지 기준으로만 검증됐고 실차 주행 테스트는 아직
+# 안 됨(fine-tune 저장소 README "실차에 바로 쓰기 전에 반드시 실제 주행 테스트로
+# 검증할 것" 참고) — 처음 투입 시 hough 백엔드로 즉시 폴백 가능한 상태로 테스트할 것.
 # hough_lane.HoughLaneDetector / perc_floor.LaneDetector와 동일하게
 #   detect(frame) -> (lane_valid, lane_offset, lane_lookahead, lane_center, path, debug_img)
 # 인터페이스를 구현하므로 track_drive.py의 perc_lane()은 수정 없이 그대로 재사용된다
@@ -82,11 +86,12 @@ except ImportError:
     get_package_share_directory = None
 
 
-# ── 모델 입출력 스펙 (fine-tune 저장소 twinlitenetplus_small_bootstrap_v2.onnx 기준 —
-#   onnxruntime InferenceSession.get_inputs()/get_outputs()로 직접 확인함, 2026-08-11) ──
+# ── 모델 입출력 스펙 (fine-tune 저장소 twinlitenetplus_medium_v2.onnx 기준 —
+#   onnxruntime InferenceSession.get_inputs()/get_outputs()로 직접 확인함, 2026-08-12,
+#   bootstrap_v2와 입출력 스펙 동일) ──
 #   images 텐서 (batch,3,384,640) float32 NCHW. 전처리는 letterbox 없이 640x384로 그냥
 #   리사이즈(harrylal 원본 blobFromImage 방식 그대로 유지) → BGR→RGB → /255.0
-#   (mean/std 정규화 없음, fine-tune/scripts/compare_bootstrap_v2_da.py의 infer_new()와 동일).
+#   (mean/std 정규화 없음).
 DL_INPUT_W = 640
 DL_INPUT_H = 384
 DL_INPUT_NAME = 'images'
@@ -208,11 +213,11 @@ DL_MODE_COLORS = {
 DL_MODE_COLOR_DEFAULT = (60, 60, 60)  # 위 셋에 없는 값(오타 등) 대비 폴백
 
 
-DL_MODEL_FILENAME = 'twinlitenetplus_small_bootstrap_v2.onnx'
+DL_MODEL_FILENAME = 'twinlitenetplus_medium_v2.onnx'
 
 
 def _default_model_path():
-    """모델 가중치 파일(twinlitenetplus_small_bootstrap_v2.onnx) 기본 경로.
+    """모델 가중치 파일(twinlitenetplus_medium_v2.onnx) 기본 경로.
     1순위: colcon install된 share 디렉터리(share/track_drive/models/<파일명>)
     2순위: 소스트리에서 직접 실행 중일 때(개발 중, colcon build 전) — track_drive 패키지 디렉터리 기준 상대경로
     같은 디렉터리의 <파일명>.data(외부 데이터 파일)도 같이 있어야 한다 — onnx 파일 안에
@@ -245,8 +250,8 @@ class TwinLiteNetEngine:
         if not os.path.isfile(self.model_path):
             raise FileNotFoundError(
                 f'TwinLiteNetPlus 가중치 파일을 찾을 수 없습니다: {self.model_path}\n'
-                'fine-tune 저장소의 outputs/onnx/twinlitenetplus_small_bootstrap_v2.onnx와 '
-                '동일 파일명의 .onnx.data(외부 데이터)를 함께 이 경로에 두세요.'
+                'fine-tune 저장소의 outputs/models/best.onnx(medium config)를 '
+                'twinlitenetplus_medium_v2.onnx(+.onnx.data)로 재export해서 이 경로에 두세요.'
             )
         self._logger = logger
 
