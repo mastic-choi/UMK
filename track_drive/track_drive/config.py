@@ -314,7 +314,13 @@ DL_DA_SEARCH_WIDEN_STEP_PX = 20.0
 DL_DA_SEARCH_WIDEN_MAX_PX = 200.0
 DL_DA_VELOCITY_EMA_ALPHA = 0.3      # 밴드 간 이동 속도(px/밴드) EMA 계수 — DL_LL_VELOCITY_EMA_ALPHA와 동일 관례
 DL_DA_VELOCITY_MAX_PX = 40.0        # 예측 이동량 클램프
-DL_DA_BAND_ANCHOR_ALPHA = 0.35      # 밴드별 탐색창 중심 계산 시 "직전 프레임 그 밴드 위치"에 주는 가중치
+# [2026-08-12] 0.35 → 0.30. "da 반응이 한 박자 늦다"는 사용자 피드백으로 직전 프레임
+# 비중을 아주 소폭 낮췄다 — 이번 프레임 전파값(cur_x, 실측+속도예측) 쪽 비중이 그만큼
+# 늘어 탐색창이 새 관측을 더 빨리 따라간다. 안정성(노이즈에 덜 흔들림)과의 트레이드오프라
+# 크게 낮추지 않고 첫 스텝만 밟음 — 더 빠른 반응이 필요하면 여기서 추가로 낮추되,
+# 노이즈에 탐색창이 흔들리기 시작하면(검출 밴드가 프레임마다 들쭉날쭉해지면) 되돌릴 것.
+# 실차 미검증.
+DL_DA_BAND_ANCHOR_ALPHA = 0.30      # 밴드별 탐색창 중심 계산 시 "직전 프레임 그 밴드 위치"에 주는 가중치
 
 # ll sanity check — ROI 내 ll(차선) foreground 비율이 이 미만이면 da 결과와 무관하게 무효 처리
 DL_LL_SANITY_MIN_RATIO = 0.005
@@ -349,22 +355,34 @@ DL_LL_DECAY_MIN_VALUE = 128.0
 #             제거 — 실차 검증 결과 면적만으로 da를 거르는 방식 자체가 불신뢰. da가 옆
 #             차선과 붙는 문제는 이제 전적으로 _clip_da_by_ll()이 담당). 하한
 #             (DL_DA_MIN_COMPONENT_AREA)은 "사실상 안 보임" 노이즈 필터로 유지.
-#   'll_da' : [2026-08-10] "corridor" 알고리즘으로 교체 — ll(차선)로 도로 폭 자체를
-#             규정하고, da는 그 안에서 장애물 회피용 열린 공간을 찾는 데만 쓴다. 밴드마다
-#             ll을 왼쪽부터 정렬해(DLSlideWindow._ll_line_centers(), 흰/노랑 구분 없는
-#             원본 ll_mask 사용 — 노란 중앙선도 "2번째 선"으로 그대로 센다) 1번째~3번째
-#             선을 도로 경계(전체 트랙, 양쪽 차로 폭)로 삼는다. 그 x범위 안에서만 da를
-#             보고 실제 열린(장애물 없는) 구간을 찾아(DLSlideWindow._pick_open_run(),
-#             직전 프레임 위치에 가장 가까운 구간을 우선하는 히스테리시스 있음) 그 중심을
-#             밴드 중심으로 쓴다(DLSlideWindow._corridor_slice_centers()). "자기 차선
-#             하나"를 전제로 한 _largest_da_component()/_clip_da_by_ll()은 건너뛰고
-#             클리핑 전 원본 da(da_mask_all_roi)를 그대로 쓴다 — 장애물이 도로를 좌/우로
-#             쪼갤 때 그 두 함수는 지나갈 수 있는 작은 쪽을 통째로 버리거나 잘라내
-#             버려서 corridor 취지(양쪽 차로를 동시에 보고 그 안에서 고른다)와
-#             반대다. 밴드에서 검출된 선이 3개 미만이거나 corridor 폭이
-#             DL_CORRIDOR_WIDTH_MIN/MAX_PX 밖이면 그 밴드는 da 폴백 없이 그냥 드롭한다
-#             — corridor 경계 자체가 ll에서 나오므로 ll이 불충분한 순간엔 "도로 폭이
-#             얼마인지" 판단할 근거가 없기 때문.
+#   'll_da' : "corridor" 알고리즘 — ll(차선)로 도로 폭 자체를 규정하고, da는 그 안에서
+#             장애물 회피용 열린 공간을 찾는 데만 쓴다.
+#             [2026-08-12 재설계] 경계(좌/우 흰선) 판정 방식을 "위치순서"에서 "색상
+#             투표"로 바꿨다 — 예전엔 DLSlideWindow._ll_line_centers()가 흰/노랑 구분
+#             없는 원본 ll_mask에서 선을 왼쪽부터 정렬해 1번째~3번째를 도로 경계로
+#             삼았는데(2번째=중앙분리선은 그냥 지나침), 이 방식은 밴드마다 선이 정확히
+#             3개 검출돼야만 동작하고 프레임 간 추적도 전혀 없어서(완전 stateless),
+#             실차에서 "노란+흰 1개씩만" 또는 "흰 1개만" 잡히는 프레임이 흔한 상황에서
+#             밴드가 계속 드롭돼 매우 불안정했다(사용자 보고). 지금은
+#             _split_ll_by_yellow()(컴포넌트 단위 색상 투표, 'll' 모드와 공유)로 이미
+#             확정된 노란선/흰선 마스크를 받아, DLSlideWindow._corridor_boundary_centers()가
+#             **노란선(중앙)·왼쪽흰선·오른쪽흰선을 각각 독립 슬라이딩 윈도우로 추적**한다
+#             (_ll_yellow_white_centers()와 동일 원리 — 밴드별 프레임간 앵커링+속도예측+
+#             미검출 시 탐색창 확장). 노란선을 못 찾아도, 흰선이 한쪽만 보여도 노란선-
+#             흰선 간격 러닝추정치(DL_LL_YELLOW_GAP_INIT_PX로 초기화, 'll' 모드와 별개로
+#             좌/우 독립 EMA)로 반대쪽을 추정해 계속 경계를 내놓는다(우선순위
+#             LR>L+Y/R+Y>L+W/R+W>Y>LOST — 상세는 _corridor_boundary_centers() docstring
+#             참고). 좌/우 흰선을 **둘 다** 이번 밴드에서 실측했을 때만
+#             DL_CORRIDOR_WIDTH_MIN/MAX_PX로 폭을 sanity check한다(엉뚱한 선 짝짓기
+#             방지) — 추정/잔상 분기는 이미 클램프된 간격에서 나오므로 별도 검증 안 함.
+#             그 경계 x범위 안에서만 da를 보고 실제 열린(장애물 없는) 구간을 찾아
+#             (DLSlideWindow._pick_open_run(), 직전 프레임 위치에 가장 가까운 구간을
+#             우선하는 히스테리시스 있음) 그 중심을 밴드 중심으로 쓴다
+#             (DLSlideWindow._corridor_slice_centers()). "자기 차선 하나"를 전제로 한
+#             _largest_da_component()/_clip_da_by_ll()은 여전히 건너뛰고 클리핑 전 원본
+#             da(da_mask_all_roi)를 그대로 쓴다 — 장애물이 도로를 좌/우로 쪼갤 때 그 두
+#             함수는 지나갈 수 있는 작은 쪽을 통째로 버리거나 잘라내 버려서 corridor
+#             취지(양쪽 차로를 동시에 보고 그 안에서 고른다)와 반대다.
 #   'll'    : ll을 흰선/노란선으로 분리(DLSlideWindow._split_ll_by_yellow(), 커넥티드
 #             컴포넌트 단위로 HSV 노란색 겹침 비율 투표 — 픽셀 단위로 빼는 것보다 dash
 #             가장자리가 깔끔함)한 뒤, **노란 중앙선 + (내 차선 판정에 따른) 한쪽 흰색
