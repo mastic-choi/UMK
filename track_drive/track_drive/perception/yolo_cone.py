@@ -53,11 +53,17 @@ def _default_model_path():
       세 단계 위(perception→track_drive 패키지→track_drive ROS 루트) 올라가야
       xycar_ws/src/(또는 이 저장소의 루트)에 닿는다. colcon install share 디렉터리는
       yolo_ros가 정식 ROS2 패키지가 아니라서(package.xml 없음) 조회하지 않는다.
+      realpath를 써야 하는 이유: --symlink-install로 빌드하면 이 파일이 실제로 로드되는
+      경로는 xycar_ws/build/track_drive/track_drive/perception/yolo_cone.py이고
+      (build/track_drive/track_drive는 src/track_drive/track_drive로 가는 심볼릭 링크) —
+      abspath는 이 심볼릭 링크를 풀어주지 않아 세 단계 위로 올라가면 xycar_ws/build로
+      잘못 도착한다(실측 확인, 2026-08-13). realpath로 심볼릭 링크를 먼저 해소해야
+      xycar_ws/src에 정확히 닿는다.
     """
     if YOLO_CONE_MODEL_PATH:
         return YOLO_CONE_MODEL_PATH
 
-    package_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # .../track_drive/track_drive
+    package_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))  # .../track_drive/track_drive
     ros_pkg_root = os.path.dirname(package_dir)                                # .../track_drive (ROS 패키지 루트)
     src_dir = os.path.dirname(ros_pkg_root)                                    # .../src (또는 저장소 루트)
     return os.path.join(src_dir, 'yolo_ros', 'cone_best_n.onnx')
