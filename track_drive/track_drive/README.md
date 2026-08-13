@@ -201,7 +201,7 @@ ros2 launch track_drive track_drive.launch.py
 | `'hough'` | `perception/hough_lane.py`의 `HoughLaneDetector` | 대안, 실차 라바콘 테스트까지 검증됨. `'dl'` 초기화 실패 시 자동 폴백 |
 | `'classic_cv'` | `perception/lane_util.py`(`CameraProcessor`+`SlideWindow`) + `perception/perc_floor.py`(`LaneDetector`) 조립 | 보존용, 현재 라이브 미검증 |
 
-`'dl'` 선택 시 `onnxruntime` 미설치나 `models/twinlitenetplus_medium_v2.onnx`(.data)
+`'dl'` 선택 시 `onnxruntime` 미설치나 `models/twinlitenetplus_kmu_v1.2.0.onnx`(.data)
 부재 등으로 초기화가 실패하면 `_build_lane_detector()`
 ([track_drive.py:303-323](track_drive.py#L303))가 에러를 로깅하고 자동으로 `'hough'`로 폴백합니다(조용히
 무시하지 않음) — 노드 시작 로그에 `DL 차선인식 백엔드 초기화 실패, hough로 폴백합니다` 가 찍혔는지 꼭 확인하세요.
@@ -1672,6 +1672,52 @@ pure_pursuit 입력단 노이즈도 같이 줄어든다 — §0.5.7(같은 날, 
   좁혔다. `LOST`가 길게 이어지는 경우(좌/우 트래커 교차 등)에 대한 명시적 방지 클램프는 아직
   없다 — 실차에서 `corridor_band_case` 스파크라인으로 `LOST` 연속 길이를 관찰하고 필요하면
   추가할 것.
+
+---
+
+### 2.29 DL 세그멘테이션 모델을 v1.2.0(bootstrap_v2+lap_005, 3446장) 결과물로 재교체 (`twinlitenetplus_kmu_v1.2.0.onnx`, 2026-08-13)
+
+**배경:** §2.26의 `twinlitenetplus_medium_v2.onnx`(medium, bootstrap_v2 1016장) 이후,
+`fine-tune` 저장소에서 다음이 추가로 진행됨(자세한 경위는 fine-tune 저장소 `PROGRESS.md`
+§2.20~§2.26 참고):
+1. da pseudo label을 6-앙상블(부트스트랩 5개 + 기존 배포 모델) soft-vote로 재생성하고,
+   사람 신뢰 리뷰로 `bootstrap_v2`를 156→1016장까지 확장.
+2. 지그재그 주행으로 추가 수집한 `lap_005`(비평행 각도 상황 보강, 사람 육안 검수 후
+   2430장)를 병합 — 최종 학습 **3446장**(`bootstrap_v2` 1016 + `lap_005` 2430).
+3. `CONFIG='medium'`으로 로컬(WSL2/ROCm, RX 9070 XT) 40epoch 재학습 — 사람 GT 1016장
+   기준 **da IoU 0.945→0.957, ll IoU 0.577→0.599**(§2.26의 v1.0.0 모델 대비 개선,
+   fine-tune 저장소 README 표 참고).
+4. **[버그 발견/수정]** fine-tune 저장소의 `outputs/models/best.onnx`가 내부적으로
+   존재하지 않는 파일명(`twinlitenet_kmu_v1.2.0.onnx.data`)을 참조하고 있어 그대로
+   로드하면 실패하는 버그를 발견 — 실차 배포 PC(AMD 미니 PC, Ryzen 7 5700U)에 처음
+   로드해보다 확인됨(fine-tune 저장소 `PROGRESS.md` §2.27). 원인은 릴리즈 산출물을
+   `best.onnx`로 리네임하는 과정에서 onnx 내부 external-data 메타데이터는 안 바뀐 것.
+
+**수정:**
+- `fine-tune/outputs/models/best.onnx`(+`.onnx.data`, 위 버그 수정 반영된 버전)를
+  `twinlitenetplus_kmu_v1.2.0.onnx`(+`.onnx.data`)로 리네임(`onnx` 파이썬 라이브러리로
+  external-data location을 새 파일명에 맞게 재작성 — 가중치 자체는 원본과 bit-exact
+  동일함을 onnxruntime 추론 결과로 확인)해서 `track_drive/track_drive/models/`에 커밋함.
+- `perception/dl_lane.py`: `DL_MODEL_FILENAME`을 `twinlitenetplus_medium_v2.onnx` →
+  `twinlitenetplus_kmu_v1.2.0.onnx`로 변경. 입출력 텐서 이름/전처리/입력 해상도
+  (640×384)는 §2.26 모델과 동일해서 `DL_INPUT_H` 등 다른 값은 그대로 둠.
+- `best.onnx`(원조)/`twinlitenetplus_small_bootstrap_v2.onnx`(§2.25)/
+  `twinlitenetplus_medium_v2.onnx`(§2.26, 직전 버전)는 롤백/비교용으로 저장소에 그대로
+  남겨뒀다(기본 경로로는 더 이상 안 쓰임).
+
+**참고 — 실차 배포 PC(AMD 미니 PC, Ryzen 7 5700U) 성능:** ROCm 미지원 iGPU라 GPU
+가속 없이 CPU로만 동작 — onnxruntime CPU 기준 이 모델 **~10.8fps(92.6ms/frame)**,
+원조 TwinLiteNet(같은 PC, CPU)은 **12.4fps**로 오히려 근소하게 더 빠름(학습에 쓴
+RX 9070 XT ROCm에서는 반대로 KMU가 원조보다 ~2배 빠름 — CAAM 어텐션이 GPU
+병렬화엔 유리해도 CPU 단일스레드에선 오버헤드로 작용하는 것으로 추정, 엄밀한
+프로파일링은 안 해봄). 실차 제어 루프가 요구하는 fps 대비 충분한지는 아직 확인 안 됨.
+
+**알려진 한계:**
+- §2.26과 마찬가지로 **실차 미검증**이다 — fine-tune 저장소 쪽 검증은 정적 이미지/ROI
+  커버리지 비교까지만 마쳤다.
+- 위 성능 표에서 보듯 이 미니 PC는 CPU 추론만 가능해서(ROCm 미지원) 온보드 실시간
+  fps가 학습 PC보다 훨씬 낮다 — 실차 투입 전 실제 제어 루프 주기(20Hz, `config.py`
+  `control_loop`)와 비교해 병목이 되는지 반드시 확인할 것.
 
 ---
 
