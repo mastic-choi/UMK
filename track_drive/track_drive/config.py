@@ -70,7 +70,8 @@ LANE_DETECTOR_BACKEND = 'dl'  # 'hough' | 'classic_cv' | 'dl'
 # #############################################################
 # 2. 차량 속도 / 조향 기본값
 # #############################################################
-SPEED_NORMAL  = 15.0   # [2026-08-10] 차선주행(S1) 기본(직진) 속도. 8.0 → 25.0 → 15.0(요청 반영,
+SPEED_NORMAL  = 3.0    # [2026-08-13] 15.0 → 3.0(요청 반영, 조향 파라미터 재튜닝 테스트용 저속화).
+                        # [2026-08-10] 차선주행(S1) 기본(직진) 속도. 8.0 → 25.0 → 15.0(요청 반영,
                         #   DL_CENTER_MODE='ll' 기본 전환과 함께 하향 — ll 재설계가 아직 실차
                         #   미검증이라 우선 보수적으로 낮춤).
                         #   0.0으로 두지 말 것 — _lane_drive()에서 나눗셈 분모로도 쓰여 ZeroDivisionError.
@@ -314,13 +315,7 @@ DL_DA_SEARCH_WIDEN_STEP_PX = 20.0
 DL_DA_SEARCH_WIDEN_MAX_PX = 200.0
 DL_DA_VELOCITY_EMA_ALPHA = 0.3      # 밴드 간 이동 속도(px/밴드) EMA 계수 — DL_LL_VELOCITY_EMA_ALPHA와 동일 관례
 DL_DA_VELOCITY_MAX_PX = 40.0        # 예측 이동량 클램프
-# [2026-08-12] 0.35 → 0.30. "da 반응이 한 박자 늦다"는 사용자 피드백으로 직전 프레임
-# 비중을 아주 소폭 낮췄다 — 이번 프레임 전파값(cur_x, 실측+속도예측) 쪽 비중이 그만큼
-# 늘어 탐색창이 새 관측을 더 빨리 따라간다. 안정성(노이즈에 덜 흔들림)과의 트레이드오프라
-# 크게 낮추지 않고 첫 스텝만 밟음 — 더 빠른 반응이 필요하면 여기서 추가로 낮추되,
-# 노이즈에 탐색창이 흔들리기 시작하면(검출 밴드가 프레임마다 들쭉날쭉해지면) 되돌릴 것.
-# 실차 미검증.
-DL_DA_BAND_ANCHOR_ALPHA = 0.30      # 밴드별 탐색창 중심 계산 시 "직전 프레임 그 밴드 위치"에 주는 가중치
+DL_DA_BAND_ANCHOR_ALPHA = 0.35      # 밴드별 탐색창 중심 계산 시 "직전 프레임 그 밴드 위치"에 주는 가중치
 
 # ll sanity check — ROI 내 ll(차선) foreground 비율이 이 미만이면 da 결과와 무관하게 무효 처리
 DL_LL_SANITY_MIN_RATIO = 0.005
@@ -355,34 +350,22 @@ DL_LL_DECAY_MIN_VALUE = 128.0
 #             제거 — 실차 검증 결과 면적만으로 da를 거르는 방식 자체가 불신뢰. da가 옆
 #             차선과 붙는 문제는 이제 전적으로 _clip_da_by_ll()이 담당). 하한
 #             (DL_DA_MIN_COMPONENT_AREA)은 "사실상 안 보임" 노이즈 필터로 유지.
-#   'll_da' : "corridor" 알고리즘 — ll(차선)로 도로 폭 자체를 규정하고, da는 그 안에서
-#             장애물 회피용 열린 공간을 찾는 데만 쓴다.
-#             [2026-08-12 재설계] 경계(좌/우 흰선) 판정 방식을 "위치순서"에서 "색상
-#             투표"로 바꿨다 — 예전엔 DLSlideWindow._ll_line_centers()가 흰/노랑 구분
-#             없는 원본 ll_mask에서 선을 왼쪽부터 정렬해 1번째~3번째를 도로 경계로
-#             삼았는데(2번째=중앙분리선은 그냥 지나침), 이 방식은 밴드마다 선이 정확히
-#             3개 검출돼야만 동작하고 프레임 간 추적도 전혀 없어서(완전 stateless),
-#             실차에서 "노란+흰 1개씩만" 또는 "흰 1개만" 잡히는 프레임이 흔한 상황에서
-#             밴드가 계속 드롭돼 매우 불안정했다(사용자 보고). 지금은
-#             _split_ll_by_yellow()(컴포넌트 단위 색상 투표, 'll' 모드와 공유)로 이미
-#             확정된 노란선/흰선 마스크를 받아, DLSlideWindow._corridor_boundary_centers()가
-#             **노란선(중앙)·왼쪽흰선·오른쪽흰선을 각각 독립 슬라이딩 윈도우로 추적**한다
-#             (_ll_yellow_white_centers()와 동일 원리 — 밴드별 프레임간 앵커링+속도예측+
-#             미검출 시 탐색창 확장). 노란선을 못 찾아도, 흰선이 한쪽만 보여도 노란선-
-#             흰선 간격 러닝추정치(DL_LL_YELLOW_GAP_INIT_PX로 초기화, 'll' 모드와 별개로
-#             좌/우 독립 EMA)로 반대쪽을 추정해 계속 경계를 내놓는다(우선순위
-#             LR>L+Y/R+Y>L+W/R+W>Y>LOST — 상세는 _corridor_boundary_centers() docstring
-#             참고). 좌/우 흰선을 **둘 다** 이번 밴드에서 실측했을 때만
-#             DL_CORRIDOR_WIDTH_MIN/MAX_PX로 폭을 sanity check한다(엉뚱한 선 짝짓기
-#             방지) — 추정/잔상 분기는 이미 클램프된 간격에서 나오므로 별도 검증 안 함.
-#             그 경계 x범위 안에서만 da를 보고 실제 열린(장애물 없는) 구간을 찾아
-#             (DLSlideWindow._pick_open_run(), 직전 프레임 위치에 가장 가까운 구간을
-#             우선하는 히스테리시스 있음) 그 중심을 밴드 중심으로 쓴다
-#             (DLSlideWindow._corridor_slice_centers()). "자기 차선 하나"를 전제로 한
-#             _largest_da_component()/_clip_da_by_ll()은 여전히 건너뛰고 클리핑 전 원본
-#             da(da_mask_all_roi)를 그대로 쓴다 — 장애물이 도로를 좌/우로 쪼갤 때 그 두
-#             함수는 지나갈 수 있는 작은 쪽을 통째로 버리거나 잘라내 버려서 corridor
-#             취지(양쪽 차로를 동시에 보고 그 안에서 고른다)와 반대다.
+#   'll_da' : [2026-08-10] "corridor" 알고리즘으로 교체 — ll(차선)로 도로 폭 자체를
+#             규정하고, da는 그 안에서 장애물 회피용 열린 공간을 찾는 데만 쓴다. 밴드마다
+#             ll을 왼쪽부터 정렬해(DLSlideWindow._ll_line_centers(), 흰/노랑 구분 없는
+#             원본 ll_mask 사용 — 노란 중앙선도 "2번째 선"으로 그대로 센다) 1번째~3번째
+#             선을 도로 경계(전체 트랙, 양쪽 차로 폭)로 삼는다. 그 x범위 안에서만 da를
+#             보고 실제 열린(장애물 없는) 구간을 찾아(DLSlideWindow._pick_open_run(),
+#             직전 프레임 위치에 가장 가까운 구간을 우선하는 히스테리시스 있음) 그 중심을
+#             밴드 중심으로 쓴다(DLSlideWindow._corridor_slice_centers()). "자기 차선
+#             하나"를 전제로 한 _largest_da_component()/_clip_da_by_ll()은 건너뛰고
+#             클리핑 전 원본 da(da_mask_all_roi)를 그대로 쓴다 — 장애물이 도로를 좌/우로
+#             쪼갤 때 그 두 함수는 지나갈 수 있는 작은 쪽을 통째로 버리거나 잘라내
+#             버려서 corridor 취지(양쪽 차로를 동시에 보고 그 안에서 고른다)와
+#             반대다. 밴드에서 검출된 선이 3개 미만이거나 corridor 폭이
+#             DL_CORRIDOR_WIDTH_MIN/MAX_PX 밖이면 그 밴드는 da 폴백 없이 그냥 드롭한다
+#             — corridor 경계 자체가 ll에서 나오므로 ll이 불충분한 순간엔 "도로 폭이
+#             얼마인지" 판단할 근거가 없기 때문.
 #   'll'    : ll을 흰선/노란선으로 분리(DLSlideWindow._split_ll_by_yellow(), 커넥티드
 #             컴포넌트 단위로 HSV 노란색 겹침 비율 투표 — 픽셀 단위로 빼는 것보다 dash
 #             가장자리가 깔끔함)한 뒤, **노란 중앙선 + (내 차선 판정에 따른) 한쪽 흰색
@@ -421,7 +404,20 @@ DL_LL_DECAY_MIN_VALUE = 128.0
 #   [2026-08-10] main 기본값을 'da'에서 'll'로 전환(요청 반영) — 위 ①~⑤ 재설계 이후
 #   실차 재검증 목적. 'll'/'ll_da' 둘 다 여전히 실차 미검증 상태라, SPEED_NORMAL도
 #   같이 낮춰뒀다(위 참고). 문제가 생기면 이 값을 'da'로 되돌릴 것.
-DL_CENTER_MODE = 'll'  # 'da' | 'll_da' | 'll'
+# [2026-08-13] 'll_da' → 'da'(요청 반영) — ll_da/ll 둘 다 노란선 인식 불안정으로 계속
+#   막혀서, 일단 da 자체 검출 품질만 따로 보려고 전환. 아래 DL_DA_SKIP_LL_CLIP과 짝.
+DL_CENTER_MODE = 'll_da'  # 'da' | 'll_da' | 'll'
+
+# [2026-08-13] DL_CENTER_MODE='da' 테스트 전용 — "da가 자체적으로 잘 검출된다"는
+#   가정하에 ll(차선) 기반으로 옆 차선을 잘라내는 _clip_da_by_ll() 단계를 통째로
+#   건너뛴다(요청 반영). True면 largest-component만 남긴 da_mask를 클리핑 없이 그대로
+#   센터라인 계산에 쓴다 — da_ll_clip_skipped/da_clip_band_virtual 등 기존 "클리핑
+#   건너뜀" 디버그 표시를 그대로 재사용해 visualize()에도 반영된다(detect() 참고).
+#   DL_CENTER_MODE='ll'에는 영향 없음 — 그쪽은 이 플래그와 무관하게 항상 클리핑 적용.
+#   ★주의★ 클리핑을 끄면 옆 차선 침범 가드가 없어지므로, da 세그멘테이션 품질 자체만
+#   보는 실험용이지 이 상태로 실주행에 쓰라는 뜻이 아니다. 테스트 끝나면 True로 남겨두지
+#   말 것(또는 다시 DL_CENTER_MODE로 전환할 때 같이 False로 되돌릴 것).
+DL_DA_SKIP_LL_CLIP = True
 
 # [2026-08-10] DL_CENTER_MODE='ll' 내부에서 실제 밴드 중심 계산 알고리즘을 고르는
 #   2차 스위치 — 같은 날 두 사람이 독립적으로 서로 다른 재설계를 했다(origin/main
@@ -640,19 +636,28 @@ PP_LOOKAHEAD_MIN_PX = 40.0         # 코너에서 lookahead가 줄어들 수 있
 #   경험적으로 맞춰졌을 가능성이 있어(다른 근사 오차를 상쇄했을 수도 있음), 67.0로 바꾸면
 #   같은 curvature에도 조향각이 더 작게(atan 인자가 작아짐) 나와 코너링이 더 완만해질 수
 #   있다 — 너무 밋밋하게 느껴지면 이 값을 다시 올릴 것(단, 그때는 "튜닝값"임을 주석에 남길 것).
-PP_WHEELBASE_PX = 67.0             # = LQR_WHEELBASE_M(0.335) * DL_PIXELS_PER_METER(200) 실측 기반 계산값
+PP_WHEELBASE_PX = 25.0             # [2026-08-13] 67.0 → 40.0 → 25.0(요청 반영, 튜닝값 — 조향을 더
+                                    #   줄이는 방향). atan(curvature*wheelbase_px) 공식상 값이 작을수록
+                                    #   같은 curvature에도 조향각이 더 작게 나옴(반응 약화) — 실차 재검증 필요.
+                                    # 원래 = LQR_WHEELBASE_M(0.335) * DL_PIXELS_PER_METER(200) 실측 기반 계산값(67.0)
 # [2026-08-12] 직진 구간에서도 계속 진동("와리가리")한다는 보고 대응 — §0.5.3 "알려진
 #   한계"에서 이미 "PP_ALPHA를 낮춰 조향각 저역통과를 더 강하게 거는 쪽을 다음으로 볼 것"
 #   이라고 못박아뒀던 그 다음 단계. 0.5 → 0.35로 낮춰 프레임간 저역통과를 더 세게 건다
 #   (README §0.5.7). 실차 미검증 — 너무 낮추면 실제 코너 진입 반응이 느려지니 같이 볼 것.
-PP_ALPHA = 0.35                    # 프레임간 조향각 저역통과 필터(1=필터없음, 0=반응없음)
+PP_ALPHA = 0.60                    # [2026-08-13] 0.35 → 0.60(요청 반영, 필터를 완화해 반응성 ↑ —
+                                    #   저속(SPEED_NORMAL=3.0) 재튜닝과 함께 조정, 실차 재검증 필요.
+                                    # 프레임간 조향각 저역통과 필터(1=필터없음, 0=반응없음)
 PP_MIN_LOOKAHEAD_PX = 90.0         # curvature 분모(ld) 바닥값 — 노이즈 증폭 방지용. PP_LOOKAHEAD_MIN_PX와 다른 값이니 헷갈리지 말 것
 # [2026-08-12] 6.0 → 15.0. 직진 진동 대응 세 번째 레버 — 원래 값이 중앙 부근 잔떨림을
 #   죽이기엔 너무 작아서(픽셀 몇 개짜리 노이즈도 그대로 통과) 직진에서도 매 프레임 미세한
 #   조향이 나갔던 것으로 추정. LANE_DEADZONE(구 PID 전용, 40px)보다는 여전히 훨씬 작게
 #   유지 — Pure Pursuit 목표점은 이미 lookahead 앞 실제 경로점이라 그만큼 크게 죽이면
 #   완만한 커브 진입까지 무시하게 된다(pure_pursuit.py 상단 주석 참고). 실차 미검증.
-PP_DX_DEADZONE_PX = 15.0           # 이 이하 픽셀오차는 0으로 죽여 중앙 부근 잔떨림 제거
+PP_DX_DEADZONE_PX = 5.0            # [2026-08-13] 15.0 → 5.0(요청 반영, PP_WHEELBASE_PX를 67→40으로
+                                    #   줄여 조향 반응 자체가 약해진 만큼 데드존도 같이 줄임 — 노란선
+                                    #   흔들림 대응). 너무 작으면 §0.5.3에서 우려했던 잔떨림이 다시
+                                    #   새어들어올 수 있어 실차 재검증 필요.
+                                    # 이 이하 픽셀오차는 0으로 죽여 중앙 부근 잔떨림 제거
 
 # ── LQR 튜닝값 (controller/lqr.py LQRController) — 전부 실차 미검증 ──
 #   speed_gain: 클수록 반응 커짐. r_steer: 올릴수록 조향 억제(지그재그 완화,
@@ -764,14 +769,14 @@ DEBUG_PERIOD = 0.5     # 위 로그 주기(s)
 # [2026-08-11] 라바콘 실차 테스트 중엔 라이다 창만 보고 싶다는 요청으로, 아래 DEBUG_VIZ_LIDAR만
 #   켜고 나머지는 전부 잠시 끔. 다른 디버그창이 다시 필요하면(예: 차선 인식 디버깅) 개별적으로
 #   다시 True로 되돌릴 것 — 서로 독립적인 스위치라 다른 항목엔 영향 없음.
-DEBUG_VIZ_LIDAR    = True   # 라이다 BEV 장애물 감지 디버그 창 (track_drive.py)
+DEBUG_VIZ_LIDAR    = False   # 라이다 BEV 장애물 감지 디버그 창 (track_drive.py)
 DEBUG_VIZ_LAVACON  = False  # 라바콘 트리거 좌우 클러스터 BEV 디버그 창 (track_drive.py)
 DEBUG_PLANNER      = False  # Hybrid A* OccupancyGrid 디버그 창 (track_drive.py, USE_HYBRID_ASTAR_FOR_B3=True일 때만 의미있음)
 DEBUG_VIZ_STEER    = False  # 조향 컨트롤러(직전값유지/현재값반영) 한글 디버그 창 (track_drive.py)
 DEBUG_VIZ_VESC     = False  # VESC 실측속도(/vesc_speed_erpm) 연동 상태(수신중/끊김/미수신) 디버그 창
                              #   (track_drive.py, 2026-08-06 LQR 브랜치에서 이식)
 
-DEBUG_VIZ_DL_LANE    = False  # 차선 — 기본 백엔드('dl') 디버그 창 (perception/dl_lane.py)
+DEBUG_VIZ_DL_LANE    = True  # 차선 — 기본 백엔드('dl') 디버그 창 (perception/dl_lane.py)
 # [2026-08-10] offset 스파크라인이 몇 프레임을 보여줄지 — [2026-08-11] 원래 별도
 #   'dl_lane_params' 창 하단에 붙었으나, 그 창의 파라미터 텍스트 목록(대부분 config
 #   고정값)을 지우면서 스파크라인만 'dl_lane' 창 맨 아래로 옮겼다(DEBUG_VIZ_DL_LANE
@@ -781,7 +786,7 @@ DEBUG_VIZ_DL_LANE    = False  # 차선 — 기본 백엔드('dl') 디버그 창 
 #   으로 시작.
 DL_DEBUG_HISTORY_LEN = 90
 DEBUG_VIZ_HOUGH_LANE = False  # 차선 — 대안 백엔드('hough') 디버그 창 (perception/hough_lane.py)
-DEBUG_VIZ_LANE       = False  # 차선 — 대안 백엔드('classic_cv') 디버그 창 (perception/lane_util.py)
+DEBUG_VIZ_LANE       = True  # 차선 — 대안 백엔드('classic_cv') 디버그 창 (perception/lane_util.py)
 DEBUG_VIZ_STOPLINE   = False  # 정지선 디버그 창, 백엔드 무관 항상 동작 (perception/perc_floor.py)
 DEBUG_VIZ_SIGNAL     = False  # 신호등(S0/S2 공용) 디버그 창 (perception/traffic_signal.py)
 DEBUG_VIZ_YOLO_CONE  = True   # 라바콘 YOLO 검출 박스 디버그 창 (perception/yolo_cone.py)
@@ -793,7 +798,7 @@ DEBUG_VIZ_YOLO_CONE  = True   # 라바콘 YOLO 검출 박스 디버그 창 (perc
 # 6. 미션 State / 실차 테스트 범위 제한
 # #############################################################
 START_STATE     = MissionState.S1_LANE_FOLLOW
-ENABLE_BEHAVIOR = True   # S1에서 라바콘/장애물/추월 Behavior를 켤지 여부(최상위 스위치)
+ENABLE_BEHAVIOR = False   # S1에서 라바콘/장애물/추월 Behavior를 켤지 여부(최상위 스위치)
 #   [2026-08-11] 라바콘(B1) 실차 테스트를 위해 True로 켬. TEST_FORCE_BEHAVIOR=True와 함께
 #   있으면 S2 교차로 없이도 시작부터 라바콘 단독 테스트 가능. B2/B3까지 실차 테스트 범위를
 #   넓힐 준비가 되기 전까지는 TEST_DISABLE_B2_B3=True로 B2/B3 발동 자체는 계속 막아둔 상태.
@@ -809,7 +814,7 @@ TEST_DISABLE_INTERSECTION = True
 # [2026-08-11] B2/B3 실차 테스트 시작 — True → False. 라바콘(B1) 격리 테스트는 이 값과
 #   무관(B1엔 트리거 조건이 없음, apply_behavior_override() 참고)하니 그대로 True 둬도
 #   B1은 계속 검증 가능하다.
-TEST_DISABLE_B2_B3 = False
+TEST_DISABLE_B2_B3 = True
 #   True: Phase가 FIXED_OBSTACLE/VEHICLE로 넘어가도 트리거 검사를 건너뛰고
 #         B0_NORMAL로 고정(B1 끝난 뒤 계속 일반 차선주행만 함).
 #   False: 원래대로 SAFETY_DIST/OVERTAKE_TRIGGER 트리거 검사해서 B2/B3 정상 발동.

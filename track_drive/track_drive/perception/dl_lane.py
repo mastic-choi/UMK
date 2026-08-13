@@ -50,11 +50,9 @@
 #             면적만으로 da를 거르는 방식 자체가 불신뢰였음 — da가 옆 차선과 붙는 문제는
 #             이제 _clip_da_by_ll()이 ll 잔상(decay)/가상경계로 전담한다).
 #   'll_da' : "corridor" 알고리즘(_corridor_slice_centers()) — ll로 도로 폭 자체를
-#             규정하고, 그 안에서 da로 장애물 회피용 열린 공간을 찾는다. [2026-08-12]
-#             경계 판정은 색상투표(_split_ll_by_yellow())로 구분한 노란선(중앙)·좌/우
-#             흰선을 각각 독립 슬라이딩 윈도우로 추적한다(_corridor_boundary_centers(),
-#             노란선/한쪽 흰선이 안 보여도 간격 추정으로 계속 경계를 낸다). "자기 차선
-#             하나"를 전제로 한 largest-component/클리핑은 건너뛴다.
+#             규정하고(1번째~3번째 선을 도로 경계로), 그 안에서 da로 장애물 회피용 열린
+#             공간을 찾는다. "자기 차선 하나"를 전제로 한 largest-component/클리핑은
+#             건너뛴다.
 #   'll'    : ll을 흰선/노란선으로 분리(_split_ll_by_yellow())한 뒤, 노란 중앙선 +
 #             (차선 판정에 따른) 한쪽 흰색 경계선을 추적한다(_ll_yellow_white_centers()).
 #             da 폴백은 없다 — 대신 노란/흰 간격 기반 재구성 + 잔상으로 저신뢰
@@ -189,7 +187,7 @@ from ..config import (
     DL_DA_VELOCITY_EMA_ALPHA, DL_DA_VELOCITY_MAX_PX, DL_DA_BAND_ANCHOR_ALPHA,
     DL_LL_SANITY_MIN_RATIO, DL_LL_CLIP_MARGIN_PX,
     DL_LL_DECAY_ALPHA, DL_LL_DECAY_MIN_VALUE,
-    DL_CENTER_MODE, DL_LL_ALGO, DL_LL_SIDE_MIN_PIXELS,
+    DL_CENTER_MODE, DL_LL_ALGO, DL_LL_SIDE_MIN_PIXELS, DL_DA_SKIP_LL_CLIP,
     DL_LL_SEARCH_HALF_WIDTH_PX,
     # DL_LL_ALGO='yw'(팀원 작성, main 기본) 전용
     DL_LL_YELLOW_GAP_INIT_PX, DL_LL_YELLOW_GAP_EMA_ALPHA,
@@ -439,28 +437,6 @@ class DLSlideWindow(SlideWindow):
         # 적용한 것과 동일한 원리 — README §2.27). corridor는 좌/우 두 갈래가 아니라
         # "열린 구간 하나"만 추적하므로 스칼라 하나면 된다.
         self._corridor_velocity = 0.0
-
-        # [2026-08-12] corridor 좌/우 경계 판정 재설계 — 예전 _ll_line_centers()(위치순서
-        # 1/2/3번째 선, stateless)를 대체하는 _corridor_boundary_centers() 전용 상태.
-        # _ll_yellow_white_centers()와 동일한 원리로 노란선(중앙)·왼쪽흰선·오른쪽흰선을
-        # 각각 독립 슬라이딩 윈도우(밴드별 앵커+속도예측+미검출 시 탐색창 확장)로 추적한다
-        # — 노란선을 못 찾거나 흰선이 한쪽만 보이는 프레임이 실차에서 흔하다는 보고 대응
-        # (_corridor_boundary_centers() docstring 참고).
-        self._corr_left_velocity = 0.0
-        self._corr_right_velocity = 0.0
-        self._corr_yellow_velocity = 0.0
-        self._corr_prev_band_left = [None] * self.n_slices
-        self._corr_prev_band_right = [None] * self.n_slices
-        self._corr_prev_band_yellow = [None] * self.n_slices
-        # 노란선-왼쪽/오른쪽흰선 간격 러닝추정치(px, EMA) — 'll' 모드
-        # (_ll_yellow_white_centers())의 self._white_yellow_gap_px와 물리적으로 동일한
-        # 개념(중앙분리선에서 차로 바깥쪽 흰선까지 거리)이라 같은 초기값(DL_LL_YELLOW_GAP_INIT_PX)을
-        # 재사용한다 — 다만 corridor는 좌/우 두 차로 폭이 대칭이라는 보장이 없어 독립적으로
-        # 추적한다.
-        self._corr_left_gap_px = DL_LL_YELLOW_GAP_INIT_PX
-        self._corr_right_gap_px = DL_LL_YELLOW_GAP_INIT_PX
-        self.corridor_band_case = ['?'] * self.n_slices  # 밴드별(길이 n_slices) 어느 분기(LR/L+Y/R+Y/L+W/R+W/Y/LOST/-)를 탔는지 — visualize() 디버그 텍스트용
-        self.corridor_search_windows = []  # 이번 프레임 좌/노랑/우 탐색창 좌표(밴드별) — visualize()가 사각형으로 그림
 
         # [2026-08-10] DL_CENTER_MODE='ll'(흰선/노란선 분리) 전용 부가 정보 — 전부
         # visualize()용이고 경로/조향 계산에는 안 쓰인다(노란선은 아직 stateless 디버그
@@ -863,20 +839,17 @@ class DLSlideWindow(SlideWindow):
     def _ll_line_centers(self, ll_band):
         """ll_band(2D 이진 밴드 슬라이스, _slice_centers/_clip_da_by_ll과 동일한 y_low:y_high
         구간)에서 서로 다른 물리적 선들을 구분해 x중심 좌표를 왼쪽부터 정렬해 반환한다.
-
-        [2026-08-12] 원래는 DL_CENTER_MODE='ll_da'(corridor)가 1번째/3번째 선을 도로
-        경계로 고르는 데 썼는데, corridor는 이제 색상투표 기반 슬라이딩윈도우
-        (_corridor_boundary_centers())로 교체됐다 — 지금 유일한 호출자는
-        _ll_yellow_white_centers()의 ④번 분기(노란선을 이번 밴드에서 못 찾았을 때,
-        넓은 창에서 흰선을 몇 개 찾았는지로 3분기하는 부분)뿐이다. 흰/노랑을 가리지
-        않은 마스크를 그대로 받아도 되고(호출측이 이미 흰선만 담긴 ll_white_mask를
-        넘김), "밴드 안의 선을 개수 제한 없이 전부 찾아 순서만 매긴다"는 동작 자체는
-        그대로다.
+        DL_CENTER_MODE='ll_da'(corridor) 전용 — _ll_yellow_white_centers()는 "노란선 +
+        한쪽 흰선" 딱 2선만 다루는 반면, 이건 밴드 안의 선을 개수 제한 없이 전부 찾아 순서만
+        매긴다(1번째/3번째를 고르는 건 호출측 _corridor_slice_centers()가 한다). 흰/노랑을
+        가리지 않은 원본 ll_mask를 그대로 받는다 — 노란 중앙선도 "2번째 선"으로 그대로
+        세야 corridor의 1/3번째 선 인덱싱이 맞는다.
 
         connectedComponentsWithStats로 성분을 찾고 DL_CORRIDOR_LINE_MIN_PIXELS 미만인
         작은 잡음은 버린다. 점선 틈으로 같은 선이 이 밴드 안에서 둘로 쪼개져 서로 다른
         component가 되는 경우가 있어(밴드 경계와 점선 간격이 우연히 겹칠 때), 정렬 후
-        인접한 두 x가 DL_CORRIDOR_LINE_MERGE_PX보다 가까우면 하나로 합친다.
+        인접한 두 x가 DL_CORRIDOR_LINE_MERGE_PX보다 가까우면 하나로 합친다 — 안 그러면
+        실제로는 3개인 선이 4개로 잘못 세어져 1/3번째 선택이 틀어진다.
         """
         num, _, stats, centroids = cv2.connectedComponentsWithStats(ll_band, connectivity=8)
         xs = sorted(
@@ -923,275 +896,35 @@ class DLSlideWindow(SlideWindow):
             return max(runs, key=lambda r: r[1] - r[0])
         return min(runs, key=lambda r: abs((r[0] + r[1]) / 2.0 - prefer_x))
 
-    def _corridor_boundary_centers(self, ll_white_mask, ll_yellow_mask, ref_x):
-        """[2026-08-12] DL_CENTER_MODE='ll_da'(corridor) 전용 — corridor의 좌/우 경계를
-        구하던 기존 _ll_line_centers()(위치순서: 왼쪽부터 1/2/3번째 선, 완전 stateless)를
-        대체한다.
-
-        **왜 바꾸나**: 위치순서 방식은 밴드당 선이 정확히 3개(혹은 그 이상 검출→병합해
-        3개) 나와야만 좌/중앙/우를 구분할 수 있는데, 실차에서는 노란선+흰선이 하나씩만
-        잡히거나 흰선 하나만 잡히는 밴드가 흔해서(사용자 보고) 그런 밴드가 전부 드롭돼
-        매우 불안정했다. 게다가 프레임 간 추적(앵커/속도예측)이 전혀 없어 매 프레임
-        독립적으로 재검출해 더 흔들렸다.
-
-        _split_ll_by_yellow()가 이미 커넥티드 컴포넌트 단위 색상 투표로 흰선/노란선을
-        분리해두므로(모듈 상단 주석 참고), 여기서는 "몇 번째 선인가"가 아니라 "이건
-        노란선/이건 흰선"이라는 확정된 정보를 그대로 쓴다. _ll_yellow_white_centers()
-        ('ll' 모드)와 동일한 원리로 **노란선(중앙)·왼쪽흰선·오른쪽흰선을 각각 독립된
-        슬라이딩 윈도우**로 추적한다(밴드별 프레임간 앵커링 DL_LL_BAND_ANCHOR_ALPHA +
-        밴드간 속도예측 DL_LL_VELOCITY_EMA_ALPHA + 미검출 시 탐색창 확장
-        DL_LL_SEARCH_WIDEN_*, 전부 기존 함수들과 동일한 상수 재사용).
-
-        밴드별로 아래 우선순위로 좌/우 경계를 정한다(노란선이 안 보여도, 흰선 한쪽만
-        보여도 계속 뭔가는 내놓는 게 목표 — 요청 반영):
-          1. 'LR'   좌/우 흰선을 **둘 다** 이번 밴드에서 실측 → 그대로 채택(가장 신뢰
-                    높음, DL_CORRIDOR_WIDTH_MIN/MAX_PX로 폭 sanity check). 노란선도
-                    실측이면 좌/노랑·노랑/우 간격(self._corr_left_gap_px/
-                    _corr_right_gap_px, EMA)을 갱신하고, 노란선을 못 찾았어도 두 흰선의
-                    중점으로 노란선 탐색창(cur_yellow)을 보정해 다음 밴드가 이어받게 한다.
-          2. 'L+Y'/'R+Y' 한쪽 흰선만 실측 + 노란선도 실측 → 노란선 위치 + 그쪽 간격
-                    러닝추정치로 반대쪽을 추정(간격 기반이라 3번보다 정확).
-          3. 'L+W'/'R+W' 한쪽 흰선만 실측, 노란선은 못 찾음 → 실측된 흰선 +
-                    (좌간격+우간격) 러닝추정치를 전체 폭으로 근사해서 반대쪽을 추정 —
-                    노란선이 전혀 안 보여도 "흰선 하나"만으로 계속 주행 가능하게 하는
-                    핵심 분기.
-          4. 'Y'    흰선을 둘 다 못 찾음, 노란선만 실측 → 노란선 ± 좌/우 간격
-                    러닝추정치로 양쪽 다 추정.
-          5. 'LOST' 셋 다 못 찾음 → 각 트래커가 자기 속도로 dead-reckoning한
-                    cur_left/cur_right를 그대로 잔상처럼 쓴다(1~4가 실제로 한 번도
-                    갱신 안 됐으면 ref_x 기준 초기값).
-        1번(둘 다 실측)만 폭을 sanity check한다 — 엉뚱한 선끼리 잘못 짝지어졌을 가능성을
-        거르기 위함. 2~5(추정/잔상)는 이미 클램프된 간격 추정치에서 나오므로 별도 폭
-        검증을 안 한다(_ll_yellow_white_centers()와 동일 원칙 — 그쪽도 간격 EMA 자체의
-        클램프만 믿고 별도 폭 검증은 안 함).
-
-          입력 : ll_white_mask, ll_yellow_mask — (roi_h, roi_w) uint8 이진마스크
-                 ref_x — 첫(근거리) 밴드의 좌/우/노랑 초기 중심 기준 x좌표(보통 직전
-                 프레임 lane_center)
-          출력 : (bounds, used) — 길이 self.n_slices.
-                 bounds[i] : 채택되면 (left_x, right_x), 아니면 None(1~5 전부 실패 —
-                 사실상 첫 프레임에 아무 것도 안 보일 때만 발생)
-                 used[i]   : 1번('LR', 좌우 흰선 둘 다 실측+sanity 통과)로 채워졌는지
-                 (bool) — 디버그 시각화용
-
-        [2026-08-12 추가] 추정 분기(2~5)가 채운 쪽의 cur_left/cur_right 재앵커링 — 처음
-        구현엔 이게 없어서, 예를 들어 오른쪽 흰선이 오래 안 보이는 동안 cur_right가
-        "마지막 실측 위치 + 관성"으로만 계속 흘러가 이번 프레임 실제 추정치(왼쪽/노란선
-        기준)와 점점 어긋나는 문제가 있었다 — 나중에 그 선이 다시 보여도 탐색창이 엉뚱한
-        곳에 있어 못 잡거나, 창이 반대쪽/노란선 쪽으로 넘어가 좌우가 뒤바뀐 채 잡힐
-        위험이 있었다(실차 미검증이지만 구조적으로 명백한 취약점 — 사용자 지적). 이제
-        L+Y/L+W는 cur_right를, R+Y/R+W는 cur_left를, Y는 둘 다 그 프레임의 추정치로
-        재앵커링한다 — 매 프레임 실제 신호(yx/lx/rx 중 하나라도)가 있는 한 좌/우 트래커가
-        서로 물리적으로 말이 되는 위치로 계속 끌어당겨진다.
-
-        알려진 한계(실차 미검증):
-        - self._corr_left_gap_px/_corr_right_gap_px 초기값(DL_LL_YELLOW_GAP_INIT_PX,
-          80px)은 'll' 모드의 "내 차로 반폭" 추정치를 그대로 재사용한 것이라, corridor의
-          "양쪽 차로" 맥락에서도 맞는지 실차 재검증 필요 — 좌/우 차로 폭이 실제로 다르면
-          각자 EMA가 알아서 수렴하지만 초기 몇 프레임은 부정확할 수 있다.
-        - 3번(간격 없이 전체폭 추정)은 5번(잔상)보다는 낫지만 여전히 근거 없는 추정이라,
-          이 분기가 길게 이어지면 반대쪽 경계가 실제와 벌어질 수 있다.
-        - 위 재앵커링도 신호가 하나도 없는 'LOST'(진짜 아무 것도 안 보임)에서는 통하지
-          않는다 — 그 구간은 여전히 순수 관성(velocity)으로만 흘러가므로, LOST가 길게
-          이어지면 좌/우 트래커가 어긋날 위험이 남는다. cur_left/cur_right가 서로 교차
-          (좌가 우보다 커짐)하는 것까지 막는 명시적 가드는 아직 없다 — corridor_band_case
-          스파크라인으로 LOST 연속 길이를 실차에서 관찰하고, 문제되면 교차 방지 클램프나
-          LOST 장기화 시 노란선 기준 강제 재초기화를 추가할 것.
-        - _ll_yellow_white_centers()의 self.ll_degraded/SPEED_LL_DEGRADED 강제 감속과
-          달리, corridor는 아직 이 저신뢰 분기(2~5)를 감속 로직에 안 연결했다 —
-          self.corridor_band_case로 어느 분기를 탔는지는 노출해뒀으니, 실차에서 2~5가
-          잦으면 이 모드도 동일한 감속 훅을 걸지 검토할 것.
-        """
-        h, w = ll_white_mask.shape
-        slice_h = h // self.n_slices
-        bounds = [None] * self.n_slices
-        used = [False] * self.n_slices
-        self.corridor_band_case = ['?'] * self.n_slices
-        self.corridor_search_windows = []
-
-        base_win = DL_LL_SEARCH_HALF_WIDTH_PX
-        cur_yellow = ref_x
-        cur_left = ref_x - self._corr_left_gap_px
-        cur_right = ref_x + self._corr_right_gap_px
-        yellow_miss = left_miss = right_miss = 0
-        last_y_i = last_y_x = None
-        last_l_i = last_l_x = None
-        last_r_i = last_r_x = None
-
-        for i in range(self.n_slices):
-            y_high = h - i * slice_h
-            y_low = 0 if i == self.n_slices - 1 else h - (i + 1) * slice_h
-
-            win_y = min(base_win + yellow_miss * DL_LL_SEARCH_WIDEN_STEP_PX, DL_LL_SEARCH_WIDEN_MAX_PX)
-            win_l = min(base_win + left_miss * DL_LL_SEARCH_WIDEN_STEP_PX, DL_LL_SEARCH_WIDEN_MAX_PX)
-            win_r = min(base_win + right_miss * DL_LL_SEARCH_WIDEN_STEP_PX, DL_LL_SEARCH_WIDEN_MAX_PX)
-
-            prev_y = self._corr_prev_band_yellow[i]
-            anchor_y = cur_yellow if prev_y is None else (
-                (1 - DL_LL_BAND_ANCHOR_ALPHA) * cur_yellow + DL_LL_BAND_ANCHOR_ALPHA * prev_y)
-            prev_l = self._corr_prev_band_left[i]
-            anchor_l = cur_left if prev_l is None else (
-                (1 - DL_LL_BAND_ANCHOR_ALPHA) * cur_left + DL_LL_BAND_ANCHOR_ALPHA * prev_l)
-            prev_r = self._corr_prev_band_right[i]
-            anchor_r = cur_right if prev_r is None else (
-                (1 - DL_LL_BAND_ANCHOR_ALPHA) * cur_right + DL_LL_BAND_ANCHOR_ALPHA * prev_r)
-
-            yx0, yx1 = int(np.clip(anchor_y - win_y, 0, w)), int(np.clip(anchor_y + win_y, 0, w))
-            yx = None
-            if yx1 > yx0:
-                M_y = cv2.moments(ll_yellow_mask[y_low:y_high, yx0:yx1], binaryImage=True)
-                if M_y['m00'] >= DL_LL_SIDE_MIN_PIXELS:
-                    yx = yx0 + M_y['m10'] / M_y['m00']
-
-            lx0, lx1 = int(np.clip(anchor_l - win_l, 0, w)), int(np.clip(anchor_l + win_l, 0, w))
-            lx = None
-            if lx1 > lx0:
-                M_l = cv2.moments(ll_white_mask[y_low:y_high, lx0:lx1], binaryImage=True)
-                if M_l['m00'] >= DL_LL_SIDE_MIN_PIXELS:
-                    lx = lx0 + M_l['m10'] / M_l['m00']
-
-            rx0, rx1 = int(np.clip(anchor_r - win_r, 0, w)), int(np.clip(anchor_r + win_r, 0, w))
-            rx = None
-            if rx1 > rx0:
-                M_r = cv2.moments(ll_white_mask[y_low:y_high, rx0:rx1], binaryImage=True)
-                if M_r['m00'] >= DL_LL_SIDE_MIN_PIXELS:
-                    rx = rx0 + M_r['m10'] / M_r['m00']
-
-            # 노란선 속도예측/앵커 갱신 — 못 찾아도 속도만큼 계속 dead-reckoning(멈추지 않음).
-            if yx is not None:
-                if last_y_i is not None and i > last_y_i:
-                    raw_v = float(np.clip((yx - last_y_x) / (i - last_y_i), -DL_LL_VELOCITY_MAX_PX, DL_LL_VELOCITY_MAX_PX))
-                    self._corr_yellow_velocity = (1 - DL_LL_VELOCITY_EMA_ALPHA) * self._corr_yellow_velocity + DL_LL_VELOCITY_EMA_ALPHA * raw_v
-                last_y_i, last_y_x = i, yx
-                self._corr_prev_band_yellow[i] = yx
-                cur_yellow = yx + self._corr_yellow_velocity
-                yellow_miss = 0
-            else:
-                cur_yellow = cur_yellow + self._corr_yellow_velocity
-                yellow_miss += 1
-
-            if lx is not None:
-                if last_l_i is not None and i > last_l_i:
-                    raw_v = float(np.clip((lx - last_l_x) / (i - last_l_i), -DL_LL_VELOCITY_MAX_PX, DL_LL_VELOCITY_MAX_PX))
-                    self._corr_left_velocity = (1 - DL_LL_VELOCITY_EMA_ALPHA) * self._corr_left_velocity + DL_LL_VELOCITY_EMA_ALPHA * raw_v
-                last_l_i, last_l_x = i, lx
-                self._corr_prev_band_left[i] = lx
-                cur_left = lx + self._corr_left_velocity
-                left_miss = 0
-            else:
-                cur_left = cur_left + self._corr_left_velocity
-                left_miss += 1
-
-            if rx is not None:
-                if last_r_i is not None and i > last_r_i:
-                    raw_v = float(np.clip((rx - last_r_x) / (i - last_r_i), -DL_LL_VELOCITY_MAX_PX, DL_LL_VELOCITY_MAX_PX))
-                    self._corr_right_velocity = (1 - DL_LL_VELOCITY_EMA_ALPHA) * self._corr_right_velocity + DL_LL_VELOCITY_EMA_ALPHA * raw_v
-                last_r_i, last_r_x = i, rx
-                self._corr_prev_band_right[i] = rx
-                cur_right = rx + self._corr_right_velocity
-                right_miss = 0
-            else:
-                cur_right = cur_right + self._corr_right_velocity
-                right_miss += 1
-
-            # ── 밴드별 좌/우 경계 결정 (우선순위 1~5, docstring 참고) ──
-            left_final = right_final = None
-            case = '-'
-            if lx is not None and rx is not None:
-                width = rx - lx
-                if DL_CORRIDOR_WIDTH_MIN_PX < width < DL_CORRIDOR_WIDTH_MAX_PX:
-                    left_final, right_final = lx, rx
-                    case = 'LR'
-                    used[i] = True
-                    if yx is not None:
-                        alpha = DL_LL_YELLOW_GAP_EMA_ALPHA
-                        self._corr_left_gap_px = float(np.clip(
-                            (1 - alpha) * self._corr_left_gap_px + alpha * (yx - lx),
-                            DL_LL_YELLOW_GAP_MIN_PX, DL_LL_YELLOW_GAP_MAX_PX))
-                        self._corr_right_gap_px = float(np.clip(
-                            (1 - alpha) * self._corr_right_gap_px + alpha * (rx - yx),
-                            DL_LL_YELLOW_GAP_MIN_PX, DL_LL_YELLOW_GAP_MAX_PX))
-                    else:
-                        # 노란선을 이번 밴드에서 못 찾았어도, 신뢰도 높은 좌/우 실측
-                        # 중점으로 노란선 탐색창을 보정해 다음 밴드가 이어받게 한다.
-                        cur_yellow = (lx + rx) / 2.0
-                # width가 이상하면 case는 '-'로 남아 아래 2~5로 계속 폴백한다(엉뚱한
-                # 선끼리 짝지어졌을 가능성 — 이 밴드의 lx/rx는 안 믿는다).
-            if case == '-' and lx is not None and yx is not None:
-                left_final, right_final = lx, yx + self._corr_right_gap_px
-                case = 'L+Y'
-            elif case == '-' and rx is not None and yx is not None:
-                left_final, right_final = yx - self._corr_left_gap_px, rx
-                case = 'R+Y'
-            elif case == '-' and lx is not None:
-                left_final = lx
-                right_final = lx + self._corr_left_gap_px + self._corr_right_gap_px
-                case = 'L+W'
-            elif case == '-' and rx is not None:
-                right_final = rx
-                left_final = rx - self._corr_left_gap_px - self._corr_right_gap_px
-                case = 'R+W'
-            elif case == '-' and yx is not None:
-                left_final = yx - self._corr_left_gap_px
-                right_final = yx + self._corr_right_gap_px
-                case = 'Y'
-            elif case == '-':
-                left_final, right_final = cur_left, cur_right
-                case = 'LOST'
-
-            # [2026-08-12] 추정으로 채워진 쪽(L+Y/R+Y/L+W/R+W/Y)의 트래커를 방금 계산한
-            # 추정값으로 재앵커링한다 — 안 그러면 그 사이드는 "마지막 실측 위치 +
-            # 관성(dead-reckoning)"으로만 계속 흘러가서, 실제로는 이번 프레임 다른
-            # 신호(노란선/반대쪽 흰선)가 가리키는 위치와 점점 어긋난다. 나중에 그 선이
-            # 다시 보여도 탐색창(cur_left/cur_right 기준)이 엉뚱한 곳을 보고 있어 못
-            # 잡거나, 최악의 경우 창이 반대쪽 선/노란선 쪽으로 넘어가 좌우가 뒤바뀐 채
-            # 잡힐 위험이 있다(사용자 지적 — "L+W에서 좌우 판정이 틀리면 사실상 주행이
-            # 힘들다"). 매 프레임 실제 신호(yx/lx/rx 중 하나라도)가 있는 한 좌/우
-            # 트래커를 그 신호 기준으로 계속 끌어당겨서, 완전히 아무 근거도 없는
-            # 'LOST'(순수 관성) 상태로만 어긋남이 누적되게 제한한다.
-            if case in ('L+Y', 'L+W'):
-                cur_right = right_final
-            elif case in ('R+Y', 'R+W'):
-                cur_left = left_final
-            elif case == 'Y':
-                cur_left, cur_right = left_final, right_final
-
-            self.corridor_band_case[i] = case
-            if left_final is not None and right_final is not None and right_final > left_final:
-                bounds[i] = (left_final, right_final)
-
-            self.corridor_search_windows.append((
-                y_low, y_high, lx0, lx1, lx, yx0, yx1, yx, rx0, rx1, rx,
-            ))
-
-        return bounds, used
-
-    def _corridor_slice_centers(self, da_mask, ll_white_mask, ll_yellow_mask, ref_x):
+    def _corridor_slice_centers(self, da_mask, ll_mask):
         """DL_CENTER_MODE='ll_da'(corridor 알고리즘)일 때만 호출된다(모듈 상단 주석
-        참고). 밴드마다 _corridor_boundary_centers()로 좌/우 경계(노란선 색상투표 +
-        좌/우 흰선 독립 슬라이딩윈도우, [2026-08-12] 재설계 — 예전엔 위치순서로 1/3번째
-        선을 그대로 썼다)를 구하고, 그 x범위 안에서만 da를 봐서 실제 열린(장애물 없는)
-        구간을 찾아 그 중심을 밴드 중심으로 삼는다.
+        참고). 밴드마다 ll에서 왼쪽부터 정렬된 선 목록을 얻어 1번째~3번째 선 사이를
+        도로(전체 트랙, 양쪽 차로 폭 — 2번째 선인 중앙분리선은 그냥 지나침)로 규정하고,
+        그 x범위 안에서만 da를 봐서 실제 열린(장애물 없는) 구간을 찾아 그 중심을 밴드
+        중심으로 삼는다.
 
-        입력 : da_mask — (roi_h, roi_w) uint8 이진마스크. largest-component 선택/ll클리핑을
-               거치지 않은 원본(self.da_mask_all_roi)이어야 한다 — corridor는 장애물이
-               도로를 좌우로 쪼갤 수 있다고 보므로, 한쪽만 남기는 largest-component/clip을
-               적용하면 지나갈 수 있는 쪽을 통째로 잃는다.
-               ll_white_mask, ll_yellow_mask — _split_ll_by_yellow()가 분리한 흰선/노란선
-               마스크. ref_x — _corridor_boundary_centers()의 좌/우/노랑 초기 탐색 기준점.
+        밴드에서 검출된 선이 3개 미만이거나(점선 틈 등) corridor 폭이 정상범위
+        (DL_CORRIDOR_WIDTH_MIN_PX~MAX_PX) 밖이면 그 밴드는 그냥 드롭한다(None) — 'da'/
+        'll' 모드처럼 da 무게중심으로 대체하지 않는다: corridor 경계 자체가 ll에서
+        나오므로 ll이 불충분한 순간엔 "도로 폭이 얼마인지" 판단할 근거가 없다(config.py
+        DL_CENTER_MODE 주석 — 실측상 이런 밴드는 드물다는 전제).
+
+        입력 : da_mask, ll_mask — 동일 shape의 (roi_h, roi_w) uint8 이진마스크. da_mask는
+               largest-component 선택/ll클리핑을 거치지 않은 원본(self.da_mask_all_roi)이어야
+               한다 — corridor는 장애물이 도로를 좌우로 쪼갤 수 있다고 보므로, 한쪽만 남기는
+               largest-component/clip을 적용하면 지나갈 수 있는 쪽을 통째로 잃는다. ll_mask는
+               흰/노랑을 가리지 않은 원본이어야 한다(_ll_line_centers() 참고 — 노란 중앙선도
+               2번째 선으로 세야 함).
         출력 : (results, used) — 길이 self.n_slices. results[i] : 채택되면 (y_center, cx),
-               아니면 None. used[i] : _corridor_boundary_centers()가 이 밴드를 'LR'(좌우
-               흰선 둘 다 실측)로 채웠는지(bool) — 시각화용.
-        부수효과 : self.corridor_bounds[i]를 채택된 밴드에 한해 갱신하고(시각화용),
-               self._corridor_prev_open_x[i]를 이번 프레임 채택된 열린 구간 중심(절대
-               좌표)으로 갱신한다(다음 프레임 히스테리시스 기준점).
+               아니면 None. used[i] : results[i]가 채택됐는지(bool) — 시각화용.
+        부수효과 : self.corridor_bounds[i]를 sanity check를 통과한 밴드에 한해 갱신하고
+               (시각화용), self._corridor_prev_open_x[i]를 이번 프레임 채택된 열린 구간
+               중심(절대 좌표)으로 갱신한다(다음 프레임 히스테리시스 기준점).
         """
         h, w = da_mask.shape
         slice_h = h // self.n_slices
         results = [None] * self.n_slices
         used = [False] * self.n_slices
-
-        boundary_bounds, boundary_used = self._corridor_boundary_centers(ll_white_mask, ll_yellow_mask, ref_x)
 
         # [2026-08-12] 밴드 간 속도예측(README §2.27) — 정적 히스테리시스(직전 프레임
         # 그 밴드의 값만 봄)만으로는 빠른 S자에서 실제 열린구간 위치가 그 사이 크게
@@ -1207,10 +940,16 @@ class DLSlideWindow(SlideWindow):
             y_low = 0 if i == self.n_slices - 1 else h - (i + 1) * slice_h
             y_center = (y_low + y_high) / 2.0
 
-            bounds_i = boundary_bounds[i]
-            if bounds_i is None:
-                continue
-            left_bound, right_bound = bounds_i
+            ll_band = ll_mask[y_low:y_high, :]
+            line_xs = self._ll_line_centers(ll_band)
+            if len(line_xs) < 3:
+                continue  # 선 부족 — 도로 폭 판단 근거 없음, 이 밴드는 드롭
+
+            left_bound, right_bound = line_xs[0], line_xs[2]
+            width = right_bound - left_bound
+            if not (DL_CORRIDOR_WIDTH_MIN_PX < width < DL_CORRIDOR_WIDTH_MAX_PX):
+                continue  # 비정상 폭 — 선 오검출/오정렬 가능성, 신뢰 불가
+
             self.corridor_bounds[i] = (left_bound, right_bound)
 
             lb = int(np.clip(left_bound, 0, w))
@@ -1239,7 +978,7 @@ class DLSlideWindow(SlideWindow):
 
             cx = lb + (run[0] + run[1]) / 2.0
             results[i] = (y_center, cx)
-            used[i] = boundary_used[i]
+            used[i] = True
             self._corridor_prev_open_x[i] = cx
 
             if last_i is not None and i > last_i:
@@ -1826,10 +1565,7 @@ class DLSlideWindow(SlideWindow):
             self.ll_band_case = ['?'] * self.n_slices
             self.ll_degraded = False
             da_mask = self.da_mask_all_roi
-            ref_x = self._confirmed[3] if self._confirmed is not None else da_mask.shape[1] / 2.0
-            merged_centers, self.ll_band_used = self._corridor_slice_centers(
-                da_mask, ll_white_mask, ll_yellow_mask, ref_x
-            )
+            merged_centers, self.ll_band_used = self._corridor_slice_centers(da_mask, ll_mask)
         else:
             # 급커브 파편화 대응: 가장 큰 덩어리만 남긴다(모듈 상단 주석 참고). ll
             # 클리핑보다 먼저 해야 한다 — 이 시점엔 da가 아직 하나의 연결된 덩어리라
@@ -1860,15 +1596,27 @@ class DLSlideWindow(SlideWindow):
             # 하는) da를 쓰는 편이 self.path가 무한정 얼어붙어 완전정지하는 것보다
             # 낫다는 판단. self.da_ll_clip_skipped로 표시해 visualize()가 구분 표시한다.
             ref_x = self._confirmed[3] if self._confirmed is not None else da_mask.shape[1] / 2.0
-            clipped, self.da_ll_virtual_clip_used = self._clip_da_by_ll(da_mask, ll_mask_for_clip, ref_x)
-            clipped_valid = sum(1 for c in self._slice_centers(clipped, 0, (0, 255, 0)) if c is not None)
-            self.da_ll_clip_skipped = clipped_valid < self.slice_fit_min
-            da_mask = da_mask if self.da_ll_clip_skipped else clipped
-            if self.da_ll_clip_skipped:
-                # 이번 클리핑 자체가 통째로 버려졌으니(위 "차선책" 주석) 밴드별
-                # ①/②(실측/가상경계) 태그도 "실제로 적용 안 된" 시도 결과라 그대로 보여주면
-                # 오해를 살 수 있다 — 전부 비워서 visualize()가 아무 것도 안 그리게 한다.
+            # [2026-08-13] DL_CENTER_MODE='da' + DL_DA_SKIP_LL_CLIP=True(config.py 주석
+            # 참고) — "da 자체가 잘 검출된다" 가정하에 이 클리핑 단계를 아예 건너뛴다.
+            # 기존 "클리핑을 버리고 되돌린" 경우(da_ll_clip_skipped)와 화면상 표시가
+            # 같아지도록(청록 오버레이 + 클리핑 틱 없음) 같은 필드를 그대로 재사용한다 —
+            # 이유는 다르지만("밴드 부족으로 버림" vs "테스트를 위해 애초에 안 함") 둘 다
+            # "이번 프레임 da_mask는 클리핑 안 된 largest-component 그대로"라는 결과는
+            # 동일하다.
+            if DL_CENTER_MODE == 'da' and DL_DA_SKIP_LL_CLIP:
+                self.da_ll_virtual_clip_used = False
+                self.da_ll_clip_skipped = True
                 self.da_clip_band_virtual = [None] * self.n_slices
+            else:
+                clipped, self.da_ll_virtual_clip_used = self._clip_da_by_ll(da_mask, ll_mask_for_clip, ref_x)
+                clipped_valid = sum(1 for c in self._slice_centers(clipped, 0, (0, 255, 0)) if c is not None)
+                self.da_ll_clip_skipped = clipped_valid < self.slice_fit_min
+                da_mask = da_mask if self.da_ll_clip_skipped else clipped
+                if self.da_ll_clip_skipped:
+                    # 이번 클리핑 자체가 통째로 버려졌으니(위 "차선책" 주석) 밴드별
+                    # ①/②(실측/가상경계) 태그도 "실제로 적용 안 된" 시도 결과라 그대로 보여주면
+                    # 오해를 살 수 있다 — 전부 비워서 visualize()가 아무 것도 안 그리게 한다.
+                    self.da_clip_band_virtual = [None] * self.n_slices
 
             # 밴드별 중심점 — DL_CENTER_MODE='da'면 da 무게중심(_slice_centers(),
             # cv2.moments)을 그대로 쓴다. [2026-08-10] 한때 좌우 경계 중점
@@ -2029,10 +1777,9 @@ class DLSlideWindow(SlideWindow):
             cv2.addWeighted(overlay, 0.35, self.vis, 0.65, 0, dst=self.vis)
 
             # corridor(DL_CENTER_MODE='ll_da') 전용: 밴드별로 채택된 corridor 경계
-            # (_corridor_boundary_centers()가 색상투표+슬라이딩윈도우로 구한 좌/우 흰선
-            # 위치, [2026-08-12] 위치순서 방식에서 교체)를 자홍색 세로 틱으로 표시 —
-            # self.corridor_bounds[i]가 채워진 밴드만 그려진다(1~5 전부 실패한 밴드만
-            # 틱이 안 보임 — 사실상 첫 프레임 극초반에만 발생).
+            # (1/3번째 ll 선)를 자홍색 세로 틱으로 표시 — sanity check를 통과해
+            # self.corridor_bounds[i]가 채워진 밴드만 그려진다(선 부족/폭 이상으로
+            # 드롭된 밴드는 틱이 안 보임 = 그 밴드가 왜 무효인지 바로 알 수 있다).
             if DL_CENTER_MODE == 'll_da':
                 slice_h = self.roi_h // self.n_slices
                 for i, bounds in enumerate(self.corridor_bounds):
@@ -2043,47 +1790,6 @@ class DLSlideWindow(SlideWindow):
                     for bx in bounds:
                         bx_i = int(np.clip(bx, 0, self.roi_w - 1))
                         cv2.line(self.vis, (bx_i, y_low), (bx_i, y_high), (255, 0, 255), 2)
-
-                # [2026-08-12] 좌/노랑/우 탐색창(_corridor_boundary_centers()가 이번
-                # 프레임에 훑은 범위) — 흰선 창은 흰색(찾음)/회색(못찾음) 테두리, 노란선
-                # 창은 노란색/회색. 밴드별 분기 태그(LR/L+Y/R+Y/L+W/R+W/Y/LOST)를 왼쪽
-                # 창 옆에 색으로 구분해 찍는다 — 초록(LR, 실측)일수록 신뢰도 높고
-                # 빨강(LOST, 잔상)에 가까울수록 추정에 의존 중이라는 뜻. 노란선을 못
-                # 찾거나 흰선이 한쪽만 보일 때 실제로 어느 분기로 주행 중인지 실차에서
-                # 바로 확인하려는 목적(요청 반영).
-                case_colors = {
-                    'LR': (0, 255, 0), 'L+Y': (0, 200, 255), 'R+Y': (0, 200, 255),
-                    'L+W': (0, 140, 255), 'R+W': (0, 140, 255), 'Y': (0, 140, 255),
-                    'LOST': (0, 0, 255), '-': (120, 120, 120),
-                }
-                for i, win in enumerate(self.corridor_search_windows):
-                    y_low, y_high, lx0, lx1, lx, yx0, yx1, yx, rx0, rx1, rx = win
-                    l_color = (255, 255, 255) if lx is not None else (120, 120, 120)
-                    y_color = (0, 255, 255) if yx is not None else (120, 120, 120)
-                    r_color = (255, 255, 255) if rx is not None else (120, 120, 120)
-                    cv2.rectangle(self.vis, (lx0, y_low), (lx1, max(y_high - 1, y_low)), l_color, 1)
-                    cv2.rectangle(self.vis, (yx0, y_low), (yx1, max(y_high - 1, y_low)), y_color, 1)
-                    cv2.rectangle(self.vis, (rx0, y_low), (rx1, max(y_high - 1, y_low)), r_color, 1)
-                    y_c = int((y_low + y_high) / 2)
-                    case = self.corridor_band_case[i] if i < len(self.corridor_band_case) else '?'
-                    cv2.putText(
-                        self.vis, case, (max(0, lx0 - 26), y_c + 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, case_colors.get(case, (255, 255, 255)), 1
-                    )
-                    # [2026-08-12] 좌/우 흰선을 둘 다 실측했을 때 실제 rx-lx 폭(px)을
-                    # 텍스트로 찍는다 — DL_CORRIDOR_WIDTH_MIN/MAX_PX(190~450) sanity
-                    # check를 실제로 통과/거부하는 값이 얼마인지 실차에서 바로 확인하려는
-                    # 목적(요청 반영). 통과(범위 안)면 초록, 거부(범위 밖 → case가 'LR'이
-                    # 아니라 L+Y/L+W 등으로 폴백됨)면 빨강 — case가 'LR'인데도 이 텍스트가
-                    # 빨강일 일은 없다(그랬으면애초에 폴백됐을 것이므로).
-                    if lx is not None and rx is not None:
-                        width = rx - lx
-                        in_range = DL_CORRIDOR_WIDTH_MIN_PX < width < DL_CORRIDOR_WIDTH_MAX_PX
-                        cv2.putText(
-                            self.vis, f'{width:.0f}px', (int(rx1) + 4, y_c + 4),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.35,
-                            (0, 255, 0) if in_range else (0, 0, 255), 1
-                        )
 
             # [2026-08-10] da/ll 클리핑(_clip_da_by_ll(), 'da'/'ll' 공통, 'll_da'=corridor는
             # 클리핑 자체를 안 해서 self.da_clip_band_virtual이 전부 None)이 밴드별로
