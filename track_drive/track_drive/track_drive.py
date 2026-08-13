@@ -548,6 +548,19 @@ class TrackDriverNode(Node):
             self.signal_straight_confirmed = self._sig_straight_cnt >= SIG_CONFIRM_FRAMES
             self.signal_left_confirmed     = self._sig_left_cnt >= SIG_CONFIRM_FRAMES
 
+    # [2026-08-13] mask(불리언 배열)에서 True인 인덱스들 중 가장 긴 "연속(인접 인덱스)"
+    # 구간의 길이를 구한다. 전방 장애물 그룹핑(perc_obstacle()의 fidx/groups, np.split을
+    # np.diff(fidx)>1 지점마다 나누는 방식)과 완전히 동일한 로직 — 흩어진 노이즈 점들과
+    # 진짜 붙어있는 물체(연속된 각도에서 찍힘)를 구분하려고 좌/우 판정에도 같은 방식을
+    # 적용한다. 단순 개수와 달리, 노이즈가 여기저기 떨어져서 총 개수가 우연히 많아져도
+    # 연속 구간 자체는 짧게 나와 "막힘"으로 잘못 판정되지 않는다.
+    def _largest_run(self, mask):
+        idx = np.where(mask)[0]
+        if idx.size == 0:
+            return 0
+        groups = np.split(idx, np.where(np.diff(idx) > 1)[0] + 1)
+        return max(len(g) for g in groups)
+
     # [2-3] 장애물(전방+측면)
     #   입력 self.lidar_ranges
     #   출력 obstacle_front/dist/side, left_clear, right_clear
@@ -670,8 +683,16 @@ class TrackDriverNode(Node):
         # ── 좌/우 차선 공간 (추월 이동·복귀 판단) ──
         left_mask  = valid & (x > SIDE_X_MIN) & (x < SIDE_X_MAX) & (y >  LEFT_Y_MIN)  & (y <  LEFT_Y_MAX)
         right_mask = valid & (x > SIDE_X_MIN) & (x < SIDE_X_MAX) & (y < -RIGHT_Y_MIN) & (y > -RIGHT_Y_MAX)
-        left_cnt_raw  = int(np.count_nonzero(left_mask))
-        right_cnt_raw = int(np.count_nonzero(right_mask))
+        # [2026-08-13] 총 점개수 대신 "가장 긴 연속(인접 인덱스) 묶음의 길이"를 쓴다
+        # (_largest_run() 참고) — 흩어진 노이즈 점들이 우연히 합쳐서 개수가 많아져도
+        # 연속 구간 자체는 짧아 '막힘'으로 잘못 잡히지 않는다. ★주의★ 값의 의미가
+        # "총 개수"에서 "최대 연속 길이"로 바뀌었으므로 LEFT/RIGHT_BLOCK_TH(위,
+        # 원래 총 개수 8/5 기준으로 잡힌 값)도 재해석이 필요할 수 있다 — 연속 길이는
+        # 보통 총 개수보다 작거나 같으므로, 같은 물체를 여전히 '막힘'으로 잡으려면
+        # 임계값을 낮춰야 할 가능성이 높다. 실차에서 DEBUG_VIZ_LIDAR의 run 표시로
+        # 실제 값 범위를 보고 재조정할 것(현재는 기존 값 그대로 유지 — 실차 미검증).
+        left_cnt_raw  = self._largest_run(left_mask)
+        right_cnt_raw = self._largest_run(right_mask)
         # [2026-08-13] 판정(임계값 비교) 전에 원본 점개수를 먼저 EMA로 스무딩한다 — 위
         # obstacle_y용 _ema_y와 같은 SIDE_EMA_ALPHA를 재사용(새 튜닝값 추가 없이 기존
         # 패턴만 확장). 히스테리시스/디바운스가 "판정 이후" 안정화라면 이건 "판정 이전"
@@ -745,10 +766,10 @@ class TrackDriverNode(Node):
             type_col = (0, 0, 255) if self.obstacle_front else (0, 255, 0)
             cv2.putText(bev, f'{self.obstacle_type.upper()} {self.obstacle_dist:.1f}m  {self.obstacle_side}  pts={front_cnt}',
                         (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, type_col, 1, cv2.LINE_AA)
-            # [2026-08-13] 원본 점개수(raw) → EMA 스무딩값 → 히스테리시스 판정(순간값) →
-            # 디바운스 확정값, 4단계를 한눈에 비교할 수 있게 전부 표시한다 — 실차 디버깅 시
-            # 어느 단계에서 값이 흔들리는지/뒤집히는지 바로 구분하기 위함.
-            cv2.putText(bev, f'pts L:{left_cnt_raw}->{self._left_cnt_ema:.1f}  R:{right_cnt_raw}->{self._right_cnt_ema:.1f}',
+            # [2026-08-13] 최대연속길이(run, 총 점개수 아님) → EMA 스무딩값 → 히스테리시스
+            # 판정(순간값) → 디바운스 확정값, 4단계를 한눈에 비교할 수 있게 전부 표시한다 —
+            # 실차 디버깅 시 어느 단계에서 값이 흔들리는지/뒤집히는지 바로 구분하기 위함.
+            cv2.putText(bev, f'run L:{left_cnt_raw}->{self._left_cnt_ema:.1f}  R:{right_cnt_raw}->{self._right_cnt_ema:.1f}',
                         (8, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
             cv2.putText(bev, f'L:{"CLR" if self.left_clear else "BLK"}({self._left_clear_cnt}/{SIDE_CLEAR_CONFIRM_FRAMES})'
                              f' R:{"CLR" if self.right_clear else "BLK"}({self._right_clear_cnt}/{SIDE_CLEAR_CONFIRM_FRAMES})',
