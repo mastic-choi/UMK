@@ -2189,3 +2189,107 @@ IMU 하드웨어를 고치고 `xycar_imu` 패키지를 빌드해도 이 줄을 �
 **알려진 한계:** IMU가 나중에 다시 죽어도(§7 VESC의 `vesc_debug` 창처럼) 바로 알아챌 디버그 창이 없습니다
 — `_imu_t`(§8.3)로 생존 체크 인프라 자체는 §0.5.5에서 만들었지만, 아직 전용 디버그 창(`imu_debug`
 같은)까지는 안 만들었습니다. 지금은 `[LAP] 누적=`이 안 늘어나는 것으로 간접 확인해야 합니다.
+
+## 9. 빌드/실행 환경 (개발 PC, 젯슨 미연결 상태에서 처음 `xydrive` 돌려보며 확인, 2026-08-13)
+
+### 9.1 `colcon build`가 `setup.py` 없다고 실패
+
+**증상:**
+```
+AssertionError: Expected [...] to pass: /usr/bin/python3: can't open file
+'/home/xytron/UMK/track_drive/setup.py': [Errno 2] No such file or directory
+Package 'track_drive' not found: ...
+```
+
+**원인:** 저장소에 `package.xml`(`<build_type>ament_python</build_type>`)만 있고
+`setup.py`/`setup.cfg`/`resource/track_drive` 마커 파일이 아예 없었음 — colcon이
+ament_python 패키지로 인식은 하지만 빌드할 대상이 없는 상태. 추가로
+`perception/controller/localization/planner/` 서브디렉터리에 `__init__.py`가 없어서
+`setuptools.find_packages()`가 이 서브패키지들을 못 찾는 상태였음(상대 임포트로는
+이미 쓰고 있었는데도).
+
+**조치:** `setup.py`(entry_points에 `track_drive = track_drive.track_drive:main`,
+launch 파일 + `models/*.onnx` 가중치를 `share/track_drive/`에 설치하도록 `data_files`
+추가), `setup.cfg`(`--symlink-install` 스크립트 경로), `resource/track_drive`(빈 마커
+파일), 서브패키지 4곳에 빈 `__init__.py` 추가.
+
+**확인 방법:** `colcon build --packages-select track_drive --symlink-install` 성공 +
+`ros2 pkg executables track_drive`에 `track_drive`가 나오는지 확인.
+
+### 9.2 `imu_node`가 `numpy has no attribute 'float'`로 죽음
+
+**증상:**
+```
+File ".../transforms3d/quaternions.py", line 26, in <module>
+    _MAX_FLOAT = np.maximum_sctype(np.float)
+AttributeError: module 'numpy' has no attribute 'float'.
+```
+
+**원인:** apt로 설치된 `python3-transforms3d` 0.3.1+ds-2
+(`/usr/lib/python3/dist-packages/`)가 넘파이 1.24부터 제거된 `np.float` alias를
+여러 파일에서 사용. pip으로 깔린 numpy는 1.26.1이라 이미 제거된 상태 — import
+시점에 즉시 죽음. `xycar_imu` 코드 자체 버그가 아니라 시스템 패키지(apt)와
+pip 패키지(numpy) 버전 불일치 문제.
+
+**조치:** `pip3 install --user --upgrade transforms3d` → 0.4.2(`np.float64` 사용,
+deprecated alias 없음). sudo 불필요한 이유: `sys.path` 상에서
+`~/.local/lib/python3.10/site-packages`(사용자 site)가
+`/usr/lib/python3/dist-packages`(apt 시스템 site)보다 먼저 와서, 시스템 파일을
+안 건드리고도 사용자 site 버전이 우선 로드됨. apt 업그레이드로 시스템 파일이
+되돌아가도 영향 없음. 새 보드/PC에서도 이 pip 명령 한 줄이면 재현됨(
+[`JETSON_SETUP.md`](JETSON_SETUP.md)에도 반영 필요).
+
+**확인 방법:** `python3 -c "from transforms3d.euler import euler2quat; print(euler2quat(0.1,0.2,0.3))"`
+이 에러 없이 값을 출력하는지, 실제로 `imu_node`가 numpy 에러 없이 `/dev/ttyIMU`를
+열려고 시도하는 로그까지 가는지 확인.
+
+### 9.3 YOLO 콘 검출 가중치 경로가 `xycar_ws/build/`로 잘못 계산됨 (`perception/yolo_cone.py`)
+
+**증상:**
+```
+[ERROR]: YOLO 콘 검출기 초기화 실패, 라바콘 트리거는 라이다 단독 판정으로 폴백합니다:
+YOLO 콘 검출 가중치 파일을 찾을 수 없습니다: /home/xytron/xycar_ws/build/yolo_ros/cone_best_n.onnx
+```
+파일은 실제로 `xycar_ws/src/yolo_ros/cone_best_n.onnx`(`~/UMK/yolo_ros/`가 실체)에
+존재하는데도 못 찾음.
+
+**원인:** `_default_model_path()`가 `__file__` 기준 3단계 위로 올라가 형제 디렉터리
+`yolo_ros/`를 찾는 방식인데, `--symlink-install`로 빌드하면 파이썬이 실제로 로드하는
+경로는 `xycar_ws/build/track_drive/track_drive/perception/yolo_cone.py`이고
+(`build/track_drive/track_drive`는 `src/track_drive/track_drive`로 가는 심볼릭
+링크) `os.path.abspath()`는 이 심볼릭 링크를 풀어주지 않아서, 3단계 위가
+`xycar_ws/src`가 아니라 `xycar_ws/build`로 잘못 도착했음.
+
+**조치:** `os.path.abspath(__file__)` → `os.path.realpath(__file__)`로 교체. 심볼릭
+링크를 먼저 해소하고 나서 경로를 계산하므로 `--symlink-install`이든 일반 빌드든
+항상 `xycar_ws/src`(실제로는 `~/UMK/`)로 정확히 도착함.
+
+**확인 방법:**
+```python
+from track_drive.perception.yolo_cone import _default_model_path
+print(_default_model_path())  # → .../UMK/yolo_ros/cone_best_n.onnx, 파일 존재해야 함
+```
+
+### 9.4 `usb_cam_node_exe`가 카메라 calibration 파일을 못 찾음 (`launch/track_drive.launch.py`)
+
+**증상:**
+```
+[ERROR]: Unable to open camera calibration file [/home/xytron/.ros/camera_info/default_cam.yaml]
+```
+`track_drive` 인지 코드는 `camera_info`/undistort를 전혀 안 써서(grep 결과 없음)
+주행엔 영향 없는 로그 노이즈였지만, 원인 자체는 실제 버그.
+
+**원인:** `usb_cam_params`가 `usb_cam/config/params.yaml`을 참조했는데 실제 usb_cam
+패키지엔 그 이름의 파일이 없음(`params_1.yaml`/`params_2.yaml`만 존재) — launch
+시작 시 "Parameter file path is not a file" 경고와 함께 이 파일 로드가 통째로
+건너뛰어지고, 노드가 내부 기본값(`camera_name=default_cam`)으로 폴백. 그 결과 실제
+있는 `usb_cam/config/camera_info.yaml`(렌즈 캘리브레이션 값 있음) 대신 없는
+`~/.ros/camera_info/default_cam.yaml`을 찾다가 실패.
+
+**조치:** 파일명을 `params_1.yaml`로 교체(`camera_name=test_camera`,
+`camera_info_url`이 실존하는 `usb_cam/config/camera_info.yaml`을 가리킴). 코드
+주석 3곳(§video_device 설명, §cam_node 위 주석)도 `params.yaml` 표기를
+`params_1.yaml`로 같이 수정.
+
+**확인 방법:** launch 시작 로그에 "Parameter file path is not a file" 경고와
+"Unable to open camera calibration file" 에러가 둘 다 안 뜨는지 확인.

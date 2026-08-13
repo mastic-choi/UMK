@@ -15,7 +15,7 @@ def generate_launch_description():
     video_device_cmd = DeclareLaunchArgument(
         'video_device',
         default_value='/dev/videoCAM',
-        description='전방 카메라 장치 경로. xycar_cam.launch.py가 쓰는 usb_cam 기본 params.yaml은'
+        description='전방 카메라 장치 경로. xycar_cam.launch.py가 쓰는 usb_cam 기본 params_1.yaml은'
                      ' video_device가 /dev/video0로 고정돼 있어 실제 xycar 카메라(/dev/videoCAM 심볼릭링크)와'
                      ' 안 맞으면 usb_cam_node_exe가 장치를 못 열고 SIGABRT로 죽는다(실측 확인됨).'
                      ' /dev/ttyLIDAR, /dev/ttyIMU와 같은 패턴의 udev 별칭이므로 여기서 직접 지정한다.')
@@ -25,10 +25,17 @@ def generate_launch_description():
     #   라이다(장애물/라바콘)만으로 수행한다.
     #   xycar_cam.launch.py를 include하지 않고 usb_cam_node_exe를 직접 띄우는 이유:
     #   include 방식은 파라미터 오버라이드가 안 되어 video_device를 못 바꾼다.
-    #   기본 params.yaml(usb_cam 패키지 표준값) 위에 video_device만 덮어써서 실제 장치를 잡는다.
+    #   기본 params_1.yaml(usb_cam 패키지 표준값) 위에 video_device만 덮어써서 실제 장치를 잡는다.
     #   img_left/right/behind는 track_drive.py에서 구독만 하고 실제로 안 쓰이므로 전방 카메라만 띄운다.
+    #   'params.yaml'(존재하지 않는 파일명)을 참조하던 버그가 있었다 — usb_cam 패키지엔
+    #   params_1.yaml/params_2.yaml만 있어서 launch가 "Parameter file path is not a
+    #   file" 경고와 함께 이 파일을 통째로 무시하고 노드 내부 기본값(camera_name=
+    #   default_cam)으로 폴백, 존재하지 않는 ~/.ros/camera_info/default_cam.yaml을
+    #   찾다가 매 실행마다 에러 로그가 남았다(실측 확인, 2026-08-13). params_1.yaml은
+    #   camera_info_url이 usb_cam 패키지에 실제로 있는 config/camera_info.yaml을
+    #   가리키므로 이걸로 교체.
     usb_cam_params = os.path.join(
-        get_package_share_directory('usb_cam'), 'config', 'params.yaml')
+        get_package_share_directory('usb_cam'), 'config', 'params_1.yaml')
 
     cam_node = Node(
         package='usb_cam',
