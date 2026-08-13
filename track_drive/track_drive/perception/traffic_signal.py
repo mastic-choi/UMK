@@ -21,6 +21,15 @@ SIG4_VERT_DIFF_MAX  = SIG4_MAX_RADIUS * 2
 SIG4_HORIZ_DIFF_MAX = SIG4_MAX_RADIUS * 11
 SIG4_MIN_DIST       = SIG4_MIN_RADIUS * 3
 
+# [2026-08-13] 디버그 창 전용 확대 배율. ROI가 원본 프레임의 일부(SIG4_ROI_*)라 원본
+# 그대로 띄우면 원/글자가 너무 작아 확인이 힘들다 — 판정 로직과 무관한 순수 표시값이라
+# config.py가 아니라 여기 상수로 둔다(튜닝 대상 아님).
+SIG4_VIZ_SCALE = 3
+# 좌→우 배치 라벨. 한글(빨강/노랑/좌회전/직진)은 OpenCV 기본 폰트(Hershey)가 한글 글리프를
+# 지원하지 않아 이미지 위에는 깨져 나온다 — 이미지 오버레이는 영문 약어, 한글 설명은 터미널
+# 로그(track_drive.py DEBUG_LOG_SIGNAL) 쪽에서 담당한다.
+SIG4_LABELS = ('R', 'Y', 'L', 'S')  # 빨강, 노랑, 좌회전, 직진
+
 
 class SignalDetector:
     def __init__(self):
@@ -40,6 +49,7 @@ class SignalDetector:
         self.s2_circle_count  = 0             # HoughCircles 가 찾은 원 개수
         self.s2_reject_reason = ''            # 실패 사유 ('' = 성공)
         self.s2_brightness    = []            # 좌→우 (빨강,노랑,좌회전,직진) 밝기
+        self.s2_lit           = []            # 좌→우 점등 여부(밝기가 평균보다 SIG4_BRIGHT_MARGIN 이상) — 배치검사 통과 시에만 채워짐
 
     def circle_brightness(self, gray, x, y, r):
         y0, y1 = max(0, y - r // 2), y + r // 2
@@ -118,18 +128,22 @@ class SignalDetector:
         l, r_ = int(w*SIG4_ROI_L), int(w*SIG4_ROI_R)
         self.roi = frame[t:b, l:r_]
 
-        gray, circles = self.find_circles(self.roi, SIG4_MIN_RADIUS, SIG4_MAX_RADIUS)
+        gray, raw_circles = self.find_circles(self.roi, SIG4_MIN_RADIUS, SIG4_MAX_RADIUS)
         self.red_on = self.straight_on = self.left_on = False
 
         # 진단값 초기화 (이번 프레임 기준)
         self.s2_roi_px        = (t, b, l, r_)
-        self.s2_circle_count  = 0 if circles is None else len(circles[0])
+        self.s2_circle_count  = 0 if raw_circles is None else len(raw_circles[0])
         self.s2_reject_reason = 'no_circles'
         self.s2_brightness    = []
+        self.s2_lit           = []
 
-        if circles is not None:
-            circles = np.round(circles[0, :]).astype(int)
-            n = len(circles)
+        all_circles = None  # [디버그뷰] Hough가 이번 프레임에 찾은 원 전부(선택 여부 무관)
+        chosen      = None  # [디버그뷰] 배치검사 통과 후 실제 판정에 쓰인 4개(좌→우 정렬)
+
+        if raw_circles is not None:
+            all_circles = np.round(raw_circles[0, :]).astype(int)
+            n = len(all_circles)
 
             if n < 4:
                 self.s2_reject_reason = f'circle_count={n}(<4)'
@@ -137,21 +151,22 @@ class SignalDetector:
                 self.s2_reject_reason = f'circle_count={n}(>{SIG4_MAX_CANDIDATES}, too noisy)'
             else:
                 if n == 4:
-                    ok, reason = self.shape_ok(circles, SIG4_VERT_DIFF_MAX, SIG4_HORIZ_DIFF_MAX, SIG4_MIN_DIST)
-                    chosen = list(circles) if ok else None
+                    ok, reason = self.shape_ok(all_circles, SIG4_VERT_DIFF_MAX, SIG4_HORIZ_DIFF_MAX, SIG4_MIN_DIST)
+                    picked = list(all_circles) if ok else None
                 else:
-                    chosen, reason = self.pick_best_4(circles, SIG4_VERT_DIFF_MAX, SIG4_HORIZ_DIFF_MAX, SIG4_MIN_DIST)
+                    picked, reason = self.pick_best_4(all_circles, SIG4_VERT_DIFF_MAX, SIG4_HORIZ_DIFF_MAX, SIG4_MIN_DIST)
 
-                if chosen is None:
+                if picked is None:
                     self.s2_reject_reason = f'circle_count={n} {reason}'
                 else:
                     self.s2_reject_reason = ''
-                    circles_sorted = sorted(chosen, key=lambda c: c[0])   #좌→우: 빨강,노랑,좌회전,직진
-                    bright = [self.circle_brightness(gray, x, y, r) for x, y, r in circles_sorted]
+                    chosen = sorted(picked, key=lambda c: c[0])   #좌→우: 빨강,노랑,좌회전,직진
+                    bright = [self.circle_brightness(gray, x, y, r) for x, y, r in chosen]
                     avg = float(np.mean(bright))
                     self.s2_brightness = [round(v, 1) for v in bright]
 
                     lit = [bv - avg > SIG4_BRIGHT_MARGIN for bv in bright]
+                    self.s2_lit = lit
                     red_lit, _yellow_lit, left_lit, straight_lit = lit
 
                     self.left_on     = left_lit
@@ -159,14 +174,43 @@ class SignalDetector:
                     self.red_on      = red_lit and not (left_lit or straight_lit)
 
         if DEBUG_VIZ_SIGNAL:
-            self.vis = self.roi.copy()
-            state = ('LEFT' if self.left_on else
-                     'STR'  if self.straight_on else
-                     'RED'  if self.red_on else '---')
-            color = ((0, 255, 0) if state in ('LEFT', 'STR') else
-                     (0, 0, 255) if state == 'RED' else (180, 180, 180))
-            cv2.putText(self.vis, state, (4, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
-            cv2.imshow('signal4_roi', self.vis)
-            cv2.waitKey(1)
+            self._draw_debug_viz(all_circles, chosen)
 
         return self.red_on, self.straight_on, self.left_on
+
+    def _draw_debug_viz(self, all_circles, chosen):
+        """'signal4_roi' 창: ROI 크롭을 SIG4_VIZ_SCALE배 확대해 그 위에
+          - 노란 원: Hough가 찾은 원 전부(선택 여부 무관, 오검출 포함)
+          - 굵은 원(초록=점등/회색=꺼짐) + R/Y/L/S 라벨 + 밝기값: 배치검사를 통과해
+            실제 판정에 쓰인 4개(chosen이 None이면 이 단계까지 못 왔다는 뜻)
+          - 좌상단 텍스트 3줄: 현재 인식 상태 / ROI 픽셀좌표 / 원검출 개수+실패사유
+        DEBUG_VIZ_SIGNAL=True일 때 detect_s2()에서만 호출된다."""
+        s = SIG4_VIZ_SCALE
+        vis = cv2.resize(self.roi, None, fx=s, fy=s, interpolation=cv2.INTER_NEAREST)
+
+        if all_circles is not None:
+            for x, y, r in all_circles:
+                cv2.circle(vis, (x * s, y * s), r * s, (0, 255, 255), 1, cv2.LINE_AA)
+                cv2.circle(vis, (x * s, y * s), 1, (0, 255, 255), -1, cv2.LINE_AA)
+
+        if chosen is not None:
+            for (x, y, r), label, lit, bv in zip(chosen, SIG4_LABELS, self.s2_lit, self.s2_brightness):
+                color = (0, 255, 0) if lit else (150, 150, 150)
+                cv2.circle(vis, (x * s, y * s), r * s, color, 2, cv2.LINE_AA)
+                cv2.putText(vis, f'{label}:{bv:.0f}', (x * s - r * s, y * s - r * s - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+
+        state = ('LEFT' if self.left_on else
+                 'STR'  if self.straight_on else
+                 'RED'  if self.red_on else '---')
+        state_color = ((0, 255, 0) if state in ('LEFT', 'STR') else
+                        (0, 0, 255) if state == 'RED' else (180, 180, 180))
+        t, b, l, r_ = self.s2_roi_px
+        reason = self.s2_reject_reason or 'OK'
+        cv2.putText(vis, f'STATE:{state}', (4, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, state_color, 1, cv2.LINE_AA)
+        cv2.putText(vis, f'roi=({t},{b},{l},{r_})', (4, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(vis, f'n={self.s2_circle_count} reason={reason}', (4, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+
+        self.vis = vis
+        cv2.imshow('signal4_roi', self.vis)
+        cv2.waitKey(1)

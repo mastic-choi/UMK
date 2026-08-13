@@ -788,7 +788,16 @@ DL_DEBUG_HISTORY_LEN = 90
 DEBUG_VIZ_HOUGH_LANE = False  # 차선 — 대안 백엔드('hough') 디버그 창 (perception/hough_lane.py)
 DEBUG_VIZ_LANE       = True  # 차선 — 대안 백엔드('classic_cv') 디버그 창 (perception/lane_util.py)
 DEBUG_VIZ_STOPLINE   = False  # 정지선 디버그 창, 백엔드 무관 항상 동작 (perception/perc_floor.py)
-DEBUG_VIZ_SIGNAL     = False  # 신호등(S0/S2 공용) 디버그 창 (perception/traffic_signal.py)
+# [2026-08-13] 신호등(S0/S2) 디버그 강화 — ROI 좌표/HoughCircles 원(후보 전체+선택된 4개)/
+#   현재 인식 상태(정지·직진·좌회전·미검출)를 창 하나에 다 보여주도록 확장
+#   (perception/traffic_signal.py detect_s2()). 요청에 따라 기본 True로 켜둠 — 다른 항목과
+#   달리(위 2026-08-11 라바콘 테스트 메모 참고) 이 스위치는 독립적으로 True 유지할 것.
+DEBUG_VIZ_SIGNAL     = True   # 신호등(S0/S2 공용) 디버그 창 (perception/traffic_signal.py)
+# DEBUG_LOG_SIGNAL: 신호등 전용 상세 진단 로그. 전역 DEBUG_LOG(0.5초 주기 요약 [SIG] 한 줄)와는
+#   별개로, 이 플래그가 켜지면 S0/S2 상태에서 매 프레임 "왜 못 잡았는지"(원 개수 부족/배치 불량/
+#   밝기 대비 부족 등) 원인을 자세히 찍는다 — DEBUG_LOG를 꺼도 이것만 켜서 신호등만 디버깅 가능.
+#   (track_drive.py perc_signal())
+DEBUG_LOG_SIGNAL     = True
 DEBUG_VIZ_YOLO_CONE  = True   # 라바콘 YOLO 검출 박스 디버그 창 (perception/yolo_cone.py)
 #   [2026-08-11] smooth-imu-yaw-rate 브랜치(0c0d88b)에서 수동 포팅 — 라바콘 실차 테스트 중
 #   라이다 창과 함께 켜 두고 나머지는 꺼둔 상태(요청 반영).
@@ -945,9 +954,25 @@ ASTAR_B3_REPLAN_TICKS = 4       # 20Hz 기준 0.2s — 이 주기마다 최소 �
 ASTAR_B3_FAIL_GRACE_TICKS = 3   # 탐색 실패가 이 틱 연속되면 TargetPassing으로 폴백
 
 # ── 신호등(S0/S2 공용 4구, perception/traffic_signal.py) ──
-SIG4_ROI_T, SIG4_ROI_B = 0.08, 0.28
-SIG4_ROI_L, SIG4_ROI_R = 0.04, 0.78
-SIG4_MIN_RADIUS, SIG4_MAX_RADIUS = 15, 25
+# [2026-08-13] 실차 랩 캡처(lap_001/frame_000055.png, 640x480)에서 신호등이 실제로 찍힌
+#   프레임을 찾아 재튜닝. 기존 값(T,B=0.08,0.28 / L,R=0.04,0.78 / R=15~25)은 이 프레임에서
+#   신호등을 아예 못 찾았다(circle_count=0) — ROI 자체가 신호등 실제 위치(native px 기준
+#   대략 x=194~291, y=81~89)와 안 맞았던 것으로 보인다. 아래 값은 그 프레임에서
+#   HoughCircles가 4개를 안정적으로 찾고 shape_ok()까지 통과하는 걸 확인한 값.
+#   ROI를 실측 박스에 딱 맞추지 않고 일부러 여유 있게(러프하게) 잡았다 — 정지 위치/각도가
+#   매번 픽셀 단위로 똑같지 않을 것이므로. 다만 얼마나 넉넉하게 잡을지는 트레이드오프였다:
+#     - 타이트(185x72px): frame_000055 성공, 무작위 25프레임 오탐 0/25
+#     - 러프(320x144px): frame_000055 성공하지만(pick_best_4가 노이즈 속에서도 골라냄),
+#       무작위 40프레임 중 4개가 우연히 shape_ok를 통과하는 오탐 발생(4/40, 약 10%) —
+#       ROI가 넓을수록 원이 더 많이 잡히고 pick_best_4()가 "적당히 나란한 4개"를 실제
+#       신호등이 아닌 조합에서도 찾아버릴 수 있다.
+#     - 지금 값(262x110px, 중간): frame_000055 성공, 무작위 40프레임 오탐 1/40 — 이 정도가
+#       "너무 타이트하지도, 오탐이 늘지도 않는" 절충점으로 판단.
+#   주의: 프레임 한 장 기준이라 다른 거리/각도(S0 vs S2)에서는 또 안 맞을 수 있다 —
+#   실차에서 DEBUG_VIZ_SIGNAL/DEBUG_LOG_SIGNAL 켜고 재확인 필요.
+SIG4_ROI_T, SIG4_ROI_B = 0.07, 0.30
+SIG4_ROI_L, SIG4_ROI_R = 0.18, 0.50  # R을 0.58→0.50으로 축소: 그 우측 벽 패널 이음새가 원으로 오검출되던 걸 제외(2026-08-13)
+SIG4_MIN_RADIUS, SIG4_MAX_RADIUS = 9, 26
 SIG4_BRIGHT_MARGIN  = 15
 SIG4_MAX_CANDIDATES = 10  # 원이 이보다 많이 잡히면 조합 탐색 없이 바로 실패 처리(ROI 자체가 노이즈로 판단)
 
