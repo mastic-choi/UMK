@@ -1814,6 +1814,69 @@ self.phase = Phase.FIXED_OBSTACLE   # __init__ 안의 self.phase 초기값을 �
 
 ---
 
+### 4.2 좌/우 차선 공간(`left_clear`/`right_clear`)에 비대칭 디바운스 추가 (`SIDE_CLEAR_CONFIRM_FRAMES`, 2026-08-13)
+
+**증상:** `TargetPassing.choose_side()`(회피 방향 결정)가 받는 `left_clear`/`right_clear`가
+[track_drive.py:661](track_drive.py#L661)에서 매 프레임 라이다 점 개수를 임계값(`LEFT_BLOCK_TH=8`,
+`RIGHT_BLOCK_TH=5`)과 비교만 한 순간값이었습니다 — 프레임 간 확인이 전혀 없었습니다.
+
+**원인:** 점 개수가 임계값 근처에서 흔들리면(라이다 노이즈), 회피 방향을 정하는 딱 그 한 프레임에
+`left_clear`/`right_clear`가 우연히 어느 쪽으로 찍히느냐에 따라 통과 방향 전체가 갈릴 수 있었습니다.
+신호등의 `signal_straight_on`(순간값)과 같은 종류의 문제인데, 신호등엔 이미 `SIG_CONFIRM_FRAMES`
+디바운스가 있었던 반면 여긴 없었습니다.
+
+**수정:** `SIG_CONFIRM_FRAMES`와 동일한 연속 프레임 카운터 패턴을 추가하되, **방향을 비대칭**으로
+뒀습니다 — "비었다(clear)"는 `SIDE_CLEAR_CONFIRM_FRAMES`(기본 3) 연속 유지돼야 확정되고, "막혔다
+(blocked)"는 한 프레임만 나와도 카운터가 즉시 0으로 리셋됩니다(`perc_obstacle()`,
+[track_drive.py:693-695](track_drive.py#L693)). 안전 관점에서 "비었다"는 성급하게 판단하면 위험하고
+"막혔다"는 빨리 판단해도 손해가 적다는 비대칭성을 반영한 것 — 신호등(True만 디바운스, False는 즉시
+리셋)과 같은 구조입니다.
+
+`self.left_clear`/`self.right_clear`(순간값)는 디버그 표시용으로 그대로 남겨두고,
+`self.left_clear_confirmed`/`self.right_clear_confirmed`(디바운스된 값)를 새로 노출해
+`_run_passing()`([track_drive.py:1990](track_drive.py#L1990), B2/B3 공통)과 B3의 Hybrid A* 대안이
+쓰는 `choose_side()` 호출([track_drive.py:1885](track_drive.py#L1885))에 이 확정값을 넘기도록
+바꿨습니다. `controller/obstacle_avoidance.py`(`TargetPassing`)는 전혀 안 건드렸습니다 — 더 신뢰도
+높은 입력을 받게 됐을 뿐입니다.
+
+**[2026-08-13 후속] 히스테리시스(이중 임계값) 추가:** 위 디바운스는 "시간 축"(같은 값이 몇 프레임
+유지됐는가) 대응이고, 라이다 점 개수가 임계값(`LEFT_BLOCK_TH=8`/`RIGHT_BLOCK_TH=5`) 바로 근처에서
+왔다갔다하는 "값 자체의 떨림"은 별개 문제라 추가로 대응했습니다. `perc_obstacle()`
+([track_drive.py:687-688](track_drive.py#L687))이 이제 상태에 따라 다른 임계값을 씁니다 —
+현재 '비었음'이면 `LEFT_BLOCK_TH`(높음)를 넘어야 '막힘'으로, 현재 '막힘'이면 `LEFT_CLEAR_TH`
+(낮음, 신규)보다 내려가야 '비었음'으로 전환됩니다(우측도 `RIGHT_BLOCK_TH`/`RIGHT_CLEAR_TH` 동일
+구조). 두 임계값 사이 구간에서는 직전 상태를 그대로 유지하므로 경계 근처 잔떨림 자체가 없어집니다
+(흔히 "Schmitt trigger"라 부르는 방식). 디바운스(시간 축)와 히스테리시스(값 축)는 서로 다른 축이라
+배타적이지 않고, 히스테리시스로 값 자체를 먼저 안정시킨 뒤 그 위에 디바운스를 걸어 이중으로
+안정화됩니다.
+
+**[2026-08-13 추가 후속] 원본 점개수 EMA 스무딩:** 위 둘은 "판정(임계값 비교) 이후" 단계를 다뤘는데,
+판정에 들어가는 원본 라이다 점개수 자체를 먼저 다듬는 3번째 층을 추가했습니다.
+`perc_obstacle()`([track_drive.py:673-681](track_drive.py#L673))이 이제 `left_cnt`/`right_cnt`를
+바로 임계값과 비교하지 않고, 바로 위에서 `obstacle_y`에 이미 쓰던 것과 같은 `SIDE_EMA_ALPHA`로
+먼저 EMA 스무딩한 뒤 그 스무딩값을 히스테리시스 비교에 넣습니다(새 튜닝값 추가 없이 기존 상수
+재사용). 최종 파이프라인은 **원본 점개수 → EMA 스무딩 → 히스테리시스 판정 → 디바운스 확정**
+4단계입니다 — 값 자체의 순간적 튐(EMA), 경계 근처 잔떨림(히스테리시스), 프레임 간 스파이크
+(디바운스)를 각각 다른 층에서 잡습니다.
+
+**디버그 방법:** `DEBUG_VIZ_LIDAR = True`([config.py](config.py)) → `lidar_bev` 창에 4단계를 전부
+표시합니다 — 원본/EMA 점개수(`pts L:7->6.2 R:3->2.8`), 히스테리시스 판정 + 디바운스 카운터
+(`L:CLR(2/3)`), 최종 확정값(`confirmed L:CLR R:BLK`, 둘 중 하나라도 CLR이면 초록, 아니면 빨강).
+어느 단계에서 값이 흔들리거나 뒤집히는지 실차에서 바로 구분할 수 있습니다.
+
+**알려진 한계:**
+- `SIDE_CLEAR_CONFIRM_FRAMES=3`은 실차 미검증 첫 추정치(`SIG_CONFIRM_FRAMES`와 같은 값을 그대로
+  가져온 것) — 너무 낮으면 디바운스 효과가 약하고, 너무 높으면 실제로 통과 가능한 순간에도 진입
+  판단이 늦어질 수 있습니다.
+- `LEFT_CLEAR_TH=4`/`RIGHT_CLEAR_TH=2`(히스테리시스 하단)도 실차 미검증 첫 추정치입니다 — 상단
+  (`LEFT_BLOCK_TH=8`/`RIGHT_BLOCK_TH=5`)의 절반으로 잡은 것뿐이라, 간격이 너무 좁으면 여전히
+  잔떨림이 남고 너무 넓으면 '비었음' 판정이 실제보다 훨씬 늦게 나올 수 있습니다.
+- 이 디바운스/히스테리시스는 "방향을 정하는 순간"의 안정성만 다룹니다 — `TargetPassing.SHIFT`
+  단계 안에서 타겟이 끼어들 때 재평가하는 `_target_cuts_in()`/`SWITCH_FRAMES`는 원래도 별개의
+  디바운스가 있어서 그대로입니다(둘 다 있어야 전체 흐름이 안전합니다).
+
+---
+
 ## 5. 차량회피/추월 (B3_VEHICLE)
 
 **수정할 곳:** `config.py:230` `START_STATE`, `config.py:242` `TEST_DISABLE_B2_B3`, `config.py:246` `TEST_FORCE_BEHAVIOR`, `track_drive.py:144` `self.phase`

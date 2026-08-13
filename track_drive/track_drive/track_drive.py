@@ -128,8 +128,20 @@ class TrackDriverNode(Node):
         self.obstacle_dist  = 999.0   # 전방 거리(m)
         self.obstacle_side  = 'none'  # 'left'/'right'/'center'/'none'
         self.obstacle_type  = 'none'  # 'fixed'/'vehicle'/'none' (라이다 점수로 판별)
-        self.left_clear     = True    # 좌측 차선 비었는지(추월 복귀 판단)
-        self.right_clear    = True    # 우측 차선 비었는지(추월 이동 판단)
+        self.left_clear     = True    # 좌측 차선 비었는지(순간값, 디버그 표시용)
+        self.right_clear    = True    # 우측 차선 비었는지(순간값, 디버그 표시용)
+        # [2026-08-13] choose_side()가 실제로 받는 디바운스된 값 — SIDE_CLEAR_CONFIRM_FRAMES
+        # 연속 프레임 "비었음"이 유지돼야 True로 확정되고, 한 프레임이라도 "막힘"이 나오면
+        # 즉시 False로 리셋된다(비대칭 디바운스 — config.py SIDE_CLEAR_CONFIRM_FRAMES 주석 참고).
+        self.left_clear_confirmed  = True
+        self.right_clear_confirmed = True
+        self._left_clear_cnt  = 0
+        self._right_clear_cnt = 0
+        # [2026-08-13] 판정(임계값 비교) 이전에 원본 점개수 자체를 먼저 EMA로 스무딩한다 —
+        # 바로 아래 _ema_y(장애물 좌우 위치)와 같은 패턴을 left_cnt/right_cnt에도 적용한 것.
+        # 히스테리시스/디바운스가 "판정 이후" 안정화라면, 이건 "판정 이전" 안정화다.
+        self._left_cnt_ema  = 0.0
+        self._right_cnt_ema = 0.0
         self._ema_y         = 0.0     # 전방 장애물 횡위치 EMA(obstacle_side 안정화)
         self.obstacle_width = 0.0     # [6] 전방 장애물 실측 횡폭(m) — 거리무관 분류 기준
         self._obstacle_last_seen = 0.0  # [9] 마지막으로 실제 검출된 시각(인식 끊김 보상)
@@ -548,8 +560,15 @@ class TrackDriverNode(Node):
         SIDE_X_MIN, SIDE_X_MAX   = 0.8, 5.5   # 측면 ROI 종방향(m)
         LEFT_Y_MIN,  LEFT_Y_MAX  = 0.7, 1.5   # 좌측 ROI 횡방향(m)
         RIGHT_Y_MIN, RIGHT_Y_MAX = 0.7, 1.5   # 우측 ROI 횡방향(m)
-        LEFT_BLOCK_TH            = 8           # 좌측 차단 임계 (추월용)
-        RIGHT_BLOCK_TH           = 5           # 우측 차단 임계
+        # [2026-08-13] 히스테리시스(이중 임계값, Schmitt trigger) — 점 개수가 임계값 바로
+        # 근처에서 오락가락하면 단일 임계값으로는 self.left_clear가 매 프레임 뒤집힌다.
+        # '비었음→막힘'과 '막힘→비었음' 전환에 서로 다른 임계값을 써서, 일단 어느 상태로
+        # 들어가면 그 경계를 확실히 넘어야만 반대로 넘어가게 한다(아래 계산부 참고).
+        # _LOW는 실차 미검증 첫 추정치 — 상단(_BLOCK_TH)의 절반으로 잡았다.
+        LEFT_BLOCK_TH            = 8           # 좌측: '비었음→막힘' 전환 임계 (기존과 동일)
+        LEFT_CLEAR_TH            = 4           # 좌측: '막힘→비었음' 전환 임계 (신규, 더 낮음)
+        RIGHT_BLOCK_TH           = 5           # 우측: '비었음→막힘' 전환 임계 (기존과 동일)
+        RIGHT_CLEAR_TH           = 2           # 우측: '막힘→비었음' 전환 임계 (신규, 더 낮음)
         SIDE_DEADZONE            = 0.25        # |EMA(mean_y)| 이하이면 'center'
         SIDE_EMA_ALPHA           = 0.3         # EMA 계수
         BODY_LO, BODY_HI         = 215, 305    # 차체 자기가림 구간 (최종 확정 2026-07-22)
@@ -561,6 +580,8 @@ class TrackDriverNode(Node):
             self.obstacle_type  = 'none'
             self.left_clear     = True
             self.right_clear    = True
+            self.left_clear_confirmed  = True
+            self.right_clear_confirmed = True
             return
 
         # LUT 지연 초기화 (최초 1회)
@@ -649,8 +670,30 @@ class TrackDriverNode(Node):
         # ── 좌/우 차선 공간 (추월 이동·복귀 판단) ──
         left_mask  = valid & (x > SIDE_X_MIN) & (x < SIDE_X_MAX) & (y >  LEFT_Y_MIN)  & (y <  LEFT_Y_MAX)
         right_mask = valid & (x > SIDE_X_MIN) & (x < SIDE_X_MAX) & (y < -RIGHT_Y_MIN) & (y > -RIGHT_Y_MAX)
-        self.left_clear  = int(np.count_nonzero(left_mask))  < LEFT_BLOCK_TH
-        self.right_clear = int(np.count_nonzero(right_mask)) < RIGHT_BLOCK_TH
+        left_cnt_raw  = int(np.count_nonzero(left_mask))
+        right_cnt_raw = int(np.count_nonzero(right_mask))
+        # [2026-08-13] 판정(임계값 비교) 전에 원본 점개수를 먼저 EMA로 스무딩한다 — 위
+        # obstacle_y용 _ema_y와 같은 SIDE_EMA_ALPHA를 재사용(새 튜닝값 추가 없이 기존
+        # 패턴만 확장). 히스테리시스/디바운스가 "판정 이후" 안정화라면 이건 "판정 이전"
+        # 안정화라 서로 다른 축 — 셋을 순서대로(스무딩→히스테리시스→디바운스) 겹쳐 쓴다.
+        self._left_cnt_ema  = SIDE_EMA_ALPHA * left_cnt_raw  + (1.0 - SIDE_EMA_ALPHA) * self._left_cnt_ema
+        self._right_cnt_ema = SIDE_EMA_ALPHA * right_cnt_raw + (1.0 - SIDE_EMA_ALPHA) * self._right_cnt_ema
+        left_cnt  = self._left_cnt_ema
+        right_cnt = self._right_cnt_ema
+        # 히스테리시스: 현재 '비었음' 상태면 높은 임계값(_BLOCK_TH)을 넘어야 '막힘'으로
+        # 전환하고, 현재 '막힘' 상태면 낮은 임계값(_CLEAR_TH) 밑으로 내려가야 '비었음'으로
+        # 전환한다 — 두 임계값 사이 구간에서는 직전 상태를 그대로 유지해 경계 근처 잔떨림을
+        # 없앤다(우변은 갱신 전 self.left_clear/right_clear, 즉 직전 프레임 상태를 읽는다).
+        self.left_clear  = (left_cnt  < LEFT_BLOCK_TH)  if self.left_clear  else (left_cnt  < LEFT_CLEAR_TH)
+        self.right_clear = (right_cnt < RIGHT_BLOCK_TH) if self.right_clear else (right_cnt < RIGHT_CLEAR_TH)
+
+        # [2026-08-13] 비대칭 디바운스 — "비었음"은 SIDE_CLEAR_CONFIRM_FRAMES 연속 유지돼야
+        # 확정되고, "막힘"은 한 프레임만 나와도 즉시 카운터가 리셋된다(config.py
+        # SIDE_CLEAR_CONFIRM_FRAMES 주석 참고). choose_side()에는 이 확정값을 넘긴다.
+        self._left_clear_cnt  = self._left_clear_cnt + 1 if self.left_clear  else 0
+        self._right_clear_cnt = self._right_clear_cnt + 1 if self.right_clear else 0
+        self.left_clear_confirmed  = self._left_clear_cnt  >= SIDE_CLEAR_CONFIRM_FRAMES
+        self.right_clear_confirmed = self._right_clear_cnt >= SIDE_CLEAR_CONFIRM_FRAMES
 
         if DEBUG_VIZ_LIDAR:
             # [2026-08-11] PPM=125(표시 범위 2m)였을 때는 실제 장애물 감지 ROI(FRONT_X_MAX=5.0m,
@@ -702,8 +745,19 @@ class TrackDriverNode(Node):
             type_col = (0, 0, 255) if self.obstacle_front else (0, 255, 0)
             cv2.putText(bev, f'{self.obstacle_type.upper()} {self.obstacle_dist:.1f}m  {self.obstacle_side}  pts={front_cnt}',
                         (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, type_col, 1, cv2.LINE_AA)
-            cv2.putText(bev, f'L:{"CLR" if self.left_clear else "BLK"}  R:{"CLR" if self.right_clear else "BLK"}',
+            # [2026-08-13] 원본 점개수(raw) → EMA 스무딩값 → 히스테리시스 판정(순간값) →
+            # 디바운스 확정값, 4단계를 한눈에 비교할 수 있게 전부 표시한다 — 실차 디버깅 시
+            # 어느 단계에서 값이 흔들리는지/뒤집히는지 바로 구분하기 위함.
+            cv2.putText(bev, f'pts L:{left_cnt_raw}->{self._left_cnt_ema:.1f}  R:{right_cnt_raw}->{self._right_cnt_ema:.1f}',
                         (8, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
+            cv2.putText(bev, f'L:{"CLR" if self.left_clear else "BLK"}({self._left_clear_cnt}/{SIDE_CLEAR_CONFIRM_FRAMES})'
+                             f' R:{"CLR" if self.right_clear else "BLK"}({self._right_clear_cnt}/{SIDE_CLEAR_CONFIRM_FRAMES})',
+                        (8, 64), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
+            cv2.putText(bev, f'confirmed L:{"CLR" if self.left_clear_confirmed else "BLK"}'
+                             f'  R:{"CLR" if self.right_clear_confirmed else "BLK"}',
+                        (8, 84), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                        (0, 255, 0) if (self.left_clear_confirmed or self.right_clear_confirmed) else (0, 0, 255),
+                        1, cv2.LINE_AA)
             cv2.imshow('lidar_bev', bev)
             cv2.waitKey(1)
 
@@ -1829,7 +1883,7 @@ class TrackDriverNode(Node):
 
         if replan:
             side = self.vehicle_controller.choose_side(
-                self.obstacle_y, self.left_clear, self.right_clear, self.lane_side)
+                self.obstacle_y, self.left_clear_confirmed, self.right_clear_confirmed, self.lane_side)
 
             if side == 0:
                 # 양쪽 다 막혔다 — TargetPassing의 'blocked' 서행재시도 동작을 그대로 재사용.
@@ -1933,8 +1987,8 @@ class TrackDriverNode(Node):
             lane_offset=self.lane_offset,
             lane_lookahead=self.lane_lookahead,
             lane_side=self.lane_side,
-            left_clear=self.left_clear,
-            right_clear=self.right_clear,
+            left_clear=self.left_clear_confirmed,
+            right_clear=self.right_clear_confirmed,
             allow_maneuver=self._maneuver_allowed,
         )
 
