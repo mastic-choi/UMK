@@ -407,7 +407,7 @@ class TrackDriverNode(Node):
             try:
                 return DLLaneDetector(logger=self.get_logger())
             except Exception as e:
-                # onnxruntime 미설치, models/twinlitenetplus_medium_v2.onnx(.data) 부재 등으로 초기화가 실패하면
+                # onnxruntime 미설치, models/twinlitenetplus_kmu_v1.2.0.onnx(.data) 부재 등으로 초기화가 실패하면
                 # 원인을 명확히 남기고 검증된 백엔드(hough)로 폴백한다 — 조용히 무시하지 않는다.
                 self.get_logger().error(
                     f'DL 차선인식 백엔드 초기화 실패, hough로 폴백합니다: {e}'
@@ -535,7 +535,9 @@ class TrackDriverNode(Node):
         detect_s2()는 원 4개가 정확히 안 잡히면(초과분은 pick_best_4()로 어느 정도 흡수하지만,
         미달은 흡수 불가) 그 프레임은 인식 실패로 순간값이 False가 될 수 있다. 여기서
         SIG_CONFIRM_FRAMES 연속 유지를 확인해 confirmed로 승격시켜, 단발성 오검출/오검출실패가
-        바로 FSM 전환(출발/좌회전)으로 새는 걸 막는다(라바콘/차량 트리거와 동일한 패턴)."""
+        바로 FSM 전환(출발/좌회전)으로 새는 걸 막는다(라바콘/차량 트리거와 동일한 패턴).
+        DEBUG_LOG_SIGNAL=True면(기본값) 매 프레임 _log_signal_debug()로 실패 원인+힌트를 찍는다
+        — DEBUG_VIZ_SIGNAL(창)과 별개 스위치라 터미널 로그만 원하면 이것만 켜도 됨."""
         if self.img_front is None:
             return
 
@@ -2162,6 +2164,49 @@ class TrackDriverNode(Node):
             f'R pts={lava_rp} run={lava_rrun}(need>=2) '
             f'masked_raw_pts={masked_pts} masked_min={masked_min_s}'
             f'{sig_line}')
+
+    def _log_signal_debug(self):
+        """DEBUG_LOG_SIGNAL 전용 상세 로그. 전역 DEBUG_LOG의 [SIG] 요약 줄(0.5초 주기, roi/circles/
+        reason/bright만 나열)과 달리, 신호등이 "왜" 안 잡히는지 단계별 원인 + 대응 힌트를 붙여서
+        찍는다 — DEBUG_LOG를 꺼둔 채로 신호등만 디버깅하고 싶을 때 이것만 켜면 됨.
+        perc_signal()에서 S0/S2 상태일 때만 호출된다(그 외 상태는 detect_s2() 자체를 안 돌림).
+        0.2초 스로틀(대략 4~5프레임당 1번, 20Hz 기준) — 매 프레임 찍으면 터미널이 너무 빨리
+        흘러가서 오히려 못 읽는다."""
+        sd = self.signal_detector
+        reason = sd.s2_reject_reason or 'OK'
+
+        if reason == 'no_circles':
+            hint = 'ROI 안에 원이 아예 안 잡힘 → 신호등이 ROI 밖이거나 노출/대비 문제 (SIG4_ROI_*)'
+        elif 'too noisy' in reason:
+            hint = '원이 너무 많이 잡힘(MAX_CANDIDATES 초과) → 반사광 등 잡음, ROI를 좁히는 것 고려'
+        elif '(<4)' in reason:
+            hint = '원이 4개 미만 → 가림/블러 또는 반지름 범위 밖 (SIG4_MIN/MAX_RADIUS)'
+        elif 'vert_spread' in reason:
+            hint = '찾은 4개가 세로로 너무 퍼짐 → 오검출이 섞였거나 카메라 각도 틀어짐 의심'
+        elif 'horiz_spread' in reason:
+            hint = '찾은 4개가 가로로 너무 퍼짐 → 오검출이 섞임 의심'
+        elif 'gap[' in reason:
+            hint = '인접한 두 원 사이 간격이 너무 좁음 → 반사광 등이 신호등 원 사이에 끼어듦'
+        elif 'no_valid_4subset' in reason:
+            hint = '원 5개 이상 중 배치조건을 만족하는 4개 조합이 없음 → 오검출 비율이 높음'
+        else:
+            hint = '배치검사 통과 — 아래 bright/lit이 실제 밝기 대비 판정 결과(정상 동작)'
+
+        state_kr = ('좌회전' if self.signal_left_on else
+                    '직진'   if self.signal_straight_on else
+                    '정지(빨강)' if self.signal_red_on else '미검출')
+
+        self.get_logger().info(
+            f'[SIG-DEBUG] {self.mission_state.name} state={state_kr}\n'
+            f'  roi(px)=(t={sd.s2_roi_px[0]},b={sd.s2_roi_px[1]},l={sd.s2_roi_px[2]},r={sd.s2_roi_px[3]}) '
+            f'radius={SIG4_MIN_RADIUS}~{SIG4_MAX_RADIUS}px circles_found={sd.s2_circle_count}\n'
+            f'  reason={reason}\n'
+            f'  → {hint}\n'
+            f'  bright(빨강,노랑,좌회전,직진)={sd.s2_brightness} margin={SIG4_BRIGHT_MARGIN} '
+            f'lit={[int(v) for v in sd.s2_lit]}\n'
+            f'  confirm: 직진={self._sig_straight_cnt}/{SIG_CONFIRM_FRAMES} '
+            f'좌회전={self._sig_left_cnt}/{SIG_CONFIRM_FRAMES}',
+            throttle_duration_sec=0.2)
 
 
 # #############################################################

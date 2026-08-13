@@ -3,18 +3,22 @@
 #=============================================
 # dl_lane.py — TwinLiteNet(ONNX Runtime) 기반 딥러닝 차선인식 백엔드.
 #
-# [2026-08-12] 모델을 bootstrap_v2(small, 사람검증 134장)에서 자체 fine-tune 최신
-# 결과물인 TwinLiteNetPlus(medium, pseudo_dataset_v2 — 사람검증 134장+자동생성 934장=
-# 1068장, letterbox 버그 수정 후 재학습, ll IOU 기준 best 체크포인트)
-# `models/twinlitenetplus_medium_v2.onnx`로 교체했다 — fine-tune 저장소 PROGRESS.md
-# §2.14 기준 da mIoU 0.937 / ll IOU 0.567(둘 다 bootstrap_v2보다 개선). 입출력 텐서
+# [2026-08-13] 모델을 twinlitenetplus_medium_v2.onnx(bootstrap_v2 1016장 기준,
+# §2.14/§2.18)에서 fine-tune 저장소 v1.2.0(`models/twinlitenetplus_kmu_v1.2.0.onnx`)로
+# 교체했다 — bootstrap_v2(1016) + lap_005(지그재그 주행 보강 2430) = 3446장으로
+# 재학습한 최신 결과물(fine-tune 저장소 PROGRESS.md §2.26/§2.27), 사람 GT 1016장 기준
+# da IoU 0.945→0.957 / ll IoU 0.577→0.599(v1.0.0 대비, README 참고). 입출력 텐서
 # 이름('images'/'da'/'ll'), 전처리(letterbox 없이 리사이즈 → BGR→RGB → /255, mean/std
 # 정규화 없음), 출력 형식((1,2,H,W) raw logit, softmax 후 채널1=foreground), 입력
-# 해상도(640x384)는 bootstrap_v2와 동일 — DL_INPUT_H 변경 없음. 이 .onnx도 가중치를
-# 외부 데이터 파일(`twinlitenetplus_medium_v2.onnx.data`, 같은 디렉터리에 있어야 함 —
+# 해상도(640x384)는 medium_v2와 동일 — DL_INPUT_H 변경 없음. 이 .onnx도 가중치를
+# 외부 데이터 파일(`twinlitenetplus_kmu_v1.2.0.onnx.data`, 같은 디렉터리에 있어야 함 —
 # onnx 파일 내부에 상대경로로 박혀 있어 파일명을 바꾸면 로드가 깨진다)로 분리해
-# export됐다. best.onnx(원조)/twinlitenetplus_small_bootstrap_v2.onnx(이전 fine-tune)는
-# 롤백/비교용으로 그대로 남겨뒀다(이제 기본 경로로는 안 쓰임).
+# export됐다(fine-tune 저장소 원본 파일명 `best.onnx`(+`.onnx.data`)를 이 레포용으로
+# `twinlitenetplus_kmu_v1.2.0.onnx`로 리네임하면서, onnx 내부 external-data location도
+# 새 파일명에 맞게 재작성함 — 원본 그대로 리네임만 하면 로드가 깨지는 버그가 fine-tune
+# 저장소 쪽에도 있었음, PROGRESS.md §2.27 참고). best.onnx(원조)/
+# twinlitenetplus_small_bootstrap_v2.onnx(이전 fine-tune)/twinlitenetplus_medium_v2.onnx
+# (직전 버전)는 롤백/비교용으로 그대로 남겨뒀다(이제 기본 경로로는 안 쓰임).
 # ⚠️ 이 모델은 정적 이미지/ROI 커버리지 기준으로만 검증됐고 실차 주행 테스트는 아직
 # 안 됨(fine-tune 저장소 README "실차에 바로 쓰기 전에 반드시 실제 주행 테스트로
 # 검증할 것" 참고) — 처음 투입 시 hough 백엔드로 즉시 폴백 가능한 상태로 테스트할 것.
@@ -86,9 +90,9 @@ except ImportError:
     get_package_share_directory = None
 
 
-# ── 모델 입출력 스펙 (fine-tune 저장소 twinlitenetplus_medium_v2.onnx 기준 —
+# ── 모델 입출력 스펙 (fine-tune 저장소 twinlitenetplus_kmu_v1.2.0.onnx 기준 —
 #   onnxruntime InferenceSession.get_inputs()/get_outputs()로 직접 확인함, 2026-08-12,
-#   bootstrap_v2와 입출력 스펙 동일) ──
+#   medium_v2와 입출력 스펙 동일) ──
 #   images 텐서 (batch,3,384,640) float32 NCHW. 전처리는 letterbox 없이 640x384로 그냥
 #   리사이즈(harrylal 원본 blobFromImage 방식 그대로 유지) → BGR→RGB → /255.0
 #   (mean/std 정규화 없음).
@@ -218,11 +222,11 @@ DL_MODE_COLORS = {
 DL_MODE_COLOR_DEFAULT = (60, 60, 60)  # 위 셋에 없는 값(오타 등) 대비 폴백
 
 
-DL_MODEL_FILENAME = 'twinlitenetplus_medium_v2.onnx'
+DL_MODEL_FILENAME = 'twinlitenetplus_kmu_v1.2.0.onnx'
 
 
 def _default_model_path():
-    """모델 가중치 파일(twinlitenetplus_medium_v2.onnx) 기본 경로.
+    """모델 가중치 파일(twinlitenetplus_kmu_v1.2.0.onnx) 기본 경로.
     1순위: colcon install된 share 디렉터리(share/track_drive/models/<파일명>)
     2순위: 소스트리에서 직접 실행 중일 때(개발 중, colcon build 전) — track_drive 패키지 디렉터리 기준 상대경로
     같은 디렉터리의 <파일명>.data(외부 데이터 파일)도 같이 있어야 한다 — onnx 파일 안에
@@ -255,8 +259,10 @@ class TwinLiteNetEngine:
         if not os.path.isfile(self.model_path):
             raise FileNotFoundError(
                 f'TwinLiteNetPlus 가중치 파일을 찾을 수 없습니다: {self.model_path}\n'
-                'fine-tune 저장소의 outputs/models/best.onnx(medium config)를 '
-                'twinlitenetplus_medium_v2.onnx(+.onnx.data)로 재export해서 이 경로에 두세요.'
+                'fine-tune 저장소의 outputs/models/best.onnx(v1.2.0, medium config)를 '
+                'twinlitenetplus_kmu_v1.2.0.onnx(+.onnx.data)로 리네임해서 이 경로에 두세요 '
+                '(리네임 시 onnx 내부 external-data location도 새 파일명에 맞게 재작성해야 함 — '
+                'fine-tune 저장소 PROGRESS.md §2.27 참고).'
             )
         self._logger = logger
 

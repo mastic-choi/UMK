@@ -201,7 +201,7 @@ ros2 launch track_drive track_drive.launch.py
 | `'hough'` | `perception/hough_lane.py`의 `HoughLaneDetector` | 대안, 실차 라바콘 테스트까지 검증됨. `'dl'` 초기화 실패 시 자동 폴백 |
 | `'classic_cv'` | `perception/lane_util.py`(`CameraProcessor`+`SlideWindow`) + `perception/perc_floor.py`(`LaneDetector`) 조립 | 보존용, 현재 라이브 미검증 |
 
-`'dl'` 선택 시 `onnxruntime` 미설치나 `models/twinlitenetplus_medium_v2.onnx`(.data)
+`'dl'` 선택 시 `onnxruntime` 미설치나 `models/twinlitenetplus_kmu_v1.2.0.onnx`(.data)
 부재 등으로 초기화가 실패하면 `_build_lane_detector()`
 ([track_drive.py:303-323](track_drive.py#L303))가 에러를 로깅하고 자동으로 `'hough'`로 폴백합니다(조용히
 무시하지 않음) — 노드 시작 로그에 `DL 차선인식 백엔드 초기화 실패, hough로 폴백합니다` 가 찍혔는지 꼭 확인하세요.
@@ -543,21 +543,63 @@ S1→S2 전환 경로만 막는 것이라 `START_STATE` 자체를 바꾸는 것�
 로그의 `[SIG]` 값부터 확인하세요.
 
 **디버그 방법:**
-- 창: `DEBUG_VIZ_SIGNAL = True`([config.py:224](config.py#L224)) → `signal4_roi` 창 하나(S0/S2 공용,
-  더 이상 `signal_roi`/`signal4_roi`로 나뉘어 있지 않음).
-- CLI 로그: `DEBUG_LOG=True`면 S0든 S2든 0.5초마다 `[SIG]` 줄을 찍습니다(`roi=`, `circles=`, `reason=`,
-  `bright=`) — 원 검출이 어느 단계(개수 부족/배치 불량/밝기 대비 부족)에서 막혔는지 터미널만으로 바로
-  보입니다. 같이 찍히는 `[SENS] sig=` 줄에는 `R/L/S` 원시 판정값과 `confirmS(n/3)`/`confirmL(n/3)` 디바운스
+- 창: `DEBUG_VIZ_SIGNAL`(config.py, **기본 True**) → `signal4_roi` 창 하나(S0/S2 공용). ROI를
+  `SIG4_VIZ_SCALE`(=3, [perception/traffic_signal.py](perception/traffic_signal.py)) 배 확대해서
+  띄우고, 그 위에 노란 얇은 원=Hough가 찾은 원 전부(오검출 포함), 굵은 초록/회색 원+`R/Y/L/S`
+  라벨+밝기값=배치검사를 통과해 실제 판정에 쓰인 4개(초록=점등, 회색=꺼짐)를 같이 그립니다.
+  좌상단 3줄에 `STATE:`(현재 인식 상태), `roi=(t,b,l,r)`(ROI 픽셀좌표), `n=/reason=`(원 개수·실패사유)도
+  표시됩니다. **주의:** 이미지 위 라벨은 영문 약어(`R`빨강/`Y`노랑/`L`좌회전/`S`직진)입니다 — OpenCV
+  기본 폰트가 한글 글리프를 지원하지 않아 이미지 오버레이에 한글을 쓰면 깨집니다.
+- CLI 로그(요약): `DEBUG_LOG=True`면 S0든 S2든 0.5초마다 `[SIG]` 줄을 찍습니다(`roi=`, `circles=`, `reason=`,
+  `bright=`). 같이 찍히는 `[SENS] sig=` 줄에는 `R/L/S` 원시 판정값과 `confirmS(n/3)`/`confirmL(n/3)` 디바운스
   카운터도 함께 나옵니다.
+- CLI 로그(상세, **2026-08-13 신설**): `DEBUG_LOG_SIGNAL`(config.py, **기본 True**, `DEBUG_LOG`와
+  무관한 독립 스위치) → `perc_signal()`이 매 프레임(0.2초 스로틀) `[SIG-DEBUG]`로 원인 단계별 진단을
+  찍습니다: ROI 픽셀좌표·반지름 범위, 이번 프레임 원 검출 개수, `reason`, 그리고 그 reason이 뭘
+  의미하는지 한글 힌트 한 줄(`no_circles`→ROI 노출/대비 의심, `(<4)`→가림/블러/반지름 범위 의심,
+  `vert_spread`/`horiz_spread`/`gap[i]`→오검출 섞임 의심 등), 마지막으로 좌→우 밝기값·점등여부·
+  디바운스 카운터까지. `DEBUG_LOG`를 꺼둔 채로 신호등만 붙잡고 디버깅할 때 이것만 켜면 됨
+  ([track_drive.py `_log_signal_debug()`](track_drive.py)).
+
+**[2026-08-13] ROI 재튜닝 (실차 랩 캡처 기반):** 기존 `SIG4_ROI_T,B=0.08,0.28` `SIG4_ROI_L,R=0.04,0.78`
+`SIG4_MIN/MAX_RADIUS=15~25`는 `lap_001/frame_000055.png`(신호등이 실제로 찍힌 프레임)에서
+`circle_count=0`으로 아예 못 잡았습니다 — ROI가 신호등 실제 위치(그 프레임 native 640×480 기준
+x≈194~291px, y≈81~89px)를 벗어나 있었습니다. 재조정하면서 "얼마나 넉넉하게 잡을지" 트레이드오프를
+확인했습니다(같은 랩 폴더에서 무작위 샘플링해 오탐 — `red/straight/left_on` 중 하나라도 True가
+되는 경우 — 를 셈):
+- 신호등 위치에 딱 맞춘 타이트 박스(185×72px): frame_000055 성공 / 무작위 25프레임 오탐 0건
+- 훨씬 넉넉한 러프 박스(320×144px): frame_000055는 여전히 성공(`pick_best_4()`가 노이즈 속에서도
+  골라냄)하지만, 무작위 40프레임 중 **4건(10%)**이 우연히 4개 원이 `shape_ok()`를 통과해버리는
+  오탐 발생 — ROI가 넓을수록 원 후보가 늘고, `pick_best_4()`는 "적당히 나란한 4개"만 볼 뿐
+  진짜 신호등인지는 모르기 때문.
+- 최종 채택(262×110px, 중간): frame_000055 성공 / 무작위 40프레임 오탐 1건(2.5%) — 정지 위치가
+  프레임마다 픽셀 단위로 안 맞아도 놓치지 않을 만큼 여유는 있으면서, 오탐은 크게 늘지 않는 절충점.
+```python
+SIG4_ROI_T, SIG4_ROI_B = 0.07, 0.30
+SIG4_ROI_L, SIG4_ROI_R = 0.18, 0.58
+SIG4_MIN_RADIUS, SIG4_MAX_RADIUS = 9, 26
+```
+**다만 프레임 한 장 기준이라** S0/S2 각각의 실제 정지 거리·각도에서 또 안 맞을 수 있습니다 —
+실차에서 `DEBUG_VIZ_SIGNAL`/`DEBUG_LOG_SIGNAL`로 재확인 필요.
+
+**[2026-08-13] 추가로 확인된 버그 가능성 — 좌회전(화살표) 램프 저평가:** 위 프레임에서 직진(4번,
+꽉 찬 원)과 좌회전(3번, 화살표 모양) 램프가 둘 다 켜진 상태였는데, `circle_brightness()`가 원
+내부 사각 패치의 **평균** 밝기를 재다 보니 화살표는 원의 일부만 밝아서 평균이 낮게 나와
+(`bright≈161`, 배경 대비 마진(`SIG4_BRIGHT_MARGIN=15`) 미달) `lit=False`로 판정됐습니다(직진은
+`bright≈252`로 확실히 `lit=True`). 즉 **좌회전 신호가 실제로 켜져 있어도 놓칠 수 있는 구조적
+문제**로 보입니다 — 아직 수정 안 함(별도 확인/합의 필요). 재현: `python3 -c` 로
+`SignalDetector().detect_s2()`를 `frame_000055.png`에 돌려보면 `s2_lit=[False,False,False,True]`.
 
 **알려진 한계(실차 미검증):**
 - `find_circles()`(Hough Circle)가 원을 4개 미만으로 찾으면 그 프레임은 무조건 인식 실패 — 폴백 없음
   (4개 **초과**로 잡히는 경우는 `pick_best_4()`가 배치가 맞는 4개 조합을 골라 완화합니다,
   [perception/traffic_signal.py:71](perception/traffic_signal.py#L71)).
-- ROI(`SIG4_ROI_*`)와 반지름 범위(`SIG4_MIN/MAX_RADIUS=15~25px`, 전부 config.py)가 S0/S2 공용 고정값이라,
+- ROI(`SIG4_ROI_*`)와 반지름 범위(`SIG4_MIN/MAX_RADIUS`, 전부 config.py)가 S0/S2 공용 고정값이라,
   카메라 각도·정지 위치가 튜닝 당시와 다르면 신호등이 ROI 밖이거나 반지름 범위 밖이라 아예 못 잡을 수 있음.
 - 색상(Hue)을 직접 보지 않고 **위치(좌→우=빨강/노랑/좌회전/직진) + 밝기 대비**로만 판정 — 밝은 반사광이
   ROI에 섞이면 오탐 가능.
+- 위 "좌회전(화살표) 램프 저평가" 참고 — 평균 밝기 기반 판정이 채우기 모양이 다른 램프(원 vs 화살표)에
+  불공평하게 작동할 수 있음.
 
 ---
 
@@ -1672,6 +1714,52 @@ pure_pursuit 입력단 노이즈도 같이 줄어든다 — §0.5.7(같은 날, 
   좁혔다. `LOST`가 길게 이어지는 경우(좌/우 트래커 교차 등)에 대한 명시적 방지 클램프는 아직
   없다 — 실차에서 `corridor_band_case` 스파크라인으로 `LOST` 연속 길이를 관찰하고 필요하면
   추가할 것.
+
+---
+
+### 2.29 DL 세그멘테이션 모델을 v1.2.0(bootstrap_v2+lap_005, 3446장) 결과물로 재교체 (`twinlitenetplus_kmu_v1.2.0.onnx`, 2026-08-13)
+
+**배경:** §2.26의 `twinlitenetplus_medium_v2.onnx`(medium, bootstrap_v2 1016장) 이후,
+`fine-tune` 저장소에서 다음이 추가로 진행됨(자세한 경위는 fine-tune 저장소 `PROGRESS.md`
+§2.20~§2.26 참고):
+1. da pseudo label을 6-앙상블(부트스트랩 5개 + 기존 배포 모델) soft-vote로 재생성하고,
+   사람 신뢰 리뷰로 `bootstrap_v2`를 156→1016장까지 확장.
+2. 지그재그 주행으로 추가 수집한 `lap_005`(비평행 각도 상황 보강, 사람 육안 검수 후
+   2430장)를 병합 — 최종 학습 **3446장**(`bootstrap_v2` 1016 + `lap_005` 2430).
+3. `CONFIG='medium'`으로 로컬(WSL2/ROCm, RX 9070 XT) 40epoch 재학습 — 사람 GT 1016장
+   기준 **da IoU 0.945→0.957, ll IoU 0.577→0.599**(§2.26의 v1.0.0 모델 대비 개선,
+   fine-tune 저장소 README 표 참고).
+4. **[버그 발견/수정]** fine-tune 저장소의 `outputs/models/best.onnx`가 내부적으로
+   존재하지 않는 파일명(`twinlitenet_kmu_v1.2.0.onnx.data`)을 참조하고 있어 그대로
+   로드하면 실패하는 버그를 발견 — 실차 배포 PC(AMD 미니 PC, Ryzen 7 5700U)에 처음
+   로드해보다 확인됨(fine-tune 저장소 `PROGRESS.md` §2.27). 원인은 릴리즈 산출물을
+   `best.onnx`로 리네임하는 과정에서 onnx 내부 external-data 메타데이터는 안 바뀐 것.
+
+**수정:**
+- `fine-tune/outputs/models/best.onnx`(+`.onnx.data`, 위 버그 수정 반영된 버전)를
+  `twinlitenetplus_kmu_v1.2.0.onnx`(+`.onnx.data`)로 리네임(`onnx` 파이썬 라이브러리로
+  external-data location을 새 파일명에 맞게 재작성 — 가중치 자체는 원본과 bit-exact
+  동일함을 onnxruntime 추론 결과로 확인)해서 `track_drive/track_drive/models/`에 커밋함.
+- `perception/dl_lane.py`: `DL_MODEL_FILENAME`을 `twinlitenetplus_medium_v2.onnx` →
+  `twinlitenetplus_kmu_v1.2.0.onnx`로 변경. 입출력 텐서 이름/전처리/입력 해상도
+  (640×384)는 §2.26 모델과 동일해서 `DL_INPUT_H` 등 다른 값은 그대로 둠.
+- `best.onnx`(원조)/`twinlitenetplus_small_bootstrap_v2.onnx`(§2.25)/
+  `twinlitenetplus_medium_v2.onnx`(§2.26, 직전 버전)는 롤백/비교용으로 저장소에 그대로
+  남겨뒀다(기본 경로로는 더 이상 안 쓰임).
+
+**참고 — 실차 배포 PC(AMD 미니 PC, Ryzen 7 5700U) 성능:** ROCm 미지원 iGPU라 GPU
+가속 없이 CPU로만 동작 — onnxruntime CPU 기준 이 모델 **~10.8fps(92.6ms/frame)**,
+원조 TwinLiteNet(같은 PC, CPU)은 **12.4fps**로 오히려 근소하게 더 빠름(학습에 쓴
+RX 9070 XT ROCm에서는 반대로 KMU가 원조보다 ~2배 빠름 — CAAM 어텐션이 GPU
+병렬화엔 유리해도 CPU 단일스레드에선 오버헤드로 작용하는 것으로 추정, 엄밀한
+프로파일링은 안 해봄). 실차 제어 루프가 요구하는 fps 대비 충분한지는 아직 확인 안 됨.
+
+**알려진 한계:**
+- §2.26과 마찬가지로 **실차 미검증**이다 — fine-tune 저장소 쪽 검증은 정적 이미지/ROI
+  커버리지 비교까지만 마쳤다.
+- 위 성능 표에서 보듯 이 미니 PC는 CPU 추론만 가능해서(ROCm 미지원) 온보드 실시간
+  fps가 학습 PC보다 훨씬 낮다 — 실차 투입 전 실제 제어 루프 주기(20Hz, `config.py`
+  `control_loop`)와 비교해 병목이 되는지 반드시 확인할 것.
 
 ---
 
