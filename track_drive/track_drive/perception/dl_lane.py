@@ -193,6 +193,8 @@ from ..config import (
     DL_LL_DECAY_ALPHA, DL_LL_DECAY_MIN_VALUE,
     DL_CENTER_MODE, DL_LL_ALGO, DL_LL_SIDE_MIN_PIXELS, DL_DA_SKIP_LL_CLIP,
     DL_LL_SEARCH_HALF_WIDTH_PX,
+    # [2026-08-14] da 안전마진(차량 폭) 침식 — README §2.30
+    DL_DA_APPLY_VEHICLE_MARGIN, DL_DA_VEHICLE_MARGIN_M, VEHICLE_WIDTH_M,
     # DL_LL_ALGO='yw'(팀원 작성, main 기본) 전용
     DL_LL_YELLOW_GAP_INIT_PX, DL_LL_YELLOW_GAP_EMA_ALPHA,
     DL_LL_YELLOW_GAP_MIN_PX, DL_LL_YELLOW_GAP_MAX_PX,
@@ -208,6 +210,16 @@ from ..config import (
     DL_LL_YELLOW_VOTE_RATIO, DL_LL_YELLOW_MIN_AREA,
     DEBUG_VIZ_DL_LANE, YELLOW_LOWER, YELLOW_UPPER, FPS_LOG_PERIOD_SEC,
     DL_DEBUG_HISTORY_LEN,
+)
+
+# ── [2026-08-14] da 안전마진(차량 폭) 침식 커널 — README §2.30 "da 안전마진 설계 논의" ──
+#   VEHICLE_WIDTH_M(실측 차폭)의 절반 + DL_DA_VEHICLE_MARGIN_M(여유)을 DL_PIXELS_PER_METER로
+#   픽셀 환산해 반경으로 쓴다. DL_CENTER_MODE='da'에서만 쓰인다(detect() 참고) — 모듈
+#   임포트 시 한 번만 계산해두고 매 프레임 재계산하지 않는다(다른 커널들과 동일 패턴).
+_DL_DA_MARGIN_PX = int(round((VEHICLE_WIDTH_M / 2.0 + DL_DA_VEHICLE_MARGIN_M) * DL_PIXELS_PER_METER))
+_DL_DA_MARGIN_KERNEL = (
+    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_DL_DA_MARGIN_PX * 2 + 1, _DL_DA_MARGIN_PX * 2 + 1))
+    if DL_DA_APPLY_VEHICLE_MARGIN and _DL_DA_MARGIN_PX > 0 else None
 )
 
 # [2026-08-10] visualize()가 result 패널 맨 위에 그리는 모드 배너 색을 한곳에서 관리.
@@ -622,6 +634,27 @@ class DLSlideWindow(SlideWindow):
 
         self._prev_da_centroid = None
         return np.zeros_like(da_mask)
+
+    def _apply_vehicle_margin(self, da_mask):
+        """[2026-08-14] da 마스크를 차폭(VEHICLE_WIDTH_M)+여유(DL_DA_VEHICLE_MARGIN_M)만큼
+        침식(erosion)해서, 중심선이 da 경계(장애물이든 트랙 벽이든 무관)에서 최소 이만큼은
+        떨어지도록 강제한다 — ROS2 Nav2의 costmap inflation과 같은 개념(README §2.30 "da
+        안전마진 설계 논의"). 지금까지 중심선 계산(`_da_slice_centers_windowed()` 등)은
+        차량을 폭 0인 점으로 취급해왔는데, 이게 "장애물 회피 중 앞코가 장애물 뒷꽁지를
+        긁는다"는 실차 보고의 원인으로 지목됐다.
+
+        ★주의★ 이건 순수 카메라 픽셀(DL_PIXELS_PER_METER, config.py에 "설계값(실측 아님)"
+        이라고 명시된 값) 기반 근사치다 — 라이다 실측으로 대신하는 안(같은 README 절)이
+        더 정확하지만 라이다-카메라 오프셋 실측이 먼저 필요해 시간이 걸리므로, 우선 이
+        단순한 안을 실차에서 먼저 테스트해본다(요청 반영, 안 되면 수정 예정).
+
+        침식으로 da가 통째로 비면(좁은 커브 등에서 과침식) 원본을 그대로 반환한다 —
+        `_largest_da_component()`의 "차선책" 폴백들과 같은 원칙: 마진 없이라도 주행하는
+        게 프레임이 무효 처리돼 멈추는 것보다 낫다는 판단."""
+        if _DL_DA_MARGIN_KERNEL is None:
+            return da_mask
+        eroded = cv2.erode(da_mask, _DL_DA_MARGIN_KERNEL)
+        return eroded if np.any(eroded) else da_mask
 
     def _da_slice_centers_windowed(self, da_mask, ref_x):
         """[2026-08-12] DL_CENTER_MODE='da' 밴드 중심 계산 — 탐색창(prior) + 밴드 간
@@ -1665,7 +1698,11 @@ class DLSlideWindow(SlideWindow):
                     )
                     self.ll_band_reason = [None] * self.n_slices
             else:
-                merged_centers = self._da_slice_centers_windowed(da_mask, ref_x)
+                # [2026-08-14] 중심선 계산에만 안전마진을 적용한다 — self.da_mask_roi(아래,
+                # 디버그 시각화용)는 침식 전 원본을 그대로 담아야 "da가 실제로 어디까지
+                # 검출됐는지"와 "마진 때문에 얼마나 물러났는지"를 구분해서 볼 수 있다.
+                margined_da_mask = self._apply_vehicle_margin(da_mask)
+                merged_centers = self._da_slice_centers_windowed(margined_da_mask, ref_x)
                 self.ll_band_used = [False] * len(merged_centers)
                 self.ll_search_windows = []
                 self.ll_band_reason = [None] * self.n_slices

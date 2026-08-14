@@ -419,6 +419,22 @@ DL_CENTER_MODE = 'da'  # 'da' | 'll_da' | 'll'
 #   말 것(또는 다시 DL_CENTER_MODE로 전환할 때 같이 False로 되돌릴 것).
 DL_DA_SKIP_LL_CLIP = True
 
+# ── [2026-08-14] da 안전마진(차량 폭) 침식 — DL_CENTER_MODE='da' 전용 ──
+#   실차에서 "장애물 회피 중 앞코가 장애물 뒷꽁지를 긁는다"는 보고가 나와 원인을 짚어보니,
+#   _da_slice_centers_windowed()가 da 중심선을 뽑을 때 차량을 폭 0인 점으로 취급해서
+#   da 경계(장애물이든 트랙 벽이든)에 바짝 붙여 경로를 뽑고 있었다(README §2.30). 라이다
+#   실측 결합안(같은 절)은 라이다-카메라 오프셋 실측이 먼저 필요해 시간이 걸리므로,
+#   우선 더 단순한 안 — da 마스크 자체를 차폭(VEHICLE_WIDTH_M)+여유만큼 침식(erosion)해서
+#   중심선이 da 경계에서 최소한 이만큼은 떨어지도록 강제한다(ROS2 Nav2의 costmap inflation과
+#   동일한 개념) — 를 실차에서 먼저 테스트해보기로 했다(요청 반영, "안 되면 수정").
+#   ★주의★ 이건 da 세그멘테이션 자체는 그대로 두고 후처리로 마진을 만드는 것뿐이라,
+#   DL_PIXELS_PER_METER(설계값, 실측 아님 — 위 주석 참고)의 원거리 외삽/피치 변화 취약성을
+#   그대로 물려받는다 — "몇 cm 여유"를 엄밀히 보장하진 못하고 근사치다. 커브가 심한
+#   구간에서 침식이 과해 da가 DL_DA_MIN_COMPONENT_AREA 밑으로 꺼지면(=그 프레임 무효
+#   처리) 실차에서 확인 후 DL_DA_VEHICLE_MARGIN_M을 낮출 것. 실차 미검증 초기값.
+DL_DA_APPLY_VEHICLE_MARGIN = True
+DL_DA_VEHICLE_MARGIN_M = 0.05   # ASTAR_VEHICLE_MARGIN_M(라이다/Hybrid A* 쪽)과 동일 관례
+
 # [2026-08-10] DL_CENTER_MODE='ll' 내부에서 실제 밴드 중심 계산 알고리즘을 고르는
 #   2차 스위치 — 같은 날 두 사람이 독립적으로 서로 다른 재설계를 했다(origin/main
 #   병합 시 두 구현이 정면으로 겹쳐 병합 커밋에서 "둘 다 남기고 전환 가능하게" 하기로
