@@ -96,6 +96,31 @@ def lidar_index_to_xy(range_m, index, n):
     return x, y
 
 
+def _to_640x480(frame):
+    """[2026-08-14, 실차 확인 후 2차 수정] 단순 cv2.resize(640,480)만 하면 원본 종횡비가
+    4:3이 아닐 때(예: 흔한 16:9 1280x720) 가로/세로가 서로 다른 비율로 눌려서(짓눌림) 실제
+    트랙 폭이 왜곡된다 — DL_BEV_SRC_PX_RAW 사다리꼴(640x480 기준 고정 좌표)이 눌린 실제
+    차선보다 상대적으로 넓게 보이는 증상으로 나타남(실차에서 확인). 리사이즈 전에 먼저
+    가운데를 4:3으로 잘라내(center crop) 종횡비를 맞춘 뒤 리사이즈하면 왜곡 없이 스케일만
+    바뀐다 — 다만 이건 "usb_cam_node_exe가 실제로 잡는 640x480 모드와 광학적으로 완전히
+    동일한 크롭"이라는 보장은 없는 근사치다(그 모드가 센서를 어떻게 크롭/스케일하는지 정확히
+    모름) — 최종 확인은 실제 라이다-카메라 오프셋 값이 안정적으로 나오는지로 할 것."""
+    h, w = frame.shape[:2]
+    if (w, h) == (640, 480):
+        return frame
+    target_ar = 640.0 / 480.0
+    src_ar = w / float(h)
+    if src_ar > target_ar:            # 원본이 더 넓다(16:9 등) -> 좌우를 잘라 4:3으로
+        new_w = int(round(h * target_ar))
+        x0 = (w - new_w) // 2
+        frame = frame[:, x0:x0 + new_w]
+    elif src_ar < target_ar:          # 원본이 더 좁다(세로가 김) -> 위아래를 잘라 4:3으로
+        new_h = int(round(w / target_ar))
+        y0 = (h - new_h) // 2
+        frame = frame[y0:y0 + new_h, :]
+    return cv2.resize(frame, (640, 480))
+
+
 def capture_camera_point(camera_index):
     """cv2.VideoCapture로 카메라를 직접 열어(ROS2 미경유), 클릭한 지점을
     (forward_m, lateral_m)으로 반환. q를 누르면 None."""
@@ -139,11 +164,13 @@ def capture_camera_point(camera_index):
             if frame.shape[1] != 640 or frame.shape[0] != 480:
                 if not _warned_resize[0]:
                     print(f'  [주의] 카메라가 {frame.shape[1]}x{frame.shape[0]}로 열렸습니다 '
-                          f'(기대값 640x480) — DL_BEV_SRC_PX_RAW 좌표계에 맞추려고 640x480으로 '
-                          f'리사이즈해서 표시합니다. cv2.CAP_PROP 요청을 드라이버가 무시한 것으로 '
-                          f'보입니다.')
+                          f'(기대값 640x480) — cv2.CAP_PROP 요청을 드라이버가 무시한 것으로 '
+                          f'보입니다. 가운데를 4:3으로 crop한 뒤 640x480으로 리사이즈해서 '
+                          f'표시합니다(종횡비 왜곡 방지) — 그래도 실제 usb_cam 640x480 모드와 '
+                          f'완전히 같다는 보장은 없으니, 화면에서 보라색 사다리꼴이 실제 차선폭과')
+                    print('  비슷하게 보이는지 육안으로 한 번 더 확인하세요.')
                     _warned_resize[0] = True
-                frame = cv2.resize(frame, (640, 480))
+                frame = _to_640x480(frame)
             vis = frame.copy()
             cv2.rectangle(vis, (0, DL_ROI_Y0), (vis.shape[1] - 1, DL_ROI_Y1), (0, 255, 255), 1)
             pts = DL_BEV_SRC_PX_RAW.astype(np.int32)
