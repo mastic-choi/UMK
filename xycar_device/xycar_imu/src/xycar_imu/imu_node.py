@@ -105,22 +105,26 @@ class RazorImuDriver(Node):
         imu_yaw_calibration = self.declare_parameter('imu_yaw_calibration', 0.0).value
 
         # Check your COM port and baud rate
+        # IMU는 없어도 나머지 노드(cam/lidar/track_drive)는 정상 동작해야 하므로(imu_yaw는
+        # track_drive.py쪽 IMU_STALE_SEC 가드로 이미 폴백 처리됨), 재시도를 짧게 줄여서
+        # launch 전체가 15초씩 멈춰 보이지 않게 한다.
         self.get_logger().info(f'Razor IMU -> Opening {port}...')
-        connection_attempts = 5
+        connection_attempts = 2
         for connection_tries in range(0, connection_attempts + 1):
             try:
                 ser = serial.Serial(port=port, baudrate=57600, timeout=1)
                 break
             except serial.serialutil.SerialException:
-                self.get_logger().error(
+                self.get_logger().warn(
                     f'Razor IMU not found at port {port}. '
-                    f'Did you specify the correct port in the launch file? '
-                    f'Trying {str(5 - connection_tries)} more times...')
+                    f'Trying {str(connection_attempts - connection_tries)} more times...')
 
             if connection_tries == connection_attempts:
-                # exit
+                self.get_logger().warn(
+                    f'Razor IMU not found at {port} — continuing without IMU '
+                    f'(imu_yaw stays at fallback value).')
                 sys.exit(0)
-            time.sleep(3)
+            time.sleep(0.5)
 
         roll = 0
         pitch = 0

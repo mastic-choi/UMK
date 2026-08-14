@@ -406,7 +406,7 @@ DL_LL_DECAY_MIN_VALUE = 128.0
 #   같이 낮춰뒀다(위 참고). 문제가 생기면 이 값을 'da'로 되돌릴 것.
 # [2026-08-13] 'll_da' → 'da'(요청 반영) — ll_da/ll 둘 다 노란선 인식 불안정으로 계속
 #   막혀서, 일단 da 자체 검출 품질만 따로 보려고 전환. 아래 DL_DA_SKIP_LL_CLIP과 짝.
-DL_CENTER_MODE = 'll_da'  # 'da' | 'll_da' | 'll'
+DL_CENTER_MODE = 'da'  # 'da' | 'll_da' | 'll'
 
 # [2026-08-13] DL_CENTER_MODE='da' 테스트 전용 — "da가 자체적으로 잘 검출된다"는
 #   가정하에 ll(차선) 기반으로 옆 차선을 잘라내는 _clip_da_by_ll() 단계를 통째로
@@ -769,11 +769,11 @@ DEBUG_PERIOD = 0.5     # 위 로그 주기(s)
 # [2026-08-11] 라바콘 실차 테스트 중엔 라이다 창만 보고 싶다는 요청으로, 아래 DEBUG_VIZ_LIDAR만
 #   켜고 나머지는 전부 잠시 끔. 다른 디버그창이 다시 필요하면(예: 차선 인식 디버깅) 개별적으로
 #   다시 True로 되돌릴 것 — 서로 독립적인 스위치라 다른 항목엔 영향 없음.
-DEBUG_VIZ_LIDAR    = False   # 라이다 BEV 장애물 감지 디버그 창 (track_drive.py)
-DEBUG_VIZ_LAVACON  = False  # 라바콘 트리거 좌우 클러스터 BEV 디버그 창 (track_drive.py)
+DEBUG_VIZ_LIDAR    = True   # 라이다 BEV 장애물 감지 디버그 창 (track_drive.py)
+DEBUG_VIZ_LAVACON  = True  # 라바콘 트리거 좌우 클러스터 BEV 디버그 창 (track_drive.py)
 DEBUG_PLANNER      = False  # Hybrid A* OccupancyGrid 디버그 창 (track_drive.py, USE_HYBRID_ASTAR_FOR_B3=True일 때만 의미있음)
-DEBUG_VIZ_STEER    = False  # 조향 컨트롤러(직전값유지/현재값반영) 한글 디버그 창 (track_drive.py)
-DEBUG_VIZ_VESC     = False  # VESC 실측속도(/vesc_speed_erpm) 연동 상태(수신중/끊김/미수신) 디버그 창
+DEBUG_VIZ_STEER    = True  # 조향 컨트롤러(직전값유지/현재값반영) 한글 디버그 창 (track_drive.py)
+DEBUG_VIZ_VESC     = True  # VESC 실측속도(/vesc_speed_erpm) 연동 상태(수신중/끊김/미수신) 디버그 창
                              #   (track_drive.py, 2026-08-06 LQR 브랜치에서 이식)
 
 DEBUG_VIZ_DL_LANE    = True  # 차선 — 기본 백엔드('dl') 디버그 창 (perception/dl_lane.py)
@@ -792,13 +792,13 @@ DEBUG_VIZ_STOPLINE   = False  # 정지선 디버그 창, 백엔드 무관 항상
 #   현재 인식 상태(정지·직진·좌회전·미검출)를 창 하나에 다 보여주도록 확장
 #   (perception/traffic_signal.py detect_s2()). 요청에 따라 기본 True로 켜둠 — 다른 항목과
 #   달리(위 2026-08-11 라바콘 테스트 메모 참고) 이 스위치는 독립적으로 True 유지할 것.
-DEBUG_VIZ_SIGNAL     = True   # 신호등(S0/S2 공용) 디버그 창 (perception/traffic_signal.py)
+DEBUG_VIZ_SIGNAL     = True   # 신호등 ROI/HoughCircles 디버그 창 (perception/traffic_signal.py)
 # DEBUG_LOG_SIGNAL: 신호등 전용 상세 진단 로그. 전역 DEBUG_LOG(0.5초 주기 요약 [SIG] 한 줄)와는
 #   별개로, 이 플래그가 켜지면 S0/S2 상태에서 매 프레임 "왜 못 잡았는지"(원 개수 부족/배치 불량/
 #   밝기 대비 부족 등) 원인을 자세히 찍는다 — DEBUG_LOG를 꺼도 이것만 켜서 신호등만 디버깅 가능.
 #   (track_drive.py perc_signal())
 DEBUG_LOG_SIGNAL     = True
-DEBUG_VIZ_YOLO_CONE  = True   # 라바콘 YOLO 검출 박스 디버그 창 (perception/yolo_cone.py)
+DEBUG_VIZ_YOLO_CONE  = False  # 라바콘 YOLO 검출 박스 디버그 창 (perception/yolo_cone.py)
 #   [2026-08-11] smooth-imu-yaw-rate 브랜치(0c0d88b)에서 수동 포팅 — 라바콘 실차 테스트 중
 #   라이다 창과 함께 켜 두고 나머지는 꺼둔 상태(요청 반영).
 
