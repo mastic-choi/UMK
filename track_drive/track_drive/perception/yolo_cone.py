@@ -104,8 +104,8 @@ class YoloConeEngine:
             # 실패 자체가 아니라 실패를 확인하기까지 약 456초(7~8분)를 태우고서야
             # onnxruntime이 조용히 CUDAExecutionProvider로 자동 폴백한다는 것 — 노드를
             # 켤 때마다(재출발/재테스트 포함) 이 지연이 매번 반복된다. dl_lane.py의
-            # TwinLiteNet은 TensorRT가 정상 동작하므로 그쪽 priority는 그대로 둔다 —
-            # 이건 이 모델(콘 검출) 전용 대응.
+            # TwinLiteNet은 TensorRT가 정상 동작하므로 그쪽 priority는 그대로 두고,
+            # 이 모델(콘 검출)만 TensorRT를 건너뛰고 바로 CUDA로 간다.
             priority = ['CUDAExecutionProvider', 'CPUExecutionProvider']
             providers = [p for p in priority if p in available] or ['CPUExecutionProvider']
 

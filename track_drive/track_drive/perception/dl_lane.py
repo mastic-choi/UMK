@@ -390,6 +390,7 @@ class DLSlideWindow(SlideWindow):
         self.da_mask_roi = None    # 시각화용(가장 큰 덩어리만 남긴 이후의 da 마스크 — 실제 waypoint 추출에 쓰는 것)
         self.da_mask_all_roi = None  # 시각화용(이진화 직후, 덩어리 선택/ll클리핑 전 da 전체 — visualize()가 파란색으로 그림)
         self.ll_mask_roi = None    # 시각화용
+        self.vis = None            # 시각화용 결과 이미지
         self.centerline = []       # 밴드별 중심점(원본 관측점, 길이 self.n_slices) — DL_CENTER_MODE에 따라 da 단독 또는 ll 우선/da 폴백
         self.ll_band_used = []     # 이번 프레임 각 밴드가 ll 기반으로 채택됐는지(길이 self.n_slices bool, 'da' 모드에선 항상 전부 False) — visualize() 색상 구분용
         self.da_fallback_used = False  # 이번 프레임 da가 직전 채택 덩어리와의 근접성이 아니라 면적순위 차선책으로 골라졌는지 — visualize() 색상 구분용
@@ -1746,7 +1747,7 @@ class DLSlideWindow(SlideWindow):
         if self.vis is None:
             return
 
-        if DEBUG_VIZ_DL_LANE and self.da_mask_roi is not None:
+        if DEBUG_VIZ_DL_LANE:
             overlay = self.vis.copy()
             # 모델이 "주행가능하다"고 본 da 전체(덩어리 선택/ll클리핑 전, self.da_mask_all_roi)를
             # 먼저 파란색으로 깔고, 그 위에 실제로 waypoint 추출에 쓰인 부분(self.da_mask_roi,
@@ -1772,7 +1773,8 @@ class DLSlideWindow(SlideWindow):
             # 않으므로 어느 순서로 칠해도 서로를 덮어쓰지 않는다.
             if self.da_fallback_used and self.da_largest_mask_roi is not None:
                 overlay[self.da_largest_mask_roi > 0] = (0, 200, 0)
-            overlay[self.da_mask_roi > 0] = da_color       # 주행가능영역(실제 채택분)
+            if self.da_mask_roi is not None:
+                overlay[self.da_mask_roi > 0] = da_color  # 주행가능영역(실제 채택분)
             # ll을 흰선/노란선 분리 결과(_split_ll_by_yellow())대로 실제 색과 맞춰
             # 칠한다 — "이 라인이 지금 흰선/노란선 중 뭘로 인식되고 있는지"를 색만
             # 보고 바로 알 수 있게.
