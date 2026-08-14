@@ -209,6 +209,7 @@ def capture_lidar_point_auto(scan_topic, front_window_deg, timeout_s):
     try:
         import rclpy
         from rclpy.node import Node
+        from rclpy.qos import qos_profile_sensor_data
         from sensor_msgs.msg import LaserScan
     except ImportError:
         print('  (rclpy 없음 — 수동 입력으로 진행합니다)')
@@ -219,7 +220,13 @@ def capture_lidar_point_auto(scan_topic, front_window_deg, timeout_s):
     class _Probe(Node):
         def __init__(self):
             super().__init__('measure_lidar_camera_offset_probe')
-            self.sub = self.create_subscription(LaserScan, scan_topic, self.cb, 10)
+            # [2026-08-14, 실차 확인 후 수정] xycar_lidar_node가 rclcpp::SensorDataQoS()
+            # (BEST_EFFORT)로 퍼블리시하는데, create_subscription에 정수 depth만 주면
+            # 기본 QoS(RELIABLE)로 구독돼 "New publisher discovered ... incompatible QoS"
+            # 경고와 함께 메시지를 전혀 못 받는다(자동모드가 항상 타임아웃 -> 수동 폴백으로만
+            # 동작하던 원인). 발행 쪽과 동일한 qos_profile_sensor_data로 맞춘다.
+            self.sub = self.create_subscription(
+                LaserScan, scan_topic, self.cb, qos_profile_sensor_data)
 
         def cb(self, msg):
             n = len(msg.ranges)

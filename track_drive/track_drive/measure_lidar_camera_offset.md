@@ -60,7 +60,8 @@
 | 1 | ROI 노란 박스/보라 사다리꼴이 트랙이 아니라 **천장 쪽**을 가리킴 | `cv2.VideoCapture()`를 해상도 지정 없이 열어서 드라이버 기본 해상도(640x480보다 훨씬 큼)로 열렸는데, 오버레이 좌표는 640x480 기준 고정값이었음 | `CAP_PROP_FRAME_WIDTH/HEIGHT`로 640x480 요청 + 실패 시 강제 리사이즈 | `46d44a9` |
 | 2 | 보라색 사다리꼴이 **실제 차선보다 넓어 보임** | 위 수정이 단순 `cv2.resize(640,480)`라 원본이 4:3이 아니면(예: 16:9) 가로/세로가 다른 비율로 눌려서(왜곡) 실제 트랙 폭이 좁아 보임 | 리사이즈 전에 **가운데를 4:3으로 crop**해서 종횡비 왜곡 방지(`_to_640x480()`) | `f14efc3` |
 | 3 | 바닥점을 클릭해도 **다음 단계로 안 넘어감** | 클릭=미리보기, Enter/Space=확정인 2단계 UX였는데 안내가 터미널에만 짧게 있고 화면엔 없었음 | 화면 상단/클릭 후 하단에 확정 안내 오버레이 추가 + Enter 키코드(13/10) 폭넓게 인식 | `f2fad52` |
-| 4 | 수동 라이다 입력에서 `range (m):` 프롬프트가 뜨자마자 **타이핑할 새도 없이 바로 "입력 취소"** | 카메라 창 Enter 확정 직후~라이다 자동탐지 3초 대기 사이 터미널에 포커스가 있는 동안 무심코 누른 키(특히 Enter)가 stdin 버퍼에 남아있다가, 다음 `input()`이 그 빈 줄을 즉시 삼켜 `float('')`→`ValueError` | `capture_lidar_point_manual()` 진입 시 `termios.tcflush()`로 stdin 버퍼를 비우는 `_flush_stdin()` 추가 | (미커밋) |
+| 4 | 수동 라이다 입력에서 `range (m):` 프롬프트가 뜨자마자 **타이핑할 새도 없이 바로 "입력 취소"** | 카메라 창 Enter 확정 직후~라이다 자동탐지 3초 대기 사이 터미널에 포커스가 있는 동안 무심코 누른 키(특히 Enter)가 stdin 버퍼에 남아있다가, 다음 `input()`이 그 빈 줄을 즉시 삼켜 `float('')`→`ValueError` | `capture_lidar_point_manual()` 진입 시 `termios.tcflush()`로 stdin 버퍼를 비우는 `_flush_stdin()` 추가 | `46db0b9` |
+| 5 | 라이다 드라이버가 살아서 `/scan`을 정상 발행 중인데도 **자동모드가 항상 3초 타임아웃 → 수동 입력으로만 폴백**, `[WARN]: New publisher discovered on topic '/scan', offering incompatible QoS` | `xycar_lidar_node`(C++)가 `rclcpp::SensorDataQoS()`(BEST_EFFORT)로 퍼블리시하는데, `capture_lidar_point_auto()`의 `create_subscription(..., 10)`은 정수 depth만 줘서 기본 QoS(RELIABLE)로 구독됨 — reliability 불일치로 메시지를 아예 못 받음 | 구독 QoS를 `rclpy.qos.qos_profile_sensor_data`로 맞춤(발행측과 동일 프로파일) | (미커밋) |
 
 ## 알려진 한계 / 다음 단계
 
