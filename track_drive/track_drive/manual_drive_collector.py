@@ -27,6 +27,8 @@
 # 조작:
 #   w/s : 속도 +/- (SPEED_STEP)      a/d : 조향 좌/우(ANGLE_STEP)
 #   x   : 조향 0으로 리셋(속도 유지)   space : 완전 정지(속도 0, 조향 0)
+#   r   : 녹화 시작/정지 토글(기본값: 정지 상태로 시작) — 세션 폴더/영상 파일은 세션당
+#         하나만 열고, r로 끈 구간은 그냥 저장을 건너뛴다(파일을 새로 만들지 않음).
 #   q   : 종료
 #
 # 저장 구조 (실행할 때마다 새 세션 폴더 생성):
@@ -91,6 +93,7 @@ class ManualDriveCollector(Node):
         self.angle = 0.0
         self.speed = float(init_speed)
         self.imu_yaw = None
+        self.recording = False   # r로 토글 — 기본값은 정지 상태(원치 않는 구간이 섞여 들어가는 것 방지)
         self._frame_idx = 0
         self.save_hz = save_hz
         self._save_interval = (1.0 / save_hz) if save_hz > 0 else 0.0
@@ -127,12 +130,17 @@ class ManualDriveCollector(Node):
         # 라이브 미리보기: 운전 중 지금 차선이 어떻게 보이는지 확인용(디스크 저장 안 함)
         bev, _white, _yellow = self.camera_processor.processor(frame)
         vis = frame.copy()
-        cv2.putText(vis, f'angle={self.angle:+.1f} speed={self.speed:+.1f} saved={self._frame_idx}',
-                    (4, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
+        rec_color = (0, 0, 255) if self.recording else (150, 150, 150)
+        rec_label = 'REC' if self.recording else 'PAUSED'
+        cv2.putText(vis, f'angle={self.angle:+.1f} speed={self.speed:+.1f} saved={self._frame_idx} [{rec_label}]',
+                    (4, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, rec_color, 2, cv2.LINE_AA)
         cv2.imshow(WINDOW_NAME, vis)
         if bev is not None:
             cv2.imshow('manual_drive_bev', bev)
         cv2.waitKey(1)
+
+        if not self.recording:
+            return
 
         now = time.time()
         if now - self._last_save_t < self._save_interval:
@@ -172,6 +180,9 @@ class ManualDriveCollector(Node):
                 self.angle = 0.0
             elif key == ' ':
                 self.angle, self.speed = 0.0, 0.0
+            elif key == 'r':
+                self.recording = not self.recording
+                self.get_logger().info('녹화 시작' if self.recording else '녹화 정지')
             elif key == 'q' or key == '\x03':   # q 또는 Ctrl+C
                 self.get_logger().info(f'종료. 총 {self._frame_idx}프레임 저장: {self.session_dir}')
                 self._close_outputs()
