@@ -287,8 +287,28 @@ class TwinLiteNetEngine:
 
         available = set(ort.get_available_providers())
         if providers is None:
-            # 요구사항: TensorRT EP > CUDA EP > CPU EP 순, 실제 존재하는 provider와 교집합만.
-            priority = ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
+            # [2026-08-14 실차 확인] 원래는 TensorRT EP > CUDA EP > CPU EP 순이었다 —
+            # 그 순서 자체는 이전 모델(twinlitenetplus_medium_v2.onnx)에서 TensorRT가
+            # 정상 동작해서 붙인 우선순위였다(아래 model_path FileNotFoundError 메시지가
+            # 안내하는 v1.2.0 모델로 교체되기 전 기준). 그런데 오늘 새로 교체된
+            # twinlitenetplus_kmu_v1.2.0.onnx는 trt_cache가 전혀 없는 상태에서(교체 직후라
+            # 당연함) TensorRT 엔진을 처음부터 빌드하는데, 실측(standalone 스크립트로 직접
+            # infer_raw() 호출) 결과 4분 넘게도 첫 추론 한 번이 안 끝났다 — yolo_cone.py의
+            # cone_best_n.onnx가 겪은 것과 같은 부류의 문제다(그쪽은 TRT가 그 모델 자체를
+            # 아예 못 빌드해서 ~456초 뒤에야 조용히 CUDA로 자동 폴백, yolo_cone.py
+            # YoloConeEngine.__init__ 주석 참고). xydrive는 재출발/재테스트마다 프로세스를
+            # 새로 띄우므로(xydrive 함수가 매번 kill -9 후 재실행), 이 지연이 매번
+            # 반복되면 사실상 추론이 한 번도 안 끝난 채로 계속 재시작만 되는 상태가 된다
+            # (실측 재현됨 — DA/LL 디버그 창이 안 뜨고 lane_valid가 계속 False였던 원인).
+            # CUDAExecutionProvider로 강제해보니 로드 0.3초, 첫 추론 0.9초, 이후 ~5.7fps로
+            # da_prob이 정상 범위(최대 0.99, DL_FG_THRESHOLD=0.5 초과 비율 27%)로 나와
+            # 모델 자체는 문제 없음을 확인했다 — 그래서 이 모델도 cone과 동일하게 CUDA를
+            # 우선한다. TensorRT는 교집합에서 아예 제외한다(교집합에 넣어두면 provider
+            # 리스트에 남아 다음 로드 때 다시 그 긴 빌드를 시도할 여지가 있음 — 완전히
+            # 배제하는 게 cone과 같은 방식). 이 모델용 trt_cache가 나중에 실제로 완성되고
+            # (수 분 이상 켜둔 채 기다려서) TensorRT가 더 빠르다는 게 실측되면 그때
+            # 되돌릴 것 — 지금은 "매번 멈춰있는 것보다 확실히 도는 것"을 우선한다.
+            priority = ['CUDAExecutionProvider', 'CPUExecutionProvider']
             providers = [p for p in priority if p in available] or ['CPUExecutionProvider']
 
         provider_options = []

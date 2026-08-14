@@ -1899,6 +1899,71 @@ BEV 좌표계에 투영해서 그 자리만 da에서 깎아내면(차폭 침식�
 - 라이다 결합안(더 정확할 걸로 예상되는 대안)은 여전히 미착수 상태로 남아있다 — 이번
   카메라+da 안이 실차에서 잘 안 되면 그쪽으로 넘어갈 것.
 
+### 2.31 DL 차선인식(TwinLiteNet)이 TensorRT 최초 엔진 빌드에 멈춰 DA/LL 디버그 창이
+전혀 안 뜨고 인식도 안 되던 문제 → `CUDAExecutionProvider` 우선으로 전환 (2026-08-14)
+
+**증상:** §2.29에서 모델을 `twinlitenetplus_kmu_v1.2.0.onnx`로 교체한 뒤 `xydrive`로
+실행하면 `DEBUG_VIZ_DL_LANE`(기본 `True`)가 켜져 있는데도 `dl_lane` 디버그 창이 한 번도
+뜨지 않고, `[LANE]` 로그도 `lane=+0.0(0)`(즉 `lane_valid=False`)가 계속 이어짐 — 그런데도
+onnxruntime 세션 로드/카메라 프레임 수신 로그는 정상이고 예외 로그도 안 보여 원인이
+겉으로 드러나지 않았다.
+
+**원인:** `TwinLiteNetEngine.__init__()`의 provider 우선순위가 여전히 `TensorRT EP > CUDA
+EP > CPU EP`였는데(§2.29 이전 모델 `twinlitenetplus_medium_v2.onnx`에서는 TensorRT가
+정상 동작해서 붙여둔 순서), 모델 파일을 교체하면 그 모델 전용 TensorRT 엔진
+캐시(`models/trt_cache/`)가 없는 상태에서 시작하게 된다 — 실제로 이 디렉터리 자체가
+없었다. TensorRT는 캐시가 없으면 **최초 1회 엔진을 처음부터 빌드**하는데, 이 빌드가
+끝나야 `session.run()`(=`infer_raw()`)이 리턴한다. 개발 PC에서 `track_drive` 패키지를
+설치해 `TwinLiteNetEngine(providers=None)`으로 직접 `infer_raw()` 한 번을 호출해
+실측해보니 **4분 넘게도 첫 추론이 안 끝났다**(그 이상은 대기하지 않고 강제 종료).
+`xydrive` 함수(`~/.bashrc`)는 실행할 때마다 `colcon build` → 기존 프로세스 `kill -9` →
+재실행을 반복하므로, 재출발/재테스트 사이 간격이 이 빌드 시간보다 짧으면 **엔진 빌드가
+완료되는 순간 자체가 한 번도 오지 않는다** — 그래서 `dl_lane.py`의 워커 스레드가
+첫 추론 결과를 `_latest_debug`/`_latest_result`에 채운 적이 없어(`_worker()` 참고)
+디버그 창이 안 뜨고 `lane_valid`도 초깃값(`False`)에서 못 벗어난 것이었다.
+
+이건 `yolo_cone.py`의 `YoloConeEngine.__init__()`이 2026-08-13에 이미 겪었던 것과 같은
+부류의 문제다 — 그쪽은 `cone_best_n.onnx`(NMS 포함 export)가 TensorRT로 아예 빌드
+불가능해서(`TRT-16198: Layers missing empty tensor support`) ~456초 뒤에야 조용히
+CUDA로 자동 폴백했고, 그 지연이 노드를 켤 때마다 반복되는 게 문제였다. 이번 건
+"영원히 실패"가 아니라 "이 모델은 처음 한 번만 오래 걸리고 그 다음부턴 캐시로 빠를
+가능성"이라는 점은 다르지만(끝까지 기다려 성공 여부를 확인하지는 않음 — 아래 알려진
+한계 참고), 실차 테스트 워크플로 자체가 짧은 주기로 재시작되는 한 결과는 똑같이
+"디버그 창도 안 뜨고 인식도 안 되는 것처럼 보임"이었다.
+
+**검증:** `providers=['CUDAExecutionProvider','CPUExecutionProvider']`로 강제해서 같은
+스크립트로 재측정 — 세션 로드 0.3초, 첫 추론 0.9초, 이후 프레임당 ~0.09초(≈5.7fps)로
+즉시 안정적으로 동작했다. `da_prob`도 정상 범위(최댓값 0.99, 평균 0.27,
+`DL_FG_THRESHOLD=0.5` 초과 비율 27%)로 나와 모델 자체의 문제가 아님을 확인. 실제
+`DLLaneDetector`(워커 스레드 포함) 경로로도 재확인 — CUDA 적용 후 `dl_lane` 합성
+디버그 이미지(result/da/ll/yellow)가 매 프레임 정상 저장/갱신되고, `da_chosen`이
+30,000px 안팎으로 안정적으로 잡히며 중심선도 매끄럽게 이어지는 것을 확인했다(단, 이
+검증은 트랙이 아니라 실내 사무실에서 촬영한 프레임이라 `ll_coverage`가
+`DL_LL_SANITY_MIN_RATIO` 미만이라 `lane_valid`는 계속 `False`였다 — 이건 화면에 차선
+자체가 없어서 생기는 정상적인 결과이지 버그가 아니다. 실제 트랙 위에서의 최종 검증은
+아직 안 됨).
+
+**수정:** `perception/dl_lane.py`의 `TwinLiteNetEngine.__init__()` provider 우선순위를
+`['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']` →
+`['CUDAExecutionProvider', 'CPUExecutionProvider']`로 변경 — `yolo_cone.py`와 동일하게
+TensorRT를 교집합에서 아예 제외했다(교집합에 남겨두면 다음 로드 때 다시 그 긴 빌드를
+시도할 여지가 있어, 완전히 배제하는 쪽을 택함 — `yolo_cone.py`의 기존 방식과 통일).
+
+**알려진 한계 / 다음 단계:**
+- 이 모델(`twinlitenetplus_kmu_v1.2.0.onnx`)의 TensorRT 엔진 빌드가 **결국 성공하는지
+  자체를 끝까지 확인하지 않았다**(4분 넘게 대기 후 중단) — `yolo_cone.py`의 콘 모델처럼
+  영구히 실패하는 것인지, 단순히 더 오래(예: 콘 모델과 비슷하게 7~8분) 걸리다 완료되는
+  것인지 아직 모른다. 언젠가 시간 여유를 두고 한 번 끝까지 켜둬서 `models/trt_cache/`가
+  생성/완성되는지 확인해볼 가치는 있다 — 만약 성공한다면 그 뒤로는 TensorRT가 CUDA보다
+  빠를 수 있어 되돌리는 걸 고려할 만하다(지금은 "매번 멈춰있는 것보다 확실히 도는 것"을
+  우선한 잠정 조치).
+- CUDA 경로 fps(~5.7fps, 개발 PC 실측)가 실제 Jetson 실차 보드에서도 20Hz 제어 루프
+  대비 충분한지는 실차에서 별도 확인 필요 — §2.29의 "실차 배포 PC" 성능 표와는 다른
+  머신/provider 조합이라 그대로 대입할 수 없다.
+- 카메라가 실제 트랙(차선이 보이는 장면)을 비추는 상태에서의 `lane_valid`/DA·LL 검출
+  품질 자체는 이번 수정 범위 밖이다 — 이번 조치는 "추론 파이프라인이 아예 안 도는"
+  문제만 해결한 것이고, 실제 트랙 위 인식 정확도는 실차 재검증이 필요하다.
+
 ---
 
 ## 3. 라바콘 (B1_LAVACON)
