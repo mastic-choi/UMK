@@ -257,7 +257,22 @@ def capture_lidar_point_auto(scan_topic, front_window_deg, timeout_s):
     return (x, y)
 
 
+def _flush_stdin():
+    """[2026-08-14, 실차 확인 후 수정] 터미널에 포커스가 있는 동안(카메라 창 Enter 확정
+    직후 ~ 라이다 자동탐지 3초 대기 사이) 무심코 누른 키(특히 Enter)가 stdin 버퍼에 그대로
+    쌓여 있으면, 바로 다음에 뜨는 input() 프롬프트가 타이핑할 틈도 없이 그 버퍼링된 빈
+    줄을 즉시 삼켜버려 `float('')` -> ValueError -> '입력 취소'로 이어지는 문제가 있었다
+    (증상: range 프롬프트가 뜨자마자 바로 취소됨). 수동 입력 시작 직전에 항상 버퍼를 비운다
+    — stdin이 tty가 아니면(리다이렉션 등) 조용히 무시."""
+    try:
+        import termios
+        termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+    except Exception:
+        pass
+
+
 def capture_lidar_point_manual():
+    _flush_stdin()
     print('  수동 입력 모드 — 다른 터미널에서 `ros2 topic echo /scan --once` 로 확인하세요.')
     print('  (물체 방향의 range값과 그 인덱스를 찾으면 됩니다 — 대략 정면이면 인덱스가')
     print(f'   {LIDAR_ANGLE_OFFSET_DEG:.0f} 근처, ranges 배열 길이가 보통 360입니다)')
