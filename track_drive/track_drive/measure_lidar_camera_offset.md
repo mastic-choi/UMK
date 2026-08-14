@@ -61,10 +61,18 @@
 | 2 | 보라색 사다리꼴이 **실제 차선보다 넓어 보임** | 위 수정이 단순 `cv2.resize(640,480)`라 원본이 4:3이 아니면(예: 16:9) 가로/세로가 다른 비율로 눌려서(왜곡) 실제 트랙 폭이 좁아 보임 | 리사이즈 전에 **가운데를 4:3으로 crop**해서 종횡비 왜곡 방지(`_to_640x480()`) | `f14efc3` |
 | 3 | 바닥점을 클릭해도 **다음 단계로 안 넘어감** | 클릭=미리보기, Enter/Space=확정인 2단계 UX였는데 안내가 터미널에만 짧게 있고 화면엔 없었음 | 화면 상단/클릭 후 하단에 확정 안내 오버레이 추가 + Enter 키코드(13/10) 폭넓게 인식 | `f2fad52` |
 | 4 | 수동 라이다 입력에서 `range (m):` 프롬프트가 뜨자마자 **타이핑할 새도 없이 바로 "입력 취소"** | 카메라 창 Enter 확정 직후~라이다 자동탐지 3초 대기 사이 터미널에 포커스가 있는 동안 무심코 누른 키(특히 Enter)가 stdin 버퍼에 남아있다가, 다음 `input()`이 그 빈 줄을 즉시 삼켜 `float('')`→`ValueError` | `capture_lidar_point_manual()` 진입 시 `termios.tcflush()`로 stdin 버퍼를 비우는 `_flush_stdin()` 추가 | `46db0b9` |
-| 5 | 라이다 드라이버가 살아서 `/scan`을 정상 발행 중인데도 **자동모드가 항상 3초 타임아웃 → 수동 입력으로만 폴백**, `[WARN]: New publisher discovered on topic '/scan', offering incompatible QoS` | `xycar_lidar_node`(C++)가 `rclcpp::SensorDataQoS()`(BEST_EFFORT)로 퍼블리시하는데, `capture_lidar_point_auto()`의 `create_subscription(..., 10)`은 정수 depth만 줘서 기본 QoS(RELIABLE)로 구독됨 — reliability 불일치로 메시지를 아예 못 받음 | 구독 QoS를 `rclpy.qos.qos_profile_sensor_data`로 맞춤(발행측과 동일 프로파일) | (미커밋) |
+| 5 | 라이다 드라이버가 살아서 `/scan`을 정상 발행 중인데도 **자동모드가 항상 3초 타임아웃 → 수동 입력으로만 폴백**, `[WARN]: New publisher discovered on topic '/scan', offering incompatible QoS` | `xycar_lidar_node`(C++)가 `rclcpp::SensorDataQoS()`(BEST_EFFORT)로 퍼블리시하는데, `capture_lidar_point_auto()`의 `create_subscription(..., 10)`은 정수 depth만 줘서 기본 QoS(RELIABLE)로 구독됨 — reliability 불일치로 메시지를 아예 못 받음 | 구독 QoS를 `rclpy.qos.qos_profile_sensor_data`로 맞춤(발행측과 동일 프로파일) | `7377f53` |
+| 6 | 위 5개 다 고친 뒤 실제로 3샘플 측정해보니 **`LIDAR_TO_CAM_DX_M` 표준편차가 0.7m**로 비정상적으로 큼 | 캡처 로그에 `index=122/500` — 이 라이다는 한 바퀴에 **500포인트**를 찍는데, `LIDAR_ANGLE_OFFSET_DEG=80.0`을 써온 기존 공식(`deg=index*(360/n)-80`)은 "인덱스 한 칸=1도"(n=360) 가정이라 정면(index≈80)에서 멀어질수록 각도가 점점 틀어짐(index=122 기준 옛 공식 42° vs 실제 30.24°, 12도 오차) — 샘플마다 물체 위치(인덱스)가 달라 오차 크기도 제각각이라 표준편차가 커진 것으로 추정 | `80`을 "각도"가 아니라 "정면 인덱스"로 다뤄 `(index-80)*(360/n)`으로 계산하도록 `_index_to_deg()` 추가(이 도구만 수정 — **`track_drive.py`의 `perc_obstacle()`/`perc_lavacon_trigger()`는 같은 문제가 있을 수 있으나 아직 미수정**, README §2.30 참고) | (미커밋) |
 
 ## 알려진 한계 / 다음 단계
 
+- **[중요, 미착수] `track_drive.py`도 같은 라이다 인덱스↔각도 버그가 있을 수 있다.**
+  버그#6에서 확인된 "n=500인데 360으로 가정"이 이 도구뿐 아니라 `perc_obstacle()`/
+  `perc_lavacon_trigger()`(`m = min(n, 360)` + 옛 공식)에도 그대로 있다 — 요청에 따라
+  **이번엔 이 도구만 고치고 프로덕션 코드는 건드리지 않았다.** 실차 n이 항상 500으로
+  고정인지 먼저 확인한 뒤, 같은 방식(`(i - 정면인덱스) * (360/n)`)으로 두 곳 다 고쳐야
+  한다 — 정면이 아닌 각도를 보는 모든 라이다 판정(장애물 좌우, 라바콘 클러스터 등)에
+  영향을 줬을 수 있다.
 - 이 도구는 **오프셋 실측까지만** 한다 — 실측한 `LIDAR_TO_CAM_DX_M`/`DY_M`을 실제로
   `dl_lane.py`에서 라이다 장애물 상자를 da 마스크에 투영해 깎는 로직은 아직 없다.
   → **다음 단계**: 실차에서 이 도구로 오프셋 실측 → `config.py`에 반영 → da 클리핑

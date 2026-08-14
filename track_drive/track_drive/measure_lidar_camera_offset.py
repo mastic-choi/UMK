@@ -86,10 +86,33 @@ def raw_px_to_cam_xy(px, py, M, block_w, block_h):
     return float(forward_m), float(lateral_m)
 
 
+def _index_to_deg(index, n):
+    """라이다 인덱스 -> 정면(0°) 기준 각도(도).
+
+    [2026-08-14, 실차 확인 후 수정] `LIDAR_ANGLE_OFFSET_DEG`는 이름과 달리 실제로는
+    "도(degree)"가 아니라 **정면일 때의 라이다 인덱스**로 실측된 값이다(README §6.2 —
+    사람을 정면에 세우고 인덱스 컴퍼스로 확인했더니 인덱스 80에서 찍혔다는 절차 그대로).
+    이 도구가 처음 썼던 `index*(360/n) - LIDAR_ANGLE_OFFSET_DEG` 공식은 "인덱스 한 칸 =
+    1도"라는 가정이 깔려 있는데, 실차 캡처(`index=122/500`, 2026-08-14)로 이 라이다가
+    한 바퀴에 **n=500** 포인트를 찍는다는 게 확인됐다 — 인덱스 한 칸은 실제로 360/500=0.72도.
+    옛 공식은 정면(index=80) 근처에서는 우연히 거의 맞지만, 정면에서 멀어질수록(index가
+    80에서 멀어질수록) 오차가 커진다 — 오프셋 측정 3샘플의 표준편차가 비정상적으로 컸던
+    (dx 표준편차 0.7m) 원인으로 추정된다.
+
+    수정한 공식: `80`을 각도가 아니라 "정면 인덱스"로 다뤄서
+    `deg = (index - 정면인덱스) * (360/n)`으로 계산한다 — index=80일 때만 옛 공식과 결과가
+    같고(정확히 그 지점에서 캘리브레이션됐으므로), 그 외에는 달라진다.
+
+    ★주의★ `track_drive.py`의 `perc_obstacle()`/`perc_lavacon_trigger()`는 아직
+    `m=min(n,360)` + 옛 공식을 그대로 쓰고 있다 — 이 도구만 먼저 고쳤고, 프로덕션 코드
+    쪽 수정은 아직 안 함(README §2.30에 메모, 다음 단계로 남겨둠)."""
+    return (index - LIDAR_ANGLE_OFFSET_DEG) * (360.0 / n)
+
+
 def lidar_index_to_xy(range_m, index, n):
-    """perc_obstacle()/perc_lavacon_trigger()(track_drive.py)와 동일한 변환식.
-    n = 그 스캔의 len(ranges)(보통 360, LaserScan 실측값 그대로 쓸 것)."""
-    deg = (index * 360.0 / n) - LIDAR_ANGLE_OFFSET_DEG
+    """라이다 (range, index) -> (x_m, y_m). n = 그 스캔의 실제 len(ranges) — 절대
+    360으로 가정하지 말 것(_index_to_deg() 주석 참고, 이 차량은 500으로 확인됨)."""
+    deg = _index_to_deg(index, n)
     rad = math.radians(deg)
     x = range_m * math.cos(rad)   # 전방(+)
     y = range_m * math.sin(rad)   # 좌측(+) — perc_obstacle()과 동일 부호 관례
@@ -236,7 +259,7 @@ def capture_lidar_point_auto(scan_topic, front_window_deg, timeout_s):
             for i, r in enumerate(msg.ranges):
                 if not math.isfinite(r) or r <= 0.0:
                     continue
-                deg = (i * 360.0 / n) - LIDAR_ANGLE_OFFSET_DEG
+                deg = _index_to_deg(i, n)
                 deg = (deg + 180.0) % 360.0 - 180.0  # -180~180으로 정규화
                 if abs(deg) <= front_window_deg:
                     if best is None or r < best[0]:
@@ -282,12 +305,15 @@ def capture_lidar_point_manual():
     _flush_stdin()
     print('  수동 입력 모드 — 다른 터미널에서 `ros2 topic echo /scan --once` 로 확인하세요.')
     print('  (물체 방향의 range값과 그 인덱스를 찾으면 됩니다 — 대략 정면이면 인덱스가')
-    print(f'   {LIDAR_ANGLE_OFFSET_DEG:.0f} 근처, ranges 배열 길이가 보통 360입니다)')
+    print(f'   {LIDAR_ANGLE_OFFSET_DEG:.0f} 근처)')
+    print('  ★주의★ ranges 배열 길이(n)를 360이라고 가정하지 마세요 — 이 라이다는 실측')
+    print('  결과 n=500으로 확인됐습니다(2026-08-14). echo 출력에서 ranges 배열 길이를')
+    print('  직접 세어 입력하세요(예: 500).')
     try:
         r = float(input('  range (m): ').strip())
         idx = int(input('  index: ').strip())
-        n = input('  ranges 배열 길이 (엔터=360): ').strip()
-        n = int(n) if n else 360
+        n = input('  ranges 배열 길이 (엔터=이전 실측값 500 사용): ').strip()
+        n = int(n) if n else 500
     except (ValueError, EOFError):
         print('  입력 취소')
         return None
