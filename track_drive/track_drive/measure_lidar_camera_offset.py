@@ -106,6 +106,18 @@ def capture_camera_point(camera_index):
                             f'점유 중이거나(usb_cam_node_exe가 떠 있으면 먼저 끌 것) 인덱스가 '
                             f'다를 수 있습니다(--camera-index로 다른 값 시도).')
 
+    # [버그 수정] DL_BEV_SRC_PX_RAW/DL_ROI_Y0/Y1은 전부 "640x480 프레임" 기준 절대 픽셀
+    # 좌표다(usb_cam_node_exe가 그 해상도로 발행하도록 맞춰져 있어서 track_drive.py가 받는
+    # /usb_cam/image_raw/front는 항상 640x480). 근데 cv2.VideoCapture()는 해상도를 지정 안
+    # 하면 드라이버 기본값(웹캠마다 다름, 보통 640x480보다 훨씬 큼 — 1280x720 등)으로 열려서,
+    # 그 상태로 250~390행에 ROI 박스를 그리면 "화면 상단 근처"만 가리키게 된다 — 카메라가
+    # 도로를 보도록 아래로 기울어 장착돼 있으면 화면 상단은 천장/벽 쪽이라, 딱 이 증상(ROI가
+    # 천장을 가리킴)으로 나타난다. CAP_PROP으로 요청은 해보되(드라이버가 안 들어줄 수 있음),
+    # 실제 읽힌 프레임을 강제로 640x480 리사이즈해서 좌표계를 항상 맞춘다.
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    _warned_resize = [False]
+
     clicked = {}
 
     def on_click(event, x, y, flags, userdata):
@@ -124,6 +136,14 @@ def capture_camera_point(camera_index):
             if not ok:
                 time.sleep(0.03)
                 continue
+            if frame.shape[1] != 640 or frame.shape[0] != 480:
+                if not _warned_resize[0]:
+                    print(f'  [주의] 카메라가 {frame.shape[1]}x{frame.shape[0]}로 열렸습니다 '
+                          f'(기대값 640x480) — DL_BEV_SRC_PX_RAW 좌표계에 맞추려고 640x480으로 '
+                          f'리사이즈해서 표시합니다. cv2.CAP_PROP 요청을 드라이버가 무시한 것으로 '
+                          f'보입니다.')
+                    _warned_resize[0] = True
+                frame = cv2.resize(frame, (640, 480))
             vis = frame.copy()
             cv2.rectangle(vis, (0, DL_ROI_Y0), (vis.shape[1] - 1, DL_ROI_Y1), (0, 255, 255), 1)
             pts = DL_BEV_SRC_PX_RAW.astype(np.int32)
