@@ -435,6 +435,28 @@ DL_DA_SKIP_LL_CLIP = True
 DL_DA_APPLY_VEHICLE_MARGIN = True
 DL_DA_VEHICLE_MARGIN_M = 0.05   # ASTAR_VEHICLE_MARGIN_M(라이다/Hybrid A* 쪽)과 동일 관례
 
+# ── [2026-08-14] 회피 "복귀 유예"(avoid-hold) — DL_CENTER_MODE='da' 전용 (README §2.32) ──
+#   위 안전마진 침식은 da에 뚫린 장애물 구멍 주변을 자연스럽게 우회하게 만들 뿐, "언제
+#   원래 차선 중앙으로 돌아가도 되는지"는 전혀 모른다. 카메라가 차량 앞코에 달려있어서
+#   장애물을 실제로 지나치는 순간 그 장애물이 화면(및 da 구멍)에서 사라지고, da가 그
+#   프레임에 바로 원래 폭으로 돌아와 중심선도 즉시 원래 차선 중앙으로 복귀한다. 장애물이
+#   정지해 있으면 문제없지만(지금 실차에서 관찰되는 회피는 전부 정지 장애물 기준 —
+#   TEST_DISABLE_B2_B3=True라 README §2.30 배경 참고), 장애물이 방해차량처럼 계속
+#   주행 중이면 "지나친 그 순간"엔 아직 옆이나 뒤에 바짝 붙어있을 수 있어 너무 이른
+#   복귀가 그 차와의 충돌(추월 후 방해차량이 우리 뒤를 들이받는 상황)로 이어질 수
+#   있다는 우려가 나왔다(요청 반영, 실차 미검증).
+#   대응: perc_obstacle()의 obstacle_front/obstacle_dist(라이다, B2/B3 미션 자체와 무관하게
+#   TEST_DISABLE_B2_B3와 상관없이 매 틱 갱신됨)를 근거로, 장애물이 AVOID_HOLD_TRIGGER_DIST_M
+#   안으로 마지막으로 들어왔던 시점부터 AVOID_HOLD_SEC초 동안은 da를 raw centroid 그대로
+#   쓰지 않고 ll(차선)로 "지금 차선 하나"만 남기도록 강제로 자른다 — 예전부터 있던
+#   _clip_da_by_ll() 클리핑(DL_DA_SKIP_LL_CLIP=True로 평소엔 꺼둔 것)을 이 창에서만
+#   되살리는 방식(track_drive.py _update_avoid_hold()/perception/dl_lane.py detect() 참고).
+#   장애물이 시야에서 사라진 직후에도 몇 초간은 옆 차선으로 안 새고 지금 차선 폭 안에서만
+#   주행해, 급하게 원래 차선 중앙으로 꺾여 들어가는 걸 늦추는 목적.
+#   ★주의★ 둘 다 실차 미검증 초기값이다.
+AVOID_HOLD_TRIGGER_DIST_M = 1.5   # 이 거리(m) 안으로 장애물이 들어오면 "회피 중"으로 본다
+AVOID_HOLD_SEC = 2.0              # 마지막으로 가까이 있었던 시점부터 이만큼(초)은 ll 클리핑 유지
+
 # [2026-08-10] DL_CENTER_MODE='ll' 내부에서 실제 밴드 중심 계산 알고리즘을 고르는
 #   2차 스위치 — 같은 날 두 사람이 독립적으로 서로 다른 재설계를 했다(origin/main
 #   병합 시 두 구현이 정면으로 겹쳐 병합 커밋에서 "둘 다 남기고 전환 가능하게" 하기로

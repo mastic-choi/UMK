@@ -152,6 +152,11 @@ class TrackDriverNode(Node):
         self.obstacle_rate  = 0.0     # 접근율(m/s, 음수=접근). 추돌 방지·교차확인용
         self._obstacle_prev_dist = None
         self._obstacle_prev_t    = 0.0
+        # [2026-08-14] 회피 "복귀 유예"(avoid-hold) — _update_avoid_hold()가 perc_obstacle()
+        # 직후 갱신하고, perc_lane()이 DL 차선인식 백엔드로 그대로 넘긴다(config.py
+        # AVOID_HOLD_TRIGGER_DIST_M/AVOID_HOLD_SEC 주석, README §2.32 참고).
+        self._avoid_hold_until_t = 0.0  # 이 시각까지는 avoid_hold_active=True
+        self.avoid_hold_active   = False
         # [2-4 라바콘]
         self.lavacon_offset = 0.0    # 디버그/로깅용(중심선 y평균) — 조향엔 더 이상 안 씀
         self.lavacon_done   = False
@@ -423,6 +428,7 @@ class TrackDriverNode(Node):
         self.perc_lane()        # 비전
         self.perc_signal()      # 비전
         self.perc_obstacle()    # 라이다
+        self._update_avoid_hold()  # 라이다(위 obstacle_front/dist 기반) — perc_obstacle() 직후여야 함
         self.perc_lavacon()     # 라이다
         self.perc_yolo_cone()   # 비전 (YOLO, perc_lavacon_trigger()가 라이다와 AND 결합해서 씀)
         self.perc_lavacon_trigger()  # 라이다+비전 (YOLO 콘 검출 AND 좌우 클러스터 동시검출 → B1_LAVACON 진입 트리거)
@@ -451,6 +457,15 @@ class TrackDriverNode(Node):
             self.lane_valid = False
             self.lane_stale = True   # 카메라 프레임 자체가 아직/더 이상 없음 — 당연히 신선하지 않음
             return
+
+        # [2026-08-14] avoid-hold(§2.32) 상태를 이번 detect() 호출 전에 DL 백엔드로 넘긴다 —
+        # hough/classic_cv처럼 이 메서드가 없는 백엔드는 getattr가 조용히 no-op을 반환해
+        # 건너뛴다(show_debug_windows()와 동일 관례). perceive_all()에서 perc_lane()이
+        # perc_obstacle()/_update_avoid_hold()보다 먼저 도는 순서라 여기 값은 엄밀히는
+        # 직전 틱 기준(0.05s 이내 오차)이다 — DL 추론 자체도 이미 논블로킹 백그라운드
+        # 워커라 결과가 한두 프레임 지연되는 걸 감안하고 설계됐으므로(모듈 상단 주석)
+        # 무시 가능한 오차로 판단.
+        getattr(self.lane_detector, 'set_avoid_hold', lambda *_: None)(self.avoid_hold_active)
 
         # hough_lane.py의 HoughLaneDetector를 사용하여 차선 인식 수행
         valid, offset, lookahead, lane_center, path, debug_img = self.lane_detector.detect(self.img_front)
@@ -783,6 +798,23 @@ class TrackDriverNode(Node):
                         1, cv2.LINE_AA)
             cv2.imshow('lidar_bev', bev)
             cv2.waitKey(1)
+
+    # [2-3b] 회피 "복귀 유예"(avoid-hold) — perc_obstacle() 직후에만 호출할 것
+    #   (obstacle_front/obstacle_dist가 이번 틱 기준으로 이미 갱신돼 있어야 함).
+    #   입력 self.obstacle_front/obstacle_dist → 출력 self.avoid_hold_active
+    def _update_avoid_hold(self):
+        """da 안전마진 회피(§2.30) 중 너무 이른 복귀를 막기 위한 타이머 — config.py
+        AVOID_HOLD_TRIGGER_DIST_M/AVOID_HOLD_SEC 주석, README §2.32 참고.
+        obstacle_front/obstacle_dist는 TEST_DISABLE_B2_B3와 무관하게 매 틱 갱신되므로
+        (perc_obstacle() 참고), B2/B3 미션 자체가 꺼져있어도 이 신호는 그대로 쓸 수 있다.
+        장애물이 가까이(AVOID_HOLD_TRIGGER_DIST_M 안) 있는 동안은 매 틱 유예 시각을
+        갱신하고, 멀어지거나 안 보여도 그 시각까지는 avoid_hold_active를 True로 유지한다
+        — "장애물이 있는 동안"이 아니라 "마지막으로 가까이 있었던 시점부터 N초"가
+        핵심이라(장애물이 카메라/라이다 시야에서 사라진 직후가 가장 위험한 구간), 매 틱
+        갱신되는 목표 시각(until_t) 하나만으로 자연스럽게 그 유예 구간을 표현한다."""
+        if self.obstacle_front and self.obstacle_dist < AVOID_HOLD_TRIGGER_DIST_M:
+            self._avoid_hold_until_t = time.time() + AVOID_HOLD_SEC
+        self.avoid_hold_active = time.time() < self._avoid_hold_until_t
 
     # [2-4] 라바콘
     #   출력 lavacon_offset(디버그용)/lavacon_done, lavacon_path(조향용 — _handle_lavacon() 참고)

@@ -427,6 +427,7 @@ class DLSlideWindow(SlideWindow):
         self.ll_band_used = []     # 이번 프레임 각 밴드가 ll 기반으로 채택됐는지(길이 self.n_slices bool, 'da' 모드에선 항상 전부 False) — visualize() 색상 구분용
         self.da_fallback_used = False  # 이번 프레임 da가 직전 채택 덩어리와의 근접성이 아니라 면적순위 차선책으로 골라졌는지 — visualize() 색상 구분용
         self.da_ll_clip_skipped = False  # 이번 프레임 ll 클리핑이 유효 밴드를 너무 줄여 건너뛰었는지 — visualize() 구분용
+        self.avoid_hold_active = False  # [2026-08-14] 이번 프레임 avoid-hold(§2.32)로 DL_DA_SKIP_LL_CLIP을 무시하고 ll 클리핑을 강제했는지 — visualize() 구분용
         self.da_ll_virtual_clip_used = False  # [2026-08-07] 이번 프레임 _clip_da_by_ll()이 ll/잔상 없이 가상경계(기대 차로폭)로 클리핑한 밴드가 있었는지 — visualize() 구분용
         self.da_largest_mask_roi = None  # 면적 1위 덩어리(차선책을 썼다면 그 사유가 된, 상한 초과로 버려진 덩어리) — fallback일 때 원래 색으로 같이 그리기용
         self.da_largest_area_px = 0  # 면적 1위 덩어리의 절대 픽셀 면적(채택 여부 무관) — DL_DA_MAX_AREA_PX 실측 튜닝용
@@ -1515,15 +1516,20 @@ class DLSlideWindow(SlideWindow):
 
         return results, used
 
-    def detect(self, raw_bgr, da_prob, ll_prob, yellow_mask):
+    def detect(self, raw_bgr, da_prob, ll_prob, yellow_mask, avoid_hold=False):
         """입력 : raw_bgr — 원본 카메라 프레임 그대로의 (H,W,3) BGR(크롭/리사이즈 없음)
                  da_prob, ll_prob — 위와 같은 (H,W) float32 foreground 확률(모델은 360행
                    고정이지만 TwinLiteNetEngine.infer_raw()가 이미 원본 크기로 업샘플링해서 줌)
                  yellow_mask — 위와 같은 (H,W) uint8 이진마스크(HSV 기반, da/ll과 무관)
+                 avoid_hold — [2026-08-14] True면 DL_DA_SKIP_LL_CLIP=True(평소 테스트 설정)를
+                   무시하고 _clip_da_by_ll()을 강제로 돌린다(§2.32, DL_CENTER_MODE='da' 전용
+                   — 다른 모드는 이 인자와 무관하게 항상 클리핑 적용). track_drive.py의
+                   _update_avoid_hold()가 라이다 obstacle_front/dist로 판단해 넘긴다.
           출력 : lane_valid, offset, lookahead, lane_center, path — 기존 SlideWindow.calc_center()와
                  동일한 계약(같은 4-tuple+path 형태)이지만, 계산은 da 중심선 기준으로 직접 한다.
           내부에서 DL_ROI_Y0:DL_ROI_Y1(원본 프레임 절대 픽셀)만 잘라서 da 중심선을 뽑는다.
         """
+        self.avoid_hold_active = bool(avoid_hold)
         h, _ = ll_prob.shape
         y0 = max(0, min(DL_ROI_Y0, h))
         y1 = max(y0, min(DL_ROI_Y1, h))
@@ -1663,7 +1669,11 @@ class DLSlideWindow(SlideWindow):
             # 이유는 다르지만("밴드 부족으로 버림" vs "테스트를 위해 애초에 안 함") 둘 다
             # "이번 프레임 da_mask는 클리핑 안 된 largest-component 그대로"라는 결과는
             # 동일하다.
-            if DL_CENTER_MODE == 'da' and DL_DA_SKIP_LL_CLIP:
+            # [2026-08-14] avoid_hold(§2.32)가 True면 위 스킵을 무시하고 클리핑을 강제
+            # 되살린다 — 회피 중 장애물이 시야에서 사라진 직후 몇 초간은 "지금 차선
+            # 하나"만 ll로 물어서(_clip_da_by_ll()) raw da가 원래 폭으로 돌아오며 바로
+            # 차선 중앙으로 복귀하는 걸 늦추는 목적(config.py AVOID_HOLD_* 주석 참고).
+            if DL_CENTER_MODE == 'da' and DL_DA_SKIP_LL_CLIP and not avoid_hold:
                 self.da_ll_virtual_clip_used = False
                 self.da_ll_clip_skipped = True
                 self.da_clip_band_virtual = [None] * self.n_slices
@@ -2013,6 +2023,8 @@ class DLSlideWindow(SlideWindow):
             tags += ' [LL_CLIP_SKIP]'
         if self.da_ll_virtual_clip_used:
             tags += ' [LL_VIRTUAL]'
+        if self.avoid_hold_active:
+            tags += ' [AVOID_HOLD]'
         if self.ll_degraded:
             tags += ' [LL_DEGRADED]'
         # 모드마다 밴드 카운트가 뜻하는 바가 달라서 라벨/부가정보를 따로 붙인다 —
@@ -2147,6 +2159,11 @@ class DLLaneDetector:
         default_center = DL_INPUT_W / 2.0
         self._lock = threading.Lock()
         self._latest_frame = None
+        # [2026-08-14] avoid-hold(§2.32) — track_drive.py의 perc_lane()이 매 틱
+        # set_avoid_hold()로 갱신하고, _worker()가 다음 추론 때 _latest_frame과 같은
+        # 락으로 같이 읽어서 DLSlideWindow.detect()에 넘긴다(config.py
+        # AVOID_HOLD_TRIGGER_DIST_M/AVOID_HOLD_SEC 주석 참고).
+        self._latest_avoid_hold = False
         self._latest_result = (False, 0.0, 0.0, default_center, [], None)
         # 디버그 창에 띄울 최근 프레임(초록/빨강 오버레이가 이미 그려진 vis, da/ll 원본 마스크).
         # 워커 스레드가 여기 값만 갱신하고, 실제 cv2.imshow()는 show_debug_windows()가
@@ -2175,6 +2192,12 @@ class DLLaneDetector:
         if self._logger is not None:
             self._logger.info(f'[dl_lane] {msg}')
 
+    def set_avoid_hold(self, active):
+        """track_drive.py의 perc_lane()이 매 틱 호출 — avoid-hold(§2.32) 상태를 다음
+        추론에 반영한다. 단순 bool 대입이라 별도 검증 없이 그대로 저장한다."""
+        with self._lock:
+            self._latest_avoid_hold = bool(active)
+
     def _worker(self):
         """추론 워커 — 이 스레드 안에서는 절대 cv2.imshow()/cv2.waitKey()를 호출하지 않는다.
         OpenCV HighGUI(GTK 백엔드)가 스레드 세이프하지 않아서, 메인 스레드(다른 디버그
@@ -2186,6 +2209,7 @@ class DLLaneDetector:
             with self._lock:
                 frame = self._latest_frame
                 self._latest_frame = None
+                avoid_hold = self._latest_avoid_hold
             if frame is None:
                 time.sleep(0.005)
                 continue
@@ -2196,7 +2220,7 @@ class DLLaneDetector:
                     cv2.cvtColor(raw_bgr, cv2.COLOR_BGR2HSV), YELLOW_LOWER, YELLOW_UPPER
                 )
                 lane_valid, offset, lookahead, lane_center, path = self._slide.detect(
-                    raw_bgr, da_prob, ll_prob, yellow_mask
+                    raw_bgr, da_prob, ll_prob, yellow_mask, avoid_hold=avoid_hold
                 )
                 debug_img = self._slide.vis
             except Exception as e:
