@@ -152,7 +152,11 @@ def capture_camera_point(camera_index):
     win = 'camera - click the object base point (q=cancel)'
     cv2.namedWindow(win)
     cv2.setMouseCallback(win, on_click)
-    print('  카메라 창에서 물체가 바닥에 닿는 지점을 클릭하세요 (q=취소)')
+    print('  카메라 창에서 물체가 바닥에 닿는 지점을 클릭하세요.')
+    print('  -> 클릭하면 forward/lateral 값이 미리보기로 뜹니다(다시 클릭하면 위치 갱신 가능).')
+    print('  -> 그 상태에서 카메라 창을 클릭해 포커스를 준 뒤 Enter 또는 Space를 눌러야 확정됩니다')
+    print('     (그냥 클릭만 하면 안 넘어갑니다 — 잘못 찍었을 때 다시 클릭해서 고칠 수 있게')
+    print('     확정을 한 단계 더 둔 것입니다). q=취소')
 
     result = None
     try:
@@ -175,10 +179,12 @@ def capture_camera_point(camera_index):
             cv2.rectangle(vis, (0, DL_ROI_Y0), (vis.shape[1] - 1, DL_ROI_Y1), (0, 255, 255), 1)
             pts = DL_BEV_SRC_PX_RAW.astype(np.int32)
             cv2.polylines(vis, [pts], True, (255, 0, 255), 1)
+            cv2.putText(vis, 'click=pick point   ENTER/SPACE=confirm   q=cancel',
+                        (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
             if 'pt' in clicked:
                 cv2.circle(vis, clicked['pt'], 6, (0, 0, 255), -1)
                 fwd, lat = raw_px_to_cam_xy(clicked['pt'][0], clicked['pt'][1], M, bw, bh)
-                cv2.putText(vis, f'forward={fwd:.3f}m lateral={lat:.3f}m',
+                cv2.putText(vis, f'forward={fwd:.3f}m lateral={lat:.3f}m  [press ENTER/SPACE to confirm]',
                             (10, vis.shape[0] - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                             (0, 255, 0), 2, cv2.LINE_AA)
                 result = (fwd, lat)
@@ -187,7 +193,8 @@ def capture_camera_point(camera_index):
             if k == ord('q'):
                 result = None
                 break
-            if k in (13, 32) and result is not None:  # Enter/Space로 확정
+            # Enter는 백엔드/OS별로 코드가 13(CR)/10(LF)로 다르게 들어올 수 있어 둘 다 받는다.
+            if k in (13, 10, 32) and result is not None:  # Enter/Space로 확정
                 break
     finally:
         cap.release()
