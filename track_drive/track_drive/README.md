@@ -1816,6 +1816,27 @@ vehicle_x=0.0)`로 라인주행(`_lane_drive()`)과 **완전히 같은 함수**(
   `self.lane_path`보다 거칠 수 있음 — Pure Pursuit/LQR 자체는 라인주행에서 검증됐지만, 이
   입력(라바콘 경로)과의 조합은 실차 미검증.
 
+**[2026-08-13] 버그 — YOLO 콘 검출기 초기화가 매번 7~8분 걸림(노드 기동 자체를 블로킹).**
+`YoloConeDetector` 생성(`track_drive.py __init__`, 라인주행/신호등 등 다른 초기화와 달리
+비동기가 아니라 노드 기동 중 동기 호출)이 매번 이상하게 오래 걸리는 게 실차에서 확인됨 —
+"느린 빌드"가 아니라 **TensorRT 빌드가 실제로 실패하는 버그**였음(`TRT-16198: Layers missing
+empty tensor support`, `cone_best_n.onnx`가 `nms=True`로 export돼 그래프에 포함된
+NonMaxSuppression 레이어의 빈 텐서 케이스를 현재 TensorRT가 못 다룸). onnxruntime이 이
+실패를 곧장 올리지 않고 약 456초(7~8분)를 태우고서야 조용히 `CUDAExecutionProvider`로
+자동 폴백해서, 겉으로는 "그냥 느리다"로만 보였음 — 노드를 켤 때마다(재출발·재테스트
+포함) 이 지연이 매번 반복됨. `perception/yolo_cone.py`의 provider 우선순위에서 이 모델만
+`TensorrtExecutionProvider`를 아예 빼고 CUDA로 바로 걸도록 고침(폴백 후 정상 성공까지는
+1.7초). `dl_lane.py`의 TwinLiteNet은 TensorRT가 정상 동작해 그쪽 priority는 안 건드림 —
+이 저장소 다른 모델에 새 ONNX를 올릴 때도 "느려 보이면 우선 실패 여부부터 의심할 것"
+(정상 동작하는 폴백이 있으면 예외가 안 터져서 실패가 값비싼 지연으로만 드러남).
+
+**알려진 한계 (구조적):** `YoloConeDetector` 생성자는 여전히 **노드 `__init__` 안에서
+동기 호출**된다 — 이번엔 원인(TRT-16198)을 없애서 우회했지만, 나중에 다른 provider나
+다른 모델에서 비슷한 "예외 없이 몇 분씩 블로킹" 버그가 또 나오면 노드 기동
+(`ros2 launch ...`, 심판이 지켜보는 화면) 자체가 다시 그만큼 멈춘다. 근본 대응(백그라운드
+스레드로 옮기고 "검출기 준비중" 상태를 FSM/디버그 창에 노출)은 아직 안 함 — 아래
+"FSM 연동" 논의 참고.
+
 ---
 
 ## 4. 사물회피 (B2_OBSTACLE, 고정장애물)

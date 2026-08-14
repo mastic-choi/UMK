@@ -97,7 +97,16 @@ class YoloConeEngine:
 
         available = set(ort.get_available_providers())
         if providers is None:
-            priority = ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
+            # [2026-08-13 실차 확인] 이 콘 모델(cone_best_n.onnx, nms=True export)은
+            # TensorrtExecutionProvider가 항상 빌드 실패한다 — "TRT-16198: Layers missing
+            # empty tensor support"(export에 포함된 NonMaxSuppression 레이어가 빈 텐서
+            # 케이스를 처리 못 함, onnxruntime/TensorRT 버전 조합 이슈로 추정). 문제는
+            # 실패 자체가 아니라 실패를 확인하기까지 약 456초(7~8분)를 태우고서야
+            # onnxruntime이 조용히 CUDAExecutionProvider로 자동 폴백한다는 것 — 노드를
+            # 켤 때마다(재출발/재테스트 포함) 이 지연이 매번 반복된다. dl_lane.py의
+            # TwinLiteNet은 TensorRT가 정상 동작하므로 그쪽 priority는 그대로 둔다 —
+            # 이건 이 모델(콘 검출) 전용 대응.
+            priority = ['CUDAExecutionProvider', 'CPUExecutionProvider']
             providers = [p for p in priority if p in available] or ['CPUExecutionProvider']
 
         provider_options = []
