@@ -14,7 +14,7 @@
 #   보로노이 정점(vertex)들로 나타난다. lavacon_offset은(디버그/로깅용으로만 계속
 #   계산되는) 이 정점들의 y좌표 평균이고, [2026-08-11] 이후로는 그 정점들을 x(전방)
 #   오름차순으로 정렬한 좌표 목록(path_m)도 함께 반환한다 — track_drive.py가 이걸
-#   차선주행(_lane_steer())과 동일한 Pure Pursuit/LQR 컨트롤러에 그대로 태워서
+#   차선주행(_lane_steer())과 동일한 Pure Pursuit 컨트롤러에 그대로 태워서
 #   조향각을 계산한다(라바콘 전용 LAVACON_KP P제어 게인 대신, 조향 파라미터를
 #   라인주행 상태와 완전히 일치시키기 위한 결정 — track_drive.py _handle_lavacon() 참고).
 #
@@ -160,7 +160,7 @@ def process_lavacon(lidar_ranges):
     lavacon_offset = float(np.clip(lavacon_offset, -OFFSET_CLAMP, OFFSET_CLAMP))
 
     # ── 9) 조향용 경로 : 채택된 정점을 x(전방) 오름차순으로 정렬 ──
-    # Voronoi 정점은 순서가 없으므로, Pure Pursuit/LQR의 _target_point()가 "가까운
+    # Voronoi 정점은 순서가 없으므로, Pure Pursuit의 _target_point()가 "가까운
     # 점→먼 점" 순으로 누적 호길이를 재는 것과 호환되도록 전방거리 기준 정렬만 해준다
     # (점들을 잇는 매끄러운 스플라인은 아니라 지그재그 트랙에서는 근사가 거칠 수 있음 —
     # 실차 미검증).

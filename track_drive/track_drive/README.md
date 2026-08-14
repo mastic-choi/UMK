@@ -127,7 +127,7 @@ Hybrid A* 경로계획(B2 대안, 보존용)은 `planner/`에 모여 있습니�
 1. 차선인식 백엔드 선택 (`LANE_DETECTOR_BACKEND`)
 2. 차량 속도/조향 기본값
 3. 차선인식(`dl_lane.py`) 세부 튜닝 — BEV 적용여부 포함
-4. 조향 컨트롤러 선택 (`STEERING_CONTROLLER`, Pure Pursuit/LQR 각 파라미터)
+4. 조향 컨트롤러 (Pure Pursuit 파라미터 — LQR은 2026-08-14 제거, §0.5 참고)
 5. 디버깅 ON/OFF (모든 `DEBUG_VIZ_*`)
 6. 미션 State / 실차 테스트 범위 제한 (`START_STATE`, `TEST_*`, 바퀴 카운트 등)
 7. 기타 튜닝 파라미터(PID, 트리거, 회피, 신호등, 정지선, 단위환산 등)
@@ -208,60 +208,35 @@ ros2 launch track_drive track_drive.launch.py
 
 ---
 
-## 0.5 조향 컨트롤러 선택 (Pure Pursuit / LQR)
+## 0.5 조향 컨트롤러 (Pure Pursuit)
 
-차선 추종(`_lane_steer()`, [track_drive.py:1141](track_drive.py#L1141))도 백엔드처럼 pluggable합니다.
-`self.pure_pursuit`과 `self.lqr` 둘 다 미리 생성해두고([track_drive.py:198-221](track_drive.py#L198),
-튜닝값은 전부 `config.py`의 `PP_*`/`LQR_*`에서 가져옴), `STEERING_CONTROLLER`([config.py:176](config.py#L176))
-값에 따라 어느 쪽을 쓸지 고릅니다. `_lane_drive()`(S1/S3 차선주행)와 S2 진입 전 감속 구간이 전부 이
-하나를 거치므로, 플래그만 바꾸면 차선 추종 전체가 전환됩니다.
+차선 추종(`_lane_steer()`, [track_drive.py](track_drive.py))은 `self.pure_pursuit`
+(`controller/pure_pursuit.py`의 `PurePursuitController`, 기하학적·속도/커브 적응형 lookahead) 하나로
+고정돼 있습니다. 튜닝값은 전부 `config.py`의 `PP_*`에서 가져옵니다. `_lane_drive()`(S1/S3 차선주행)와
+`_handle_lavacon()`(B1 라바콘, 조향 파라미터를 라인주행과 완전히 일치시킴)이 전부 이 하나를 거칩니다.
 
-```python
-STEERING_CONTROLLER = 'pure_pursuit'  # 'pure_pursuit' | 'lqr'
-```
-
-| 값 | 구현 | 상태 |
-|---|---|---|
-| `'pure_pursuit'` | `controller/pure_pursuit.py`의 `PurePursuitController` (기하학적, 속도/커브 적응형 lookahead) | **현재 기본값** |
-| `'lqr'` | `controller/lqr.py`의 `LQRController` (횡오차/헤딩오차 2-state 운동학 LQR) | 신규, 실차 미검증 |
-
-**주의:** `pure_pursuit.control()`은 속도적응형 lookahead 때문에 `speed=` 인자를 받지만, `lqr.control()`은
-자체 `speed_gain` 튜닝값을 쓰고 그 인자가 없습니다 — 그래서 `_lane_steer()`가 컨트롤러별로 분기해서
-호출합니다([track_drive.py:1158-1160](track_drive.py#L1158)). 두 컨트롤러를 직접 갖다 붙일 일이 있으면
-이 시그니처 차이를 꼭 확인하세요.
-
-**[2026-08-05, LQR 브랜치에서 이식] 단위버그 수정 — 픽셀/미터 두 모드:** 원래 `Q=diag(1,1)`이 `e_y`(px,
-O(1~100))와 `e_psi`(rad, O(0.01~0.5))를 같은 가중치로 취급해서, 미세한 오차에도 조향각이 클램프(±100°)까지
-튀는 버그가 실차 영상에서 확인됐다(`e_y=-40px` 하나만 넣어도 클램프 전 raw 조향각이 1234°). `LANE_DETECTOR_BACKEND=='dl'
-and DL_USE_BEV`이면 `track_drive.py`가 자동으로 `DL_PIXELS_PER_METER`를 넘겨 `e_y`를 미터로 환산하는
-**미터 모드**로 동작(같은 `e_y=-40px`에서 raw 조향각이 10.2°로 정상화됨) — 그 외 백엔드에서는 `None`이
-넘어가 기존 픽셀 게인 방식(**레거시 모드**)으로 자동 폴백한다(`controller/lqr.py` 상단 주석 참고).
-
-**LQR 튜닝 파라미터** (`config.py` `LQR_*`, 전부 실차 미검증):
-| 파라미터 | 의미 | 비고 |
-|---|---|---|
-| `LQR_R_STEER=1.0` | 조향각 가중치(올릴수록 조향 억제, 지그재그 완화) | `Q_LATERAL`/`Q_HEADING` 건드리기 전에 먼저 조정 |
-| `LQR_Q_LATERAL=1.0` / `LQR_Q_HEADING=1.0` | 횡오차/헤딩오차 비중 | lateral 비중↑ → 중앙복귀 서두름(오버슈트 위험), heading 비중↑ → 각도부터 맞추고 천천히 복귀 |
-| `LQR_ALPHA=0.5` | 프레임간 저역통과 필터 | 반응이 느리면 올리고, 잔떨림이 있으면 낮출 것 |
-| `LQR_WHEELBASE_M=0.26` / `LQR_SPEED_MPS=1.0` | [미터 모드] 실측 축거(m) / 속도 추정치(m/s) | `wheelbase_m`은 줄자 실측 가능. `speed_mps`는 엔코더 연동 전 임시값 — 실차 최우선 튜닝 대상 |
-| `LQR_HEADING_PROBE_M`/`LQR_MIN_PATH_M=0.3` | [미터 모드] 헤딩오차 참조거리 / 최소 경로길이(m) | 노이즈 방지 안전장치 |
-| `LQR_WHEELBASE_GAIN=50.0` / `LQR_SPEED_GAIN=120.0` | [레거시 모드 전용] 조향 강도 / 속도 대응값 | `pixels_per_meter=None`일 때만 사용 |
-| `LQR_HEADING_PROBE_PX`/`LQR_MIN_PATH_PX=65.0` | [레거시 모드 전용] 노이즈 방지 안전장치 | 조향이 자꾸 직전값 유지로 빠지면 낮출 것 |
+**[2026-08-14] LQR 컨트롤러 제거:** `controller/lqr.py`(`LQRController`, 횡오차/헤딩오차 2-state 운동학
+LQR)와 그 사이를 고르던 `STEERING_CONTROLLER` 스위치를 코드베이스에서 완전히 걷어냈습니다 — 실차 미검증
+상태로 한 번도 켜본 적 없이 계속 `pure_pursuit`만 써왔던 죽은 분기라, 유지보수 부담(설정 하나 바꿀 때마다
+두 컨트롤러 모두 신경 써야 함)만 있었습니다. 아래는 제거 전 남아있던 설계 기록입니다 — 나중에 LQR을
+다시 시도할 일이 있으면 참고하되, 코드 자체는 git 히스토리(`controller/lqr.py` 삭제 커밋 이전)에서
+가져와야 합니다:
+- **단위버그(픽셀/미터 두 모드):** `Q=diag(1,1)`이 `e_y`(px, O(1~100))와 `e_psi`(rad, O(0.01~0.5))를
+  같은 가중치로 취급해 미세한 오차에도 조향각이 클램프까지 튀는 버그가 있었고, `DL_PIXELS_PER_METER`로
+  `e_y`를 미터로 환산하는 "미터 모드"로 고쳤었습니다.
+- **튜닝 파라미터:** `LQR_R_STEER`(조향 억제)/`LQR_Q_LATERAL`·`LQR_Q_HEADING`(횡오차·헤딩오차 비중)/
+  `LQR_ALPHA`(저역통과)/`LQR_WHEELBASE_M`·`LQR_SPEED_MPS`(미터 모드)/`LQR_WHEELBASE_GAIN`·
+  `LQR_SPEED_GAIN`(레거시 픽셀 모드) 등. 이 중 `LQR_WHEELBASE_M`(실측 축거, §6.7)만은 LQR 전용이 아니라
+  `EncoderPoseEstimator`(로컬라이제이션)도 쓰던 값이라, 제거하지 않고 `WHEELBASE_M`으로 이름만 바꿔
+  `config.py`에 남겨뒀습니다.
+- `localization/pose_estimator.py`의 `EncoderPoseEstimator`는 LQR 제거와 무관하게 여전히 미배선
+  상태입니다(실제 엔코더 ROS 토픽 미확인) — §0.5의 이전 버전에 있던 관련 한계는 유효합니다.
 
 **디버그 방법:**
-- 창: `DEBUG_VIZ_STEER = True`(기본값, [config.py:218](config.py#L218)) → `steer_debug` 창에서
-  지금 어느 컨트롤러가 쓰이는지, 이번 프레임이 "직전값 유지"(주황)인지 "현재값 반영"(초록)인지, 조향각과
-  (`lqr`일 때) 횡오차 `e_y`/헤딩오차 `e_psi`까지 한글로 보여줍니다(디버그 표시는 미터 모드에서도 항상 픽셀
-  단위). cv2 기본폰트가 한글을 못 그려서 `kr_text.py`의 PIL 기반 렌더러를 씁니다 — 한글 폰트가 없는 환경이면
+- 창: `DEBUG_VIZ_STEER = True`(기본값, config.py) → `steer_debug` 창에서 이번 프레임이 "직전값
+  유지"(주황)인지 "현재값 반영"(초록)인지, 조향각·lookahead/curvature·IMU curvature를 한글로 보여줍니다.
+  cv2 기본폰트가 한글을 못 그려서 `kr_text.py`의 PIL 기반 렌더러를 씁니다 — 한글 폰트가 없는 환경이면
   영문 fallback으로 표시됩니다.
-
-**알려진 한계:**
-- LQR은 아직 실차 튜닝 전입니다. 처음 켤 때는 저속에서, 언제든 사람이 개입할 수 있는 상태로 테스트하세요.
-- `localization/pose_estimator.py`의 `EncoderPoseEstimator`가 `self.pose_estimator`로 준비돼 있지만
-  ([track_drive.py:249](track_drive.py#L257)), 실제 엔코더 ROS 토픽이 아직 확인 전이라 **어떤 콜백도
-  갱신하지 않는 미배선 상태**입니다. 미터 모드도 지금은 이 pose 추정기를 쓰지 않고 `LQR_SPEED_MPS`(튜닝
-  임시값)로 대신합니다 — 엔코더 토픽이 확인되면 실제 m/s를 `set_speed_mps()`(레거시 모드면 `set_speed_gain()`)에
-  매 프레임 넣어주는 식으로 전환할 것.
 
 ### 0.5.1 코너 진입 시 회전반경 기반 감속 (`pure_pursuit` 전용)
 
@@ -279,9 +254,6 @@ and DL_USE_BEV`이면 `track_drive.py`가 자동으로 `DL_PIXELS_PER_METER`를 
 `PIXELS_PER_METER`가 미실측이라 반경도 미터가 아니라 픽셀 단위입니다. `CORNER_MIN_RADIUS_PX=250px`는
 `PP_LOOKAHEAD_BASE_PX(90)~PP_LOOKAHEAD_MAX_PX(150)`(둘 다 config.py) 범위에서 alpha 20~30도짜리 코너의
 반경을 역산해 다소 이르게(보수적으로) 개입하도록 잡은 추정치일 뿐 실차 미검증입니다.
-
-`STEERING_CONTROLLER='lqr'`일 때는 적용되지 않습니다 — LQR은 curvature가 아니라 횡오차/헤딩오차
-상태로 도는 별개 모델이라 이 반경 개념 자체가 안 맞습니다.
 
 **왜 추가했나:** 짧은 lookahead에서 조향이 얼어붙던 버그를 고친 뒤에도, 코너처럼 회전반경이 급격히
 작아지는 구간은 여전히 픽셀 노이즈에 민감합니다. 회전반경이 작아질수록 미리 속도를 낮춰두면, 같은
@@ -331,7 +303,6 @@ lookahead가 `PP_LOOKAHEAD_MIN_PX(40px)` 근처에 계속 눌려있어 절대 �
 - `PP_LOOKAHEAD_CURVATURE_GAIN=100.0`, `PP_LOOKAHEAD_MIN_PX=40px`(둘 다 config.py) 모두 추정치입니다
   (`curvature=0.01`, 반경≈100px짜리 중간 코너에서 배율 0.5가 되도록 잡음). `steer_debug` 창이나 CLI
   로그로 관찰하며 튜닝이 필요합니다.
-- `STEERING_CONTROLLER='lqr'`일 때는 적용되지 않습니다 — `lqr.py`는 curvature 개념 자체가 없습니다.
 - probe도 근거리 밴드 자체가 구조적으로(노이즈가 아니라 매 프레임 일관되게) 옆으로 치우쳐 있으면 여전히
   큰 curvature를 재현합니다(자기순환은 끊었지만 "근거리 세그멘테이션이 원래 부정확한" 문제 자체를
   고치진 않음) — da/ll 세그멘테이션 정확도 쪽(2.1/2.2절)이 근본 대응입니다.
@@ -652,7 +623,7 @@ TEST_FORCE_BEHAVIOR = False   # 라바콘 등 Behavior 없이 순수 차선주�
 무효 프레임엔 `self.path`를 갱신하지 않고 직전 경로를 그대로 유지하는데(원래 "1~2프레임짜리 튐 방지"
 목적), 이 무효 상태가 여러 프레임 연속되면 `self.path`가 사실상 무한정 옛 카메라 좌표에 얼어붙는다.
 그런데 `_s1_lane_follow()`는 `self.lane_valid`를 확인하지 않고 매 주기 `_lane_drive()`를 호출하므로
-(아래 "알려진 한계" 참고), 이 stale 경로를 계속 pure_pursuit/LQR에 먹인다 — 차는 계속 움직이는데
+(아래 "알려진 한계" 참고), 이 stale 경로를 계속 pure_pursuit에 먹인다 — 차는 계속 움직이는데
 경로가 안 따라오니 조향이 점점 커지고(`turn_now`→1.0 포화), `_lane_drive()`의 3제곱 감속식이
 `target_speed`를 바닥값 `SPEED_NORMAL*0.15`까지 계속 눌러버린다. §6.5 실측 결과 이 바닥값(실측
 `SPEED_NORMAL=8.0` 기준 1.2)이 실차 구동 최소치(§6.5에서 추정한 데드존 ≈1.4)보다 낮아서, 명령은
@@ -1991,11 +1962,10 @@ TEST_FORCE_BEHAVIOR = True    # S2를 거치지 않고 시작부터 Behavior(라
 보고 계산)였는데, 이제는 `perc_lavacon()`이 채택된 보로노이 중심선 정점들을 x(전방)
 오름차순으로 정렬한 뒤 `self.lane_path`와 동일한 픽셀 스케일(`DL_PIXELS_PER_METER=200px/m`)로
 변환해 `self.lavacon_path`에 담아두고, `_handle_lavacon()`이 `_lane_steer(path=self.lavacon_path,
-vehicle_x=0.0)`로 라인주행(`_lane_drive()`)과 **완전히 같은 함수**(`STEERING_CONTROLLER`로
-고른 Pure Pursuit/LQR 컨트롤러 인스턴스, 같은 `PP_*`/`LQR_*` 게인)를 그대로 호출합니다.
-`LAVACON_KP`는 이제 안 쓰여서 config.py에서 삭제했습니다. Pure Pursuit/LQR 둘 다
-"1m=200px, x=오른쪽+, 전방=이미지 위쪽" 스케일로 실측 축거를 캘리브레이션해뒀기 때문에
-(controller/pure_pursuit.py·lqr.py 상단 주석 참고) 이 변환이 물리적으로 맞지만, **Voronoi
+vehicle_x=0.0)`로 라인주행(`_lane_drive()`)과 **완전히 같은 함수**(`self.pure_pursuit` 인스턴스,
+같은 `PP_*` 게인)를 그대로 호출합니다. `LAVACON_KP`는 이제 안 쓰여서 config.py에서 삭제했습니다.
+`pure_pursuit`이 "1m=200px, x=오른쪽+, 전방=이미지 위쪽" 스케일로 실측 축거(`PP_WHEELBASE_PX`)를
+캘리브레이션해뒀기 때문에(controller/pure_pursuit.py 상단 주석 참고) 이 변환이 물리적으로 맞지만, **Voronoi
 정점을 그냥 x순으로 정렬만 한 것이라 매끄러운 스플라인이 아니고, 지그재그가 심한 구간에서는
 경로가 거칠 수 있습니다 — 실차 미검증.**
 
@@ -2006,7 +1976,7 @@ vehicle_x=0.0)`로 라인주행(`_lane_drive()`)과 **완전히 같은 함수**(
 - 창: `DEBUG_VIZ_LAVACON = True`([config.py:216](config.py#L216)) → `lavacon_bev` 창(트리거 ROI,
   좌/우 클러스터, `YOLO cone=` 검출 상태를 시각으로 확인). **[2026-08-11]** 조향에 실제로 쓰이는
   경로(`self._lavacon_path_m`, `perc_lavacon()`이 채운 보로노이 정점 → x오름차순 정렬 결과)도
-  노란 점(정점 하나하나)+선(Pure Pursuit/LQR이 그대로 걷는 꺾은선)으로 같은 창에 겹쳐 그림 —
+  노란 점(정점 하나하나)+선(Pure Pursuit이 그대로 걷는 꺾은선)으로 같은 창에 겹쳐 그림 —
   트리거 판정용 ROI(좁은 0.3~0.5m)와는 별개로, 조향 경로 계산용 ROI(0~4m)에서 나온 결과라는
   점에 주의(`perception/perc_lavacon.py` 참고).
 - 창: `DEBUG_VIZ_YOLO_CONE = True` → `yolo_cone_result` 창(카메라 프레임 위에 콘 검출 박스/신뢰도
@@ -2016,7 +1986,7 @@ vehicle_x=0.0)`로 라인주행(`_lane_drive()`)과 **완전히 같은 함수**(
 - `LAVACON_DONE_FRAMES=80`(우측 콘 연속 미검출 시 구간 종료 판정)이 실차 미검증 값.
 - `YOLO_CONE_CONF_THRESHOLD=0.5`/`YOLO_CONE_INPUT_SIZE=640`이 실차 미검증 초기값.
 - 조향에 쓰는 `self.lavacon_path`가 Voronoi 정점을 단순 정렬한 것이라 스플라인 피팅된
-  `self.lane_path`보다 거칠 수 있음 — Pure Pursuit/LQR 자체는 라인주행에서 검증됐지만, 이
+  `self.lane_path`보다 거칠 수 있음 — Pure Pursuit 자체는 라인주행에서 검증됐지만, 이
   입력(라바콘 경로)과의 조합은 실차 미검증.
 
 **[2026-08-13] 버그 — YOLO 콘 검출기 초기화가 매번 7~8분 걸림(노드 기동 자체를 블로킹).**
@@ -2474,13 +2444,16 @@ m/px 환산이 없었는데, BEV(585×298px 캔버스, 면적비 옛 ROI 대비 
 4. ROS2쪽 `track_drive.py`의 `cb_vesc()`가 이 토픽을 구독해 `VESC_SPEED_TO_ERPM_GAIN`(=4614.0,
    `vesc.yaml`의 `speed_to_erpm_gain` 실측값, [config.py](config.py))로 나눠 `self.v_mps`(m/s)로 변환합니다.
 
-**이 값을 쓰는 곳 두 군데** (`control_loop()`, [track_drive.py](track_drive.py)):
-- `self.lqr.set_speed_mps(self.v_mps)` — `VESC_MIN_SPEED_MPS`(=0.05) 이상일 때만 갱신합니다. 정지
-  상태(v≈0)에서 그대로 넣으면 LQR의 상태전이행렬 B가 퇴화(조향이 상태에 영향을 못 미치는 것으로
-  계산됨)하므로, 그 미만이면 직전 게인을 유지합니다.
+**이 값을 쓰는 곳** (`control_loop()`/`_speed_for_lookahead()`, [track_drive.py](track_drive.py)):
+- `_speed_for_lookahead()`가 `VESC_MIN_SPEED_MPS`(=0.05) 이상이고 최근에 살아있으면(`_vesc_live()`)
+  `self.v_mps`를 `pure_pursuit`의 속도 적응형 lookahead에 넘깁니다 — 그 미만이면 `self._prev_speed`
+  (명령속도)로 폴백합니다(§0.5.4).
 - `self.pose_estimator.update(self.v_mps, math.radians(self.ctrl_angle), 0.05)` — 매 주기 갱신. 이제
-  `EncoderPoseEstimator(wheelbase_m=LQR_WHEELBASE_M)`로 축거도 실측값이 물려 있어(§6.7), pose 추정이
-  플레이스홀더 없이 동작합니다.
+  `EncoderPoseEstimator(wheelbase_m=WHEELBASE_M)`(옛 이름 `LQR_WHEELBASE_M`)로 축거도 실측값이
+  물려 있어(§6.7), pose 추정이 플레이스홀더 없이 동작합니다.
+- **[2026-08-14 제거]** 당시엔 `self.lqr.set_speed_mps(self.v_mps)`도 여기서 같은 `VESC_MIN_SPEED_MPS`
+  가드로 갱신했습니다(정지 상태에서 그대로 넣으면 LQR 상태전이행렬 B가 퇴화하는 것을 피하기 위함) —
+  LQR 컨트롤러 제거(§0.5)와 함께 이 용도는 사라졌습니다.
 
 **배포 방법 (ROS1쪽, 이 워크스페이스 바깥):**
 [launch/vesc_speed_bridge.py](launch/vesc_speed_bridge.py) 자체는 ROS1 노드라 이 ROS2 워크스페이스

@@ -19,7 +19,7 @@
 #   그대로 기하 계산을 한다.
 #   [2026-08-06] 단, 기본 조합(LANE_DETECTOR_BACKEND='dl' + DL_USE_BEV=True)에서는
 #   self.lane_path가 정확히 config.DL_PIXELS_PER_METER(=200px/m) 스케일이므로,
-#   wheelbase_px를 실측 LQR_WHEELBASE_M(0.335m, README §6.7)*DL_PIXELS_PER_METER로
+#   wheelbase_px를 실측 WHEELBASE_M(0.335m, README §6.7 — 옛 이름 LQR_WHEELBASE_M)*DL_PIXELS_PER_METER로
 #   계산한 물리 기반 값(67.0)으로 이미 대체했다(config.py PP_WHEELBASE_PX 주석 참고) —
 #   여전히 픽셀 좌표계에서 계산하지만 게인 자체는 이제 실측에 근거한다. 실차 재검증 필요.
 #=============================================
@@ -97,7 +97,7 @@ class PurePursuitController:
         # "곡률→조향각" 게인. 표준 Pure Pursuit 공식 steer = atan(2*L*sin(alpha)/Ld)에서
         # L 자리에 들어간다 — 크게 잡을수록 같은 곡률에도 조향각이 커진다(더 공격적).
         # [2026-08-06] 기본 조합(dl+BEV)에서는 self.lane_path가 DL_PIXELS_PER_METER
-        # (200px/m) 스케일이라, 이제 실측 LQR_WHEELBASE_M(0.335m)*200=67.0으로 물리
+        # (200px/m) 스케일이라, 이제 실측 WHEELBASE_M(0.335m, 옛 이름 LQR_WHEELBASE_M)*200=67.0으로 물리
         # 기반 값을 쓴다(config.py PP_WHEELBASE_PX 주석 참고) — 그래도 여전히 실차에서
         # 직진 안정성/코너 추종성을 보고 미세조정할 것(경험적으로 다른 근사 오차를
         # 상쇄해온 값일 수 있어 재검증 필요).

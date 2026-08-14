@@ -611,18 +611,14 @@ FPS_LOG_PERIOD_SEC = 5.0   # dl_lane.py 워커 스레드 FPS/provider 로그 주
 
 
 # #############################################################
-# 4. 조향 컨트롤러 선택 (Pure Pursuit / LQR)
+# 4. 조향 컨트롤러 (Pure Pursuit)
 # #############################################################
-#   track_drive.py의 _lane_steer()가 self.lane_path를 받아 조향각(도)을
-#   계산하는데, 아래 값으로 어떤 컨트롤러를 쓸지 고른다. 둘 다
-#   control(path, vehicle_xy)->조향각(도) 계약이 동일해 전환에 다른 코드
-#   수정이 필요 없다.
-#     'pure_pursuit' : controller/pure_pursuit.py (기하학적, 속도/커브 적응형
-#                      lookahead). **현재 기본값**.
-#     'lqr'          : controller/lqr.py (2-state 운동학 오차모델 LQR, 신규·
-#                      실차 미검증). 처음 켤 때는 저속에서, 언제든 사람이
-#                      개입할 수 있는 상태로 테스트할 것.
-STEERING_CONTROLLER = 'pure_pursuit'  # 'pure_pursuit' | 'lqr'
+#   track_drive.py의 _lane_steer()가 self.lane_path를 받아 controller/pure_pursuit.py의
+#   PurePursuitController.control(path, vehicle_xy)로 조향각(도)을 계산한다.
+# [2026-08-14] LQR 컨트롤러(controller/lqr.py)와 그 사이를 고르던 STEERING_CONTROLLER
+#   스위치를 코드베이스에서 완전히 제거했다 — 실차 미검증 상태로 한 번도 켜본 적 없이
+#   pure_pursuit만 계속 써온 죽은 분기라 유지보수 부담만 있었다. 과거 LQR 설계 배경/
+#   튜닝값 기록은 README §0.5, §6.7, §7에 남아있다.
 
 # ── Pure Pursuit 튜닝값 (controller/pure_pursuit.py PurePursuitController) ──
 #   전부 실차 미검증 튜닝값. 각 값의 설계 배경은 pure_pursuit.py __init__ 상단
@@ -646,8 +642,9 @@ PP_LOOKAHEAD_MIN_PX = 40.0         # 코너에서 lookahead가 줄어들 수 있
 #   픽셀→미터 변환이 아직 실측 전이라 wheelbase_px를 대신 쓴다, PIXELS_PER_METER가 실측되면
 #   실제 축거리(m)*PIXELS_PER_METER로 대체 가능"). LANE_DETECTOR_BACKEND='dl'(기본값) +
 #   DL_USE_BEV=True(기본값)에서는 self.lane_path가 정확히 DL_PIXELS_PER_METER(=200px/m,
-#   BEV 캔버스의 정의상 스케일)로 만들어진 픽셀좌표이므로, 이제 실측 `LQR_WHEELBASE_M`
-#   (0.335m, §6.7)을 그대로 곱해 물리 기반 값으로 대체할 수 있다: 0.335 * 200 = 67.0.
+#   BEV 캔버스의 정의상 스케일)로 만들어진 픽셀좌표이므로, 이제 실측 `WHEELBASE_M`
+#   (0.335m, §6.7 — 옛 이름 LQR_WHEELBASE_M)을 그대로 곱해 물리 기반 값으로 대체할 수
+#   있다: 0.335 * 200 = 67.0.
 #   ★ 실차 재검증 필요 ★ — 80.0은 그 자체로 실차에서 "이 정도 조향 반응이 적당하더라"고
 #   경험적으로 맞춰졌을 가능성이 있어(다른 근사 오차를 상쇄했을 수도 있음), 67.0로 바꾸면
 #   같은 curvature에도 조향각이 더 작게(atan 인자가 작아짐) 나와 코너링이 더 완만해질 수
@@ -655,7 +652,7 @@ PP_LOOKAHEAD_MIN_PX = 40.0         # 코너에서 lookahead가 줄어들 수 있
 PP_WHEELBASE_PX = 25.0             # [2026-08-13] 67.0 → 40.0 → 25.0(요청 반영, 튜닝값 — 조향을 더
                                     #   줄이는 방향). atan(curvature*wheelbase_px) 공식상 값이 작을수록
                                     #   같은 curvature에도 조향각이 더 작게 나옴(반응 약화) — 실차 재검증 필요.
-                                    # 원래 = LQR_WHEELBASE_M(0.335) * DL_PIXELS_PER_METER(200) 실측 기반 계산값(67.0)
+                                    # 원래 = WHEELBASE_M(0.335) * DL_PIXELS_PER_METER(200) 실측 기반 계산값(67.0)
 # [2026-08-12] 직진 구간에서도 계속 진동("와리가리")한다는 보고 대응 — §0.5.3 "알려진
 #   한계"에서 이미 "PP_ALPHA를 낮춰 조향각 저역통과를 더 강하게 거는 쪽을 다음으로 볼 것"
 #   이라고 못박아뒀던 그 다음 단계. 0.5 → 0.35로 낮춰 프레임간 저역통과를 더 세게 건다
@@ -675,42 +672,13 @@ PP_DX_DEADZONE_PX = 5.0            # [2026-08-13] 15.0 → 5.0(요청 반영, PP
                                     #   새어들어올 수 있어 실차 재검증 필요.
                                     # 이 이하 픽셀오차는 0으로 죽여 중앙 부근 잔떨림 제거
 
-# ── LQR 튜닝값 (controller/lqr.py LQRController) — 전부 실차 미검증 ──
-#   speed_gain: 클수록 반응 커짐. r_steer: 올릴수록 조향 억제(지그재그 완화,
-#   q_lateral/q_heading 건드리기 전에 먼저 조정). q_lateral/q_heading: lateral
-#   비중↑→중앙복귀 서두름(오버슈트 위험), heading 비중↑→각도부터 맞추고 천천히
-#   복귀. wheelbase_gain: 조향 강도. alpha: 저역통과(반응 느리면 올리고 잔떨림
-#   있으면 낮출 것). heading_probe_px/min_path_px: 노이즈 방지 안전장치(조향이
-#   자꾸 직전값 유지로 빠지면 낮출 것).
-#
-#   [LQR 브랜치에서 이식, 2026-08-05] Q=diag(1,1)이 e_y(px, O(1~100))와 e_psi(rad,
-#   O(0.01~0.5))를 같은 가중치로 취급하면 Riccati가 극단적으로 큰 K를 내놓아 미세한
-#   오차에도 조향각이 클램프까지 튀는 버그가 실차에서 확인됐다(controller/lqr.py 상단
-#   주석 참고). DL+BEV 조합(LANE_DETECTOR_BACKEND='dl' and DL_USE_BEV)일 때는
-#   DL_PIXELS_PER_METER로 e_y를 미터로 환산하는 "미터 모드"를 쓰면 e_y·e_psi가 비슷한
-#   크기가 되어 이 문제가 사라진다 — track_drive.py가 LQRController 생성 시 이 조건을
-#   보고 pixels_per_meter를 넘길지(미터 모드) None을 넘길지(레거시 픽셀 모드, 아래
-#   LQR_WHEELBASE_GAIN/LQR_SPEED_GAIN/LQR_HEADING_PROBE_PX/LQR_MIN_PATH_PX 사용) 자동
-#   결정한다. 아래 LQR_WHEELBASE_M/LQR_SPEED_MPS/LQR_HEADING_PROBE_M/LQR_MIN_PATH_M은
-#   미터 모드 전용값 — wheelbase_m은 줄자 실측, speed_mps는 엔코더 연동 전 임시값(실차
-#   최우선 튜닝 대상).
-LQR_WHEELBASE_GAIN = 50.0
-LQR_SPEED_GAIN = 120.0
-LQR_Q_LATERAL = 1.0
-LQR_Q_HEADING = 1.0
-LQR_R_STEER = 1.0
-LQR_DT = 0.05               # control_loop 타이머 주기(20Hz)와 반드시 일치 — 튜닝값 아닌 시스템 상수
-LQR_HEADING_PROBE_PX = 65.0
-LQR_ALPHA = 0.5
-LQR_MIN_PATH_PX = 65.0
-LQR_WHEELBASE_M = 0.335     # [미터 모드] 실측값(2026-08-06, 줄자로 앞바퀴-뒷바퀴 축간거리 실측 —
-                             #   LQR 브랜치에서 이식). planner/hybrid_astar.py의 wheelbase 기본값(같은
-                             #   차량이므로 반드시 같은 값)과 일치시킬 것 — 재실측 시 둘 다 갱신.
-LQR_SPEED_MPS = 1.0         # [미터 모드] 속도 추정치(m/s) — 아래 VESC 연동이 살아있으면 매 주기
-                             #   set_speed_mps()로 실측값으로 덮어써진다(track_drive.py의 cb_vesc()
-                             #   참고). 이 값은 그 전까지, 혹은 VESC 브리지가 안 떠 있을 때 쓰는 폴백.
-LQR_HEADING_PROBE_M = 0.3   # [미터 모드] 헤딩오차 추정용 근거리 참조거리(m)
-LQR_MIN_PATH_M = 0.3        # [미터 모드] 경로 전체 길이가 이보다 짧으면 직전값 유지
+# ── 차량 물리 상수 ──
+# [2026-08-14] 옛 이름 LQR_WHEELBASE_M → WHEELBASE_M. LQR 컨트롤러 제거로 "LQR 전용"이
+#   아니라 EncoderPoseEstimator(localization/pose_estimator.py)가 쓰는 일반 차량 상수임을
+#   반영한 이름 변경 — 값 자체는 그대로(실측 유지).
+WHEELBASE_M = 0.335         # 실측값(2026-08-06, 줄자로 앞바퀴-뒷바퀴 축간거리 실측 — LQR 브랜치에서
+                             #   이식). planner/hybrid_astar.py의 wheelbase 기본값(같은 차량이므로
+                             #   반드시 같은 값)과 일치시킬 것 — 재실측 시 둘 다 갱신.
 
 # ── VESC 실측 속도 연동 (2026-08-06, LQR 브랜치의 ROS1 연동 작업에서 이식) ──
 #   이 로봇엔 별도 엔코더 토픽이 없고, VESC 드라이버(ROS1, vesc_driver)가 /sensors/core
@@ -725,14 +693,11 @@ VESC_SPEED_TO_ERPM_GAIN = 4614.0  # VESC 드라이버 vesc.yaml의 speed_to_erpm
 VESC_STALE_SEC = 0.5        # 마지막 /vesc_speed_erpm 수신 후 이 시간(s)이 지나면 vesc_debug 창에서
                              #   "끊김"으로 표시(20Hz 기준 약 10틱).
 VESC_MIN_SPEED_MPS = 0.05    # v_mps가 이 미만(정지/거의정지, 혹은 vesc_speed_bridge 노드 미실행으로
-                             #   0.0 고정)이면 "VESC 실측값을 못 믿는다"고 보고 폴백한다. 두 곳에서 씀:
-                             #   ① self.lqr.set_speed_mps() 갱신을 건너뛰고 직전 게인 유지 — v≈0에서
-                             #     B≈0으로 게인이 퇴화(조향이 상태에 영향을 못 미치는 것으로 계산됨)하는
-                             #     것을 피하기 위함.
-                             #   ② _speed_for_lookahead()(2026-08-06, pure_pursuit용)가 v_mps 대신
-                             #     self._prev_speed(명령속도)로 폴백 — track_drive.py 참고. 이름은
-                             #     LQR 전용처럼 보이지만 "VESC 값을 신뢰할 최소 속도"라는 의미라
-                             #     LQR_이 아니라 VESC_ 접두어를 씀.
+                             #   0.0 고정)이면 "VESC 실측값을 못 믿는다"고 보고 _speed_for_lookahead()
+                             #   (2026-08-06, pure_pursuit용)가 v_mps 대신 self._prev_speed(명령속도)로
+                             #   폴백한다 — track_drive.py 참고. [2026-08-14] LQR 컨트롤러 제거 전엔
+                             #   self.lqr.set_speed_mps() 갱신도 이 값으로 건너뛰었으나(v≈0에서 상태공간
+                             #   게인이 퇴화하는 것을 피하기 위함) 그 용도는 LQR과 함께 사라졌다.
 
 IMU_STALE_SEC = 0.5          # 마지막 /imu 수신 후 이 시간(s)이 지나면 "죽었다"고 본다(VESC_STALE_SEC과
                              #   동일 철학). imu_yaw 자체는 값이 없어도 초기값 0.0을 계속 들고 있어서

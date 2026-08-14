@@ -2249,8 +2249,8 @@ class DLLaneDetector:
         멀어지는 걸 한눈에 보려는 디버그용 — 실제 판단 로직에는 영향 없다. pure_pursuit은
         detect()가 만든 self.path를 한 제어 틱(0.05s) 뒤에 소비하므로, 여기 찍히는 점은
         엄밀히는 "이번에 그려진 result"가 아니라 "직전 틱까지 계산된 최신 목표점"이다(한
-        프레임 이내 오차, 디버깅 목적엔 무시 가능). path가 아직 없거나(첫 프레임)
-        STEERING_CONTROLLER='lqr'이면 호출측이 None을 넘기고, 이 경우 마커를 그리지 않는다.
+        프레임 이내 오차, 디버깅 목적엔 무시 가능). path가 아직 없으면(첫 프레임) 호출측이
+        None을 넘기고, 이 경우 마커를 그리지 않는다.
         ★ 반드시 메인 스레드(ROS 콜백/타이머가 도는 스레드)에서만 호출할 것 ★ — 워커
         스레드가 cv2.imshow를 직접 부르지 않는 이유는 _worker()/DLSlideWindow.visualize()
         주석 참고. track_drive.py의 perc_lane()이 detect() 직후 이 메서드를 호출한다

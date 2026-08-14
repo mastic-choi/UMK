@@ -109,7 +109,8 @@ class EncoderPoseEstimator:
         """매 제어주기(track_drive.py control_loop, 20Hz) 호출할 것.
           v_mps     : 엔코더로 잰 선속도(m/s). 후진이면 음수.
           steer_rad : 현재 조향각(rad). 부호 규약은 이 프로젝트 기준
-                      (+ = 우회전, controller/lqr.py 상단 주석 참고)과 일치시켜서 호출할 것.
+                      (+ = 우회전, track_drive.py TURN_ANGLE=-60이 좌회전인 것과 일치)과
+                      일치시켜서 호출할 것.
           dt        : 경과시간(s)
           imu_yaw   : yaw_source='imu'일 때만 전달(rad). track_drive.py의
                       self.imu_yaw를 그대로 넘기면 된다.

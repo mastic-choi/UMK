@@ -49,7 +49,6 @@ from .planner.hybrid_astar import HybridAStar
 from .planner.occupancy import OccupancyGrid
 from .controller.stanley import StanleyController
 from .controller.pure_pursuit import PurePursuitController
-from .controller.lqr import LQRController
 from .planner.node import Node as PlannerNode
 from .localization.pose_estimator import EncoderPoseEstimator
 from .kr_text import put_text_kr_multi
@@ -243,10 +242,12 @@ class TrackDriverNode(Node):
         # 차선 세그멘테이션 경로(self.lane_path) 추종용 — _lane_pid()(PID)를 대체.
         # _lane_pid()는 B2/B3 장애물회피 behavior(apply_behavior_override())가 여전히
         # 쓰므로 그대로 남겨둔다 — 없앤 게 아니라 "일반 차선주행" 용도에서만 교체한 것.
-        # 튜닝값은 전부 config.py의 PP_*/LQR_* 에서 가져온다 — 클래스 자체의 기본값은
-        # config.py를 안 거치고 pure_pursuit.py/lqr.py를 직접 쓸 때(단독 테스트 등)를
-        # 위한 fallback이라, 여기서 명시적으로 넘기지 않으면 config.py를 고쳐도 반영이
-        # 안 된다. STEERING_CONTROLLER로 아래 둘 중 _lane_steer()가 실제로 호출할 것을 고른다.
+        # 튜닝값은 전부 config.py의 PP_* 에서 가져온다 — 클래스 자체의 기본값은 config.py를
+        # 안 거치고 pure_pursuit.py를 직접 쓸 때(단독 테스트 등)를 위한 fallback이라,
+        # 여기서 명시적으로 넘기지 않으면 config.py를 고쳐도 반영이 안 된다.
+        # [2026-08-14] LQR 컨트롤러(self.lqr)와 그 사이를 고르던 STEERING_CONTROLLER는
+        # 실차 미검증 상태로 한 번도 켜본 적 없어 코드베이스에서 제거했다 — config.py
+        # section 4 주석 참고.
         self.pure_pursuit = PurePursuitController(
             lookahead_base_px=PP_LOOKAHEAD_BASE_PX,
             lookahead_speed_gain=PP_LOOKAHEAD_SPEED_GAIN,
@@ -258,28 +259,6 @@ class TrackDriverNode(Node):
             dx_deadzone_px=PP_DX_DEADZONE_PX,
             lookahead_curvature_gain=PP_LOOKAHEAD_CURVATURE_GAIN,
             lookahead_min_px=PP_LOOKAHEAD_MIN_PX,
-        )
-        self.lqr = LQRController(
-            # DL+BEV 조합일 때만 픽셀->미터 환산이 유효하다(DL_PIXELS_PER_METER는 BEV
-            # 워프 목적캔버스 기준값이라 BEV가 꺼져있으면 의미가 없다) — 그 외(hough/
-            # classic_cv, 혹은 DL_USE_BEV=False)엔 None을 넘겨 레거시 픽셀 게인 모드로
-            # 자동 폴백한다(controller/lqr.py 상단 "좌표계" 주석 참고).
-            pixels_per_meter=(DL_PIXELS_PER_METER
-                               if (LANE_DETECTOR_BACKEND == 'dl' and DL_USE_BEV) else None),
-            wheelbase_m=LQR_WHEELBASE_M,
-            speed_mps=LQR_SPEED_MPS,
-            heading_probe_m=LQR_HEADING_PROBE_M,
-            min_path_m=LQR_MIN_PATH_M,
-            wheelbase_gain=LQR_WHEELBASE_GAIN,
-            speed_gain=LQR_SPEED_GAIN,
-            q_lateral=LQR_Q_LATERAL,
-            q_heading=LQR_Q_HEADING,
-            r_steer=LQR_R_STEER,
-            dt=LQR_DT,
-            heading_probe_px=LQR_HEADING_PROBE_PX,
-            angle_max_deg=ANGLE_MAX,
-            alpha=LQR_ALPHA,
-            min_path_px=LQR_MIN_PATH_PX,
         )
 
         self.path = None
@@ -308,18 +287,17 @@ class TrackDriverNode(Node):
         # ── VESC 기반 실측 속도 (엔코더 대체, 2026-08-06 LQR 브랜치의 ROS1 연동 작업에서 이식) ──
         #   cb_vesc()가 '/vesc_speed_erpm'(ROS1 launch/vesc_speed_bridge.py가 중계)을 받을 때마다
         #   갱신한다. 그 브리지 노드가 안 떠 있거나 아직 메시지를 한 번도 못 받았으면 0.0으로
-        #   유지된다 — 아래 control_loop()의 VESC_MIN_SPEED_MPS 가드가 이 상태에서 self.lqr 게인을
-        #   건드리지 않게 막아준다(즉 이 값이 안 들어와도 LQRController 생성자 기본값
-        #   speed_mps=LQR_SPEED_MPS로 조용히 폴백하지, v=0으로 게인이 퇴화하는 일은 없다).
+        #   유지된다 — _speed_for_lookahead()가 VESC_MIN_SPEED_MPS 가드로 이 상태를 걸러내고
+        #   self._prev_speed(명령속도)로 폴백한다(cb_vesc()/VESC_MIN_SPEED_MPS 주석 참고).
         self.v_mps = 0.0
         self._vesc_t = None
 
         # ── 엔코더(VESC) 기반 pose 추정기 (localization/pose_estimator.py) ──
         #   위 self.vehicle_x/y/yaw(플래너용, 명령속도 적분 근사)와는 별개 컴포넌트. wheelbase_m은
-        #   2026-08-06 실측값(LQR_WHEELBASE_M, config.py — LQR 컨트롤러와 같은 차량이므로 같은 값을
-        #   공유). v_mps는 cb_vesc()가 갱신하는 self.v_mps를 control_loop()에서 매 주기 넣어준다.
-        #   IMU를 yaw 소스로 쓰려면 set_yaw_source('imu') 후 update(..., imu_yaw=self.imu_yaw).
-        self.pose_estimator = EncoderPoseEstimator(wheelbase_m=LQR_WHEELBASE_M)
+        #   2026-08-06 실측값(config.py WHEELBASE_M, 옛 이름 LQR_WHEELBASE_M). v_mps는 cb_vesc()가
+        #   갱신하는 self.v_mps를 control_loop()에서 매 주기 넣어준다. IMU를 yaw 소스로 쓰려면
+        #   set_yaw_source('imu') 후 update(..., imu_yaw=self.imu_yaw).
+        self.pose_estimator = EncoderPoseEstimator(wheelbase_m=WHEELBASE_M)
 
 
         # ── ROS 통신 ──
@@ -460,12 +438,9 @@ class TrackDriverNode(Node):
         # 백엔드는 이 메서드가 없으므로 getattr로 조용히 건너뛴다.
         #   속도 적응형 look-ahead 목표점(pure_pursuit.py last_target_xy)도 같이 넘겨서
         #   result 패널에 찍는다 — self._lane_steer()가 이번 틱에 아직 안 돌았으므로
-        #   엄밀히는 직전 틱 값(0.05s 이내 오차, 디버깅 목적엔 무시 가능). LQR을 쓰면
-        #   pure_pursuit이 안 갱신되므로 None이 넘어가 마커가 그려지지 않는다.
-        lookahead_xy = lookahead_px = None
-        if STEERING_CONTROLLER == 'pure_pursuit':
-            lookahead_xy = self.pure_pursuit.last_target_xy
-            lookahead_px = self.pure_pursuit.last_lookahead_px
+        #   엄밀히는 직전 틱 값(0.05s 이내 오차, 디버깅 목적엔 무시 가능).
+        lookahead_xy = self.pure_pursuit.last_target_xy
+        lookahead_px = self.pure_pursuit.last_lookahead_px
         getattr(self.lane_detector, 'show_debug_windows', lambda *a, **k: None)(lookahead_xy, lookahead_px)
 
         # [2026-08-11] "재사용된 최신값"과 "완전히 안 갱신됨"을 구분 — DLLaneDetector가
@@ -790,18 +765,12 @@ class TrackDriverNode(Node):
         self.lavacon_offset, self.lavacon_done, path_m = process_lavacon(self.lidar_ranges)
         # [2026-08-11] 라바콘 조향 파라미터를 라인주행(_lane_steer())과 완전히 일치시키기로
         # 한 결정 — LAVACON_KP 같은 라바콘 전용 P게인 대신, self.lane_path와 동일하게
-        # self.pure_pursuit/self.lqr(STEERING_CONTROLLER로 선택되는 바로 그 컨트롤러
-        # 인스턴스, 같은 PP_*/LQR_* 게인)에 태운다. 두 컨트롤러 모두 "1m=DL_PIXELS_PER_METER
-        # px, x=오른쪽+, 전방=이미지 위쪽(y 감소)" 스케일로 실측 축거(PP_WHEELBASE_PX/
-        # LQR_WHEELBASE_M)를 캘리브레이션해뒀으므로(controller/pure_pursuit.py,
-        # controller/lqr.py 상단 주석 참고), 라이다 미터 좌표(x=전방+, y=좌측+)를 그
-        # 스케일로 그대로 변환하면 물리적으로 일관된 입력이 된다 — 차량 기준점은 원점
-        # (0,0)으로 두고(_handle_lavacon()이 vehicle_x=0.0으로 호출), 좌측(+y_m)은
-        # 이미지 왼쪽(-col_px)에 대응한다.
-        #   ★주의★ LQR은 LANE_DETECTOR_BACKEND=='dl' and DL_USE_BEV일 때만 이 px 스케일로
-        #   실제 캘리브레이션되고(track_drive.py __init__ 참고), 그 외 조합에서는 레거시
-        #   픽셀 게인 모드로 폴백해 이 변환과 스케일이 안 맞을 수 있다 — 라인주행 쪽도
-        #   동일하게 겪는 기존 제약이라 여기서 새로 생기는 문제는 아니다.
+        # self.pure_pursuit(같은 PP_* 게인)에 태운다. "1m=DL_PIXELS_PER_METER px,
+        # x=오른쪽+, 전방=이미지 위쪽(y 감소)" 스케일로 실측 축거(PP_WHEELBASE_PX)를
+        # 캘리브레이션해뒀으므로(controller/pure_pursuit.py 상단 주석 참고), 라이다 미터
+        # 좌표(x=전방+, y=좌측+)를 그 스케일로 그대로 변환하면 물리적으로 일관된 입력이
+        # 된다 — 차량 기준점은 원점(0,0)으로 두고(_handle_lavacon()이 vehicle_x=0.0으로
+        # 호출), 좌측(+y_m)은 이미지 왼쪽(-col_px)에 대응한다.
         self.lavacon_path = [(-y * DL_PIXELS_PER_METER, -x * DL_PIXELS_PER_METER) for x, y in path_m]
         # 위 px 변환 전 원본(라이다 미터 좌표) — _draw_lavacon_bev()가 DEBUG_VIZ_LAVACON일 때
         # 그대로 그려서 "실제로 조향에 쓰이는 경로"를 시각적으로 보여준다.
@@ -1391,8 +1360,6 @@ class TrackDriverNode(Node):
         curvatureConstraint()와 동일한 공식(CORNER_MIN_RADIUS_PX 주석 참고): 회전반경이
         CORNER_MIN_RADIUS_PX보다 작아지면 그 비율만큼 속도를 깎는다. 반경이 0에 가까워져도
         속도가 0으로 죽지 않게 CORNER_MIN_SPEED_SCALE로 하한을 둔다.
-        STEERING_CONTROLLER가 'pure_pursuit'일 때만 적용한다 — lqr.py는 curvature가 아니라
-        횡오차/헤딩오차 상태로 도는 별개 모델이라 이 반경 개념이 안 맞는다.
 
         [2026-08-06, 2026-08-10 복원] curvature는 self.pure_pursuit.last_curvature(이번 틱의
         순간값)가 아니라 _lane_drive()가 매 틱 갱신하는 self._corner_signal(조향각의 signed
@@ -1400,8 +1367,6 @@ class TrackDriverNode(Node):
         감속하는 문제). [2026-08-10] 이 신호 전환이 커밋 80aefe3("디버그창 적용", 조향과 무관한
         디버그 캔버스 레이아웃 변경)에서 실수로 되돌려져 있던 걸 발견해 복원함 — README §0.5.3
         참고."""
-        if STEERING_CONTROLLER != 'pure_pursuit':
-            return 1.0
         curvature = math.tan(math.radians(self._corner_signal)) / self.pure_pursuit.wheelbase_px
         if curvature == 0.0:
             return 1.0
@@ -1521,15 +1486,14 @@ class TrackDriverNode(Node):
         다시 튜닝해야 하므로). VESC 브리지가 안 떠 있거나 메시지가 끊겼거나(_vesc_t가
         VESC_STALE_SEC 이상 지남) 값이 너무 작으면(정지 근방, 노이즈 대비 신뢰 불가)
         예전처럼 self._prev_speed로 폴백한다 — cb_vesc()/VESC_MIN_SPEED_MPS 주석과 동일한
-        가드 원칙(control_loop()의 self.lqr.set_speed_mps() 가드와 짝을 맞춤)."""
+        가드 원칙."""
         if self._vesc_live():
             return abs(self.v_mps) / METERS_PER_SPEED_UNIT
         return self._prev_speed
 
     def _lane_steer(self, path=None, vehicle_x=None):
-        """path(ROI 픽셀좌표 경로, 가까운점→먼점)를 STEERING_CONTROLLER로 고른 컨트롤러
-        (pure_pursuit.py 또는 lqr.py)로 추종해 조향각(도)을 계산한다. 차량 기준점은
-        (vehicle_x, path[0]의 y좌표)로 둔다.
+        """path(ROI 픽셀좌표 경로, 가까운점→먼점)를 pure_pursuit(controller/pure_pursuit.py)로
+        추종해 조향각(도)을 계산한다. 차량 기준점은 (vehicle_x, path[0]의 y좌표)로 둔다.
 
         인자를 생략하면(기본 호출부인 _lane_drive() 등) 기존과 동일하게 self.lane_path와
         ROI 하단 중앙(roi_w/2)을 쓴다 — path[0].y는 lane_util._fit_and_sample_path()가
@@ -1539,23 +1503,16 @@ class TrackDriverNode(Node):
         게인을 두지 않고 이 함수를 그대로 재사용하기로 한 결정(perc_lavacon() 주석 참고).
 
         경로가 비어있으면(첫 프레임, 혹은 roi_w를 아직 모르는 백엔드) 직전 조향각을
-        그대로 유지한다 — 두 컨트롤러의 control()이 내부적으로 동일하게 처리.
-        (구 이름 _pure_pursuit_steer — STEERING_CONTROLLER로 lqr도 고를 수 있게 되며
-        컨트롤러 중립적인 이름으로 변경)
-        pure_pursuit은 속도 적응형 lookahead 때문에 speed(_speed_for_lookahead() 참고)를
-        받지만, lqr은 자체 speed_gain 튜닝값을 쓰고 control()에 speed 인자가 없다
-        (controller/lqr.py 참고) — 그래서 여기서 컨트롤러별로 분기해서 호출한다(공통
-        kwarg로 합칠 수 없음)."""
-        controller = self.lqr if STEERING_CONTROLLER == 'lqr' else self.pure_pursuit
+        그대로 유지한다 — pure_pursuit.control()이 내부적으로 이렇게 처리한다.
+        [2026-08-14] STEERING_CONTROLLER로 pure_pursuit/lqr 중 고르던 분기를 LQR 컨트롤러
+        제거와 함께 없앴다 — 이제 pure_pursuit 고정."""
         if path is None:
             path = self.lane_path
             roi_w = getattr(self.lane_detector, 'roi_w', 0) or 0
             vehicle_x = roi_w / 2.0
         if not path or vehicle_x is None:
-            return controller.prev_steer_deg
+            return self.pure_pursuit.prev_steer_deg
         vehicle_xy = (vehicle_x, path[0][1])
-        if STEERING_CONTROLLER == 'lqr':
-            return self.lqr.control(path, vehicle_xy)
         return self.pure_pursuit.control(path, vehicle_xy, speed=self._speed_for_lookahead(),
                                           imu_curvature_px=self._imu_curvature_px())
 
@@ -1568,47 +1525,36 @@ class TrackDriverNode(Node):
     # 덮어써도(apply_behavior_override) 이 창은 항상 "차선 조향 컨트롤러 자체"의 상태를
     # 보여주기 위함이다.
     def _debug_viz_steer(self):
-        controller = self.lqr if STEERING_CONTROLLER == 'lqr' else self.pure_pursuit
+        controller = self.pure_pursuit
         held = getattr(controller, 'held', False)
 
         # 주황 = 직전값 유지(경로 부족/노이즈로 신뢰 못 함), 초록 = 현재값 반영(정상 계산됨)
         status_color = (0, 140, 255) if held else (0, 200, 0)
         status_text = '직전값 유지 (경로 부족/노이즈)' if held else '현재값 반영'
-        controller_name = 'LQR' if STEERING_CONTROLLER == 'lqr' else 'Pure Pursuit'
 
         lines = [
-            (f'컨트롤러: {controller_name}', (10, 8), (255, 255, 255), 20, f'Controller: {controller_name}'),
+            ('컨트롤러: Pure Pursuit', (10, 8), (255, 255, 255), 20, 'Controller: Pure Pursuit'),
             (f'상태: {status_text}', (10, 40), status_color, 20,
              f'Status: {"HOLD (prev)" if held else "LIVE (fresh)"}'),
             (f'조향각: {controller.prev_steer_deg:+.1f}도', (10, 72), (255, 255, 255), 20,
              f'Steer: {controller.prev_steer_deg:+.1f}deg'),
         ]
-        if STEERING_CONTROLLER == 'lqr':
-            e_y = getattr(controller, 'last_e_y', None)
-            e_psi = getattr(controller, 'last_e_psi', None)
-            if e_y is not None:
-                lines.append((f'횡오차 e_y: {e_y:+.1f}px', (10, 8 + 32 * len(lines)), (255, 255, 255), 20,
-                               f'e_y: {e_y:+.1f}px'))
-            if e_psi is not None:
-                lines.append((f'헤딩오차 e_psi: {math.degrees(e_psi):+.1f}도', (10, 8 + 32 * len(lines)),
-                               (255, 255, 255), 20, f'e_psi: {math.degrees(e_psi):+.1f}deg'))
-        else:
-            # [2026-08-06] IMU curvature damping 보강이 실제로 반영되는지(그냥 코드만
-            # 들어가고 IMU/VESC 둘 중 하나가 죽어서 조용히 폴백 중인 건 아닌지) 여기서
-            # 바로 확인할 수 있게 노출한다 — _imu_curvature_px()가 None을 주면
-            # pure_pursuit.last_imu_curvature_px도 None으로 유지되므로(control() 참고)
-            # None이면 "지금은 probe_curvature 단독 판단 중"이라는 뜻.
-            lookahead_px = getattr(controller, 'last_lookahead_px', None)
-            curvature = getattr(controller, 'last_curvature', None)
-            imu_kappa = getattr(controller, 'last_imu_curvature_px', None)
-            if lookahead_px is not None and curvature is not None:
-                lines.append((f'lookahead: {lookahead_px:.0f}px  curvature: {curvature:+.4f}',
-                               (10, 8 + 32 * len(lines)), (255, 255, 255), 18,
-                               f'lookahead: {lookahead_px:.0f}px  curvature: {curvature:+.4f}'))
-            imu_color = (0, 200, 0) if imu_kappa is not None else (140, 140, 140)
-            imu_text = f'{imu_kappa:+.4f}' if imu_kappa is not None else '미반영(IMU/VESC 확인)'
-            lines.append((f'IMU curvature: {imu_text}', (10, 8 + 32 * len(lines)), imu_color, 18,
-                           f'IMU curvature: {imu_text if imu_kappa is not None else "N/A"}'))
+        # [2026-08-06] IMU curvature damping 보강이 실제로 반영되는지(그냥 코드만
+        # 들어가고 IMU/VESC 둘 중 하나가 죽어서 조용히 폴백 중인 건 아닌지) 여기서
+        # 바로 확인할 수 있게 노출한다 — _imu_curvature_px()가 None을 주면
+        # pure_pursuit.last_imu_curvature_px도 None으로 유지되므로(control() 참고)
+        # None이면 "지금은 probe_curvature 단독 판단 중"이라는 뜻.
+        lookahead_px = getattr(controller, 'last_lookahead_px', None)
+        curvature = getattr(controller, 'last_curvature', None)
+        imu_kappa = getattr(controller, 'last_imu_curvature_px', None)
+        if lookahead_px is not None and curvature is not None:
+            lines.append((f'lookahead: {lookahead_px:.0f}px  curvature: {curvature:+.4f}',
+                           (10, 8 + 32 * len(lines)), (255, 255, 255), 18,
+                           f'lookahead: {lookahead_px:.0f}px  curvature: {curvature:+.4f}'))
+        imu_color = (0, 200, 0) if imu_kappa is not None else (140, 140, 140)
+        imu_text = f'{imu_kappa:+.4f}' if imu_kappa is not None else '미반영(IMU/VESC 확인)'
+        lines.append((f'IMU curvature: {imu_text}', (10, 8 + 32 * len(lines)), imu_color, 18,
+                       f'IMU curvature: {imu_text if imu_kappa is not None else "N/A"}'))
 
         # DA(주행가능영역) 면적 — DL_DA_MAX_AREA_PX 실측 튜닝용. 원래 da_debug라는 별도
         # 창이었는데 조향 상태랑 같이 한눈에 보고 싶다는 요청으로 이 창에 합쳤다(2026-08-06).
@@ -1783,9 +1729,9 @@ class TrackDriverNode(Node):
         우측 콘이 연속 LAVACON_DONE_FRAMES 프레임 미검출되면 고정장애물 구간으로 전환.
 
         [2026-08-11] 조향은 라바콘 전용 P게인(LAVACON_KP, 폐기) 대신 _lane_steer()를
-        그대로 재사용한다 — 라인주행(_lane_drive())과 조향 파라미터(STEERING_CONTROLLER로
-        고른 컨트롤러 인스턴스, PP_*/LQR_* 게인, ANGLE_MAX/ANGLE_RATE_MAX)를 완전히
-        일치시키기로 한 결정. self.lavacon_path는 perc_lavacon()이 라이다 미터 좌표를
+        그대로 재사용한다 — 라인주행(_lane_drive())과 조향 파라미터(self.pure_pursuit
+        인스턴스, PP_* 게인, ANGLE_MAX/ANGLE_RATE_MAX)를 완전히 일치시키기로 한 결정.
+        self.lavacon_path는 perc_lavacon()이 라이다 미터 좌표를
         self.lane_path와 같은 px 스케일로 변환해둔 것이고, 차량 기준점은 그 변환의
         원점인 (0.0, path[0].y)다.
         """
@@ -2051,12 +1997,6 @@ class TrackDriverNode(Node):
         """
         self.perceive_all()                 # 1. 인지
         self._update_lap()                  #    바퀴 카운트(누적 yaw + 정지선)
-        # VESC 실측 속도를 LQR 게인에 반영(2026-08-06 LQR 브랜치에서 이식) — run_mission_fsm()보다
-        # 먼저 해야 이번 틱의 _lane_steer()가 최신 속도로 계산된 게인을 쓴다. VESC_MIN_SPEED_MPS
-        # 미만(정지/거의정지, 혹은 vesc_speed_bridge 노드 미실행으로 self.v_mps가 계속 0.0)이면
-        # 건너뛰고 직전 게인을 유지한다(cb_vesc()/VESC_MIN_SPEED_MPS 주석 참고).
-        if abs(self.v_mps) >= VESC_MIN_SPEED_MPS:
-            self.lqr.set_speed_mps(self.v_mps)
         self.run_mission_fsm()              # 2. 판단(Mission)
 
         if DEBUG_VIZ_STEER:
