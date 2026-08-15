@@ -205,6 +205,12 @@ class TrackDriverNode(Node):
         self.mission_state  = START_STATE
         self.behavior_state = BehaviorState.B0_NORMAL
         self.phase          = Phase.LAVACON     # S1 내부 진행 순서(라바콘부터 시작)
+        # [2026-08-15] Phase.OBSTACLE_ZONE 통합(da_based_b2b3_proposal.md B안) —
+        # B2/B3 각각 최소 한 번 완료됐는지 추적. 둘 다 True가 돼야 Phase.DONE으로
+        # 넘어간다(_mark_behavior_passed() 참고) — 순서를 안 따지므로 어느 쪽이 먼저
+        # 끝나도 상관없다.
+        self._b2_passed = False
+        self._b3_passed = False
         self._behavior_enabled = TEST_FORCE_BEHAVIOR  # 원래 S2 교차로 "직진"으로 S1 재진입 시에만 True
                                                        #   (TEST_FORCE_BEHAVIOR=True면 라바콘 단독 테스트용으로 시작부터 강제 ON)
         self._lavacon_engaged  = False          # B1_LAVACON 진입 확정 latch (트리거 이후 잠깐 한쪽 클러스터가
@@ -1195,6 +1201,8 @@ class TrackDriverNode(Node):
             self.obstacle_controller.reset()
             self.vehicle_controller.reset()
             self.behavior_state = BehaviorState.B0_NORMAL
+            self._b2_passed = False   # [2026-08-15] Phase.OBSTACLE_ZONE 통합 — 완료 추적도 매 바퀴 리셋
+            self._b3_passed = False
 
     def run_mission_fsm(self):
         {
@@ -1441,8 +1449,19 @@ class TrackDriverNode(Node):
     # ── Behavior FSM (Phase에 따라 순차 전용으로 배타 실행, 우선순위 판단 불필요) ──
     def run_behavior_fsm(self):
         """
-        S1(차선주행) 재진입 후 Phase 순서(LAVACON→FIXED_OBSTACLE→VEHICLE→DONE)에 따라
-        딱 하나의 Behavior만 활성화한다. Phase 전환은 각 핸들러가 완료 시점에 직접 수행.
+        S1(차선주행) 재진입 후 Phase 순서(LAVACON→OBSTACLE_ZONE→DONE)에 따라 딱 하나의
+        Behavior만 활성화한다. Phase 전환은 각 핸들러가 완료 시점에 직접 수행
+        (`_mark_behavior_passed()` 참고).
+
+        [2026-08-15] OBSTACLE_ZONE 통합(da_based_b2b3_proposal.md B안) — 예전엔
+        FIXED_OBSTACLE/VEHICLE 두 Phase로 미리 순서를 나눠 "지금이 고정장애물 구간인지
+        방해차량 구간인지"를 Phase가 알려줬는데, da 안전마진(§2.30)+avoid-hold
+        (§2.32/§2.33)로 회피 기동 자체가 정적/동적 구분 없이 da 경로를 그대로 신뢰하는
+        쪽으로 가면서 그 구분을 미리 나눠둘 이유가 약해졌다. 이제 정적/동적 구분은
+        Phase가 아니라 매 프레임 `obstacle_type`(라이다 실측 폭 기반, `perc_obstacle()`
+        참고)으로 그때그때 판단한다 — 예전에 "Phase가 순서를 강제하니 트리거에서
+        `obstacle_type` 조건을 뺐다"던 이유(아래 참고)가 Phase 통합으로 없어졌으니
+        다시 넣을 수 있게 된 것.
         """
         if self.phase == Phase.LAVACON:
             # 좌우 라이다 클러스터가 동시에(디바운스 프레임수만큼) 검출되면 B1_LAVACON 진입을 확정(latch)한다.
@@ -1453,36 +1472,48 @@ class TrackDriverNode(Node):
             self.behavior_state = (BehaviorState.B1_LAVACON
                                     if self._lavacon_engaged
                                     else BehaviorState.B0_NORMAL)
-        elif self.phase == Phase.FIXED_OBSTACLE:
-            # TEST_DISABLE_B2_B3=True면 SAFETY_DIST 트리거 검사(아래 triggered 계산)를 아예 안 하고
-            # 바로 리턴 — 장애물이 실제로 잡혀도 B2_OBSTACLE로 안 넘어가고 B0로 고정되어
-            # _s1_lane_follow의 일반 차선 PID가 계속 돎(placeholder 회피 기동이 실행 안 됨).
+        elif self.phase == Phase.OBSTACLE_ZONE:
+            # TEST_DISABLE_B2_B3=True면 트리거 검사를 아예 안 하고 바로 리턴 — 장애물/방해차량이
+            # 실제로 잡혀도 B2_OBSTACLE/B3_VEHICLE로 안 넘어가고 B0로 고정되어 _s1_lane_follow의
+            # 일반 차선 PID가 계속 돎(placeholder 회피 기동이 실행 안 됨). 이 게이팅은 통합 전과
+            # 동일하게 유지된다 — False로 바꾸면 트리거/디스패치가 예전과 같은 조건으로 그대로
+            # 동작한다(달라진 건 "두 Phase로 미리 나눔" → "한 Phase 안에서 타입으로 나눔"뿐).
             if TEST_DISABLE_B2_B3:
-                self.behavior_state = BehaviorState.B0_NORMAL   # 테스트 범위 제한: B2 트리거 무시
+                self.behavior_state = BehaviorState.B0_NORMAL
                 return
-            # 트리거에서 obstacle_type=='fixed' 조건을 뺐다.
-            #   [6]에서 분류 기준을 실폭으로 바꾸면서, 차선을 막고 선 '차량'(폭 넓음)은
-            #   'vehicle' 로 분류된다. 옛 조건대로면 이 Phase 에서 영영 트리거되지 않아
-            #   Phase.VEHICLE 로 넘어가지도 못하고 교착된다.
-            #   회피 기동 자체는 고정물이든 차량이든 '반대편 차선으로 비킨다'로 동일하므로
-            #   여기서는 '앞을 막고 있는가'만 본다(순서는 Phase 가 이미 강제하고 있음).
-            triggered = (self.obstacle_front
-                         and self.obstacle_dist < SAFETY_DIST
-                         and self._maneuver_allowed)
-            self.behavior_state = (BehaviorState.B2_OBSTACLE
-                                    if (triggered or self._obstacle_active)
-                                    else BehaviorState.B0_NORMAL)
-        elif self.phase == Phase.VEHICLE:
-            # 위와 동일한 이유로 트리거 검사를 건너뛰고 B0로 고정(placeholder 추월 기동 비활성화)
-            if TEST_DISABLE_B2_B3:
-                self.behavior_state = BehaviorState.B0_NORMAL   # 테스트 범위 제한: B3 트리거 무시
+
+            # 이미 진행 중인 기동이 있으면 이번 프레임 obstacle_type이 흔들려도 핸들러를
+            # 중간에 바꾸지 않는다(진행 중 스왑은 위험 — 기존 "or self._obstacle_active"/
+            # "or self._overtake_active" 유지 패턴과 동일 원칙, 우선순위만 명시적으로 첫
+            # 분기로 올렸다).
+            if self._obstacle_active:
+                self.behavior_state = BehaviorState.B2_OBSTACLE
                 return
-            # 진입 판정은 perc_vehicle_trigger()의 라이다 디바운스 결과를 사용.
-            # 한번 진입한 뒤(_overtake_active)에는 기존과 동일하게 라이다 단독으로 유지/종료 판단.
-            self.behavior_state = (BehaviorState.B3_VEHICLE
-                                    if ((self.vehicle_trigger and self._maneuver_allowed)
-                                        or self._overtake_active)
-                                    else BehaviorState.B0_NORMAL)
+            if self._overtake_active:
+                self.behavior_state = BehaviorState.B3_VEHICLE
+                return
+
+            # 새로 트리거를 판단할 때만 obstacle_type으로 B2/B3를 가른다. 두 트리거
+            # (SAFETY_DIST 기반 triggered_fixed, OVERTAKE_TRIGGER+디바운스 기반
+            # perc_vehicle_trigger()의 self.vehicle_trigger)는 원래 서로 다른 Phase에서만
+            # 봐서 겹칠 일이 없었는데, 이제 같은 프레임에 동시에 참일 수 있다 —
+            # obstacle_type=='vehicle'이면 방해차량 쪽을 우선한다(vehicle_trigger가 아직
+            # 디바운스 중이라도 폭이 이미 vehicle로 잡혔으면 B3로 본다). ★알려진 한계★:
+            # 트리거 발동 직후 몇 프레임은 obstacle_type/vehicle_trigger 디바운스 타이밍이
+            # 안 맞아 잠깐 B2로 걸렸다가 B3로 바뀌는 등 짧은 오분류가 있을 수 있다 —
+            # `_obstacle_active`/`_overtake_active` latch가 실제로 걸리기 전(TargetPassing이
+            # 아직 IDLE)에만 해당하는 구간이라 영향은 제한적이라고 판단.
+            triggered_fixed = (self.obstacle_front
+                                and self.obstacle_dist < SAFETY_DIST
+                                and self._maneuver_allowed)
+            triggered_vehicle = self.vehicle_trigger and self._maneuver_allowed
+
+            if triggered_vehicle and self.obstacle_type == 'vehicle':
+                self.behavior_state = BehaviorState.B3_VEHICLE
+            elif triggered_fixed:
+                self.behavior_state = BehaviorState.B2_OBSTACLE
+            else:
+                self.behavior_state = BehaviorState.B0_NORMAL
         else:  # Phase.DONE
             self.behavior_state = BehaviorState.B0_NORMAL
 
@@ -1980,8 +2011,8 @@ class TrackDriverNode(Node):
                 self._pid_prev_error = 0.0
                 self._pid_integral   = 0.0
                 self._lavacon_engaged = False   # B1 진입 latch 해제 (구간 재진입 대비)
-                self.phase = Phase.FIXED_OBSTACLE
-                self.get_logger().info('[LAVACON] 구간 통과 완료 → 고정장애물 구간')
+                self.phase = Phase.OBSTACLE_ZONE
+                self.get_logger().info('[LAVACON] 구간 통과 완료 → 장애물 구간')
         else:
             self._lavacon_empty_cnt = 0
 
@@ -1994,8 +2025,7 @@ class TrackDriverNode(Node):
             # TargetPassing으로 덮어쓰지 않고 이번 틱은 그냥 둔다.
             return
 
-        self._run_passing(self.obstacle_controller, 'B2',
-                          done_next_phase=Phase.VEHICLE)
+        self._run_passing(self.obstacle_controller, 'B2')
 
     # [2026-08-11] da 기반 회피가 이 정지 장애물을 알아서 피하고 있다고 믿을 수 있는지
     #   판단한다. False면 TargetPassing 개입 없이 da 경로 그대로, True면 위
@@ -2022,7 +2052,8 @@ class TrackDriverNode(Node):
 
     # ── B3-방해차량 추월 ──★재설계 예정(임시 placeholder) ──
     # target_lane 반영 수정
-    # 회피 후 복귀하는 로직 추가 : idle -> avoid -> idle+Phase.VEHICLE => idel -> avoid -> return -> idle
+    # 회피 후 복귀하는 로직 추가 : idle -> avoid -> idle+B2/B3 완료 => idel -> avoid -> return -> idle
+    # (2026-08-15: Phase.VEHICLE는 Phase.OBSTACLE_ZONE 통합으로 없어짐 — _mark_behavior_passed() 참고)
     def _handle_overtake(self):
         """방해차량 추월. 규정상 '방해차량이 주행하지 않는 차선'으로 지나가야 하고,
         그 차량이 1·2차선을 오가므로 매 프레임 타겟 횡위치를 다시 보고 필요하면
@@ -2037,8 +2068,7 @@ class TrackDriverNode(Node):
             self._handle_overtake_astar()
             return
 
-        self._run_passing(self.vehicle_controller, 'B3',
-                          done_next_phase=Phase.DONE)
+        self._run_passing(self.vehicle_controller, 'B3')
 
     # ── B3 대안: Hybrid A* 경로계획 방식 (USE_HYBRID_ASTAR_FOR_B3=True 일 때만) ──
     #   [2026-08-11] B2 쪽 Hybrid A* 대안(_handle_fixed_obstacle_astar)은 삭제됐다 —
@@ -2093,7 +2123,7 @@ class TrackDriverNode(Node):
                 # 양쪽 다 막혔다 — TargetPassing의 'blocked' 서행재시도 동작을 그대로 재사용.
                 self._b3_astar_reset()
                 self._b3_using_fallback = True
-                self._run_passing(self.vehicle_controller, 'B3', done_next_phase=Phase.DONE)
+                self._run_passing(self.vehicle_controller, 'B3')
                 return
 
             goal = self.planner.make_goal_by_side(self.obstacle_dist, side)
@@ -2122,7 +2152,7 @@ class TrackDriverNode(Node):
                 if self._b3_fail_cnt >= ASTAR_B3_FAIL_GRACE_TICKS:
                     self._b3_astar_reset()
                     self._b3_using_fallback = True
-                    self._run_passing(self.vehicle_controller, 'B3', done_next_phase=Phase.DONE)
+                    self._run_passing(self.vehicle_controller, 'B3')
                     return
                 self.path = None
                 self.ctrl_speed = max(SPEED_NORMAL * 0.15, 0.5)
@@ -2153,7 +2183,7 @@ class TrackDriverNode(Node):
             self._b3_astar_reset()
             self.stanley.reset()
 
-            self.phase = Phase.DONE
+            self._mark_behavior_passed('B3')  # [2026-08-15] Phase.OBSTACLE_ZONE 통합 — B2도 끝나야 DONE
             self.behavior_state = BehaviorState.B0_NORMAL
 
             self._pid_prev_error = 0.0
@@ -2182,8 +2212,24 @@ class TrackDriverNode(Node):
         self._b3_fail_cnt = 0
         self._b3_side = 0
 
+    # [2026-08-15] Phase.OBSTACLE_ZONE 통합(da_based_b2b3_proposal.md B안) — B2/B3가
+    # 완료를 알리는 공통 지점. 예전엔 각자 다음 Phase를 직접 지정했는데(B2 완료 →
+    # Phase.VEHICLE, B3 완료 → Phase.DONE, 트랙 순서가 고정이라는 가정), 이제 Phase가
+    # 하나로 합쳐져서 "둘 다 최소 한 번 끝났는가"로 판단해야 한다 — 어느 쪽이 먼저
+    # 끝나도 상관없다. 트랙에 둘 중 하나가 아예 없어서 영영 안 끝나면 Phase는
+    # OBSTACLE_ZONE에 계속 남지만, 그래도 무해하다(run_behavior_fsm()이 매 프레임
+    # 트리거를 다시 보므로 일반 차선주행과 다를 바 없다).
+    def _mark_behavior_passed(self, tag):
+        if tag == 'B2':
+            self._b2_passed = True
+        elif tag == 'B3':
+            self._b3_passed = True
+        if self._b2_passed and self._b3_passed:
+            self.phase = Phase.DONE
+            self.get_logger().info('[OBSTACLE_ZONE] B2/B3 모두 통과 완료 → DONE')
+
     # ── B2/B3 공통 실행부 ──
-    def _run_passing(self, controller, tag, done_next_phase):
+    def _run_passing(self, controller, tag):
         steer_offset, speed, done, status = controller.update(
             obstacle_front=self.obstacle_front,
             obstacle_dist=self.obstacle_dist,
@@ -2210,14 +2256,14 @@ class TrackDriverNode(Node):
         self.ctrl_speed = speed
 
         if done:
-            self.phase = done_next_phase
+            self._mark_behavior_passed(tag)
             self._pid_prev_error = 0.0
             self._pid_integral = 0.0
             if tag == 'B3':
                 # astar가 실패해서 여기로 폴백해 있던 상태였다면, 이번 통과가 끝났으니
                 # 다음 방해차량 조우 때는 다시 astar부터 시도할 수 있게 풀어준다.
                 self._b3_using_fallback = False
-            self.get_logger().info(f'[{tag}] 통과 완료 → {done_next_phase.name}')
+            self.get_logger().info(f'[{tag}] 통과 완료 (phase={self.phase.name})')
 
 
     # #########################################################

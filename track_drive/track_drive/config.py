@@ -41,15 +41,23 @@ class MissionState(Enum):
 class BehaviorState(Enum):
     B0_NORMAL   = 0  # Mission(차선주행) 출력 그대로
     B1_LAVACON  = 1  # 라바콘 구간 주행 (Phase.LAVACON일 때, 좌우 라이다 클러스터 동시검출 트리거로 활성)
-    B2_OBSTACLE = 2  # 고정장애물 회피 (Phase.FIXED_OBSTACLE일 때, 감지 시 활성)
-    B3_VEHICLE  = 3  # 방해차량 추월   (Phase.VEHICLE일 때, 감지 시 활성)
+    B2_OBSTACLE = 2  # 고정장애물 회피 (Phase.OBSTACLE_ZONE일 때 obstacle_type=='fixed'로 감지 시 활성)
+    B3_VEHICLE  = 3  # 방해차량 추월   (Phase.OBSTACLE_ZONE일 때 obstacle_type=='vehicle'로 감지 시 활성)
 
-# S1(차선주행) 내부 진행 순서 — 순서 고정(라바콘→고정장애물→방해차량→완료), 순차 전용(우선순위 판단 불필요)
+# S1(차선주행) 내부 진행 순서 — 순서 고정(라바콘→장애물구간→완료), 순차 전용(우선순위 판단 불필요)
+# [2026-08-15] FIXED_OBSTACLE/VEHICLE을 OBSTACLE_ZONE 하나로 통합했다
+# (da_based_b2b3_proposal.md "해결 방향 B안"). 예전엔 이 둘을 트랙 순서로 미리 나눠
+# "지금이 고정장애물 구간인지 방해차량 구간인지"를 Phase가 알려줬는데, da 안전마진
+# (§2.30)+avoid-hold(§2.32/§2.33)로 회피 기동 자체가 정적/동적 구분 없이 동일해지면서
+# 그 구분이 굳이 필요 없어졌다 — 이제 정적/동적 구분은 Phase가 아니라 매 프레임
+# obstacle_type(라이다 실측 폭 기반, perc_obstacle() 참고)으로 그때그때 판단한다
+# (track_drive.py run_behavior_fsm() 참고). OBSTACLE_ZONE→DONE 전환은 B2/B3 둘 다
+# 최소 한 번씩 완료돼야 넘어간다(_mark_behavior_passed(), 순서 고정 가정을 버렸으므로
+# "마지막에 끝난 쪽"이 아니라 "둘 다 끝났는가"로 판단).
 class Phase(Enum):
     LAVACON        = 0
-    FIXED_OBSTACLE = 1
-    VEHICLE        = 2
-    DONE           = 3  # 모든 Behavior 미션 완료 — 이후 계속 B0로 일반 차선주행
+    OBSTACLE_ZONE  = 1  # 고정장애물 회피 + 방해차량 추월 통합 구간 (예전 FIXED_OBSTACLE/VEHICLE)
+    DONE           = 2  # 모든 Behavior 미션 완료 — 이후 계속 B0로 일반 차선주행
 
 
 # #############################################################

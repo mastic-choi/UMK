@@ -78,11 +78,13 @@ Hybrid A* 경로계획(B2 대안, 보존용)은 `planner/`에 모여 있습니�
 - 코너 안쪽 컷을 막기 위해 일부 코너 안쪽에 **주행 방해용 고정 장애물**이 배치됨 — 여기 걸려 멈추면 빨리
   판단해 터치(5초 벌초)로 옮겨야 함.
 
-### 고정 장애물 회피 (`Phase.FIXED_OBSTACLE` / `BehaviorState.B2_OBSTACLE`)
+### 고정 장애물 회피 (`Phase.OBSTACLE_ZONE`(2026-08-15부터, 이전 `Phase.FIXED_OBSTACLE`) /
+`BehaviorState.B2_OBSTACLE`)
 - 고장난 차량 모형 등 정지 장애물을 충돌 없이 회피. 이 구간의 차선 이탈/터치는 위 일반 규정과 동일 적용
   (별도 예외 없음).
 
-### 방해차량 추월 (`Phase.VEHICLE` / `BehaviorState.B3_VEHICLE`)
+### 방해차량 추월 (`Phase.OBSTACLE_ZONE`(2026-08-15부터, 이전 `Phase.VEHICLE`) /
+`BehaviorState.B3_VEHICLE`)
 - 방해차량 1대가 저속으로 1·2차선을 오가며 주행.
 - **추월 중에는 실선 이탈을 차선 이탈로 안 봄.** 추월 후 최대한 빨리 실선 안쪽 복귀 필요 — 복귀 후 방해차량과
   간격이 **90cm 이상**이면 오히려 차선 이탈로 판정.
@@ -2109,6 +2111,54 @@ DL 추론 자체도 이미 논블로킹 백그라운드 워커라 결과가 프�
   `avoid_hold_improvement_proposal.md`에도 기록돼 있으니 실차 첫 테스트 시 주의 깊게
   볼 것.
 
+### 2.34 `Phase.FIXED_OBSTACLE`/`Phase.VEHICLE` → `Phase.OBSTACLE_ZONE` 통합 (2026-08-15,
+실차 미검증)
+
+**배경:** avoid-hold(§2.32/§2.33) 이후 토론에서 나온 질문 — "da 안전마진(§2.30)+avoid-hold로
+회피 기동 자체가 정적/동적 구분 없이 동일해졌는데, `TargetPassing`이 정적/동적을 미리
+구분해서 받는(`moving` 플래그) 전제였던 `Phase.FIXED_OBSTACLE`/`Phase.VEHICLE` 순차 구분이
+여전히 필요한가?" `da_based_b2b3_proposal.md`에서 검토한 결과: 원래 Phase가 필요했던 이유는
+`TargetPassing`이 **한번 시작하면 끝까지 실행하는 커밋형 기동**이라, 그 기동 종류를 실시간
+속도추정(노이즈 취약)으로 고르면 잘못된 기동을 통째로 커밋할 위험이 있어서였다
+(`controller/obstacle_avoidance.py` 상단 주석 — "정적/동적 판별을 위한 속도추정은 하지
+않는다, 상위 Phase가 이미 구분해주므로"). da 기반 회피가 커밋형 기동 없이 매 프레임
+연속적으로 반응하는 쪽으로 가면서 그 위험 자체가 줄었다고 판단해, 이번에 두 Phase를 하나로
+합쳤다.
+
+**구현:**
+- `config.py` `Phase` enum: `FIXED_OBSTACLE`/`VEHICLE` → `OBSTACLE_ZONE` 하나로.
+- `run_behavior_fsm()`: `Phase.OBSTACLE_ZONE` 한 브랜치 안에서 두 트리거(`SAFETY_DIST` 기반
+  고정장애물 트리거, `perc_vehicle_trigger()`의 `vehicle_trigger`)를 동시에 보고,
+  `obstacle_type`(라이다 실측 폭 기반, `perc_obstacle()`)으로 `B2_OBSTACLE`/`B3_VEHICLE`을
+  그때그때 가른다 — 예전엔 Phase가 순서를 강제해서 트리거에서 `obstacle_type` 조건을 뺐었는데
+  (2026-08-11, "옛 조건대로면 Phase.VEHICLE로 넘어가지도 못하고 교착된다"), 그 이유였던
+  Phase 세분화 자체가 없어졌으니 다시 넣을 수 있게 됐다. 이미 진행 중인 기동
+  (`_obstacle_active`/`_overtake_active`)이 있으면 이번 프레임 분류가 흔들려도 핸들러를
+  중간에 바꾸지 않는다.
+- **Phase 전진**: 예전엔 B2 완료 → `Phase.VEHICLE`, B3 완료 → `Phase.DONE`으로 각 핸들러가
+  직접 다음 Phase를 지정했다(트랙 순서 고정 가정). 이제 `_mark_behavior_passed(tag)`가
+  `self._b2_passed`/`self._b3_passed`를 따로 추적하다가 **둘 다 True가 돼야**
+  `Phase.DONE`으로 넘어간다 — 어느 쪽이 먼저 끝나도 상관없다. 두 플래그는
+  `RESET_PHASE_EACH_LAP`과 함께 매 바퀴 리셋된다.
+
+**`TEST_DISABLE_B2_B3`는 그대로 동작한다** — `Phase.OBSTACLE_ZONE` 브랜치 맨 위에서 여전히
+`if TEST_DISABLE_B2_B3: behavior_state = B0_NORMAL; return`으로 트리거 검사 자체를
+건너뛴다. `False`로 바꾸면 예전과 같은 조건(SAFETY_DIST/OVERTAKE_TRIGGER+디바운스)으로
+트리거가 그대로 걸리고, 달라진 건 "두 Phase로 미리 나눠 어느 트리거를 볼지 정함" → "한
+Phase 안에서 매 프레임 타입으로 나눔"뿐이다.
+
+**알려진 한계(실차 미검증):**
+- 트리거 발동 직후 몇 프레임은 `obstacle_type`/`vehicle_trigger` 디바운스 타이밍이 안 맞아
+  잠깐 `B2_OBSTACLE`로 걸렸다가 `B3_VEHICLE`로 바뀌는 등 짧은 오분류가 있을 수 있다 —
+  `_obstacle_active`/`_overtake_active` latch가 실제로 걸리기 전(TargetPassing이 아직
+  IDLE)에만 해당하는 구간이라 영향은 제한적이라고 판단했지만 실차 확인 전이다.
+- `_da_avoidance_failed()`의 `da_unaware_of_obstacle=True`는 아직 안 건드렸다 — 즉 B2는
+  여전히 항상 `TargetPassing`으로 폴백한다. 이번 변경은 Phase 구조만 정리한 것이고,
+  "da를 실제로 신뢰하기 시작하는" 다음 단계는 `da_based_b2b3_proposal.md` "다음 단계"에
+  남아있다.
+- `RESET_PHASE_EACH_LAP=True`(현재값) 기준으로만 검증됐다 — `False`로 두고 여러 바퀴를
+  도는 경로는 아직 안 봄.
+
 ---
 
 ## 3. 라바콘 (B1_LAVACON)
@@ -2200,10 +2250,13 @@ NonMaxSuppression 레이어의 빈 텐서 케이스를 현재 TensorRT가 못 �
 START_STATE = MissionState.S1_LANE_FOLLOW
 TEST_DISABLE_B2_B3 = False     # B2 트리거 검사를 켜야 함
 TEST_FORCE_BEHAVIOR = True
-self.phase = Phase.FIXED_OBSTACLE   # __init__ 안의 self.phase 초기값을 임시로 변경 (격리 테스트용)
+self.phase = Phase.OBSTACLE_ZONE   # __init__ 안의 self.phase 초기값을 임시로 변경 (격리 테스트용)
 ```
-정상 흐름은 라바콘(B1) 완료 후 자동으로 `Phase.FIXED_OBSTACLE`로 넘어가는 것이라, 이 기능만 격리
+정상 흐름은 라바콘(B1) 완료 후 자동으로 `Phase.OBSTACLE_ZONE`으로 넘어가는 것이라, 이 기능만 격리
 테스트하려면 `__init__`의 `self.phase = Phase.LAVACON`을 위처럼 임시로 바꾸면 됩니다.
+**[2026-08-15]** 예전엔 여기가 `Phase.FIXED_OBSTACLE`이었는데, B2/B3가 `Phase.OBSTACLE_ZONE`
+하나로 합쳐졌습니다(§2.34 참고) — B2만 격리 테스트하려면 트랙에 방해차량(폭 `OBSTACLE_VEHICLE_WIDTH_M`
+이상) 없이 고정 장애물만 놓고 확인하세요(`obstacle_type` 분류가 폭 기반이라 B3로 안 걸림).
 
 **진입 게이트 — `_da_avoidance_failed()` (2026-08-11 추가):** B2 트리거가 걸렸다고 바로
 `TargetPassing`이 켜지지 않고 먼저 `_da_avoidance_failed()`를 봅니다. `False`면(= da 기반 경로가
@@ -2359,9 +2412,13 @@ self.phase = Phase.FIXED_OBSTACLE   # __init__ 안의 self.phase 초기값을 �
 START_STATE = MissionState.S1_LANE_FOLLOW
 TEST_DISABLE_B2_B3 = False
 TEST_FORCE_BEHAVIOR = True
-self.phase = Phase.VEHICLE     # 격리 테스트용 임시 변경
+self.phase = Phase.OBSTACLE_ZONE     # 격리 테스트용 임시 변경
 ```
-B2와 마찬가지로 별도 노드 전환 없이 `self.phase = Phase.VEHICLE`만 바꾸면 격리 테스트할 수 있습니다.
+B2와 마찬가지로 별도 노드 전환 없이 `self.phase = Phase.OBSTACLE_ZONE`만 바꾸면 격리 테스트할 수
+있습니다. **[2026-08-15]** 예전엔 여기가 전용 `Phase.VEHICLE`이라 B3만 격리하기 쉬웠는데,
+Phase가 하나로 합쳐진 뒤로는(§2.34) 트랙에 폭 `OBSTACLE_VEHICLE_WIDTH_M` 이상인 타겟(방해차량
+쪽으로 분류됨)을 놓아야 `run_behavior_fsm()`이 B3_VEHICLE로 디스패치합니다 — 폭이 좁으면
+B2_OBSTACLE로 걸립니다.
 진입 조건은 **라이다 단독** — 전방 장애물 + 거리 < `OVERTAKE_TRIGGER=6.5m`가 `VEHICLE_TRIGGER_FRAMES(5프레임)`
 연속 유지되면 확정됩니다(`perc_vehicle_trigger()`).
 
