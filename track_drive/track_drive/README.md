@@ -1768,7 +1768,9 @@ BEV 좌표계에 투영해서 그 자리만 da에서 깎아내면(차폭 침식�
 아니다** — 라이다와 카메라가 차체의 서로 다른 위치에 붙어있는데도 지금까지 "둘 다
 차량 중심이 원점"이라고 각자 독립적으로 가정만 해왔지 실측 대조를 한 적이 없었다.
 
-**만든 것 — `measure_lidar_camera_offset.py`(신규, `track_drive/track_drive/` 최상위):**
+**만든 것 — `measure_lidar_camera_offset.py`(신규, `UMK/tools/`
+— [2026-08-15] 주행 파이프라인과 무관한 실측 도구라 `tools/` 폴더로 이동함, README
+§2.35 참고):**
 이 오프셋을 실측하는 독립 실행 도구. 설계 원칙:
 - **ROS2 빌드/노드 없이 `python3 measure_lidar_camera_offset.py`로 바로 실행** —
   `track_drive` 패키지를 import하지 않고 필요한 상수(`DL_BEV_SRC_PX_RAW`,
@@ -2129,6 +2131,26 @@ Phase 안에서 매 프레임 타입으로 나눔"뿐이다.
   남아있다.
 - `RESET_PHASE_EACH_LAP=True`(현재값) 기준으로만 검증됐다 — `False`로 두고 여러 바퀴를
   도는 경로는 아직 안 봄.
+
+### 2.35 주행과 무관한 실측 도구를 `UMK/tools/`로 이동 (2026-08-15)
+
+**배경:** `measure_lidar_camera_offset.py`(+ 짝 문서 `measure_lidar_camera_offset.md`,
+§2.30)는 `track_drive` ROS2 패키지를 import하지 않는 완전 독립 실행 스크립트(필요한
+상수는 `config.py`에서 그대로 복사해 파일 상단에 둠)인데, 지금까지
+`track_drive/track_drive/` 안에 다른 주행 코드와 섞여 있었다. 주행 파이프라인과
+무관한 실측/캘리브레이션 도구를 따로 모아두면 어떤 파일이 실제로 실차에서 도는
+코드인지 구분하기 쉬워진다는 판단으로 저장소 최상위에 `tools/` 폴더를 신설해 옮겼다.
+
+**이동:** `track_drive/track_drive/measure_lidar_camera_offset.py`/`.md` →
+`tools/measure_lidar_camera_offset.py`/`.md`. 이 스크립트는 애초에 상대 import가
+전혀 없는 독립 스크립트라(`import cv2`/`numpy`/표준 라이브러리뿐) 실행 방법
+(`python3 tools/measure_lidar_camera_offset.py`)만 경로가 바뀌었을 뿐 동작은 그대로다.
+
+**알려진 한계:** `JETSON_SETUP.md`가 언급하는 `bev_point_picker.py`/
+`stationary_noise_calib.py`도 성격상 같은 `tools/`에 들어가야 맞지만, 이번에
+저장소를 확인해보니 **둘 다 트래킹된 파일 자체가 존재하지 않는다**(JETSON_SETUP.md
+"⚠️ 알려진 문제"절에 이미 "소스 파일 자체가 없는 엔트리 포인트"로 기록돼 있던
+것과 같은 상태) — 나중에 이 파일들이 복원/추가되면 그때 같이 `tools/`로 옮길 것.
 
 ---
 

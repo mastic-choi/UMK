@@ -4,6 +4,9 @@
 이 저장소의 각 최상위 폴더(`track_drive/`, `yolo_ros/`, `xycar_device/`)는 실제 로봇의
 `~/xycar_ws/src/` 안에 들어가는 ROS2 패키지입니다. 여기서 수정 → 실차에서 pull →
 해당 폴더를 `xycar_ws/src/`에 붙여넣고 `colcon build`하는 배포 모델입니다.
+**`tools/`는 예외** — ROS2 패키지가 아니라(`xycar_ws/src/`에 안 들어감), 주행
+파이프라인과 무관한 실측/캘리브레이션용 독립 스크립트(예: `measure_lidar_camera_offset.py`)
+만 모아두는 폴더입니다(2026-08-15 도입, README §2.35).
 
 ## 이 환경엔 ROS2 툴체인이 없음
 `ros2`/`colcon` 미설치. 검증은 `python3 -m py_compile <file>`(문법 체크)까지만 가능 —
