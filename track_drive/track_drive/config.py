@@ -41,15 +41,23 @@ class MissionState(Enum):
 class BehaviorState(Enum):
     B0_NORMAL   = 0  # Mission(차선주행) 출력 그대로
     B1_LAVACON  = 1  # 라바콘 구간 주행 (Phase.LAVACON일 때, 좌우 라이다 클러스터 동시검출 트리거로 활성)
-    B2_OBSTACLE = 2  # 고정장애물 회피 (Phase.FIXED_OBSTACLE일 때, 감지 시 활성)
-    B3_VEHICLE  = 3  # 방해차량 추월   (Phase.VEHICLE일 때, 감지 시 활성)
+    B2_OBSTACLE = 2  # 고정장애물 회피 (Phase.OBSTACLE_ZONE일 때 obstacle_type=='fixed'로 감지 시 활성)
+    B3_VEHICLE  = 3  # 방해차량 추월   (Phase.OBSTACLE_ZONE일 때 obstacle_type=='vehicle'로 감지 시 활성)
 
-# S1(차선주행) 내부 진행 순서 — 순서 고정(라바콘→고정장애물→방해차량→완료), 순차 전용(우선순위 판단 불필요)
+# S1(차선주행) 내부 진행 순서 — 순서 고정(라바콘→장애물구간→완료), 순차 전용(우선순위 판단 불필요)
+# [2026-08-15] FIXED_OBSTACLE/VEHICLE을 OBSTACLE_ZONE 하나로 통합했다
+# (da_based_b2b3_proposal.md "해결 방향 B안"). 예전엔 이 둘을 트랙 순서로 미리 나눠
+# "지금이 고정장애물 구간인지 방해차량 구간인지"를 Phase가 알려줬는데, da 안전마진
+# (§2.30)+avoid-hold(§2.32/§2.33)로 회피 기동 자체가 정적/동적 구분 없이 동일해지면서
+# 그 구분이 굳이 필요 없어졌다 — 이제 정적/동적 구분은 Phase가 아니라 매 프레임
+# obstacle_type(라이다 실측 폭 기반, perc_obstacle() 참고)으로 그때그때 판단한다
+# (track_drive.py run_behavior_fsm() 참고). OBSTACLE_ZONE→DONE 전환은 B2/B3 둘 다
+# 최소 한 번씩 완료돼야 넘어간다(_mark_behavior_passed(), 순서 고정 가정을 버렸으므로
+# "마지막에 끝난 쪽"이 아니라 "둘 다 끝났는가"로 판단).
 class Phase(Enum):
     LAVACON        = 0
-    FIXED_OBSTACLE = 1
-    VEHICLE        = 2
-    DONE           = 3  # 모든 Behavior 미션 완료 — 이후 계속 B0로 일반 차선주행
+    OBSTACLE_ZONE  = 1  # 고정장애물 회피 + 방해차량 추월 통합 구간 (예전 FIXED_OBSTACLE/VEHICLE)
+    DONE           = 2  # 모든 Behavior 미션 완료 — 이후 계속 B0로 일반 차선주행
 
 
 # #############################################################
@@ -435,6 +443,85 @@ DL_DA_SKIP_LL_CLIP = True
 DL_DA_APPLY_VEHICLE_MARGIN = True
 DL_DA_VEHICLE_MARGIN_M = 0.05   # ASTAR_VEHICLE_MARGIN_M(라이다/Hybrid A* 쪽)과 동일 관례
 
+# ── [2026-08-14] 회피 "복귀 유예"(avoid-hold) — DL_CENTER_MODE='da' 전용 (README §2.32) ──
+#   위 안전마진 침식은 da에 뚫린 장애물 구멍 주변을 자연스럽게 우회하게 만들 뿐, "언제
+#   원래 차선 중앙으로 돌아가도 되는지"는 전혀 모른다. 카메라가 차량 앞코에 달려있어서
+#   장애물을 실제로 지나치는 순간 그 장애물이 화면(및 da 구멍)에서 사라지고, da가 그
+#   프레임에 바로 원래 폭으로 돌아와 중심선도 즉시 원래 차선 중앙으로 복귀한다. 장애물이
+#   정지해 있으면 문제없지만(지금 실차에서 관찰되는 회피는 전부 정지 장애물 기준 —
+#   TEST_DISABLE_B2_B3=True라 README §2.30 배경 참고), 장애물이 방해차량처럼 계속
+#   주행 중이면 "지나친 그 순간"엔 아직 옆이나 뒤에 바짝 붙어있을 수 있어 너무 이른
+#   복귀가 그 차와의 충돌(추월 후 방해차량이 우리 뒤를 들이받는 상황)로 이어질 수
+#   있다는 우려가 나왔다(요청 반영, 실차 미검증).
+#   대응: perc_obstacle()의 obstacle_front/obstacle_dist(라이다, B2/B3 미션 자체와 무관하게
+#   TEST_DISABLE_B2_B3와 상관없이 매 틱 갱신됨)를 근거로, 장애물이 AVOID_HOLD_TRIGGER_DIST_M
+#   안으로 마지막으로 들어왔던 시점부터 AVOID_HOLD_SEC초 동안은 da를 raw centroid 그대로
+#   쓰지 않고 ll(차선)로 "지금 차선 하나"만 남기도록 강제로 자른다 — 예전부터 있던
+#   _clip_da_by_ll() 클리핑(DL_DA_SKIP_LL_CLIP=True로 평소엔 꺼둔 것)을 이 창에서만
+#   되살리는 방식(track_drive.py _update_avoid_hold()/perception/dl_lane.py detect() 참고).
+#   장애물이 시야에서 사라진 직후에도 몇 초간은 옆 차선으로 안 새고 지금 차선 폭 안에서만
+#   주행해, 급하게 원래 차선 중앙으로 꺾여 들어가는 걸 늦추는 목적.
+#   ★주의★ 둘 다 실차 미검증 초기값이다.
+AVOID_HOLD_TRIGGER_DIST_M = 1.5   # 이 거리(m) 안으로 장애물이 들어오면 "회피 중"으로 본다
+
+# [2026-08-15] avoid-hold 개선 — 가변 유예시간 + 거리기반 조기 해제 + da 연속성 보조트리거 +
+#   방향 힌트 + 안전판(avoid_hold_improvement_proposal.md "1차 적용 결정" 적용1~4). 기존
+#   고정 AVOID_HOLD_SEC(=2.0, 아래 AVOID_HOLD_SEC_BASE로 대체)만으로는 "짧으면 방해차량에
+#   위험, 길면 정지장애물엔 낭비"라는 트레이드오프를 하나의 숫자로 감내할 수밖에 없었다 —
+#   설계 배경/시나리오별 사이드이펙트/대비책은 위 proposal 문서, 실제 시나리오 비교는
+#   같은 문서가 링크한 다이어그램 참고. ★ 아래 값 중 실측이 필요한 건 track_drive/
+#   track_drive/avoid_hold_measurement_todo.md에 측정 절차와 함께 정리해뒀다 — 실차
+#   테스트 전에 그 문서부터 볼 것. DEBUG_VIZ_AVOID_HOLD(아래 "5. 디버깅 ON/OFF" 참고) 창이
+#   이 값들과 지금 상태를 실시간으로 같이 보여준다 ★
+
+# [적용1] 유예시간 계산(track_drive.py _update_avoid_hold()) —
+#   hold_sec = clip(BASE + RATE_GAIN*|target_speed_est|, MIN, MAX)
+#   target_speed_est = v_mps + obstacle_rate, 트리거가 걸리는 순간 1회만 스냅샷한다 —
+#   매 틱 다시 계산하면 obstacle_rate의 프레임간 노이즈가 유예시간 자체의 흔들림으로
+#   샌다(문제1 대비책). target_speed_est가 OBSTACLE_STATIC_SPEED_TH_MPS(아래 "7. 기타"
+#   절) 이하인 애매한 회색지대는 정지로 보고 RATE_GAIN을 아예 적용하지 않는다
+#   (_cross_check_obstacle_motion()이 이미 쓰는 데드존을 그대로 재사용).
+AVOID_HOLD_SEC_BASE = 2.0    # 기존 AVOID_HOLD_SEC과 동일값 — 상대속도가 데드존 이하일 때(정지 장애물 등)
+AVOID_HOLD_SEC_MIN  = 2.0    # clip 하한. BASE+RATE_GAIN*x는 항상 BASE 이상이라 지금은 사실상 BASE와
+                              #   같지만, clip() 형태를 명시적으로 유지해 나중에 BASE를 낮출 때도
+                              #   이 하한이 안전판으로 남게 한다.
+AVOID_HOLD_SEC_MAX  = 3.5    # clip 상한 — 아무리 빠르게 접근해도 여기서 캡(무한정 길어지는 것 방지).
+                              #   ★실측 필요★ — avoid_hold_measurement_todo.md 참고.
+AVOID_HOLD_RATE_GAIN = 0.75  # target_speed_est(m/s) 1당 유예를 이만큼(초) 늘림. ★실측 필요★
+
+# [적용1] 조기 해제(같은 함수) — obstacle_front=False가 RELEASE_CONFIRM_FRAMES 연속 +
+#   마지막으로 obstacle_front=True였을 때의 obstacle_dist가 RELEASE_DIST_M 이상이면
+#   hold_sec을 다 채우기 전에도 즉시 해제한다. "안 보임=멀어짐"이 아니라 "마지막으로 봤을
+#   때 이미 멀었음"으로 조건화해 라이다 사각지대와 실제 이탈을 최소한이나마 구분한다
+#   (문제6 대비책) — 그래도 둘을 완전히 못 가르는 건 여전한 한계(proposal 문서 참고).
+AVOID_HOLD_RELEASE_DIST_M = 2.0        # TRIGGER_DIST_M(1.5)보다 크게 둬 히스테리시스 확보. ★실측 필요★
+AVOID_HOLD_RELEASE_CONFIRM_FRAMES = 4  # SIG_CONFIRM_FRAMES(3)/VEHICLE_TRIGGER_FRAMES(5) 등과
+                                        #   동일 관례 — 순간적 미검출(사각지대/flicker)로
+                                        #   조기해제가 새는 것 방지.
+
+# [적용2] da 연속성 보조 트리거(perception/dl_lane.py DLSlideWindow) — 라이다 사각지대
+#   (문제3) 보완. 이번 프레임 da_chosen_area_px가 직전 프레임 대비 이 배율 이상 급증하면
+#   (=방금까지 뚫려있던 구멍이 갑자기 메워짐) "뭔가 방금 시야에서 사라졌을 수 있다"는
+#   신호로 보고, 라이다 obstacle_front 트리거와 OR로 결합한다(단독 트리거로는 안 씀 —
+#   세그멘테이션 자체가 흔들리는 프레임에서 오발동할 수 있어서, 문제3 대비책).
+AVOID_HOLD_DA_AREA_JUMP_RATIO = 1.4    # ★실측 필요★
+
+# [적용3] 방향 힌트(track_drive.py _update_avoid_hold()가 매 틱 계산 → perc_lane()이
+#   DL 백엔드로 전달 → perception/dl_lane.py _clip_da_by_ll()) — TargetPassing.choose_side()
+#   가 반환한 side(-1/0/+1, lane_offset과 동일한 "우측+" 부호규약)를, _clip_da_by_ll()의
+#   "ll도 잔상도 없는" 최후수단 가상경계 폴백에서만 기준점을 이만큼(px) 안전한 쪽으로
+#   미리 기울이는 데 쓴다 — 실측/잔상 등 실제 증거가 있는 밴드는 건드리지 않는다(방향
+#   힌트가 실패해도 원래 로직으로 조용히 폴백되는 소프트 제약, 문제2 대비책).
+AVOID_HOLD_DIR_BIAS_PX = 20.0   # ≈ PASS_OFFSET(80.0, "7. 기타" 절, 실측 기반)의 1/4.
+                                 #   ★비율 자체는 실측/재검증 필요★
+
+# [적용4] 안전판(track_drive.py _lane_drive()) — avoid_hold 활성 중 choose_side()가
+#   0(양쪽 다 막혀 어느 쪽으로도 못 피함)을 반환하면 목표속도를 강제로 이 값까지 낮춘다
+#   (F1TENTH류 반응형 스택의 "완벽한 회피보다 안전한 감속" 철학 반영). SPEED_CORNER_MIN/
+#   SPEED_LL_DEGRADED/SPEED_LANE_STALE(위 "2. 차량 속도/조향 기본값" 절)과 같은 "즉시 cap"
+#   관례 — 급정지가 아니라 눈에 띄게만 낮춘다는 설계도 동일.
+SPEED_AVOID_HOLD_BLOCKED = 5.0   # SPEED_CORNER_MIN과 같은 값으로 시작(모터 데드존 위 안전마진). ★실측 필요★
+
 # [2026-08-10] DL_CENTER_MODE='ll' 내부에서 실제 밴드 중심 계산 알고리즘을 고르는
 #   2차 스위치 — 같은 날 두 사람이 독립적으로 서로 다른 재설계를 했다(origin/main
 #   병합 시 두 구현이 정면으로 겹쳐 병합 커밋에서 "둘 다 남기고 전환 가능하게" 하기로
@@ -780,6 +867,12 @@ DEBUG_VIZ_SIGNAL     = True   # 신호등 ROI/HoughCircles 디버그 창 (percep
 #   (track_drive.py perc_signal())
 DEBUG_LOG_SIGNAL     = True
 DEBUG_VIZ_YOLO_CONE  = False  # 라바콘 YOLO 검출 박스 디버그 창 (perception/yolo_cone.py)
+# [2026-08-15] avoid-hold(§2.32) 전용 상태창 — 지금 유예가 걸려있는지/왜 걸렸는지/방향
+#   힌트/조기해제 진행상황을 한곳에 모아 보여주고, 실측 안 된 파라미터 값도 항상 같이
+#   띄워서 "이 숫자 아직 지어낸 값"이라는 걸 상기시킨다(track_drive.py
+#   _debug_viz_avoid_hold(), avoid_hold_measurement_todo.md 참고). 다른 회피 관련 창
+#   (lidar_bev 등)과 별개로 언제든 독립적으로 켜고 끌 수 있다.
+DEBUG_VIZ_AVOID_HOLD = True
 #   [2026-08-11] smooth-imu-yaw-rate 브랜치(0c0d88b)에서 수동 포팅 — 라바콘 실차 테스트 중
 #   라이다 창과 함께 켜 두고 나머지는 꺼둔 상태(요청 반영).
 

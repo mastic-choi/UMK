@@ -151,6 +151,20 @@ class TrackDriverNode(Node):
         self.obstacle_rate  = 0.0     # 접근율(m/s, 음수=접근). 추돌 방지·교차확인용
         self._obstacle_prev_dist = None
         self._obstacle_prev_t    = 0.0
+        # [2026-08-14] 회피 "복귀 유예"(avoid-hold) — _update_avoid_hold()가 perc_obstacle()
+        # 직후 갱신하고, perc_lane()이 DL 차선인식 백엔드로 그대로 넘긴다(config.py
+        # AVOID_HOLD_TRIGGER_DIST_M/AVOID_HOLD_SEC_* 주석, README §2.32/§2.33 참고).
+        self._avoid_hold_until_t = 0.0  # 이 시각까지는 avoid_hold_active=True
+        self.avoid_hold_active   = False
+        # [2026-08-15] avoid-hold 개선 — avoid_hold_improvement_proposal.md "1차 적용 결정"
+        # 적용1(가변 유예시간+거리기반 조기해제)/적용3(방향 힌트) 상태. 전부
+        # _update_avoid_hold()가 매 틱 갱신하고, _debug_viz_avoid_hold()가 그대로 보여준다.
+        self.avoid_hold_hold_sec = AVOID_HOLD_SEC_BASE  # 이번 유예 구간에 쓰이는 hold_sec(트리거 시점 스냅샷)
+        self.avoid_hold_side = 0             # choose_side() 결과(-1/0/+1) — 0이면 "양쪽 다 막힘"(적용4 안전판 트리거)
+        self.avoid_hold_release_reason = ''  # 직전 유예가 끝난 사유: 'timeout'/'early_dist'/''(아직 없음)
+        self._avoid_hold_release_cnt = 0            # obstacle_front=False 연속 프레임(조기해제 디바운스)
+        self._avoid_hold_last_valid_dist = 999.0    # 마지막으로 obstacle_front=True였던 순간의 obstacle_dist
+        self._avoid_hold_target_speed_est = 0.0     # 트리거 시점 target_speed_est 스냅샷(디버그 표시용)
         # [2-4 라바콘]
         self.lavacon_offset = 0.0    # 디버그/로깅용(중심선 y평균) — 조향엔 더 이상 안 씀
         self.lavacon_done   = False
@@ -190,6 +204,12 @@ class TrackDriverNode(Node):
         self.mission_state  = START_STATE
         self.behavior_state = BehaviorState.B0_NORMAL
         self.phase          = Phase.LAVACON     # S1 내부 진행 순서(라바콘부터 시작)
+        # [2026-08-15] Phase.OBSTACLE_ZONE 통합(da_based_b2b3_proposal.md B안) —
+        # B2/B3 각각 최소 한 번 완료됐는지 추적. 둘 다 True가 돼야 Phase.DONE으로
+        # 넘어간다(_mark_behavior_passed() 참고) — 순서를 안 따지므로 어느 쪽이 먼저
+        # 끝나도 상관없다.
+        self._b2_passed = False
+        self._b3_passed = False
         self._behavior_enabled = TEST_FORCE_BEHAVIOR  # 원래 S2 교차로 "직진"으로 S1 재진입 시에만 True
                                                        #   (TEST_FORCE_BEHAVIOR=True면 라바콘 단독 테스트용으로 시작부터 강제 ON)
         self._lavacon_engaged  = False          # B1_LAVACON 진입 확정 latch (트리거 이후 잠깐 한쪽 클러스터가
@@ -401,6 +421,7 @@ class TrackDriverNode(Node):
         self.perc_lane()        # 비전
         self.perc_signal()      # 비전
         self.perc_obstacle()    # 라이다
+        self._update_avoid_hold()  # 라이다(위 obstacle_front/dist 기반) — perc_obstacle() 직후여야 함
         self.perc_lavacon()     # 라이다
         self.perc_yolo_cone()   # 비전 (YOLO, perc_lavacon_trigger()가 라이다와 AND 결합해서 씀)
         self.perc_lavacon_trigger()  # 라이다+비전 (YOLO 콘 검출 AND 좌우 클러스터 동시검출 → B1_LAVACON 진입 트리거)
@@ -429,6 +450,18 @@ class TrackDriverNode(Node):
             self.lane_valid = False
             self.lane_stale = True   # 카메라 프레임 자체가 아직/더 이상 없음 — 당연히 신선하지 않음
             return
+
+        # [2026-08-14] avoid-hold(§2.32) 상태를 이번 detect() 호출 전에 DL 백엔드로 넘긴다 —
+        # hough/classic_cv처럼 이 메서드가 없는 백엔드는 getattr가 조용히 no-op을 반환해
+        # 건너뛴다(show_debug_windows()와 동일 관례). perceive_all()에서 perc_lane()이
+        # perc_obstacle()/_update_avoid_hold()보다 먼저 도는 순서라 여기 값은 엄밀히는
+        # 직전 틱 기준(0.05s 이내 오차)이다 — DL 추론 자체도 이미 논블로킹 백그라운드
+        # 워커라 결과가 한두 프레임 지연되는 걸 감안하고 설계됐으므로(모듈 상단 주석)
+        # 무시 가능한 오차로 판단.
+        # [2026-08-15] 적용3 — avoid_hold_side(방향 힌트, -1/0/+1)도 같이 넘긴다
+        # (config.py AVOID_HOLD_DIR_BIAS_PX 주석, perception/dl_lane.py _clip_da_by_ll() 참고).
+        getattr(self.lane_detector, 'set_avoid_hold', lambda *_a, **_k: None)(
+            self.avoid_hold_active, self.avoid_hold_side)
 
         # hough_lane.py의 HoughLaneDetector를 사용하여 차선 인식 수행
         valid, offset, lookahead, lane_center, path, debug_img = self.lane_detector.detect(self.img_front)
@@ -759,6 +792,82 @@ class TrackDriverNode(Node):
             cv2.imshow('lidar_bev', bev)
             cv2.waitKey(1)
 
+    # [2-3b] 회피 "복귀 유예"(avoid-hold) — perc_obstacle() 직후에만 호출할 것
+    #   (obstacle_front/obstacle_dist가 이번 틱 기준으로 이미 갱신돼 있어야 함).
+    #   입력 self.obstacle_front/obstacle_dist → 출력 self.avoid_hold_active
+    def _update_avoid_hold(self):
+        """da 안전마진 회피(§2.30) 중 너무 이른 복귀를 막기 위한 타이머 — config.py
+        AVOID_HOLD_* 주석, README §2.32, avoid_hold_improvement_proposal.md 참고.
+        obstacle_front/obstacle_dist는 TEST_DISABLE_B2_B3와 무관하게 매 틱 갱신되므로
+        (perc_obstacle() 참고), B2/B3 미션 자체가 꺼져있어도 이 신호는 그대로 쓸 수 있다.
+
+        [2026-08-15 개선] 기존엔 트리거~해제 둘 다 "장애물이 AVOID_HOLD_TRIGGER_DIST_M
+        안에 있는가" 하나와 고정 AVOID_HOLD_SEC뿐이었다. 아래 네 갈래를 추가했다
+        (avoid_hold_improvement_proposal.md "1차 적용 결정" 적용1/2/3):
+          ① 트리거가 걸리는 순간 target_speed_est(=v_mps+obstacle_rate)를 1회 스냅샷해
+             hold_sec을 가변으로 정한다(정지 장애물엔 짧게, 방해차량처럼 빠르게 붙는
+             경우엔 길게, AVOID_HOLD_SEC_MAX로 캡).
+          ② da 연속성(perception/dl_lane.py DLSlideWindow.da_area_jump_detected)을 라이다
+             obstacle_front와 OR로 결합 — 라이다 사각지대를 카메라 쪽이 보완한다.
+          ③ obstacle_front=False가 AVOID_HOLD_RELEASE_CONFIRM_FRAMES 연속 + 마지막
+             유효 obstacle_dist가 AVOID_HOLD_RELEASE_DIST_M 이상이면, hold_sec을 다
+             채우기 전에도 즉시 해제한다("안 보임=멀어짐"이 아니라 "마지막으로 봤을 때
+             이미 멀었음"으로 조건화).
+          ④ TargetPassing.choose_side()로 "지금 어느 쪽이 안전한가"를 매 틱 갱신해
+             self.avoid_hold_side에 저장한다(perc_lane()이 DL 백엔드로 전달 → 방향
+             힌트로 씀, side==0이면 apply_behavior_override() 이전 _lane_drive()가
+             안전판 감속을 건다 — 적용4).
+        """
+        now = time.time()
+
+        # ② da 연속성 보조 트리거 — 백엔드에 없으면(hough/classic_cv) getattr가 False를
+        # 반환해 조용히 건너뛴다(show_debug_windows()와 동일 관례).
+        da_area_jump = bool(getattr(self.lane_detector, 'da_area_jump', False))
+        triggered_now = ((self.obstacle_front and self.obstacle_dist < AVOID_HOLD_TRIGGER_DIST_M)
+                          or da_area_jump)
+
+        if triggered_now:
+            if self._avoid_hold_until_t <= now:
+                # 직전엔 유예가 꺼져있었다 = 이번이 새 트리거 — 여기서만 target_speed_est를
+                # 스냅샷해서 hold_sec을 정한다(① — 노이즈가 유예시간 자체의 흔들림으로
+                # 새는 것을 막는 게 핵심, 매 틱 재계산하지 않는다).
+                target_speed_est = self.v_mps + self.obstacle_rate
+                self._avoid_hold_target_speed_est = target_speed_est
+                gain_term = (AVOID_HOLD_RATE_GAIN * abs(target_speed_est)
+                             if abs(target_speed_est) > OBSTACLE_STATIC_SPEED_TH_MPS else 0.0)
+                self.avoid_hold_hold_sec = min(
+                    AVOID_HOLD_SEC_MAX, max(AVOID_HOLD_SEC_MIN, AVOID_HOLD_SEC_BASE + gain_term))
+                self._avoid_hold_release_cnt = 0
+                self.avoid_hold_release_reason = ''
+            self._avoid_hold_until_t = now + self.avoid_hold_hold_sec
+
+        # ③ 조기 해제 판정용 상태 갱신 — obstacle_front가 True인 동안(=아직 가까움)은
+        # "마지막 유효 거리"를 계속 최신으로 두고 디바운스 카운터를 리셋한다.
+        if self.obstacle_front:
+            self._avoid_hold_last_valid_dist = self.obstacle_dist
+            self._avoid_hold_release_cnt = 0
+        else:
+            self._avoid_hold_release_cnt += 1
+
+        was_active = self.avoid_hold_active
+        if (was_active
+                and self._avoid_hold_release_cnt >= AVOID_HOLD_RELEASE_CONFIRM_FRAMES
+                and self._avoid_hold_last_valid_dist >= AVOID_HOLD_RELEASE_DIST_M):
+            self._avoid_hold_until_t = now  # 조기 해제 — hold_sec을 다 채우기 전에 즉시 종료
+            self.avoid_hold_release_reason = 'early_dist'
+
+        self.avoid_hold_active = now < self._avoid_hold_until_t
+        if was_active and not self.avoid_hold_active and self.avoid_hold_release_reason != 'early_dist':
+            self.avoid_hold_release_reason = 'timeout'
+
+        # ④ 방향 힌트 — choose_side()는 입력값(obstacle_y/left_clear_confirmed/
+        # right_clear_confirmed/lane_side)만 보는 순수 판정 함수라 self.vehicle_controller의
+        # 다른 상태(phase/side 등, B2/B3 FSM 전용)를 건드리지 않는다. left_clear_confirmed/
+        # right_clear_confirmed는 perc_obstacle()이 TEST_DISABLE_B2_B3와 무관하게 매 틱
+        # 갱신하므로(코드 확인 완료) 별도 stale 가드 없이 그대로 호출해도 안전하다.
+        self.avoid_hold_side = self.vehicle_controller.choose_side(
+            self.obstacle_y, self.left_clear_confirmed, self.right_clear_confirmed, self.lane_side)
+
     # [2-4] 라바콘
     #   출력 lavacon_offset(디버그용)/lavacon_done, lavacon_path(조향용 — _handle_lavacon() 참고)
     def perc_lavacon(self):
@@ -1061,6 +1170,8 @@ class TrackDriverNode(Node):
             self.obstacle_controller.reset()
             self.vehicle_controller.reset()
             self.behavior_state = BehaviorState.B0_NORMAL
+            self._b2_passed = False   # [2026-08-15] Phase.OBSTACLE_ZONE 통합 — 완료 추적도 매 바퀴 리셋
+            self._b3_passed = False
 
     def run_mission_fsm(self):
         {
@@ -1307,8 +1418,19 @@ class TrackDriverNode(Node):
     # ── Behavior FSM (Phase에 따라 순차 전용으로 배타 실행, 우선순위 판단 불필요) ──
     def run_behavior_fsm(self):
         """
-        S1(차선주행) 재진입 후 Phase 순서(LAVACON→FIXED_OBSTACLE→VEHICLE→DONE)에 따라
-        딱 하나의 Behavior만 활성화한다. Phase 전환은 각 핸들러가 완료 시점에 직접 수행.
+        S1(차선주행) 재진입 후 Phase 순서(LAVACON→OBSTACLE_ZONE→DONE)에 따라 딱 하나의
+        Behavior만 활성화한다. Phase 전환은 각 핸들러가 완료 시점에 직접 수행
+        (`_mark_behavior_passed()` 참고).
+
+        [2026-08-15] OBSTACLE_ZONE 통합(da_based_b2b3_proposal.md B안) — 예전엔
+        FIXED_OBSTACLE/VEHICLE 두 Phase로 미리 순서를 나눠 "지금이 고정장애물 구간인지
+        방해차량 구간인지"를 Phase가 알려줬는데, da 안전마진(§2.30)+avoid-hold
+        (§2.32/§2.33)로 회피 기동 자체가 정적/동적 구분 없이 da 경로를 그대로 신뢰하는
+        쪽으로 가면서 그 구분을 미리 나눠둘 이유가 약해졌다. 이제 정적/동적 구분은
+        Phase가 아니라 매 프레임 `obstacle_type`(라이다 실측 폭 기반, `perc_obstacle()`
+        참고)으로 그때그때 판단한다 — 예전에 "Phase가 순서를 강제하니 트리거에서
+        `obstacle_type` 조건을 뺐다"던 이유(아래 참고)가 Phase 통합으로 없어졌으니
+        다시 넣을 수 있게 된 것.
         """
         if self.phase == Phase.LAVACON:
             # 좌우 라이다 클러스터가 동시에(디바운스 프레임수만큼) 검출되면 B1_LAVACON 진입을 확정(latch)한다.
@@ -1319,36 +1441,48 @@ class TrackDriverNode(Node):
             self.behavior_state = (BehaviorState.B1_LAVACON
                                     if self._lavacon_engaged
                                     else BehaviorState.B0_NORMAL)
-        elif self.phase == Phase.FIXED_OBSTACLE:
-            # TEST_DISABLE_B2_B3=True면 SAFETY_DIST 트리거 검사(아래 triggered 계산)를 아예 안 하고
-            # 바로 리턴 — 장애물이 실제로 잡혀도 B2_OBSTACLE로 안 넘어가고 B0로 고정되어
-            # _s1_lane_follow의 일반 차선 PID가 계속 돎(placeholder 회피 기동이 실행 안 됨).
+        elif self.phase == Phase.OBSTACLE_ZONE:
+            # TEST_DISABLE_B2_B3=True면 트리거 검사를 아예 안 하고 바로 리턴 — 장애물/방해차량이
+            # 실제로 잡혀도 B2_OBSTACLE/B3_VEHICLE로 안 넘어가고 B0로 고정되어 _s1_lane_follow의
+            # 일반 차선 PID가 계속 돎(placeholder 회피 기동이 실행 안 됨). 이 게이팅은 통합 전과
+            # 동일하게 유지된다 — False로 바꾸면 트리거/디스패치가 예전과 같은 조건으로 그대로
+            # 동작한다(달라진 건 "두 Phase로 미리 나눔" → "한 Phase 안에서 타입으로 나눔"뿐).
             if TEST_DISABLE_B2_B3:
-                self.behavior_state = BehaviorState.B0_NORMAL   # 테스트 범위 제한: B2 트리거 무시
+                self.behavior_state = BehaviorState.B0_NORMAL
                 return
-            # 트리거에서 obstacle_type=='fixed' 조건을 뺐다.
-            #   [6]에서 분류 기준을 실폭으로 바꾸면서, 차선을 막고 선 '차량'(폭 넓음)은
-            #   'vehicle' 로 분류된다. 옛 조건대로면 이 Phase 에서 영영 트리거되지 않아
-            #   Phase.VEHICLE 로 넘어가지도 못하고 교착된다.
-            #   회피 기동 자체는 고정물이든 차량이든 '반대편 차선으로 비킨다'로 동일하므로
-            #   여기서는 '앞을 막고 있는가'만 본다(순서는 Phase 가 이미 강제하고 있음).
-            triggered = (self.obstacle_front
-                         and self.obstacle_dist < SAFETY_DIST
-                         and self._maneuver_allowed)
-            self.behavior_state = (BehaviorState.B2_OBSTACLE
-                                    if (triggered or self._obstacle_active)
-                                    else BehaviorState.B0_NORMAL)
-        elif self.phase == Phase.VEHICLE:
-            # 위와 동일한 이유로 트리거 검사를 건너뛰고 B0로 고정(placeholder 추월 기동 비활성화)
-            if TEST_DISABLE_B2_B3:
-                self.behavior_state = BehaviorState.B0_NORMAL   # 테스트 범위 제한: B3 트리거 무시
+
+            # 이미 진행 중인 기동이 있으면 이번 프레임 obstacle_type이 흔들려도 핸들러를
+            # 중간에 바꾸지 않는다(진행 중 스왑은 위험 — 기존 "or self._obstacle_active"/
+            # "or self._overtake_active" 유지 패턴과 동일 원칙, 우선순위만 명시적으로 첫
+            # 분기로 올렸다).
+            if self._obstacle_active:
+                self.behavior_state = BehaviorState.B2_OBSTACLE
                 return
-            # 진입 판정은 perc_vehicle_trigger()의 라이다 디바운스 결과를 사용.
-            # 한번 진입한 뒤(_overtake_active)에는 기존과 동일하게 라이다 단독으로 유지/종료 판단.
-            self.behavior_state = (BehaviorState.B3_VEHICLE
-                                    if ((self.vehicle_trigger and self._maneuver_allowed)
-                                        or self._overtake_active)
-                                    else BehaviorState.B0_NORMAL)
+            if self._overtake_active:
+                self.behavior_state = BehaviorState.B3_VEHICLE
+                return
+
+            # 새로 트리거를 판단할 때만 obstacle_type으로 B2/B3를 가른다. 두 트리거
+            # (SAFETY_DIST 기반 triggered_fixed, OVERTAKE_TRIGGER+디바운스 기반
+            # perc_vehicle_trigger()의 self.vehicle_trigger)는 원래 서로 다른 Phase에서만
+            # 봐서 겹칠 일이 없었는데, 이제 같은 프레임에 동시에 참일 수 있다 —
+            # obstacle_type=='vehicle'이면 방해차량 쪽을 우선한다(vehicle_trigger가 아직
+            # 디바운스 중이라도 폭이 이미 vehicle로 잡혔으면 B3로 본다). ★알려진 한계★:
+            # 트리거 발동 직후 몇 프레임은 obstacle_type/vehicle_trigger 디바운스 타이밍이
+            # 안 맞아 잠깐 B2로 걸렸다가 B3로 바뀌는 등 짧은 오분류가 있을 수 있다 —
+            # `_obstacle_active`/`_overtake_active` latch가 실제로 걸리기 전(TargetPassing이
+            # 아직 IDLE)에만 해당하는 구간이라 영향은 제한적이라고 판단.
+            triggered_fixed = (self.obstacle_front
+                                and self.obstacle_dist < SAFETY_DIST
+                                and self._maneuver_allowed)
+            triggered_vehicle = self.vehicle_trigger and self._maneuver_allowed
+
+            if triggered_vehicle and self.obstacle_type == 'vehicle':
+                self.behavior_state = BehaviorState.B3_VEHICLE
+            elif triggered_fixed:
+                self.behavior_state = BehaviorState.B2_OBSTACLE
+            else:
+                self.behavior_state = BehaviorState.B0_NORMAL
         else:  # Phase.DONE
             self.behavior_state = BehaviorState.B0_NORMAL
 
@@ -1423,6 +1557,15 @@ class TrackDriverNode(Node):
         # 진짜로 갱신이 멈춘 경우에만 발동한다.
         if self.lane_stale:
             target_speed = min(target_speed, SPEED_LANE_STALE)
+        # [2026-08-15] avoid-hold 적용4(안전판) — 회피 유예가 걸려있는 동안 choose_side()가
+        # 0(양쪽 다 막혀 어느 쪽으로도 못 피함)을 반환하면 강제로 감속한다. avoid_hold_side는
+        # _update_avoid_hold()가 매 틱 갱신하므로 이 조건은 avoid_hold_active가 아닌 틱에는
+        # 자연히 걸리지 않는다(avoid_hold_side 자체는 항상 계산되지만 여기서 avoid_hold_active
+        # 도 같이 확인). SPEED_CORNER_MIN/SPEED_LL_DEGRADED/SPEED_LANE_STALE과 같은 "즉시 cap"
+        # 관례 — avoid_hold_improvement_proposal.md "적용4" 참고, SPEED_AVOID_HOLD_BLOCKED
+        # 실차 미검증.
+        if self.avoid_hold_active and self.avoid_hold_side == 0:
+            target_speed = min(target_speed, SPEED_AVOID_HOLD_BLOCKED)
         speed_ratio = min(1.0, self._prev_speed / SPEED_NORMAL)
         corner_decay = CORNER_HOLD_DECAY_LO + (CORNER_HOLD_DECAY_HI - CORNER_HOLD_DECAY_LO) * speed_ratio
         self._corner_hold = max(turn_now, self._corner_hold * corner_decay)
@@ -1663,6 +1806,75 @@ class TrackDriverNode(Node):
         cv2.imshow('vesc_debug', canvas)
         cv2.waitKey(1)
 
+    # [DEBUG_VIZ_AVOID_HOLD] avoid-hold(§2.32, avoid_hold_improvement_proposal.md) 전용
+    # 상태창 — 2026-08-15에 추가. 지금 유예가 걸려있는지/왜 걸렸는지/직전엔 왜 풀렸는지/
+    # 방향 힌트가 뭔지를 실차에서 한눈에 보기 위한 것과 동시에, 이 기능이 새로 들여온
+    # 파라미터 중 실측이 안 된 값들을 매 프레임 같이 띄워서 "이 숫자는 아직 지어낸
+    # 값"이라는 걸 계속 상기시키는 용도(실측 절차는 avoid_hold_measurement_todo.md 참고).
+    # 아래 6개(RATE_GAIN/SEC_MAX/RELEASE_DIST_M/DA_AREA_JUMP_RATIO/DIR_BIAS_PX/
+    # SPEED_AVOID_HOLD_BLOCKED)는 그 문서에 적힌 측정 절차를 실차에서 그대로 따라가며
+    # 이 창의 실시간 값을 관찰하는 용도로도 쓰인다(예: da_area_jump가 실제 통과 순간에만
+    # True로 뜨는지, 노이즈 프레임에서도 뜨는지 여기서 직접 눈으로 확인). control_loop()
+    # 에서 매 주기 호출.
+    def _debug_viz_avoid_hold(self):
+        now = time.time()
+        remaining = max(0.0, self._avoid_hold_until_t - now)
+        active_color = (0, 200, 0) if self.avoid_hold_active else (110, 110, 110)
+        side_label = {1: '오른쪽(+1)', -1: '왼쪽(-1)', 0: '방향없음/양쪽막힘(0)'}
+        side_color = (0, 140, 255) if self.avoid_hold_side == 0 else (255, 255, 255)
+
+        slide = getattr(self.lane_detector, '_slide', None)
+        da_area = getattr(slide, 'da_chosen_area_px', 0)
+        da_jump = bool(getattr(self.lane_detector, 'da_area_jump', False))
+
+        UNMEASURED = (60, 160, 255)  # 실측 미검증 파라미터 강조색(주황) — 다른 창의 STALE 색과 통일
+        lines = [
+            (f'AVOID-HOLD: {"활성" if self.avoid_hold_active else "대기"}  '
+             f'(남은 {remaining:.2f}s / hold_sec={self.avoid_hold_hold_sec:.2f}s)',
+             (10, 8), active_color, 17,
+             f'AVOID-HOLD: {"ACTIVE" if self.avoid_hold_active else "idle"} '
+             f'({remaining:.2f}s left / hold_sec={self.avoid_hold_hold_sec:.2f}s)'),
+            (f'직전 해제 사유: {self.avoid_hold_release_reason or "(아직 없음)"}   '
+             f'방향 힌트: {side_label[self.avoid_hold_side]}',
+             (10, 34), side_color, 14,
+             f'last release: {self.avoid_hold_release_reason or "(none)"}  '
+             f'dir hint: {self.avoid_hold_side:+d}'),
+            (f'트리거 입력 — front={self.obstacle_front} dist={self.obstacle_dist:.2f}m '
+             f'rate={self.obstacle_rate:+.2f}m/s  v_mps={self.v_mps:+.2f}',
+             (10, 62), (255, 255, 255), 13,
+             f'trigger — front={self.obstacle_front} dist={self.obstacle_dist:.2f}m '
+             f'rate={self.obstacle_rate:+.2f} v={self.v_mps:+.2f}'),
+            (f'target_speed_est(트리거 스냅샷) = {self._avoid_hold_target_speed_est:+.2f} m/s',
+             (10, 84), (255, 255, 255), 13,
+             f'target_speed_est(snapshot) = {self._avoid_hold_target_speed_est:+.2f} m/s'),
+            (f'da 연속성 보조트리거(적용2) — chosen_area={da_area}px  jump={"O" if da_jump else "X"}',
+             (10, 106), (0, 200, 255) if da_jump else (150, 150, 150), 13,
+             f'da continuity — area={da_area}px jump={"YES" if da_jump else "no"}'),
+            (f'조기해제 진행 — front=False {self._avoid_hold_release_cnt}/{AVOID_HOLD_RELEASE_CONFIRM_FRAMES}'
+             f'  마지막유효dist={self._avoid_hold_last_valid_dist:.2f}m (>= {AVOID_HOLD_RELEASE_DIST_M}m 필요)',
+             (10, 128), (200, 200, 200), 12,
+             f'early-release {self._avoid_hold_release_cnt}/{AVOID_HOLD_RELEASE_CONFIRM_FRAMES}, '
+             f'last_valid_dist={self._avoid_hold_last_valid_dist:.2f} (need>={AVOID_HOLD_RELEASE_DIST_M})'),
+            ('── ★ 실차 미검증(실측 필요) — avoid_hold_measurement_todo.md 참고 ★',
+             (10, 156), UNMEASURED, 13, '-- UNMEASURED, see avoid_hold_measurement_todo.md --'),
+            (f'RATE_GAIN={AVOID_HOLD_RATE_GAIN}   SEC_MAX={AVOID_HOLD_SEC_MAX}s   '
+             f'RELEASE_DIST_M={AVOID_HOLD_RELEASE_DIST_M}m',
+             (10, 178), UNMEASURED, 12,
+             f'RATE_GAIN={AVOID_HOLD_RATE_GAIN} SEC_MAX={AVOID_HOLD_SEC_MAX} '
+             f'RELEASE_DIST_M={AVOID_HOLD_RELEASE_DIST_M}'),
+            (f'DA_AREA_JUMP_RATIO={AVOID_HOLD_DA_AREA_JUMP_RATIO}   DIR_BIAS_PX={AVOID_HOLD_DIR_BIAS_PX}px'
+             f'   SPEED_BLOCKED={SPEED_AVOID_HOLD_BLOCKED}',
+             (10, 198), UNMEASURED, 12,
+             f'DA_AREA_JUMP_RATIO={AVOID_HOLD_DA_AREA_JUMP_RATIO} '
+             f'DIR_BIAS_PX={AVOID_HOLD_DIR_BIAS_PX} SPEED_BLOCKED={SPEED_AVOID_HOLD_BLOCKED}'),
+        ]
+        canvas = np.full((222, 620, 3), 30, dtype=np.uint8)
+        put_text_kr_multi(canvas, lines)
+        cv2.rectangle(canvas, (0, 0), (canvas.shape[1] - 1, canvas.shape[0] - 1), active_color, 3)
+
+        cv2.imshow('avoid_hold_debug', canvas)
+        cv2.waitKey(1)
+
     def _lane_pid(self, offset, deadzone=LANE_DEADZONE):
         """차선 중앙편차(offset)를 PID 제어로 조향각(angle)으로 변환한다."""
         if abs(offset) < deadzone:
@@ -1745,8 +1957,8 @@ class TrackDriverNode(Node):
                 self._pid_prev_error = 0.0
                 self._pid_integral   = 0.0
                 self._lavacon_engaged = False   # B1 진입 latch 해제 (구간 재진입 대비)
-                self.phase = Phase.FIXED_OBSTACLE
-                self.get_logger().info('[LAVACON] 구간 통과 완료 → 고정장애물 구간')
+                self.phase = Phase.OBSTACLE_ZONE
+                self.get_logger().info('[LAVACON] 구간 통과 완료 → 장애물 구간')
         else:
             self._lavacon_empty_cnt = 0
 
@@ -1759,8 +1971,7 @@ class TrackDriverNode(Node):
             # TargetPassing으로 덮어쓰지 않고 이번 틱은 그냥 둔다.
             return
 
-        self._run_passing(self.obstacle_controller, 'B2',
-                          done_next_phase=Phase.VEHICLE)
+        self._run_passing(self.obstacle_controller, 'B2')
 
     # [2026-08-11] da 기반 회피가 이 정지 장애물을 알아서 피하고 있다고 믿을 수 있는지
     #   판단한다. False면 TargetPassing 개입 없이 da 경로 그대로, True면 위
@@ -1787,7 +1998,8 @@ class TrackDriverNode(Node):
 
     # ── B3-방해차량 추월 ──★재설계 예정(임시 placeholder) ──
     # target_lane 반영 수정
-    # 회피 후 복귀하는 로직 추가 : idle -> avoid -> idle+Phase.VEHICLE => idel -> avoid -> return -> idle
+    # 회피 후 복귀하는 로직 추가 : idle -> avoid -> idle+B2/B3 완료 => idel -> avoid -> return -> idle
+    # (2026-08-15: Phase.VEHICLE는 Phase.OBSTACLE_ZONE 통합으로 없어짐 — _mark_behavior_passed() 참고)
     def _handle_overtake(self):
         """방해차량 추월. 규정상 '방해차량이 주행하지 않는 차선'으로 지나가야 하고,
         그 차량이 1·2차선을 오가므로 매 프레임 타겟 횡위치를 다시 보고 필요하면
@@ -1802,8 +2014,7 @@ class TrackDriverNode(Node):
             self._handle_overtake_astar()
             return
 
-        self._run_passing(self.vehicle_controller, 'B3',
-                          done_next_phase=Phase.DONE)
+        self._run_passing(self.vehicle_controller, 'B3')
 
     # ── B3 대안: Hybrid A* 경로계획 방식 (USE_HYBRID_ASTAR_FOR_B3=True 일 때만) ──
     #   [2026-08-11] B2 쪽 Hybrid A* 대안(_handle_fixed_obstacle_astar)은 삭제됐다 —
@@ -1858,7 +2069,7 @@ class TrackDriverNode(Node):
                 # 양쪽 다 막혔다 — TargetPassing의 'blocked' 서행재시도 동작을 그대로 재사용.
                 self._b3_astar_reset()
                 self._b3_using_fallback = True
-                self._run_passing(self.vehicle_controller, 'B3', done_next_phase=Phase.DONE)
+                self._run_passing(self.vehicle_controller, 'B3')
                 return
 
             goal = self.planner.make_goal_by_side(self.obstacle_dist, side)
@@ -1887,7 +2098,7 @@ class TrackDriverNode(Node):
                 if self._b3_fail_cnt >= ASTAR_B3_FAIL_GRACE_TICKS:
                     self._b3_astar_reset()
                     self._b3_using_fallback = True
-                    self._run_passing(self.vehicle_controller, 'B3', done_next_phase=Phase.DONE)
+                    self._run_passing(self.vehicle_controller, 'B3')
                     return
                 self.path = None
                 self.ctrl_speed = max(SPEED_NORMAL * 0.15, 0.5)
@@ -1918,7 +2129,7 @@ class TrackDriverNode(Node):
             self._b3_astar_reset()
             self.stanley.reset()
 
-            self.phase = Phase.DONE
+            self._mark_behavior_passed('B3')  # [2026-08-15] Phase.OBSTACLE_ZONE 통합 — B2도 끝나야 DONE
             self.behavior_state = BehaviorState.B0_NORMAL
 
             self._pid_prev_error = 0.0
@@ -1947,8 +2158,24 @@ class TrackDriverNode(Node):
         self._b3_fail_cnt = 0
         self._b3_side = 0
 
+    # [2026-08-15] Phase.OBSTACLE_ZONE 통합(da_based_b2b3_proposal.md B안) — B2/B3가
+    # 완료를 알리는 공통 지점. 예전엔 각자 다음 Phase를 직접 지정했는데(B2 완료 →
+    # Phase.VEHICLE, B3 완료 → Phase.DONE, 트랙 순서가 고정이라는 가정), 이제 Phase가
+    # 하나로 합쳐져서 "둘 다 최소 한 번 끝났는가"로 판단해야 한다 — 어느 쪽이 먼저
+    # 끝나도 상관없다. 트랙에 둘 중 하나가 아예 없어서 영영 안 끝나면 Phase는
+    # OBSTACLE_ZONE에 계속 남지만, 그래도 무해하다(run_behavior_fsm()이 매 프레임
+    # 트리거를 다시 보므로 일반 차선주행과 다를 바 없다).
+    def _mark_behavior_passed(self, tag):
+        if tag == 'B2':
+            self._b2_passed = True
+        elif tag == 'B3':
+            self._b3_passed = True
+        if self._b2_passed and self._b3_passed:
+            self.phase = Phase.DONE
+            self.get_logger().info('[OBSTACLE_ZONE] B2/B3 모두 통과 완료 → DONE')
+
     # ── B2/B3 공통 실행부 ──
-    def _run_passing(self, controller, tag, done_next_phase):
+    def _run_passing(self, controller, tag):
         steer_offset, speed, done, status = controller.update(
             obstacle_front=self.obstacle_front,
             obstacle_dist=self.obstacle_dist,
@@ -1975,14 +2202,14 @@ class TrackDriverNode(Node):
         self.ctrl_speed = speed
 
         if done:
-            self.phase = done_next_phase
+            self._mark_behavior_passed(tag)
             self._pid_prev_error = 0.0
             self._pid_integral = 0.0
             if tag == 'B3':
                 # astar가 실패해서 여기로 폴백해 있던 상태였다면, 이번 통과가 끝났으니
                 # 다음 방해차량 조우 때는 다시 astar부터 시도할 수 있게 풀어준다.
                 self._b3_using_fallback = False
-            self.get_logger().info(f'[{tag}] 통과 완료 → {done_next_phase.name}')
+            self.get_logger().info(f'[{tag}] 통과 완료 (phase={self.phase.name})')
 
 
     # #########################################################
@@ -2005,6 +2232,8 @@ class TrackDriverNode(Node):
             self._debug_viz_steer()
         if DEBUG_VIZ_VESC:
             self._debug_viz_vesc()
+        if DEBUG_VIZ_AVOID_HOLD:
+            self._debug_viz_avoid_hold()
 
         if ENABLE_BEHAVIOR and self.mission_state == MissionState.S1_LANE_FOLLOW and self._behavior_enabled:
             self.run_behavior_fsm()         #    Behavior 상태 결정

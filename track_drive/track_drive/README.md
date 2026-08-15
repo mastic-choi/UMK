@@ -78,11 +78,13 @@ Hybrid A* 경로계획(B2 대안, 보존용)은 `planner/`에 모여 있습니�
 - 코너 안쪽 컷을 막기 위해 일부 코너 안쪽에 **주행 방해용 고정 장애물**이 배치됨 — 여기 걸려 멈추면 빨리
   판단해 터치(5초 벌초)로 옮겨야 함.
 
-### 고정 장애물 회피 (`Phase.FIXED_OBSTACLE` / `BehaviorState.B2_OBSTACLE`)
+### 고정 장애물 회피 (`Phase.OBSTACLE_ZONE`(2026-08-15부터, 이전 `Phase.FIXED_OBSTACLE`) /
+`BehaviorState.B2_OBSTACLE`)
 - 고장난 차량 모형 등 정지 장애물을 충돌 없이 회피. 이 구간의 차선 이탈/터치는 위 일반 규정과 동일 적용
   (별도 예외 없음).
 
-### 방해차량 추월 (`Phase.VEHICLE` / `BehaviorState.B3_VEHICLE`)
+### 방해차량 추월 (`Phase.OBSTACLE_ZONE`(2026-08-15부터, 이전 `Phase.VEHICLE`) /
+`BehaviorState.B3_VEHICLE`)
 - 방해차량 1대가 저속으로 1·2차선을 오가며 주행.
 - **추월 중에는 실선 이탈을 차선 이탈로 안 봄.** 추월 후 최대한 빨리 실선 안쪽 복귀 필요 — 복귀 후 방해차량과
   간격이 **90cm 이상**이면 오히려 차선 이탈로 판정.
@@ -1935,6 +1937,199 @@ TensorRT를 교집합에서 아예 제외했다(교집합에 남겨두면 다음
   품질 자체는 이번 수정 범위 밖이다 — 이번 조치는 "추론 파이프라인이 아예 안 도는"
   문제만 해결한 것이고, 실제 트랙 위 인식 정확도는 실차 재검증이 필요하다.
 
+### 2.32 회피 "복귀 유예"(avoid-hold) — 장애물 통과 직후 너무 이른 차선 중앙 복귀 방지
+(`AVOID_HOLD_TRIGGER_DIST_M`/`AVOID_HOLD_SEC`, 2026-08-14, 실차 미검증)
+
+**배경(요청 반영):** §2.30에서 넣은 da 안전마진 침식은 장애물 주변을 자연스럽게
+우회하게 만들지만, "언제 원래 차선 중앙으로 돌아가도 되는지"는 전혀 판단하지 않는다.
+카메라가 차량 앞코에 달려있어서, 장애물을 실제로 지나치는 순간(옆·뒤로 빠지는 순간)
+그 장애물이 화면(및 da 구멍)에서 사라지고 da가 그 프레임에 바로 원래 폭으로 돌아와
+중심선도 즉시 원래 차선 중앙으로 복귀한다. 지금 실차에서 관찰되는 회피는 전부 정지
+장애물 기준(`TEST_DISABLE_B2_B3=True`라 정식 B2/B3는 아직 트리거된 적 없음, §2.30
+배경 참고)이라 문제가 안 됐지만, **장애물이 방해차량(B3)처럼 계속 주행 중이면** 지나친
+그 순간엔 아직 옆이나 뒤에 바짝 붙어있을 수 있어 너무 이른 복귀가 그 차와의 충돌(추월
+후 방해차량이 우리 뒤를 들이받는 상황)로 이어질 수 있다는 우려가 나왔다.
+
+**아이디어(요청 반영) — 예전 ll 클리핑 헤리티지를 짧게 되살린다:** 이 저장소엔 이미
+`_clip_da_by_ll()`(§2.14)이라는, ll(차선) 라인을 경계로 da를 "지금 차선 하나"로
+자르는 로직이 있다. `DL_CENTER_MODE='da'`에서는 §2.13(2026-08-13)부터
+`DL_DA_SKIP_LL_CLIP=True`로 평소엔 이 클리핑을 꺼두고 있다(da 자체 검출 품질만 따로
+보려는 테스트 목적). 이번 기능은 이 클리핑을 **영구히 되돌리는 대신**, 회피 기동이
+시작된 뒤 약 `AVOID_HOLD_SEC`(2초)간만 한시적으로 되살려서 raw da 폭 그대로의 급격한
+복귀를 늦추자는 아이디어다 — ll 인식 자체는 여전히 불안정(`ll_da`/`ll` 모드가 계속
+막힌 이력, §2.16/§2.18)해서 상시 의존은 위험하지만, "짧은 창"이라면 그 위험을
+제한적으로만 감수하면 된다는 판단.
+
+**구현:**
+- **트리거 신호**: `TargetPassing`(B2/B3 상태기계) 자체는 `TEST_DISABLE_B2_B3=True`로
+  꺼져있지만, 그 밑에서 매 틱 돌아가는 라이다 기반 `perc_obstacle()`(→
+  `self.obstacle_front`/`self.obstacle_dist`)은 이 플래그와 무관하게 항상 갱신된다 —
+  이 신호를 그대로 재사용한다("차량이 앞에 감지되고" = `obstacle_front`가
+  `AVOID_HOLD_TRIGGER_DIST_M`(1.5m) 안으로 들어옴).
+- **타이머**: `track_drive.py`에 `_update_avoid_hold()`를 추가해(`perc_obstacle()` 직후,
+  `perceive_all()`에서 호출) `self._avoid_hold_until_t`를 관리한다 — 장애물이 가까이
+  있는 동안은 매 틱 "지금+`AVOID_HOLD_SEC`"로 목표시각을 계속 밀어두고,
+  `self.avoid_hold_active = now < self._avoid_hold_until_t`로 판정한다. "장애물이
+  있는 동안"이 아니라 "마지막으로 가까이 있었던 시점부터 N초"가 핵심이다(장애물이
+  시야에서 사라진 직후가 가장 위험한 구간이므로) — `_vesc_live()` 류의 `_*_t` +
+  `*_STALE_SEC` 패턴과 반대 방향(살아있는 동안이 아니라 사라진 뒤 유예)이지만 같은
+  타임스탬프 비교 구조를 재사용했다.
+- **전달 경로**: DL 추론이 `control_loop()`와 분리된 백그라운드 워커 스레드에서 도는
+  구조라(모듈 상단 "실시간 전략" 주석), `avoid_hold_active`를 스레드 세이프하게 넘겨야
+  한다. `perc_lane()`이 매 틱 `DLLaneDetector.set_avoid_hold(active)`를 호출해
+  `self._latest_avoid_hold`에 저장해두면, `_worker()`가 다음 추론 때 `_latest_frame`과
+  같은 락으로 같이 읽어 `DLSlideWindow.detect(..., avoid_hold=...)`에 넘긴다(다른
+  백엔드는 `set_avoid_hold`가 없으므로 `getattr(..., lambda *_: None)`로 조용히
+  건너뜀 — `show_debug_windows()`와 동일 관례).
+- **효과**: `DLSlideWindow.detect()` 안에서 `DL_CENTER_MODE=='da' and DL_DA_SKIP_LL_CLIP
+  and not avoid_hold`일 때만 클리핑을 건너뛰도록 조건을 바꿨다 — `avoid_hold=True`인
+  동안은 평소 꺼둔 `_clip_da_by_ll()`이 그대로 되살아나, da가 raw 폭으로 돌아와도
+  ll(잔상 포함)/가상경계가 "지금 차선 하나" 폭으로 다시 잘라준다. 디버그 태그
+  `[AVOID_HOLD]`를 `visualize()` 텍스트에 추가해 지금 이 유예가 발동 중인지 실차
+  화면에서 바로 보이게 했다.
+
+**perceive_all() 순서 관련 알려진 오차:** `perc_lane()`이 `perc_obstacle()`/
+`_update_avoid_hold()`보다 먼저 돈다(`perceive_all()` 상단 순서, 변경하지 않음) —
+그래서 `perc_lane()`이 넘기는 `avoid_hold_active`는 엄밀히는 직전 틱(0.05s 이내) 값이다.
+DL 추론 자체도 이미 논블로킹 백그라운드 워커라 결과가 프레임 몇 개 지연되는 걸 감안하고
+설계됐으므로(모듈 상단 주석) 무시 가능한 오차로 판단해 `perceive_all()` 순서 자체는
+건드리지 않았다.
+
+**알려진 한계(실차 미검증):**
+- `AVOID_HOLD_TRIGGER_DIST_M=1.5`/`AVOID_HOLD_SEC=2.0` 둘 다 첫 추정치 — 방해차량
+  속도/추월 소요 시간에 맞춰 실차에서 조정이 필요할 것이다. 유예가 너무 길면 정지
+  장애물을 지나친 뒤에도 한동안 ll 클리핑(불안정 이력이 있는 경로)에 끌려다니고, 너무
+  짧으면 원래 우려(너무 이른 복귀)를 그대로 남긴다.
+- `_clip_da_by_ll()`을 되살리는 동안 ll이 그 프레임에 아예 안 보이면(§2.14가 다루는
+  "얇은 다리가 아니라 뭉텅하게 병합" 실패모드) 잔상/가상경계로 대응하긴 하지만, 그
+  경로 자체가 여전히 실차에서 충분히 검증되지 않은 상태다 — 평소(`avoid_hold=False`)엔
+  아예 안 쓰이던 코드 경로가 회피 상황(오히려 가장 신뢰성이 중요한 순간)에만
+  활성화된다는 점을 유의할 것.
+- 트리거가 라이다 `obstacle_front` 하나뿐이라, 장애물이 라이다 사각지대(예: 차체
+  자기가림 `BODY_LO`~`BODY_HI`)에 있거나 `FRONT_Y_HALF`(1.5m) 폭 밖으로 완전히
+  비켜났을 때는 유예가 갱신되지 않고 조기에 만료될 수 있다.
+- 방해차량이 실제로 우리 차선으로 다시 끼어드는 상황(차선을 오가는 §5 B3 시나리오)까지
+  이 기능이 막아주진 않는다 — 이건 순수하게 "내 쪽 복귀 타이밍"만 늦추는 것이고,
+  상대가 다시 내 차선으로 들어오는 것 자체를 감지/회피하는 로직은 아니다.
+
+### 2.33 avoid-hold 개선 — 가변 유예시간 + 거리기반 조기 해제 + 방향 힌트 + 안전판
+(2026-08-15, 실차 미검증)
+
+**배경:** §2.32의 avoid-hold는 고정 `AVOID_HOLD_SEC=2.0` 하나뿐이라, 정지 장애물(짧아도
+안전)과 방해차량(빠르게 붙으면 위험할 수 있음)을 구분하지 못했다 — 짧게 잡으면 방해차량
+시나리오에서 위험, 길게 잡으면 정지 장애물에도 매번 낭비라는 트레이드오프를 숫자 하나로
+감내할 수밖에 없었다. 또한 §2.32 자체가 이미 지적했듯 트리거가 라이다 `obstacle_front`
+단일 신호뿐이라 사각지대에서 조기 만료될 수 있고, 회피 방향(어느 쪽이 안전한지)을 전혀
+판단하지 않았다. 조사(오픈소스 사례: Autoware의 TTC 기반 상대속도 반영, Nav2 STVL의
+공간적 decay, Apollo의 명시적 방향 결정 단계, F1TENTH류 반응형 스택의 "완벽한 회피보다
+안전한 감속" 철학)와 상세 설계는 `avoid_hold_improvement_proposal.md`에 문제 1~7별로
+정리해뒀다 — 이 절은 그중 실제로 구현한 4개(적용1~4)만 요약한다.
+
+**구현(`track_drive.py` `_update_avoid_hold()`가 매 틱 전부 갱신):**
+- **[적용1] 가변 유예시간**: 트리거가 걸리는 순간 `target_speed_est = v_mps +
+  obstacle_rate`를 1회만 스냅샷해(`OBSTACLE_STATIC_SPEED_TH_MPS` 이하면 정지로 보고
+  게인 미적용) `hold_sec = clip(AVOID_HOLD_SEC_BASE + AVOID_HOLD_RATE_GAIN*|target_speed_est|,
+  AVOID_HOLD_SEC_MIN, AVOID_HOLD_SEC_MAX)`로 유예 길이를 정한다. 매 틱 재계산하지 않는
+  이유는 `obstacle_rate`의 프레임간 노이즈가 유예시간 자체의 흔들림으로 새는 걸 막기
+  위해서다.
+- **[적용1] 거리기반 조기 해제**: `obstacle_front=False`가 `AVOID_HOLD_RELEASE_CONFIRM_FRAMES`
+  연속 + 마지막으로 `obstacle_front=True`였을 때의 거리가 `AVOID_HOLD_RELEASE_DIST_M`
+  이상이면, `hold_sec`을 다 채우기 전에도 즉시 해제한다 — "안 보임=멀어짐"이 아니라
+  "마지막으로 봤을 때 이미 멀었음"으로 조건화(그래도 사각지대와 실제 이탈을 완전히는
+  못 가름, 아래 알려진 한계 참고).
+- **[적용2] da 연속성 보조 트리거**: `perception/dl_lane.py`의 `DLSlideWindow`가 매
+  프레임 `da_chosen_area_px`를 직전 프레임과 비교해, `AVOID_HOLD_DA_AREA_JUMP_RATIO`
+  이상 급증하면(=방금까지 뚫려있던 구멍이 갑자기 메워짐) `da_area_jump_detected`를
+  True로 표시한다. `DLLaneDetector`가 이 값을 `da_area_jump`로 노출하고,
+  `_update_avoid_hold()`가 라이다 `obstacle_front`와 **OR**로 결합해 트리거 판정에
+  쓴다(라이다 사각지대를 카메라 쪽이 보완, 단독 트리거로는 안 씀 — 세그멘테이션
+  흔들림에 취약해서).
+- **[적용3] 방향 힌트**: 이미 있었지만 avoid-hold와 분리돼 있던
+  `controller/obstacle_avoidance.py`의 `TargetPassing.choose_side()`(순수 판정 함수,
+  `self.vehicle_controller`에 이미 생성돼 있던 인스턴스를 그대로 재사용)를 매 틱 호출해
+  `self.avoid_hold_side`(-1/0/+1)에 저장한다. `perc_lane()`이 `DLLaneDetector.set_avoid_hold(active,
+  side)`로 DL 백엔드에 넘기고, `perception/dl_lane.py`의 `_clip_da_by_ll()`이 **ll/잔상이
+  전혀 없는 최후수단(가상경계) 분기에서만** 기준점을 `AVOID_HOLD_DIR_BIAS_PX`만큼 그
+  방향으로 기울인다 — 실측(ll)/잔상이 있는 밴드는 건드리지 않는다(실제 증거가 항상
+  힌트보다 우선).
+- **[적용4] 안전판**: `choose_side()`가 `0`(양쪽 다 막힘)을 반환하는 동안
+  `_lane_drive()`가 목표속도를 `SPEED_AVOID_HOLD_BLOCKED`까지 강제로 낮춘다 —
+  `SPEED_CORNER_MIN`/`SPEED_LL_DEGRADED`/`SPEED_LANE_STALE`과 동일한 "즉시 cap" 관례.
+
+**디버그 창(`DEBUG_VIZ_AVOID_HOLD`, 신규):** `_debug_viz_avoid_hold()`가 `avoid_hold_debug`
+창에 지금 유예 활성 여부/남은 시간/hold_sec/직전 해제 사유/방향 힌트/트리거 입력값
+(`obstacle_front`/`dist`/`rate`/`v_mps`/`target_speed_est` 스냅샷)/da 연속성 신호/조기해제
+디바운스 진행상황을 전부 띄우고, 실측이 안 된 파라미터 6개(`AVOID_HOLD_RATE_GAIN`,
+`AVOID_HOLD_SEC_MAX`, `AVOID_HOLD_RELEASE_DIST_M`, `AVOID_HOLD_DA_AREA_JUMP_RATIO`,
+`AVOID_HOLD_DIR_BIAS_PX`, `SPEED_AVOID_HOLD_BLOCKED`)은 주황색으로 항상 같이 표시한다 —
+이 값들의 측정 절차는 `avoid_hold_measurement_todo.md` 참고. 실차에서 회피 로직이 왜
+이렇게 동작했는지 나중에 판단할 때 이 창(또는 녹화 영상)을 1차로 볼 것.
+
+**알려진 한계(실차 미검증):**
+- 위 실측 필요 6개 파라미터는 전부 첫 추정치다 — `avoid_hold_measurement_todo.md`의
+  절차대로 실측하기 전까지는 근거 없는 값으로 취급할 것.
+- 적용2(da 연속성)는 세그멘테이션 자체가 흔들리는 프레임에서 오발동할 수 있다는 근본
+  한계를 그대로 안고 있다 — OR 결합이라 "사각지대 누락을 줄이는 대신 오발동이 늘 수
+  있다"는 트레이드오프는 여전히 남아있다.
+- 적용3(방향 힌트)은 ll/잔상이 전혀 없는 최후수단 분기에서만 동작하므로, 대부분의
+  일반적인 상황(ll이 잡히는 경우)에서는 효과가 없다 — 이 힌트가 실제로 의미 있게
+  작동하는 빈도 자체가 실차에서 얼마나 되는지 아직 모른다.
+- §2.32에 이미 적힌 "트리거가 라이다 하나뿐이라 사각지대에서 조기 만료될 수 있다"는
+  한계는 적용2로 일부만 완화됐을 뿐 완전히 해소되지 않았다.
+- `choose_side()`는 이번에 avoid-hold 경로에서 처음 실제로 호출되기 시작한 함수다
+  (`TEST_DISABLE_B2_B3=True`라 원래 B2/B3 FSM 경로로는 여전히 한 번도 안 불려봄) —
+  회피 상황(가장 신뢰성이 중요한 순간)에 실차 미검증 함수가 새로 얹힌다는 리스크는
+  `avoid_hold_improvement_proposal.md`에도 기록돼 있으니 실차 첫 테스트 시 주의 깊게
+  볼 것.
+
+### 2.34 `Phase.FIXED_OBSTACLE`/`Phase.VEHICLE` → `Phase.OBSTACLE_ZONE` 통합 (2026-08-15,
+실차 미검증)
+
+**배경:** avoid-hold(§2.32/§2.33) 이후 토론에서 나온 질문 — "da 안전마진(§2.30)+avoid-hold로
+회피 기동 자체가 정적/동적 구분 없이 동일해졌는데, `TargetPassing`이 정적/동적을 미리
+구분해서 받는(`moving` 플래그) 전제였던 `Phase.FIXED_OBSTACLE`/`Phase.VEHICLE` 순차 구분이
+여전히 필요한가?" `da_based_b2b3_proposal.md`에서 검토한 결과: 원래 Phase가 필요했던 이유는
+`TargetPassing`이 **한번 시작하면 끝까지 실행하는 커밋형 기동**이라, 그 기동 종류를 실시간
+속도추정(노이즈 취약)으로 고르면 잘못된 기동을 통째로 커밋할 위험이 있어서였다
+(`controller/obstacle_avoidance.py` 상단 주석 — "정적/동적 판별을 위한 속도추정은 하지
+않는다, 상위 Phase가 이미 구분해주므로"). da 기반 회피가 커밋형 기동 없이 매 프레임
+연속적으로 반응하는 쪽으로 가면서 그 위험 자체가 줄었다고 판단해, 이번에 두 Phase를 하나로
+합쳤다.
+
+**구현:**
+- `config.py` `Phase` enum: `FIXED_OBSTACLE`/`VEHICLE` → `OBSTACLE_ZONE` 하나로.
+- `run_behavior_fsm()`: `Phase.OBSTACLE_ZONE` 한 브랜치 안에서 두 트리거(`SAFETY_DIST` 기반
+  고정장애물 트리거, `perc_vehicle_trigger()`의 `vehicle_trigger`)를 동시에 보고,
+  `obstacle_type`(라이다 실측 폭 기반, `perc_obstacle()`)으로 `B2_OBSTACLE`/`B3_VEHICLE`을
+  그때그때 가른다 — 예전엔 Phase가 순서를 강제해서 트리거에서 `obstacle_type` 조건을 뺐었는데
+  (2026-08-11, "옛 조건대로면 Phase.VEHICLE로 넘어가지도 못하고 교착된다"), 그 이유였던
+  Phase 세분화 자체가 없어졌으니 다시 넣을 수 있게 됐다. 이미 진행 중인 기동
+  (`_obstacle_active`/`_overtake_active`)이 있으면 이번 프레임 분류가 흔들려도 핸들러를
+  중간에 바꾸지 않는다.
+- **Phase 전진**: 예전엔 B2 완료 → `Phase.VEHICLE`, B3 완료 → `Phase.DONE`으로 각 핸들러가
+  직접 다음 Phase를 지정했다(트랙 순서 고정 가정). 이제 `_mark_behavior_passed(tag)`가
+  `self._b2_passed`/`self._b3_passed`를 따로 추적하다가 **둘 다 True가 돼야**
+  `Phase.DONE`으로 넘어간다 — 어느 쪽이 먼저 끝나도 상관없다. 두 플래그는
+  `RESET_PHASE_EACH_LAP`과 함께 매 바퀴 리셋된다.
+
+**`TEST_DISABLE_B2_B3`는 그대로 동작한다** — `Phase.OBSTACLE_ZONE` 브랜치 맨 위에서 여전히
+`if TEST_DISABLE_B2_B3: behavior_state = B0_NORMAL; return`으로 트리거 검사 자체를
+건너뛴다. `False`로 바꾸면 예전과 같은 조건(SAFETY_DIST/OVERTAKE_TRIGGER+디바운스)으로
+트리거가 그대로 걸리고, 달라진 건 "두 Phase로 미리 나눠 어느 트리거를 볼지 정함" → "한
+Phase 안에서 매 프레임 타입으로 나눔"뿐이다.
+
+**알려진 한계(실차 미검증):**
+- 트리거 발동 직후 몇 프레임은 `obstacle_type`/`vehicle_trigger` 디바운스 타이밍이 안 맞아
+  잠깐 `B2_OBSTACLE`로 걸렸다가 `B3_VEHICLE`로 바뀌는 등 짧은 오분류가 있을 수 있다 —
+  `_obstacle_active`/`_overtake_active` latch가 실제로 걸리기 전(TargetPassing이 아직
+  IDLE)에만 해당하는 구간이라 영향은 제한적이라고 판단했지만 실차 확인 전이다.
+- `_da_avoidance_failed()`의 `da_unaware_of_obstacle=True`는 아직 안 건드렸다 — 즉 B2는
+  여전히 항상 `TargetPassing`으로 폴백한다. 이번 변경은 Phase 구조만 정리한 것이고,
+  "da를 실제로 신뢰하기 시작하는" 다음 단계는 `da_based_b2b3_proposal.md` "다음 단계"에
+  남아있다.
+- `RESET_PHASE_EACH_LAP=True`(현재값) 기준으로만 검증됐다 — `False`로 두고 여러 바퀴를
+  도는 경로는 아직 안 봄.
+
 ---
 
 ## 3. 라바콘 (B1_LAVACON)
@@ -2025,10 +2220,13 @@ NonMaxSuppression 레이어의 빈 텐서 케이스를 현재 TensorRT가 못 �
 START_STATE = MissionState.S1_LANE_FOLLOW
 TEST_DISABLE_B2_B3 = False     # B2 트리거 검사를 켜야 함
 TEST_FORCE_BEHAVIOR = True
-self.phase = Phase.FIXED_OBSTACLE   # __init__ 안의 self.phase 초기값을 임시로 변경 (격리 테스트용)
+self.phase = Phase.OBSTACLE_ZONE   # __init__ 안의 self.phase 초기값을 임시로 변경 (격리 테스트용)
 ```
-정상 흐름은 라바콘(B1) 완료 후 자동으로 `Phase.FIXED_OBSTACLE`로 넘어가는 것이라, 이 기능만 격리
+정상 흐름은 라바콘(B1) 완료 후 자동으로 `Phase.OBSTACLE_ZONE`으로 넘어가는 것이라, 이 기능만 격리
 테스트하려면 `__init__`의 `self.phase = Phase.LAVACON`을 위처럼 임시로 바꾸면 됩니다.
+**[2026-08-15]** 예전엔 여기가 `Phase.FIXED_OBSTACLE`이었는데, B2/B3가 `Phase.OBSTACLE_ZONE`
+하나로 합쳐졌습니다(§2.34 참고) — B2만 격리 테스트하려면 트랙에 방해차량(폭 `OBSTACLE_VEHICLE_WIDTH_M`
+이상) 없이 고정 장애물만 놓고 확인하세요(`obstacle_type` 분류가 폭 기반이라 B3로 안 걸림).
 
 **진입 게이트 — `_da_avoidance_failed()` (2026-08-11 추가):** B2 트리거가 걸렸다고 바로
 `TargetPassing`이 켜지지 않고 먼저 `_da_avoidance_failed()`를 봅니다. `False`면(= da 기반 경로가
@@ -2184,9 +2382,13 @@ self.phase = Phase.FIXED_OBSTACLE   # __init__ 안의 self.phase 초기값을 �
 START_STATE = MissionState.S1_LANE_FOLLOW
 TEST_DISABLE_B2_B3 = False
 TEST_FORCE_BEHAVIOR = True
-self.phase = Phase.VEHICLE     # 격리 테스트용 임시 변경
+self.phase = Phase.OBSTACLE_ZONE     # 격리 테스트용 임시 변경
 ```
-B2와 마찬가지로 별도 노드 전환 없이 `self.phase = Phase.VEHICLE`만 바꾸면 격리 테스트할 수 있습니다.
+B2와 마찬가지로 별도 노드 전환 없이 `self.phase = Phase.OBSTACLE_ZONE`만 바꾸면 격리 테스트할 수
+있습니다. **[2026-08-15]** 예전엔 여기가 전용 `Phase.VEHICLE`이라 B3만 격리하기 쉬웠는데,
+Phase가 하나로 합쳐진 뒤로는(§2.34) 트랙에 폭 `OBSTACLE_VEHICLE_WIDTH_M` 이상인 타겟(방해차량
+쪽으로 분류됨)을 놓아야 `run_behavior_fsm()`이 B3_VEHICLE로 디스패치합니다 — 폭이 좁으면
+B2_OBSTACLE로 걸립니다.
 진입 조건은 **라이다 단독** — 전방 장애물 + 거리 < `OVERTAKE_TRIGGER=6.5m`가 `VEHICLE_TRIGGER_FRAMES(5프레임)`
 연속 유지되면 확정됩니다(`perc_vehicle_trigger()`).
 
