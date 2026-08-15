@@ -2039,6 +2039,76 @@ DL 추론 자체도 이미 논블로킹 백그라운드 워커라 결과가 프�
   이 기능이 막아주진 않는다 — 이건 순수하게 "내 쪽 복귀 타이밍"만 늦추는 것이고,
   상대가 다시 내 차선으로 들어오는 것 자체를 감지/회피하는 로직은 아니다.
 
+### 2.33 avoid-hold 개선 — 가변 유예시간 + 거리기반 조기 해제 + 방향 힌트 + 안전판
+(2026-08-15, 실차 미검증)
+
+**배경:** §2.32의 avoid-hold는 고정 `AVOID_HOLD_SEC=2.0` 하나뿐이라, 정지 장애물(짧아도
+안전)과 방해차량(빠르게 붙으면 위험할 수 있음)을 구분하지 못했다 — 짧게 잡으면 방해차량
+시나리오에서 위험, 길게 잡으면 정지 장애물에도 매번 낭비라는 트레이드오프를 숫자 하나로
+감내할 수밖에 없었다. 또한 §2.32 자체가 이미 지적했듯 트리거가 라이다 `obstacle_front`
+단일 신호뿐이라 사각지대에서 조기 만료될 수 있고, 회피 방향(어느 쪽이 안전한지)을 전혀
+판단하지 않았다. 조사(오픈소스 사례: Autoware의 TTC 기반 상대속도 반영, Nav2 STVL의
+공간적 decay, Apollo의 명시적 방향 결정 단계, F1TENTH류 반응형 스택의 "완벽한 회피보다
+안전한 감속" 철학)와 상세 설계는 `avoid_hold_improvement_proposal.md`에 문제 1~7별로
+정리해뒀다 — 이 절은 그중 실제로 구현한 4개(적용1~4)만 요약한다.
+
+**구현(`track_drive.py` `_update_avoid_hold()`가 매 틱 전부 갱신):**
+- **[적용1] 가변 유예시간**: 트리거가 걸리는 순간 `target_speed_est = v_mps +
+  obstacle_rate`를 1회만 스냅샷해(`OBSTACLE_STATIC_SPEED_TH_MPS` 이하면 정지로 보고
+  게인 미적용) `hold_sec = clip(AVOID_HOLD_SEC_BASE + AVOID_HOLD_RATE_GAIN*|target_speed_est|,
+  AVOID_HOLD_SEC_MIN, AVOID_HOLD_SEC_MAX)`로 유예 길이를 정한다. 매 틱 재계산하지 않는
+  이유는 `obstacle_rate`의 프레임간 노이즈가 유예시간 자체의 흔들림으로 새는 걸 막기
+  위해서다.
+- **[적용1] 거리기반 조기 해제**: `obstacle_front=False`가 `AVOID_HOLD_RELEASE_CONFIRM_FRAMES`
+  연속 + 마지막으로 `obstacle_front=True`였을 때의 거리가 `AVOID_HOLD_RELEASE_DIST_M`
+  이상이면, `hold_sec`을 다 채우기 전에도 즉시 해제한다 — "안 보임=멀어짐"이 아니라
+  "마지막으로 봤을 때 이미 멀었음"으로 조건화(그래도 사각지대와 실제 이탈을 완전히는
+  못 가름, 아래 알려진 한계 참고).
+- **[적용2] da 연속성 보조 트리거**: `perception/dl_lane.py`의 `DLSlideWindow`가 매
+  프레임 `da_chosen_area_px`를 직전 프레임과 비교해, `AVOID_HOLD_DA_AREA_JUMP_RATIO`
+  이상 급증하면(=방금까지 뚫려있던 구멍이 갑자기 메워짐) `da_area_jump_detected`를
+  True로 표시한다. `DLLaneDetector`가 이 값을 `da_area_jump`로 노출하고,
+  `_update_avoid_hold()`가 라이다 `obstacle_front`와 **OR**로 결합해 트리거 판정에
+  쓴다(라이다 사각지대를 카메라 쪽이 보완, 단독 트리거로는 안 씀 — 세그멘테이션
+  흔들림에 취약해서).
+- **[적용3] 방향 힌트**: 이미 있었지만 avoid-hold와 분리돼 있던
+  `controller/obstacle_avoidance.py`의 `TargetPassing.choose_side()`(순수 판정 함수,
+  `self.vehicle_controller`에 이미 생성돼 있던 인스턴스를 그대로 재사용)를 매 틱 호출해
+  `self.avoid_hold_side`(-1/0/+1)에 저장한다. `perc_lane()`이 `DLLaneDetector.set_avoid_hold(active,
+  side)`로 DL 백엔드에 넘기고, `perception/dl_lane.py`의 `_clip_da_by_ll()`이 **ll/잔상이
+  전혀 없는 최후수단(가상경계) 분기에서만** 기준점을 `AVOID_HOLD_DIR_BIAS_PX`만큼 그
+  방향으로 기울인다 — 실측(ll)/잔상이 있는 밴드는 건드리지 않는다(실제 증거가 항상
+  힌트보다 우선).
+- **[적용4] 안전판**: `choose_side()`가 `0`(양쪽 다 막힘)을 반환하는 동안
+  `_lane_drive()`가 목표속도를 `SPEED_AVOID_HOLD_BLOCKED`까지 강제로 낮춘다 —
+  `SPEED_CORNER_MIN`/`SPEED_LL_DEGRADED`/`SPEED_LANE_STALE`과 동일한 "즉시 cap" 관례.
+
+**디버그 창(`DEBUG_VIZ_AVOID_HOLD`, 신규):** `_debug_viz_avoid_hold()`가 `avoid_hold_debug`
+창에 지금 유예 활성 여부/남은 시간/hold_sec/직전 해제 사유/방향 힌트/트리거 입력값
+(`obstacle_front`/`dist`/`rate`/`v_mps`/`target_speed_est` 스냅샷)/da 연속성 신호/조기해제
+디바운스 진행상황을 전부 띄우고, 실측이 안 된 파라미터 6개(`AVOID_HOLD_RATE_GAIN`,
+`AVOID_HOLD_SEC_MAX`, `AVOID_HOLD_RELEASE_DIST_M`, `AVOID_HOLD_DA_AREA_JUMP_RATIO`,
+`AVOID_HOLD_DIR_BIAS_PX`, `SPEED_AVOID_HOLD_BLOCKED`)은 주황색으로 항상 같이 표시한다 —
+이 값들의 측정 절차는 `avoid_hold_measurement_todo.md` 참고. 실차에서 회피 로직이 왜
+이렇게 동작했는지 나중에 판단할 때 이 창(또는 녹화 영상)을 1차로 볼 것.
+
+**알려진 한계(실차 미검증):**
+- 위 실측 필요 6개 파라미터는 전부 첫 추정치다 — `avoid_hold_measurement_todo.md`의
+  절차대로 실측하기 전까지는 근거 없는 값으로 취급할 것.
+- 적용2(da 연속성)는 세그멘테이션 자체가 흔들리는 프레임에서 오발동할 수 있다는 근본
+  한계를 그대로 안고 있다 — OR 결합이라 "사각지대 누락을 줄이는 대신 오발동이 늘 수
+  있다"는 트레이드오프는 여전히 남아있다.
+- 적용3(방향 힌트)은 ll/잔상이 전혀 없는 최후수단 분기에서만 동작하므로, 대부분의
+  일반적인 상황(ll이 잡히는 경우)에서는 효과가 없다 — 이 힌트가 실제로 의미 있게
+  작동하는 빈도 자체가 실차에서 얼마나 되는지 아직 모른다.
+- §2.32에 이미 적힌 "트리거가 라이다 하나뿐이라 사각지대에서 조기 만료될 수 있다"는
+  한계는 적용2로 일부만 완화됐을 뿐 완전히 해소되지 않았다.
+- `choose_side()`는 이번에 avoid-hold 경로에서 처음 실제로 호출되기 시작한 함수다
+  (`TEST_DISABLE_B2_B3=True`라 원래 B2/B3 FSM 경로로는 여전히 한 번도 안 불려봄) —
+  회피 상황(가장 신뢰성이 중요한 순간)에 실차 미검증 함수가 새로 얹힌다는 리스크는
+  `avoid_hold_improvement_proposal.md`에도 기록돼 있으니 실차 첫 테스트 시 주의 깊게
+  볼 것.
+
 ---
 
 ## 3. 라바콘 (B1_LAVACON)

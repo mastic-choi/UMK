@@ -195,6 +195,9 @@ from ..config import (
     DL_LL_SEARCH_HALF_WIDTH_PX,
     # [2026-08-14] da 안전마진(차량 폭) 침식 — README §2.30
     DL_DA_APPLY_VEHICLE_MARGIN, DL_DA_VEHICLE_MARGIN_M, VEHICLE_WIDTH_M,
+    # [2026-08-15] avoid-hold 개선 적용2(da 연속성 보조트리거)/적용3(방향 힌트) — README §2.32,
+    # avoid_hold_improvement_proposal.md
+    AVOID_HOLD_DA_AREA_JUMP_RATIO, AVOID_HOLD_DIR_BIAS_PX,
     # DL_LL_ALGO='yw'(팀원 작성, main 기본) 전용
     DL_LL_YELLOW_GAP_INIT_PX, DL_LL_YELLOW_GAP_EMA_ALPHA,
     DL_LL_YELLOW_GAP_MIN_PX, DL_LL_YELLOW_GAP_MAX_PX,
@@ -428,6 +431,9 @@ class DLSlideWindow(SlideWindow):
         self.da_fallback_used = False  # 이번 프레임 da가 직전 채택 덩어리와의 근접성이 아니라 면적순위 차선책으로 골라졌는지 — visualize() 색상 구분용
         self.da_ll_clip_skipped = False  # 이번 프레임 ll 클리핑이 유효 밴드를 너무 줄여 건너뛰었는지 — visualize() 구분용
         self.avoid_hold_active = False  # [2026-08-14] 이번 프레임 avoid-hold(§2.32)로 DL_DA_SKIP_LL_CLIP을 무시하고 ll 클리핑을 강제했는지 — visualize() 구분용
+        self.avoid_hold_dir_hint = 0    # [2026-08-15] 적용3 — 이번 프레임 track_drive.py가 넘긴 방향 힌트(-1/0/+1) — visualize() 구분용
+        self._prev_da_chosen_area_px = 0    # [2026-08-15] 적용2 — 직전 프레임 da_chosen_area_px(급증 감지용)
+        self.da_area_jump_detected = False  # [2026-08-15] 적용2 — 이번 프레임 da_chosen_area_px가 직전 대비 AVOID_HOLD_DA_AREA_JUMP_RATIO 이상 급증했는지 — DLLaneDetector가 그대로 읽어 track_drive.py에 노출
         self.da_ll_virtual_clip_used = False  # [2026-08-07] 이번 프레임 _clip_da_by_ll()이 ll/잔상 없이 가상경계(기대 차로폭)로 클리핑한 밴드가 있었는지 — visualize() 구분용
         self.da_largest_mask_roi = None  # 면적 1위 덩어리(차선책을 썼다면 그 사유가 된, 상한 초과로 버려진 덩어리) — fallback일 때 원래 색으로 같이 그리기용
         self.da_largest_area_px = 0  # 면적 1위 덩어리의 절대 픽셀 면적(채택 여부 무관) — DL_DA_MAX_AREA_PX 실측 튜닝용
@@ -776,7 +782,7 @@ class DLSlideWindow(SlideWindow):
         안 됨)을 잘못 참조하는 실수를 막기 위함."""
         return self._white_yellow_gap_px if DL_LL_ALGO == 'yw' else self._ll_half_width
 
-    def _clip_da_by_ll(self, da_mask, ll_mask, ref_x):
+    def _clip_da_by_ll(self, da_mask, ll_mask, ref_x, direction_hint=0):
         """da_mask에서 ll(차선) 라인을 경계로 "내 차선 바깥"에 해당하는 픽셀을 지운다.
         da는 점선 틈으로 옆 차선 da와 하나의 덩어리로 이어붙는 실패모드가 있는데, 이 경우
         _largest_da_component()의 "가장 큰 덩어리" 기준만으로는 옆 차선까지 통째로 살아남는다.
@@ -815,6 +821,12 @@ class DLSlideWindow(SlideWindow):
           입력 : da_mask — (roi_h, roi_w) uint8 이진마스크
                  ll_mask — 동일 shape 이진마스크. 호출부가 실측/잔상 어느 쪽을 넣어도 무방.
                  ref_x   — 첫(근거리) 밴드의 기준 x좌표. 보통 직전 프레임 lane_center.
+                 direction_hint — [2026-08-15] avoid-hold 적용3(config.py AVOID_HOLD_DIR_BIAS_PX
+                   주석). -1/0/+1, lane_offset과 동일한 "우측+" 부호규약. self.avoid_hold_active
+                   이고 0이 아닐 때만, 아래 ②(가상경계 — 실측/잔상이 전혀 없는 최후수단)
+                   분기에서 기준점을 이 방향으로 AVOID_HOLD_DIR_BIAS_PX만큼 미리 기울인다.
+                   ①(실측/잔상 있음) 분기는 건드리지 않는다 — 실제 증거가 항상 힌트보다
+                   우선한다(문제2 대비책, 실측 없이 방향만으로 결정하지 않음).
           출력 : (clipped, virtual_used) — clipped는 da_mask에서 ll(또는 가상) 경계 밖
                  픽셀만 0으로 지운 복사본(shape 동일), virtual_used는 이번 호출에서 ②
                  (가상경계)가 한 밴드라도 발동했는지(bool) — visualize() 디버그 표시용.
@@ -852,13 +864,23 @@ class DLSlideWindow(SlideWindow):
             else:
                 # ② ll도 잔상도 없음 — 최후 수단: 기대 차로 반폭 기준 가상 경계로 강제 클리핑.
                 half_width = self._ll_active_half_width()
-                lcut = int(np.clip(cur_ref - half_width, 0, w))
-                rcut = int(np.clip(cur_ref + half_width, 0, w))
+                # [2026-08-15] avoid-hold 적용3 — 실측 근거가 전혀 없는 이 최후수단에서만,
+                # 방향 힌트가 있으면(avoid_hold 활성 중 + direction_hint != 0) 기준점을
+                # 그 방향으로 미리 살짝 기울인다. 근거 없는 추정에 또 다른 근거 없는
+                # 추정(힌트)을 더하는 것뿐이라 위험이 없진 않지만, 힌트 자체는 라이다
+                # 실측(obstacle_y)에서 나온 값이라 "아무 근거 없는 것"보다는 낫다는 판단.
+                biased_ref = cur_ref
+                if self.avoid_hold_active and direction_hint:
+                    biased_ref = cur_ref + direction_hint * AVOID_HOLD_DIR_BIAS_PX
+                lcut = int(np.clip(biased_ref - half_width, 0, w))
+                rcut = int(np.clip(biased_ref + half_width, 0, w))
                 clipped[y_low:y_high, :lcut] = 0
                 clipped[y_low:y_high, rcut:] = 0
                 virtual_used = True
                 self.da_clip_band_virtual[i] = True
-                # cur_ref는 갱신하지 않는다 — 실측 근거 없는 추정이라 그대로 다음 밴드로 넘김.
+                # cur_ref는 갱신하지 않는다 — 실측 근거 없는 추정이라 그대로 다음 밴드로 넘김
+                # (biased_ref로 방향만 살짝 튼 것도 마찬가지 — 다음 밴드는 원래 cur_ref 기준으로
+                # 다시 판단한다).
 
         return clipped, virtual_used
 
@@ -1516,7 +1538,7 @@ class DLSlideWindow(SlideWindow):
 
         return results, used
 
-    def detect(self, raw_bgr, da_prob, ll_prob, yellow_mask, avoid_hold=False):
+    def detect(self, raw_bgr, da_prob, ll_prob, yellow_mask, avoid_hold=False, direction_hint=0):
         """입력 : raw_bgr — 원본 카메라 프레임 그대로의 (H,W,3) BGR(크롭/리사이즈 없음)
                  da_prob, ll_prob — 위와 같은 (H,W) float32 foreground 확률(모델은 360행
                    고정이지만 TwinLiteNetEngine.infer_raw()가 이미 원본 크기로 업샘플링해서 줌)
@@ -1524,12 +1546,18 @@ class DLSlideWindow(SlideWindow):
                  avoid_hold — [2026-08-14] True면 DL_DA_SKIP_LL_CLIP=True(평소 테스트 설정)를
                    무시하고 _clip_da_by_ll()을 강제로 돌린다(§2.32, DL_CENTER_MODE='da' 전용
                    — 다른 모드는 이 인자와 무관하게 항상 클리핑 적용). track_drive.py의
-                   _update_avoid_hold()가 라이다 obstacle_front/dist로 판단해 넘긴다.
+                   _update_avoid_hold()가 라이다 obstacle_front/dist(+da 연속성, 적용2)로
+                   판단해 넘긴다.
+                 direction_hint — [2026-08-15] 적용3(avoid_hold_improvement_proposal.md).
+                   track_drive.py TargetPassing.choose_side()가 반환한 -1/0/+1(lane_offset과
+                   동일한 "우측+" 부호규약) — _clip_da_by_ll()의 실측/잔상이 전혀 없는
+                   최후수단(가상경계) 폴백에서만 기준점을 이 방향으로 살짝 기울이는 데 쓴다.
           출력 : lane_valid, offset, lookahead, lane_center, path — 기존 SlideWindow.calc_center()와
                  동일한 계약(같은 4-tuple+path 형태)이지만, 계산은 da 중심선 기준으로 직접 한다.
           내부에서 DL_ROI_Y0:DL_ROI_Y1(원본 프레임 절대 픽셀)만 잘라서 da 중심선을 뽑는다.
         """
         self.avoid_hold_active = bool(avoid_hold)
+        self.avoid_hold_dir_hint = int(direction_hint)
         h, _ = ll_prob.shape
         y0 = max(0, min(DL_ROI_Y0, h))
         y1 = max(y0, min(DL_ROI_Y1, h))
@@ -1643,6 +1671,17 @@ class DLSlideWindow(SlideWindow):
             # 확인됨).
             da_mask = self._largest_da_component(da_mask)
 
+            # [2026-08-15] avoid-hold 적용2(문제3 라이다 사각지대 보완, config.py
+            # AVOID_HOLD_DA_AREA_JUMP_RATIO 주석) — da_chosen_area_px가 직전 프레임 대비
+            # 급증했으면(=방금까지 뚫려있던 구멍이 갑자기 메워짐) "뭔가 방금 시야에서
+            # 사라졌을 수 있다"는 보조 신호로 쓴다. track_drive.py _update_avoid_hold()가
+            # 라이다 obstacle_front와 OR로만 결합한다(세그멘테이션 자체가 흔들리는
+            # 프레임에서 이 신호 단독으로는 오발동할 수 있어서 — 문제3 대비책).
+            prev_area = self._prev_da_chosen_area_px
+            self.da_area_jump_detected = bool(
+                prev_area > 0 and self.da_chosen_area_px >= prev_area * AVOID_HOLD_DA_AREA_JUMP_RATIO)
+            self._prev_da_chosen_area_px = self.da_chosen_area_px
+
             # 옆 차선 침범 대응: ll(잔상 포함) 또는 가상경계로 그 바깥(옆 차선 쪽) da를
             # 잘라낸다(모듈 상단 주석, _clip_da_by_ll() docstring 참고). ref_x는 직전
             # 프레임 확정 lane_center — 아직 없으면(첫 프레임) ROI 중앙을 기준으로
@@ -1678,7 +1717,8 @@ class DLSlideWindow(SlideWindow):
                 self.da_ll_clip_skipped = True
                 self.da_clip_band_virtual = [None] * self.n_slices
             else:
-                clipped, self.da_ll_virtual_clip_used = self._clip_da_by_ll(da_mask, ll_mask_for_clip, ref_x)
+                clipped, self.da_ll_virtual_clip_used = self._clip_da_by_ll(
+                    da_mask, ll_mask_for_clip, ref_x, direction_hint=direction_hint)
                 clipped_valid = sum(1 for c in self._slice_centers(clipped, 0, (0, 255, 0)) if c is not None)
                 self.da_ll_clip_skipped = clipped_valid < self.slice_fit_min
                 da_mask = da_mask if self.da_ll_clip_skipped else clipped
@@ -2024,7 +2064,8 @@ class DLSlideWindow(SlideWindow):
         if self.da_ll_virtual_clip_used:
             tags += ' [LL_VIRTUAL]'
         if self.avoid_hold_active:
-            tags += ' [AVOID_HOLD]'
+            dir_tag = {1: 'R', -1: 'L', 0: '-'}[self.avoid_hold_dir_hint]
+            tags += f' [AVOID_HOLD dir:{dir_tag}]'
         if self.ll_degraded:
             tags += ' [LL_DEGRADED]'
         # 모드마다 밴드 카운트가 뜻하는 바가 달라서 라벨/부가정보를 따로 붙인다 —
@@ -2162,8 +2203,16 @@ class DLLaneDetector:
         # [2026-08-14] avoid-hold(§2.32) — track_drive.py의 perc_lane()이 매 틱
         # set_avoid_hold()로 갱신하고, _worker()가 다음 추론 때 _latest_frame과 같은
         # 락으로 같이 읽어서 DLSlideWindow.detect()에 넘긴다(config.py
-        # AVOID_HOLD_TRIGGER_DIST_M/AVOID_HOLD_SEC 주석 참고).
+        # AVOID_HOLD_TRIGGER_DIST_M/AVOID_HOLD_SEC_* 주석 참고).
         self._latest_avoid_hold = False
+        # [2026-08-15] 적용3 — set_avoid_hold()가 side도 같이 받아 저장해두면 _worker()가
+        # 다음 추론 때 avoid_hold와 같은 락으로 같이 읽어 DLSlideWindow.detect()에 넘긴다.
+        self._latest_avoid_hold_side = 0
+        # [2026-08-15] 적용2 — _worker()가 매 추론 후 DLSlideWindow.da_area_jump_detected를
+        # 여기로 복사해둔다. result_seq/yellow_centers와 동일한 관례로, 단순 bool 대입이라
+        # GIL 하에서 원자적이므로 별도 락 없이 읽는다(track_drive.py _update_avoid_hold()가
+        # getattr(self.lane_detector, 'da_area_jump', False)로 조회).
+        self.da_area_jump = False
         self._latest_result = (False, 0.0, 0.0, default_center, [], None)
         # 디버그 창에 띄울 최근 프레임(초록/빨강 오버레이가 이미 그려진 vis, da/ll 원본 마스크).
         # 워커 스레드가 여기 값만 갱신하고, 실제 cv2.imshow()는 show_debug_windows()가
@@ -2192,11 +2241,13 @@ class DLLaneDetector:
         if self._logger is not None:
             self._logger.info(f'[dl_lane] {msg}')
 
-    def set_avoid_hold(self, active):
-        """track_drive.py의 perc_lane()이 매 틱 호출 — avoid-hold(§2.32) 상태를 다음
-        추론에 반영한다. 단순 bool 대입이라 별도 검증 없이 그대로 저장한다."""
+    def set_avoid_hold(self, active, side=0):
+        """track_drive.py의 perc_lane()이 매 틱 호출 — avoid-hold(§2.32) 상태와
+        [2026-08-15 적용3] 방향 힌트(side, -1/0/+1)를 다음 추론에 반영한다. 단순 대입이라
+        별도 검증 없이 그대로 저장한다."""
         with self._lock:
             self._latest_avoid_hold = bool(active)
+            self._latest_avoid_hold_side = int(side)
 
     def _worker(self):
         """추론 워커 — 이 스레드 안에서는 절대 cv2.imshow()/cv2.waitKey()를 호출하지 않는다.
@@ -2210,6 +2261,7 @@ class DLLaneDetector:
                 frame = self._latest_frame
                 self._latest_frame = None
                 avoid_hold = self._latest_avoid_hold
+                avoid_hold_side = self._latest_avoid_hold_side
             if frame is None:
                 time.sleep(0.005)
                 continue
@@ -2220,7 +2272,8 @@ class DLLaneDetector:
                     cv2.cvtColor(raw_bgr, cv2.COLOR_BGR2HSV), YELLOW_LOWER, YELLOW_UPPER
                 )
                 lane_valid, offset, lookahead, lane_center, path = self._slide.detect(
-                    raw_bgr, da_prob, ll_prob, yellow_mask, avoid_hold=avoid_hold
+                    raw_bgr, da_prob, ll_prob, yellow_mask,
+                    avoid_hold=avoid_hold, direction_hint=avoid_hold_side
                 )
                 debug_img = self._slide.vis
             except Exception as e:
@@ -2229,6 +2282,7 @@ class DLLaneDetector:
 
             with self._lock:
                 self.yellow_centers = self._slide.yellow_centers
+                self.da_area_jump = self._slide.da_area_jump_detected  # [2026-08-15] 적용2
                 self._latest_result = (lane_valid, offset, lookahead, lane_center, path, debug_img)
                 self._latest_debug = (
                     self._slide.vis, self._slide.da_mask_roi, self._slide.ll_mask_roi,

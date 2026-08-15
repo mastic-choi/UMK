@@ -154,9 +154,18 @@ class TrackDriverNode(Node):
         self._obstacle_prev_t    = 0.0
         # [2026-08-14] 회피 "복귀 유예"(avoid-hold) — _update_avoid_hold()가 perc_obstacle()
         # 직후 갱신하고, perc_lane()이 DL 차선인식 백엔드로 그대로 넘긴다(config.py
-        # AVOID_HOLD_TRIGGER_DIST_M/AVOID_HOLD_SEC 주석, README §2.32 참고).
+        # AVOID_HOLD_TRIGGER_DIST_M/AVOID_HOLD_SEC_* 주석, README §2.32/§2.33 참고).
         self._avoid_hold_until_t = 0.0  # 이 시각까지는 avoid_hold_active=True
         self.avoid_hold_active   = False
+        # [2026-08-15] avoid-hold 개선 — avoid_hold_improvement_proposal.md "1차 적용 결정"
+        # 적용1(가변 유예시간+거리기반 조기해제)/적용3(방향 힌트) 상태. 전부
+        # _update_avoid_hold()가 매 틱 갱신하고, _debug_viz_avoid_hold()가 그대로 보여준다.
+        self.avoid_hold_hold_sec = AVOID_HOLD_SEC_BASE  # 이번 유예 구간에 쓰이는 hold_sec(트리거 시점 스냅샷)
+        self.avoid_hold_side = 0             # choose_side() 결과(-1/0/+1) — 0이면 "양쪽 다 막힘"(적용4 안전판 트리거)
+        self.avoid_hold_release_reason = ''  # 직전 유예가 끝난 사유: 'timeout'/'early_dist'/''(아직 없음)
+        self._avoid_hold_release_cnt = 0            # obstacle_front=False 연속 프레임(조기해제 디바운스)
+        self._avoid_hold_last_valid_dist = 999.0    # 마지막으로 obstacle_front=True였던 순간의 obstacle_dist
+        self._avoid_hold_target_speed_est = 0.0     # 트리거 시점 target_speed_est 스냅샷(디버그 표시용)
         # [2-4 라바콘]
         self.lavacon_offset = 0.0    # 디버그/로깅용(중심선 y평균) — 조향엔 더 이상 안 씀
         self.lavacon_done   = False
@@ -465,7 +474,10 @@ class TrackDriverNode(Node):
         # 직전 틱 기준(0.05s 이내 오차)이다 — DL 추론 자체도 이미 논블로킹 백그라운드
         # 워커라 결과가 한두 프레임 지연되는 걸 감안하고 설계됐으므로(모듈 상단 주석)
         # 무시 가능한 오차로 판단.
-        getattr(self.lane_detector, 'set_avoid_hold', lambda *_: None)(self.avoid_hold_active)
+        # [2026-08-15] 적용3 — avoid_hold_side(방향 힌트, -1/0/+1)도 같이 넘긴다
+        # (config.py AVOID_HOLD_DIR_BIAS_PX 주석, perception/dl_lane.py _clip_da_by_ll() 참고).
+        getattr(self.lane_detector, 'set_avoid_hold', lambda *_a, **_k: None)(
+            self.avoid_hold_active, self.avoid_hold_side)
 
         # hough_lane.py의 HoughLaneDetector를 사용하여 차선 인식 수행
         valid, offset, lookahead, lane_center, path, debug_img = self.lane_detector.detect(self.img_front)
@@ -804,17 +816,76 @@ class TrackDriverNode(Node):
     #   입력 self.obstacle_front/obstacle_dist → 출력 self.avoid_hold_active
     def _update_avoid_hold(self):
         """da 안전마진 회피(§2.30) 중 너무 이른 복귀를 막기 위한 타이머 — config.py
-        AVOID_HOLD_TRIGGER_DIST_M/AVOID_HOLD_SEC 주석, README §2.32 참고.
+        AVOID_HOLD_* 주석, README §2.32, avoid_hold_improvement_proposal.md 참고.
         obstacle_front/obstacle_dist는 TEST_DISABLE_B2_B3와 무관하게 매 틱 갱신되므로
         (perc_obstacle() 참고), B2/B3 미션 자체가 꺼져있어도 이 신호는 그대로 쓸 수 있다.
-        장애물이 가까이(AVOID_HOLD_TRIGGER_DIST_M 안) 있는 동안은 매 틱 유예 시각을
-        갱신하고, 멀어지거나 안 보여도 그 시각까지는 avoid_hold_active를 True로 유지한다
-        — "장애물이 있는 동안"이 아니라 "마지막으로 가까이 있었던 시점부터 N초"가
-        핵심이라(장애물이 카메라/라이다 시야에서 사라진 직후가 가장 위험한 구간), 매 틱
-        갱신되는 목표 시각(until_t) 하나만으로 자연스럽게 그 유예 구간을 표현한다."""
-        if self.obstacle_front and self.obstacle_dist < AVOID_HOLD_TRIGGER_DIST_M:
-            self._avoid_hold_until_t = time.time() + AVOID_HOLD_SEC
-        self.avoid_hold_active = time.time() < self._avoid_hold_until_t
+
+        [2026-08-15 개선] 기존엔 트리거~해제 둘 다 "장애물이 AVOID_HOLD_TRIGGER_DIST_M
+        안에 있는가" 하나와 고정 AVOID_HOLD_SEC뿐이었다. 아래 네 갈래를 추가했다
+        (avoid_hold_improvement_proposal.md "1차 적용 결정" 적용1/2/3):
+          ① 트리거가 걸리는 순간 target_speed_est(=v_mps+obstacle_rate)를 1회 스냅샷해
+             hold_sec을 가변으로 정한다(정지 장애물엔 짧게, 방해차량처럼 빠르게 붙는
+             경우엔 길게, AVOID_HOLD_SEC_MAX로 캡).
+          ② da 연속성(perception/dl_lane.py DLSlideWindow.da_area_jump_detected)을 라이다
+             obstacle_front와 OR로 결합 — 라이다 사각지대를 카메라 쪽이 보완한다.
+          ③ obstacle_front=False가 AVOID_HOLD_RELEASE_CONFIRM_FRAMES 연속 + 마지막
+             유효 obstacle_dist가 AVOID_HOLD_RELEASE_DIST_M 이상이면, hold_sec을 다
+             채우기 전에도 즉시 해제한다("안 보임=멀어짐"이 아니라 "마지막으로 봤을 때
+             이미 멀었음"으로 조건화).
+          ④ TargetPassing.choose_side()로 "지금 어느 쪽이 안전한가"를 매 틱 갱신해
+             self.avoid_hold_side에 저장한다(perc_lane()이 DL 백엔드로 전달 → 방향
+             힌트로 씀, side==0이면 apply_behavior_override() 이전 _lane_drive()가
+             안전판 감속을 건다 — 적용4).
+        """
+        now = time.time()
+
+        # ② da 연속성 보조 트리거 — 백엔드에 없으면(hough/classic_cv) getattr가 False를
+        # 반환해 조용히 건너뛴다(show_debug_windows()와 동일 관례).
+        da_area_jump = bool(getattr(self.lane_detector, 'da_area_jump', False))
+        triggered_now = ((self.obstacle_front and self.obstacle_dist < AVOID_HOLD_TRIGGER_DIST_M)
+                          or da_area_jump)
+
+        if triggered_now:
+            if self._avoid_hold_until_t <= now:
+                # 직전엔 유예가 꺼져있었다 = 이번이 새 트리거 — 여기서만 target_speed_est를
+                # 스냅샷해서 hold_sec을 정한다(① — 노이즈가 유예시간 자체의 흔들림으로
+                # 새는 것을 막는 게 핵심, 매 틱 재계산하지 않는다).
+                target_speed_est = self.v_mps + self.obstacle_rate
+                self._avoid_hold_target_speed_est = target_speed_est
+                gain_term = (AVOID_HOLD_RATE_GAIN * abs(target_speed_est)
+                             if abs(target_speed_est) > OBSTACLE_STATIC_SPEED_TH_MPS else 0.0)
+                self.avoid_hold_hold_sec = min(
+                    AVOID_HOLD_SEC_MAX, max(AVOID_HOLD_SEC_MIN, AVOID_HOLD_SEC_BASE + gain_term))
+                self._avoid_hold_release_cnt = 0
+                self.avoid_hold_release_reason = ''
+            self._avoid_hold_until_t = now + self.avoid_hold_hold_sec
+
+        # ③ 조기 해제 판정용 상태 갱신 — obstacle_front가 True인 동안(=아직 가까움)은
+        # "마지막 유효 거리"를 계속 최신으로 두고 디바운스 카운터를 리셋한다.
+        if self.obstacle_front:
+            self._avoid_hold_last_valid_dist = self.obstacle_dist
+            self._avoid_hold_release_cnt = 0
+        else:
+            self._avoid_hold_release_cnt += 1
+
+        was_active = self.avoid_hold_active
+        if (was_active
+                and self._avoid_hold_release_cnt >= AVOID_HOLD_RELEASE_CONFIRM_FRAMES
+                and self._avoid_hold_last_valid_dist >= AVOID_HOLD_RELEASE_DIST_M):
+            self._avoid_hold_until_t = now  # 조기 해제 — hold_sec을 다 채우기 전에 즉시 종료
+            self.avoid_hold_release_reason = 'early_dist'
+
+        self.avoid_hold_active = now < self._avoid_hold_until_t
+        if was_active and not self.avoid_hold_active and self.avoid_hold_release_reason != 'early_dist':
+            self.avoid_hold_release_reason = 'timeout'
+
+        # ④ 방향 힌트 — choose_side()는 입력값(obstacle_y/left_clear_confirmed/
+        # right_clear_confirmed/lane_side)만 보는 순수 판정 함수라 self.vehicle_controller의
+        # 다른 상태(phase/side 등, B2/B3 FSM 전용)를 건드리지 않는다. left_clear_confirmed/
+        # right_clear_confirmed는 perc_obstacle()이 TEST_DISABLE_B2_B3와 무관하게 매 틱
+        # 갱신하므로(코드 확인 완료) 별도 stale 가드 없이 그대로 호출해도 안전하다.
+        self.avoid_hold_side = self.vehicle_controller.choose_side(
+            self.obstacle_y, self.left_clear_confirmed, self.right_clear_confirmed, self.lane_side)
 
     # [2-4] 라바콘
     #   출력 lavacon_offset(디버그용)/lavacon_done, lavacon_path(조향용 — _handle_lavacon() 참고)
@@ -1490,6 +1561,15 @@ class TrackDriverNode(Node):
         # 진짜로 갱신이 멈춘 경우에만 발동한다.
         if self.lane_stale:
             target_speed = min(target_speed, SPEED_LANE_STALE)
+        # [2026-08-15] avoid-hold 적용4(안전판) — 회피 유예가 걸려있는 동안 choose_side()가
+        # 0(양쪽 다 막혀 어느 쪽으로도 못 피함)을 반환하면 강제로 감속한다. avoid_hold_side는
+        # _update_avoid_hold()가 매 틱 갱신하므로 이 조건은 avoid_hold_active가 아닌 틱에는
+        # 자연히 걸리지 않는다(avoid_hold_side 자체는 항상 계산되지만 여기서 avoid_hold_active
+        # 도 같이 확인). SPEED_CORNER_MIN/SPEED_LL_DEGRADED/SPEED_LANE_STALE과 같은 "즉시 cap"
+        # 관례 — avoid_hold_improvement_proposal.md "적용4" 참고, SPEED_AVOID_HOLD_BLOCKED
+        # 실차 미검증.
+        if self.avoid_hold_active and self.avoid_hold_side == 0:
+            target_speed = min(target_speed, SPEED_AVOID_HOLD_BLOCKED)
         speed_ratio = min(1.0, self._prev_speed / SPEED_NORMAL)
         corner_decay = CORNER_HOLD_DECAY_LO + (CORNER_HOLD_DECAY_HI - CORNER_HOLD_DECAY_LO) * speed_ratio
         self._corner_hold = max(turn_now, self._corner_hold * corner_decay)
@@ -1747,6 +1827,75 @@ class TrackDriverNode(Node):
         cv2.rectangle(canvas, (0, 0), (canvas.shape[1] - 1, canvas.shape[0] - 1), color, 3)
 
         cv2.imshow('vesc_debug', canvas)
+        cv2.waitKey(1)
+
+    # [DEBUG_VIZ_AVOID_HOLD] avoid-hold(§2.32, avoid_hold_improvement_proposal.md) 전용
+    # 상태창 — 2026-08-15에 추가. 지금 유예가 걸려있는지/왜 걸렸는지/직전엔 왜 풀렸는지/
+    # 방향 힌트가 뭔지를 실차에서 한눈에 보기 위한 것과 동시에, 이 기능이 새로 들여온
+    # 파라미터 중 실측이 안 된 값들을 매 프레임 같이 띄워서 "이 숫자는 아직 지어낸
+    # 값"이라는 걸 계속 상기시키는 용도(실측 절차는 avoid_hold_measurement_todo.md 참고).
+    # 아래 6개(RATE_GAIN/SEC_MAX/RELEASE_DIST_M/DA_AREA_JUMP_RATIO/DIR_BIAS_PX/
+    # SPEED_AVOID_HOLD_BLOCKED)는 그 문서에 적힌 측정 절차를 실차에서 그대로 따라가며
+    # 이 창의 실시간 값을 관찰하는 용도로도 쓰인다(예: da_area_jump가 실제 통과 순간에만
+    # True로 뜨는지, 노이즈 프레임에서도 뜨는지 여기서 직접 눈으로 확인). control_loop()
+    # 에서 매 주기 호출.
+    def _debug_viz_avoid_hold(self):
+        now = time.time()
+        remaining = max(0.0, self._avoid_hold_until_t - now)
+        active_color = (0, 200, 0) if self.avoid_hold_active else (110, 110, 110)
+        side_label = {1: '오른쪽(+1)', -1: '왼쪽(-1)', 0: '방향없음/양쪽막힘(0)'}
+        side_color = (0, 140, 255) if self.avoid_hold_side == 0 else (255, 255, 255)
+
+        slide = getattr(self.lane_detector, '_slide', None)
+        da_area = getattr(slide, 'da_chosen_area_px', 0)
+        da_jump = bool(getattr(self.lane_detector, 'da_area_jump', False))
+
+        UNMEASURED = (60, 160, 255)  # 실측 미검증 파라미터 강조색(주황) — 다른 창의 STALE 색과 통일
+        lines = [
+            (f'AVOID-HOLD: {"활성" if self.avoid_hold_active else "대기"}  '
+             f'(남은 {remaining:.2f}s / hold_sec={self.avoid_hold_hold_sec:.2f}s)',
+             (10, 8), active_color, 17,
+             f'AVOID-HOLD: {"ACTIVE" if self.avoid_hold_active else "idle"} '
+             f'({remaining:.2f}s left / hold_sec={self.avoid_hold_hold_sec:.2f}s)'),
+            (f'직전 해제 사유: {self.avoid_hold_release_reason or "(아직 없음)"}   '
+             f'방향 힌트: {side_label[self.avoid_hold_side]}',
+             (10, 34), side_color, 14,
+             f'last release: {self.avoid_hold_release_reason or "(none)"}  '
+             f'dir hint: {self.avoid_hold_side:+d}'),
+            (f'트리거 입력 — front={self.obstacle_front} dist={self.obstacle_dist:.2f}m '
+             f'rate={self.obstacle_rate:+.2f}m/s  v_mps={self.v_mps:+.2f}',
+             (10, 62), (255, 255, 255), 13,
+             f'trigger — front={self.obstacle_front} dist={self.obstacle_dist:.2f}m '
+             f'rate={self.obstacle_rate:+.2f} v={self.v_mps:+.2f}'),
+            (f'target_speed_est(트리거 스냅샷) = {self._avoid_hold_target_speed_est:+.2f} m/s',
+             (10, 84), (255, 255, 255), 13,
+             f'target_speed_est(snapshot) = {self._avoid_hold_target_speed_est:+.2f} m/s'),
+            (f'da 연속성 보조트리거(적용2) — chosen_area={da_area}px  jump={"O" if da_jump else "X"}',
+             (10, 106), (0, 200, 255) if da_jump else (150, 150, 150), 13,
+             f'da continuity — area={da_area}px jump={"YES" if da_jump else "no"}'),
+            (f'조기해제 진행 — front=False {self._avoid_hold_release_cnt}/{AVOID_HOLD_RELEASE_CONFIRM_FRAMES}'
+             f'  마지막유효dist={self._avoid_hold_last_valid_dist:.2f}m (>= {AVOID_HOLD_RELEASE_DIST_M}m 필요)',
+             (10, 128), (200, 200, 200), 12,
+             f'early-release {self._avoid_hold_release_cnt}/{AVOID_HOLD_RELEASE_CONFIRM_FRAMES}, '
+             f'last_valid_dist={self._avoid_hold_last_valid_dist:.2f} (need>={AVOID_HOLD_RELEASE_DIST_M})'),
+            ('── ★ 실차 미검증(실측 필요) — avoid_hold_measurement_todo.md 참고 ★',
+             (10, 156), UNMEASURED, 13, '-- UNMEASURED, see avoid_hold_measurement_todo.md --'),
+            (f'RATE_GAIN={AVOID_HOLD_RATE_GAIN}   SEC_MAX={AVOID_HOLD_SEC_MAX}s   '
+             f'RELEASE_DIST_M={AVOID_HOLD_RELEASE_DIST_M}m',
+             (10, 178), UNMEASURED, 12,
+             f'RATE_GAIN={AVOID_HOLD_RATE_GAIN} SEC_MAX={AVOID_HOLD_SEC_MAX} '
+             f'RELEASE_DIST_M={AVOID_HOLD_RELEASE_DIST_M}'),
+            (f'DA_AREA_JUMP_RATIO={AVOID_HOLD_DA_AREA_JUMP_RATIO}   DIR_BIAS_PX={AVOID_HOLD_DIR_BIAS_PX}px'
+             f'   SPEED_BLOCKED={SPEED_AVOID_HOLD_BLOCKED}',
+             (10, 198), UNMEASURED, 12,
+             f'DA_AREA_JUMP_RATIO={AVOID_HOLD_DA_AREA_JUMP_RATIO} '
+             f'DIR_BIAS_PX={AVOID_HOLD_DIR_BIAS_PX} SPEED_BLOCKED={SPEED_AVOID_HOLD_BLOCKED}'),
+        ]
+        canvas = np.full((222, 620, 3), 30, dtype=np.uint8)
+        put_text_kr_multi(canvas, lines)
+        cv2.rectangle(canvas, (0, 0), (canvas.shape[1] - 1, canvas.shape[0] - 1), active_color, 3)
+
+        cv2.imshow('avoid_hold_debug', canvas)
         cv2.waitKey(1)
 
     def _lane_pid(self, offset, deadzone=LANE_DEADZONE):
@@ -2097,6 +2246,8 @@ class TrackDriverNode(Node):
             self._debug_viz_steer()
         if DEBUG_VIZ_VESC:
             self._debug_viz_vesc()
+        if DEBUG_VIZ_AVOID_HOLD:
+            self._debug_viz_avoid_hold()
 
         if ENABLE_BEHAVIOR and self.mission_state == MissionState.S1_LANE_FOLLOW and self._behavior_enabled:
             self.run_behavior_fsm()         #    Behavior 상태 결정
