@@ -1294,6 +1294,10 @@ PP_TUNE_PRESETS = {
         SPEED_NORMAL=25.0,
     ),
 }
-PP_TUNE_ACTIVE_PRESET = None   # None / 'speed15' / 'speed25' — 실차 A/B 테스트용 스위치
+# [2026-08-17i] None → 'speed15'(요청 반영, 실차 테스트 활성화). ★주의★ 위 "speed15 프리셋
+#   주의" 문단대로 SPEED_CORNER_MIN=14.05(SPEED_NORMAL=15와 거의 같음 = 사실상 코너 무감속)
+#   + SPEED_ACCEL_STEP=1.014(기존 0.4의 2.5배, 배터리 LVC 트립 위험 미검증)로 바뀐다 —
+#   서행 가능한 곳에서 개입 준비하고 첫 실차 테스트할 것. 문제 생기면 None으로 되돌릴 것.
+PP_TUNE_ACTIVE_PRESET = 'speed15'   # None / 'speed15' / 'speed25' — 실차 A/B 테스트용 스위치
 if PP_TUNE_ACTIVE_PRESET is not None:
     globals().update(PP_TUNE_PRESETS[PP_TUNE_ACTIVE_PRESET])
