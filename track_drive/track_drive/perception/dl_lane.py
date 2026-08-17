@@ -1710,10 +1710,13 @@ class DLSlideWindow(SlideWindow):
             # "이번 프레임 da_mask는 클리핑 안 된 largest-component 그대로"라는 결과는
             # 동일하다.
             # [2026-08-14] avoid_hold(§2.32)가 True면 위 스킵을 무시하고 클리핑을 강제
-            # 되살린다 — 회피 중 장애물이 시야에서 사라진 직후 몇 초간은 "지금 차선
-            # 하나"만 ll로 물어서(_clip_da_by_ll()) raw da가 원래 폭으로 돌아오며 바로
-            # 차선 중앙으로 복귀하는 걸 늦추는 목적(config.py AVOID_HOLD_* 주석 참고).
-            if DL_CENTER_MODE == 'da' and DL_DA_SKIP_LL_CLIP and not avoid_hold:
+            # 되살리던 예외였으나, [2026-08-17] da 단독 검출 테스트 중엔 노란선/ll을 완전히
+            # 무시하고 싶다는 요청으로 이 예외를 없앴다 — avoid_hold 중에도 항상 스킵.
+            # avoid_hold_active 자체(§2.32 유예 타이머)는 ENABLE_BEHAVIOR와 무관하게 계속
+            # 갱신되므로, 이 예외를 살려두면 라이다가 전방 장애물을 잡을 때마다 테스트 중에도
+            # 조용히 클리핑이 되살아나 "노란선 무시"가 깨졌었다. da 클리핑을 다시 켜고 싶으면
+            # DL_DA_SKIP_LL_CLIP=False로 되돌리거나(모든 프레임 클리핑 적용) 이 예외를 복원할 것.
+            if DL_CENTER_MODE == 'da' and DL_DA_SKIP_LL_CLIP:
                 self.da_ll_virtual_clip_used = False
                 self.da_ll_clip_skipped = True
                 self.da_clip_band_virtual = [None] * self.n_slices

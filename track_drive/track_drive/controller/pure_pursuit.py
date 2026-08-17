@@ -288,12 +288,19 @@ class PurePursuitController:
 
         # [2026-08-17b] 명시적 직진 모드 판정(2/2: 잔여 편향 조건) — dx_deadzone_px로
         # 자르기 전의 raw dx를 EMA로 누적해서 "곡률은 0인데 dx만 계속 한쪽으로 쏠려있는"
-        # 경우(코너 탈출 직후 잔여 오프셋 등)를 잡아낸다. __init__ 상단 주석 참고 — 이
-        # EMA가 straight_deadzone_px 폭을 넘으면 노이즈가 아니라 진짜 편향으로 보고
-        # curvature 조건과 무관하게 직진확정을 해제한다.
+        # 경우(코너 탈출 직후 잔여 오프셋 등)를 잡아낸다. __init__ 상단 주석 참고.
+        #   [2026-08-17d 버그 수정] 판정 기준을 straight_deadzone_px(=dx를 0으로 죽이는
+        #   그 데드존 폭, 20px)로 잡았었는데, 이러면 20px 미만의 모든 지속 편향이
+        #   "진짜 편향"으로 절대 감지되지 않는다 — bias_ema가 그 데드존 자체에 막혀 20px를
+        #   못 넘으므로 판정 기준을 원천적으로 못 넘는 자기모순. 실차 재현: 차량이 차선
+        #   중앙에서 10~15px 우측으로 치우친 채(육안으론 "평행하게 직진") 영원히 안
+        #   돌아옴 — waypoint는 매 프레임 정확히 중앙(dx≈편향값)을 가리키는데도 그 dx가
+        #   20px 데드존에 걸려 0으로 죽어버려 조향 보정이 아예 안 나간 것. 판정 기준을
+        #   dx_deadzone_px(코너/S자용 좁은 데드존, 6px)로 낮춰 6px 넘게 지속되는 편향은
+        #   반드시 잡히게 한다.
         self._dx_bias_ema = (self.straight_bias_ema_alpha * dx
                               + (1.0 - self.straight_bias_ema_alpha) * self._dx_bias_ema)
-        bias_ok = abs(self._dx_bias_ema) < self.straight_deadzone_px
+        bias_ok = abs(self._dx_bias_ema) < self.dx_deadzone_px
         self.is_straight = curvature_confirmed_straight and bias_ok
 
         dx_deadzone_px = self.straight_deadzone_px if self.is_straight else self.dx_deadzone_px
