@@ -1626,7 +1626,16 @@ class TrackDriverNode(Node):
         corner_decay = CORNER_HOLD_DECAY_LO + (CORNER_HOLD_DECAY_HI - CORNER_HOLD_DECAY_LO) * speed_ratio
         self._corner_hold = max(turn_now, self._corner_hold * corner_decay)
         accel_step = SPEED_ACCEL_STEP * max(0.25, 1.0 - self._corner_hold)
-        if target_speed > self._prev_speed + accel_step:
+        # [2026-08-17n] 정지(또는 데드존 이하)에서 새로 출발하는 틱 — SPEED_ACCEL_STEP
+        # 계단 램프로 데드존(≈1.4)을 여러 틱에 걸쳐 오르면 그동안 바퀴는 안 움직이는데
+        # (RPM=0, 역기전력 없음) duty만 계속 올라가 락터 전류가 가장 큰 구간에 가장 오래
+        # 머문다 — "틱틱거림/초반 힘딸림"의 유력 원인(config.py SPEED_KICK_START 주석,
+        # README §7.2). 이 조건이 참인 틱 1회만 accel_step 램프를 건너뛰고 SPEED_KICK_START로
+        # 점프해 정지마찰 구간 체류를 줄인다 — target_speed가 이미 그보다 낮으면(코너 진입 등
+        # 저속 유지 상황) 점프하지 않고 그대로 둔다.
+        if self._prev_speed < SPEED_KICK_START < target_speed:
+            target_speed = SPEED_KICK_START
+        elif target_speed > self._prev_speed + accel_step:
             target_speed = self._prev_speed + accel_step
         self.ctrl_speed = target_speed
         self._prev_speed = target_speed

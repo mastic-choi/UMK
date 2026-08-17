@@ -43,15 +43,20 @@
 #        킬스위치) — Ctrl+C를 누르면 즉시 speed=0을 발행하고 종료한다
 #      - --max-duration(기본 10초)이 지나면 마크 입력과 무관하게 자동으로 speed=0 발행
 #
-# ── 사용법(능동 모드 예시) ──
-#   python3 measure_speed_calibration.py --drive-speed 15
-#   (--interval-m 기본값 0.35 그대로 사용 — 줄자로 35cm 간격 표시를 미리 해둔다)
-#   1) 차량을 정지선 뒤에 두고, 그 지점부터 줄자로 35cm 간격 표시를 미리 해둔다.
-#   2) 스크립트 실행 → "0m 지점(출발) — 준비되면 Enter" 프롬프트에서 Enter →
-#      그 즉시 차량이 speed=15 목표로 출발(가속램프 적용)하고 mark0(0m)가 기록된다.
-#   3) 차량이 각 표시 지점(0.35m, 0.7m, 1.05m, ...)을 지나는 순간마다 Enter.
-#   4) 다 지났으면 'q' + Enter로 종료 → 자동 speed=0 발행 + 구간별 결과표 출력 +
-#      CSV 저장. 터미널에 출력된 표를 그대로 복사해 Claude에게 붙여넣으면 취합/판단.
+# ── 사용법(능동 모드, §3.5 2마커 프로토콜) ──
+#   python3 measure_speed_calibration.py --drive-speed 20
+#   (--interval-m은 이 방식에선 안 씀 — 실제 mark1↔mark2 거리는 나중에 줄자로 재서 직접
+#    비교한다. 마크는 사람이 딱 2번만 찍는다: mark0(출발)·mark1(정속 진입). mark2(정속구간
+#    끝)는 --max-duration 컷오프 직전에 코드가 자동으로 찍는다[2026-08-19] — 사람이 컷오프
+#    타이밍을 직접 맞추다 감속이 섞이거나 너무 일찍 찍는 실수를 없애기 위함.)
+#   1) 차량을 출발선에 두고 실행 → "0m 지점(출발) — 준비되면 Enter" 프롬프트에서 Enter →
+#      그 즉시 차량이 speed=20 목표로 출발(가속램프 적용)하고 mark0가 기록된다.
+#   2) 가속 끝나고 정속 됐다 싶은 순간 Enter → mark1. 이 순간 물리적 위치를 표시해둘 것.
+#   3) 이후엔 그냥 기다리면 됨 — 컷오프(기본 10초) 직전에 mark2가 자동 기록되고 자동으로
+#      speed=0 발행 + 구간별 결과표 출력 + CSV 저장까지 끝난다. 애매하면 Ctrl+C로 즉시 정지.
+#   4) 차 세운 뒤 mark1↔mark2 사이 실측 거리를 줄자로 재서, 그 구간(seg2)의 dt와 함께
+#      real_mps = 실측거리 / dt로 직접 계산한다(표에 찍힌 dd/real_mps는 --interval-m 가정
+#      기반이라 무시). ctrl_avg/vesc_avg는 그 구간 자동평균이라 그대로 신뢰 가능.
 #
 # ── 사용법(패시브 모드) ──
 #   python3 measure_speed_calibration.py
@@ -62,6 +67,12 @@
 # 아래 상수들은 config.py에서 그대로 복사해 왔다(measure_lidar_camera_offset.py와 같은
 # 관례 — 이 도구는 track_drive 패키지를 import하지 않고 독립 실행됨). config.py에서 값이
 # 바뀌면 여기도 같이 갱신할 것.
+#
+# [2026-08-19] vesc_debug 창(DEBUG_VIZ_VESC 이식)을 한때 추가했다가 다시 뺐다 — 실차에서
+# "출발 못하고 울컥거리는" 현상 중에도 계속 초록(LIVE)으로만 뜨는 게 확인됨. 바퀴가 실제로
+# 안 도는 순간엔 원인(배터리 LVC 트립이든 §7.2 정지마찰/락터전류 스틱션이든)과 무관하게
+# VESC가 v_mps=0을 "정직하게" 보고하므로, 이 창은 애초에 토픽 자체가 죽었는지(주황/빨강)만
+# 가려줄 뿐 파이프라인이 멀쩡한 채로 진짜 안 도는 케이스의 세부 원인은 구분해주지 못한다.
 #=============================================
 import argparse
 import csv
@@ -82,16 +93,32 @@ VESC_SPEED_TO_ERPM_GAIN = 4614.0   # vesc.yaml speed_to_erpm_gain 실측값
 SPEED_ACCEL_STEP = 0.4             # 가속 램프(주기당 최대 증가량) — control_loop과 동일 주기 가정
 CONTROL_PERIOD_SEC = 0.05          # track_drive.py control_loop 주기(20Hz)와 동일
 
+# [2026-08-19] §3.5 2마커 프로토콜의 mark2("정속구간 끝, 감속 시작 직전")를 사람이 직접
+# 타이밍 맞춰 누르게 하면 반응이 늦어 감속이 섞이거나(오염) 너무 일찍 눌러 정속구간이
+# 짧아지는 실수가 나기 쉽다 — --max-duration 컷오프 시각을 이미 알고 있으니 그 직전을
+# 코드가 대신 찍어준다. 이 여유(lead)만큼 일찍 찍어서 컷오프 명령(speed=0, _drive_step 참고)
+# 자체가 아직 안 나간 시점의 순수 정속 구간만 mark2에 잡히게 한다.
+AUTO_MARK2_LEAD_SEC = 0.3
+
 
 class SpeedCalibNode(Node):
-    def __init__(self, motor_topic, vesc_topic, drive_speed, max_duration):
+    def __init__(self, motor_topic, vesc_topic, drive_speed, max_duration, interval_m,
+                 stop_event=None):
         super().__init__('measure_speed_calibration')
         self.drive_speed = drive_speed
         self.max_duration = max_duration
+        self.interval_m = interval_m
+        self._stop_event = stop_event
 
         self._lock = threading.Lock()
         self.ctrl_samples = []   # [(t, ctrl_speed), ...] — xycar_motor에서 관측
         self.vesc_samples = []   # [(t, v_mps), ...]
+
+        self._markers_lock = threading.Lock()
+        self.markers = []        # [{'idx','t','dist_m'}, ...] — add_marker()로만 추가(수동/자동 공용)
+        self.mark1_ready = False # [2026-08-19] 능동모드에서 mark1(정속 진입)이 찍혔는지 —
+                                  # 이게 True여야 _drive_step()이 mark2를 자동으로 찍는다.
+        self._auto_mark2_done = False
 
         self.create_subscription(Float32MultiArray, motor_topic, self._cb_motor, 10)
         self.create_subscription(Float32, vesc_topic, self._cb_vesc, qos_profile_sensor_data)
@@ -103,6 +130,15 @@ class SpeedCalibNode(Node):
         if drive_speed is not None:
             self._motor_pub = self.create_publisher(Float32MultiArray, motor_topic, 10)
             self.create_timer(CONTROL_PERIOD_SEC, self._drive_step)
+
+    def add_marker(self, dist_m=None):
+        """수동(입력 스레드)/자동(mark2) 공용 마커 추가 — idx는 항상 현재 길이로 자동 부여."""
+        with self._markers_lock:
+            idx = len(self.markers)
+            d = dist_m if dist_m is not None else idx * self.interval_m
+            m = {'idx': idx, 't': time.time(), 'dist_m': d}
+            self.markers.append(m)
+            return m
 
     def _cb_motor(self, msg):
         if len(msg.data) < 2:
@@ -121,11 +157,24 @@ class SpeedCalibNode(Node):
         if self._drive_t0 is None or self._motor_pub is None:
             return
         elapsed = time.time() - self._drive_t0
+
+        # [2026-08-19] mark1이 찍힌 뒤(정속 진입 확인됨), 컷오프 lead초 전에 mark2를 자동으로
+        # 찍는다 — 사람이 컷오프 타이밍을 직접 맞추다 감속을 섞이게 하거나 너무 일찍 찍는
+        # 실수를 없애기 위함. mark1 전에는(아직 가속 중일 수 있으므로) 절대 찍지 않는다.
+        if (self.mark1_ready and not self._auto_mark2_done
+                and elapsed >= self.max_duration - AUTO_MARK2_LEAD_SEC):
+            self._auto_mark2_done = True
+            m = self.add_marker()
+            print(f'\n[자동 mark{m["idx"]}] 컷오프 {AUTO_MARK2_LEAD_SEC:.1f}초 전 자동 기록 '
+                  f'(elapsed={elapsed:.2f}s)')
+
         if elapsed >= self.max_duration:
             if not self._force_stopped:
                 self._force_stopped = True
                 self.get_logger().warn(
                     f'[안전정지] --max-duration({self.max_duration:.1f}s) 경과 — speed=0 강제 발행')
+                if self._stop_event is not None:
+                    self._stop_event.set()
             self._cur_speed = 0.0
         else:
             target = self.drive_speed
@@ -154,10 +203,18 @@ class SpeedCalibNode(Node):
             return list(self.ctrl_samples), list(self.vesc_samples)
 
 
-def _input_worker(node, interval_m, markers, stop_event):
-    """마크 입력 전담 스레드. 첫 Enter가 0m 기준점(+능동모드면 출발 트리거)이고,
-    이후 매 Enter가 다음 마크. 숫자를 입력하면 그 마크의 절대거리(m)를 균일간격 대신
-    직접 지정(간격이 고르지 않은 트랙 사정 대응용), 'q'는 종료."""
+def _input_worker(node, stop_event):
+    """마크 입력 전담 스레드.
+
+    능동모드(§3.5 2마커 프로토콜): 사람은 mark0(출발)·mark1(정속 진입)만 찍는다.
+    mark2(정속구간 끝)는 --max-duration 컷오프 직전에 node._drive_step()이 자동으로
+    찍으므로[2026-08-19] 이 스레드는 mark1 이후 더 이상 프롬프트를 띄우지 않고 조용히
+    끝난다(daemon 스레드라 그대로 둬도 프로세스 종료 시 같이 정리됨). 그래도 문제가
+    생기면 Ctrl+C로 언제든 즉시 정지 가능.
+
+    패시브모드: 컷오프 개념이 없으므로 기존처럼 매 Enter가 다음 마크, 숫자 입력 시
+    절대거리 직접 지정(간격이 고르지 않은 트랙 대응), 'q'로 종료."""
+    interval_m = node.interval_m
     if node.drive_speed is not None:
         print(f'\n[능동모드] 0m 지점(출발선)에 차량을 두고 준비되면 Enter — '
               f'즉시 speed={node.drive_speed:.1f} 목표로 출발합니다.')
@@ -168,10 +225,22 @@ def _input_worker(node, interval_m, markers, stop_event):
     except EOFError:
         stop_event.set()
         return
-    t0 = time.time()
-    markers.append({'idx': 0, 't': t0, 'dist_m': 0.0})
+    m0 = node.add_marker(dist_m=0.0)
     if node.drive_speed is not None:
-        node.start_drive(t0)
+        node.start_drive(m0['t'])
+
+    if node.drive_speed is not None:
+        try:
+            input('  가속 끝나고 정속 됐다 싶은 순간 Enter (mark1) — 이후 mark2는 컷오프 직전에 '
+                  '자동으로 기록됩니다: ')
+        except EOFError:
+            stop_event.set()
+            return
+        node.add_marker()
+        node.mark1_ready = True
+        print('  mark1 기록됨 — 이제 기다리면 컷오프 직전 자동으로 mark2가 기록되고 정지합니다.'
+              ' (Ctrl+C로 언제든 즉시 중단 가능)')
+        return
 
     idx = 1
     while not stop_event.is_set():
@@ -188,7 +257,7 @@ def _input_worker(node, interval_m, markers, stop_event):
                 dist = float(line)
             except ValueError:
                 print('    (숫자로 해석 안 됨 — 균일 간격으로 처리)')
-        markers.append({'idx': idx, 't': time.time(), 'dist_m': dist})
+        node.add_marker(dist_m=dist)
         idx += 1
     stop_event.set()
 
@@ -356,12 +425,11 @@ def main():
         print('=' * 60)
 
     rclpy.init(args=[])
-    node = SpeedCalibNode(args.motor_topic, args.vesc_topic, args.drive_speed, args.max_duration)
-
-    markers = []
     stop_event = threading.Event()
-    th = threading.Thread(target=_input_worker, args=(node, args.interval_m, markers, stop_event),
-                           daemon=True)
+    node = SpeedCalibNode(args.motor_topic, args.vesc_topic, args.drive_speed, args.max_duration,
+                           args.interval_m, stop_event=stop_event)
+
+    th = threading.Thread(target=_input_worker, args=(node, stop_event), daemon=True)
     th.start()
 
     try:
@@ -374,6 +442,7 @@ def main():
         for _ in range(3):   # 정지 명령이 확실히 나가도록 몇 차례 더 publish
             rclpy.spin_once(node, timeout_sec=0.05)
         ctrl_samples, vesc_samples = node.samples_snapshot()
+        markers = list(node.markers)
         node.destroy_node()
         rclpy.shutdown()
 
