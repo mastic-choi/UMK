@@ -1,0 +1,2 @@
+seg,accel_phase,segment_m,dt_s,real_mps,ctrl_avg,pred_mps_cfg,vesc_avg_mps,implied_meters_per_unit,n_ctrl,n_vesc
+1,True,0.35,19.955459594726562,0.017539059841673157,6.842380781387847,0.9216686912529429,0.010243503912897316,0.002563297834780205,2789,998
