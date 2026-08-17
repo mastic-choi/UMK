@@ -1192,3 +1192,76 @@ VEHICLE_LENGTH_M      = 0.64  # 실측(2026-08-04): xycar 본체 세로(전후) 
 #   실측(2026-08-04): 고정장애물(고장난 차량) 가로20cm×세로41cm×높이16cm,
 #   방해차량 가로28cm×세로54cm×높이19cm → (0.20+0.28)/2 = 0.24
 OBSTACLE_VEHICLE_WIDTH_M = 0.24
+
+# #############################################################
+# 8. Pure Pursuit + 코너감속 튜닝 프리셋 (pp_tune_gridsearch.py, 2026-08-17)
+# #############################################################
+#   pp_tune_gridsearch.py의 화이트박스 시뮬레이션(조향 PP_* 14개 + 감속 8개,
+#   총 22개 파라미터 조인트 랜덤서치 4000샘플)이 SPEED_NORMAL=15/25(모터단위)
+#   각각에서 찾은 "최적" 조합을 실차 A/B 테스트용으로 저장해둔다. 실차 미검증 —
+#   시뮬레이션이 가정한 트랙 곡률(반경 1.2~1.3m)/세그멘테이션 잡음(1.5px)에
+#   의존하므로 그대로 믿지 말고 반드시 서행 가능한 상황에서 개입 준비하고 켤 것.
+#
+#   ★ speed15 프리셋 주의 ★ SPEED_CORNER_MIN=14.05로 나왔다 — SPEED_NORMAL=15와
+#   거의 같은 값이라 사실상 "코너에서 거의 안 늦춤"을 뜻한다. 시뮬레이션 트랙보다
+#   실제 코너가 더 급하면 위험할 수 있는 값이니 첫 테스트는 특히 주의.
+#
+#   사용법: 아래 PP_TUNE_ACTIVE_PRESET을 None(기존 개별 값 그대로) / 'speed15' /
+#   'speed25' 중 하나로 바꾸고 colcon build 후 실차에서 테스트. 프리셋이 활성화되면
+#   이 파일 위쪽의 개별 PP_*/SPEED_NORMAL/SPEED_CORNER_MIN/CORNER_* 값을 전부
+#   덮어쓴다(아래 globals().update() — 이 파일 맨 끝에 있어야 나중 정의가 안 덮어씀).
+PP_TUNE_PRESETS = {
+    'speed15': dict(
+        PP_LOOKAHEAD_BASE_PX=84.2,
+        PP_LOOKAHEAD_SPEED_GAIN=2.901,
+        PP_LOOKAHEAD_MAX_PX=174.5,
+        PP_WHEELBASE_PX=47.36,
+        PP_ALPHA=0.4842,
+        PP_MIN_LOOKAHEAD_PX=70.98,
+        PP_DX_DEADZONE_PX=4.277,
+        PP_LOOKAHEAD_CURVATURE_GAIN=214.5,
+        PP_LOOKAHEAD_MIN_PX=47.88,
+        PP_STRAIGHT_CURVATURE_EPS=0.004085,
+        PP_STRAIGHT_CONFIRM_FRAMES=2,
+        PP_STRAIGHT_DEADZONE_PX=7.084,
+        PP_STRAIGHT_ALPHA=0.9243,
+        PP_STRAIGHT_BIAS_EMA_ALPHA=0.3405,
+        SPEED_CORNER_MIN=14.05,
+        CORNER_SIGN_EMA_ALPHA=0.3575,
+        LANE_LOOKAHEAD_REF=291.3,
+        SPEED_ACCEL_STEP=1.014,
+        CORNER_HOLD_DECAY_LO=0.8375,
+        CORNER_HOLD_DECAY_HI=0.9444,
+        CORNER_MIN_RADIUS_PX=460.8,
+        CORNER_MIN_SPEED_SCALE=0.145,
+        SPEED_NORMAL=15.0,
+    ),
+    'speed25': dict(
+        PP_LOOKAHEAD_BASE_PX=63.28,
+        PP_LOOKAHEAD_SPEED_GAIN=1.931,
+        PP_LOOKAHEAD_MAX_PX=143.6,
+        PP_WHEELBASE_PX=46.24,
+        PP_ALPHA=0.8001,
+        PP_MIN_LOOKAHEAD_PX=64.25,
+        PP_DX_DEADZONE_PX=2.479,
+        PP_LOOKAHEAD_CURVATURE_GAIN=190.0,
+        PP_LOOKAHEAD_MIN_PX=56.54,
+        PP_STRAIGHT_CURVATURE_EPS=0.005799,
+        PP_STRAIGHT_CONFIRM_FRAMES=2,
+        PP_STRAIGHT_DEADZONE_PX=25.9,
+        PP_STRAIGHT_ALPHA=0.7232,
+        PP_STRAIGHT_BIAS_EMA_ALPHA=0.1865,
+        SPEED_CORNER_MIN=8.233,
+        CORNER_SIGN_EMA_ALPHA=0.2785,
+        LANE_LOOKAHEAD_REF=227.7,
+        SPEED_ACCEL_STEP=1.447,
+        CORNER_HOLD_DECAY_LO=0.9101,
+        CORNER_HOLD_DECAY_HI=0.9446,
+        CORNER_MIN_RADIUS_PX=469.3,
+        CORNER_MIN_SPEED_SCALE=0.6517,
+        SPEED_NORMAL=25.0,
+    ),
+}
+PP_TUNE_ACTIVE_PRESET = None   # None / 'speed15' / 'speed25' — 실차 A/B 테스트용 스위치
+if PP_TUNE_ACTIVE_PRESET is not None:
+    globals().update(PP_TUNE_PRESETS[PP_TUNE_ACTIVE_PRESET])
