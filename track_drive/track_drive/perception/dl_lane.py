@@ -209,7 +209,9 @@ from ..config import (
     DL_CENTER_MODE, DL_LL_ALGO, DL_LL_SIDE_MIN_PIXELS, DL_DA_SKIP_LL_CLIP,
     DL_LL_SEARCH_HALF_WIDTH_PX,
     # [2026-08-14] da 안전마진(차량 폭) 침식 — README §2.30
+    # [2026-08-17g] 방해차량 "뒤" 방향 속도비례 추가마진 — config.py DL_DA_REAR_MARGIN_* 주석 참고
     DL_DA_APPLY_VEHICLE_MARGIN, DL_DA_VEHICLE_MARGIN_M, VEHICLE_WIDTH_M,
+    DL_DA_REAR_MARGIN_REACT_SEC, DL_DA_REAR_MARGIN_MAX_M,
     # [2026-08-15] avoid-hold 개선 적용2(da 연속성 보조트리거)/적용3(방향 힌트) — README §2.32,
     # avoid_hold_improvement_proposal.md
     AVOID_HOLD_DA_AREA_JUMP_RATIO, AVOID_HOLD_DIR_BIAS_PX,
@@ -232,13 +234,22 @@ from ..config import (
 
 # ── [2026-08-14] da 안전마진(차량 폭) 침식 커널 — README §2.30 "da 안전마진 설계 논의" ──
 #   VEHICLE_WIDTH_M(실측 차폭)의 절반 + DL_DA_VEHICLE_MARGIN_M(여유)을 DL_PIXELS_PER_METER로
-#   픽셀 환산해 반경으로 쓴다. DL_CENTER_MODE='da'에서만 쓰인다(detect() 참고) — 모듈
-#   임포트 시 한 번만 계산해두고 매 프레임 재계산하지 않는다(다른 커널들과 동일 패턴).
+#   픽셀 환산해 좌우(가로) 반경으로 쓴다. DL_CENTER_MODE='da'에서만 쓰인다(detect() 참고).
 _DL_DA_MARGIN_PX = int(round((VEHICLE_WIDTH_M / 2.0 + DL_DA_VEHICLE_MARGIN_M) * DL_PIXELS_PER_METER))
-_DL_DA_MARGIN_KERNEL = (
-    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_DL_DA_MARGIN_PX * 2 + 1, _DL_DA_MARGIN_PX * 2 + 1))
-    if DL_DA_APPLY_VEHICLE_MARGIN and _DL_DA_MARGIN_PX > 0 else None
-)
+# [2026-08-17g] 예전엔 위 반경을 그대로 정사각 커널(가로=세로, 등방)로 써서 좌우 마진과
+#   전/후("방해차량 뒤" 포함) 마진이 항상 같은 값이었다. 이제 세로(진행방향) 반경만
+#   v_mps에 비례해 늘려서 "뒤" 쪽 여유를 속도에 맞게 더 벌린다 — config.py
+#   DL_DA_REAR_MARGIN_REACT_SEC/MAX_M 주석 참고. 속도에 따라 매 프레임 달라지므로(다른
+#   커널들과 달리) 모듈 임포트 시 한 번만 만들어두지 못하고 _apply_vehicle_margin()이
+#   호출될 때마다 새로 만든다 — cv2.getStructuringElement는 이 크기(수십 px)에서는
+#   무시할 만큼 가볍다.
+def _dl_da_margin_kernel(v_mps):
+    if not DL_DA_APPLY_VEHICLE_MARGIN or _DL_DA_MARGIN_PX <= 0:
+        return None
+    extra_m = min(DL_DA_REAR_MARGIN_REACT_SEC * max(float(v_mps), 0.0), DL_DA_REAR_MARGIN_MAX_M)
+    ry = _DL_DA_MARGIN_PX + int(round(extra_m * DL_PIXELS_PER_METER))
+    rx = _DL_DA_MARGIN_PX
+    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (rx * 2 + 1, ry * 2 + 1))
 
 # [2026-08-10] visualize()가 result 패널 맨 위에 그리는 모드 배너 색을 한곳에서 관리.
 # [2026-08-11] 원래는 여기 색을 _build_params_panel()의 배너와도 맞췄었는데, 그 함수를
@@ -684,13 +695,17 @@ class DLSlideWindow(SlideWindow):
         self._prev_da_centroid = None
         return np.zeros_like(da_mask)
 
-    def _apply_vehicle_margin(self, da_mask):
+    def _apply_vehicle_margin(self, da_mask, v_mps=0.0):
         """[2026-08-14] da 마스크를 차폭(VEHICLE_WIDTH_M)+여유(DL_DA_VEHICLE_MARGIN_M)만큼
         침식(erosion)해서, 중심선이 da 경계(장애물이든 트랙 벽이든 무관)에서 최소 이만큼은
         떨어지도록 강제한다 — ROS2 Nav2의 costmap inflation과 같은 개념(README §2.30 "da
         안전마진 설계 논의"). 지금까지 중심선 계산(`_da_slice_centers_windowed()` 등)은
         차량을 폭 0인 점으로 취급해왔는데, 이게 "장애물 회피 중 앞코가 장애물 뒷꽁지를
         긁는다"는 실차 보고의 원인으로 지목됐다.
+
+        [2026-08-17g] v_mps(현재 속도, m/s)가 높을수록 세로(진행방향, "뒤" 포함) 반경을
+        추가로 늘린다 — `_dl_da_margin_kernel()`/config.py DL_DA_REAR_MARGIN_* 참고. 좌우
+        반경은 속도와 무관하게 그대로다.
 
         ★주의★ 이건 순수 카메라 픽셀(DL_PIXELS_PER_METER, config.py에 "설계값(실측 아님)"
         이라고 명시된 값) 기반 근사치다 — 라이다 실측으로 대신하는 안(같은 README 절)이
@@ -700,9 +715,10 @@ class DLSlideWindow(SlideWindow):
         침식으로 da가 통째로 비면(좁은 커브 등에서 과침식) 원본을 그대로 반환한다 —
         `_largest_da_component()`의 "차선책" 폴백들과 같은 원칙: 마진 없이라도 주행하는
         게 프레임이 무효 처리돼 멈추는 것보다 낫다는 판단."""
-        if _DL_DA_MARGIN_KERNEL is None:
+        kernel = _dl_da_margin_kernel(v_mps)
+        if kernel is None:
             return da_mask
-        eroded = cv2.erode(da_mask, _DL_DA_MARGIN_KERNEL)
+        eroded = cv2.erode(da_mask, kernel)
         return eroded if np.any(eroded) else da_mask
 
     def _da_slice_centers_windowed(self, da_mask, ref_x):
@@ -1573,7 +1589,7 @@ class DLSlideWindow(SlideWindow):
 
         return results, used
 
-    def detect(self, raw_bgr, da_prob, ll_prob, yellow_mask, avoid_hold=False, direction_hint=0):
+    def detect(self, raw_bgr, da_prob, ll_prob, yellow_mask, avoid_hold=False, direction_hint=0, v_mps=0.0):
         """입력 : raw_bgr — 원본 카메라 프레임 그대로의 (H,W,3) BGR(크롭/리사이즈 없음)
                  da_prob, ll_prob — 위와 같은 (H,W) float32 foreground 확률(모델은 360행
                    고정이지만 TwinLiteNetEngine.infer_raw()가 이미 원본 크기로 업샘플링해서 줌)
@@ -1583,6 +1599,9 @@ class DLSlideWindow(SlideWindow):
                    — 다른 모드는 이 인자와 무관하게 항상 클리핑 적용). track_drive.py의
                    _update_avoid_hold()가 라이다 obstacle_front/dist(+da 연속성, 적용2)로
                    판단해 넘긴다.
+                 v_mps — [2026-08-17g] 현재 실측 속도(m/s). DL_CENTER_MODE='da'의
+                   _apply_vehicle_margin()이 방해차량 "뒤" 방향 추가 마진 계산에만 쓴다
+                   (config.py DL_DA_REAR_MARGIN_* 참고) — 그 외 로직에는 영향 없다.
                  direction_hint — [2026-08-15] 적용3(avoid_hold_improvement_proposal.md).
                    track_drive.py TargetPassing.choose_side()가 반환한 -1/0/+1(lane_offset과
                    동일한 "우측+" 부호규약) — _clip_da_by_ll()의 실측/잔상이 전혀 없는
@@ -1816,7 +1835,7 @@ class DLSlideWindow(SlideWindow):
                 # [2026-08-14] 중심선 계산에만 안전마진을 적용한다 — self.da_mask_roi(아래,
                 # 디버그 시각화용)는 침식 전 원본을 그대로 담아야 "da가 실제로 어디까지
                 # 검출됐는지"와 "마진 때문에 얼마나 물러났는지"를 구분해서 볼 수 있다.
-                margined_da_mask = self._apply_vehicle_margin(da_mask)
+                margined_da_mask = self._apply_vehicle_margin(da_mask, v_mps)
                 merged_centers = self._da_slice_centers_windowed(margined_da_mask, ref_x)
                 self.ll_band_used = [False] * len(merged_centers)
                 self.ll_search_windows = []
@@ -2310,6 +2329,10 @@ class DLLaneDetector:
         # [2026-08-15] 적용3 — set_avoid_hold()가 side도 같이 받아 저장해두면 _worker()가
         # 다음 추론 때 avoid_hold와 같은 락으로 같이 읽어 DLSlideWindow.detect()에 넘긴다.
         self._latest_avoid_hold_side = 0
+        # [2026-08-17g] 현재 속도(m/s) — track_drive.py가 매 틱 set_speed()로 갱신하면
+        # _worker()가 avoid_hold와 같은 락으로 같이 읽어 DLSlideWindow.detect()에 넘긴다
+        # (da 안전마진의 속도비례 "뒤" 마진 계산용, config.py DL_DA_REAR_MARGIN_* 참고).
+        self._latest_v_mps = 0.0
         # [2026-08-15] 적용2 — _worker()가 매 추론 후 DLSlideWindow.da_area_jump_detected를
         # 여기로 복사해둔다. result_seq/yellow_centers와 동일한 관례로, 단순 bool 대입이라
         # GIL 하에서 원자적이므로 별도 락 없이 읽는다(track_drive.py _update_avoid_hold()가
@@ -2351,6 +2374,12 @@ class DLLaneDetector:
             self._latest_avoid_hold = bool(active)
             self._latest_avoid_hold_side = int(side)
 
+    def set_speed(self, v_mps):
+        """[2026-08-17g] track_drive.py가 매 틱 호출 — 현재 실측 속도(m/s)를 다음 추론에
+        반영한다(set_avoid_hold()와 동일 관례). 단순 대입이라 별도 검증 없이 저장한다."""
+        with self._lock:
+            self._latest_v_mps = float(v_mps)
+
     def _worker(self):
         """추론 워커 — 이 스레드 안에서는 절대 cv2.imshow()/cv2.waitKey()를 호출하지 않는다.
         OpenCV HighGUI(GTK 백엔드)가 스레드 세이프하지 않아서, 메인 스레드(다른 디버그
@@ -2364,6 +2393,7 @@ class DLLaneDetector:
                 self._latest_frame = None
                 avoid_hold = self._latest_avoid_hold
                 avoid_hold_side = self._latest_avoid_hold_side
+                v_mps = self._latest_v_mps
             if frame is None:
                 time.sleep(0.005)
                 continue
@@ -2375,7 +2405,7 @@ class DLLaneDetector:
                 )
                 lane_valid, offset, lookahead, lane_center, path = self._slide.detect(
                     raw_bgr, da_prob, ll_prob, yellow_mask,
-                    avoid_hold=avoid_hold, direction_hint=avoid_hold_side
+                    avoid_hold=avoid_hold, direction_hint=avoid_hold_side, v_mps=v_mps
                 )
                 debug_img = self._slide.vis
             except Exception as e:
@@ -2419,7 +2449,7 @@ class DLLaneDetector:
         with self._lock:
             return self._latest_result
 
-    def show_debug_windows(self, lookahead_xy=None, lookahead_px=None, is_straight=None):
+    def show_debug_windows(self, lookahead_xy=None, lookahead_px=None, is_straight=None, v_mps=None):
         """da(초록)/ll(흰선=흰색·노란선=노랑) 오버레이 + (모드에 따라) 좌우 슬라이딩
         윈도우/corridor 경계가 그려진 result에 da/ll/노란선 원본 이진마스크를 위→아래로
         이어붙여 창 하나(`dl_lane`)로 띄운다 — result/da/ll/yellow 순서로 세로 스택.
@@ -2452,6 +2482,11 @@ class DLLaneDetector:
         참고), 지금 어느 파라미터 세트가 적용 중인지 화면만 보고 바로 알 수 있게 한다.
         None이면(호출측이 안 넘기거나 pure_pursuit이 아직 없는 초기 프레임) 아무것도 안
         그린다.
+
+        v_mps(있으면) : 현재 실측 속도(m/s, track_drive.py self.v_mps) — [2026-08-17g]
+        맨 아래 노란선(yellow) 전용 패널을 없애고 그 자리에 이 값과 is_straight 상태를 함께
+        표시한다(요청 반영: "yellow 부분을 제거하고 현 속도를 거기에 표시"). 노란선 자체는
+        result 패널에 이미 색으로 겹쳐 그려지므로 정보 손실은 없다.
         ★ 반드시 메인 스레드(ROS 콜백/타이머가 도는 스레드)에서만 호출할 것 ★ — 워커
         스레드가 cv2.imshow를 직접 부르지 않는 이유는 _worker()/DLSlideWindow.visualize()
         주석 참고. track_drive.py의 perc_lane()이 detect() 직후 이 메서드를 호출한다
@@ -2480,14 +2515,20 @@ class DLLaneDetector:
                         fallback='STRAIGHT' if is_straight else 'CURVE')
         da_bgr = cv2.cvtColor(da_mask, cv2.COLOR_GRAY2BGR)
         ll_bgr = cv2.cvtColor(ll_mask, cv2.COLOR_GRAY2BGR)
-        # 노란선 패널만 실제 노란색(BGR 0,255,255)으로 칠해서 흰/회색인 다른 패널과
-        # 바로 구분되게 한다 — 단순 GRAY2BGR이면 da/ll처럼 흰색 마스크로 보여서
-        # "이게 노란선 전용 패널"이라는 게 라벨 텍스트 말곤 안 보임.
-        yellow_bgr = np.zeros((*ll_yellow_mask.shape, 3), dtype=np.uint8)
-        yellow_bgr[ll_yellow_mask > 0] = (0, 255, 255)
-        for label, panel in (('result', vis), ('da', da_bgr), ('ll', ll_bgr), ('yellow', yellow_bgr)):
+        # [2026-08-17g] 예전엔 여기 노란선(ll_yellow_mask) 전용 패널이 있었다(노란선만
+        # 100% 불투명하게 보여 dash 끊김 확인용, ll_yellow_mask.shape 크기). 요청 반영으로
+        # 제거하고 같은 크기 패널에 속도+직진/커브대응 상태를 표시한다 — 노란선 자체는
+        # result 패널 오버레이에 이미 보이므로 이 패널이 없어져도 정보 손실은 없다.
+        speed_bgr = np.zeros((*ll_yellow_mask.shape, 3), dtype=np.uint8)
+        if v_mps is not None:
+            state_text = '직진' if is_straight else '커브대응' if is_straight is not None else '?'
+            state_color = (0, 220, 0) if is_straight else (0, 140, 255) if is_straight is not None else (200, 200, 200)
+            speed_text = f'speed: {v_mps:+.2f} m/s  {state_text}'
+            put_text_kr(speed_bgr, speed_text, (10, 8), font_size=22, color_bgr=state_color,
+                        fallback=f'speed:{v_mps:+.2f}m/s {"STRAIGHT" if is_straight else "CURVE"}')
+        for label, panel in (('result', vis), ('da', da_bgr), ('ll', ll_bgr), ('speed', speed_bgr)):
             cv2.putText(panel, label, (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-        stack = [vis, da_bgr, ll_bgr, yellow_bgr]
+        stack = [vis, da_bgr, ll_bgr, speed_bgr]
         if sparkline is not None:
             stack.append(sparkline)
         cv2.imshow('dl_lane', cv2.vconcat(stack))
