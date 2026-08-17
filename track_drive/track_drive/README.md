@@ -474,6 +474,55 @@ avoid-hold+da 안전마진으로 정적/동적 회피 기동 자체가 매 프�
 `TEST_DISABLE_B2_B3`는 그대로 동작. **`da_unaware_of_obstacle=True` 하드코딩(§4)은 이번에 안 건드림 —
 B2는 여전히 항상 `TargetPassing`으로 폴백.**
 
+### 2.35 [중대 버그] `DLLaneDetector.roi_w`가 실제 경로 좌표계와 다른 폭으로 고정돼 조향에
+상시 좌편향이 있던 문제 — raw 카메라 데이터셋 재생 검증으로 발견 (2026-08-17)
+
+**배경:** 사용자 요청으로 실제 lap 주행 raw 카메라 프레임(`lap_005`, 2734장 — fine-tune 저장소의
+학습 데이터 원본)을 `track_drive` 패키지를 ROS2 없이 standalone 임포트해서(§2.30/§2.31이 이미 쓴
+방식과 동일, `TwinLiteNetEngine`+`DLSlideWindow`를 직접 호출) 실제로 돌려보며 pure_pursuit
+파이프라인이 잘 동작하는지 검증하던 중 발견.
+
+**증상/원인:** `DLLaneDetector.__init__()`가 `self.roi_w = DL_INPUT_W`(640, 모델 입력 고정폭)로
+설정해두는데, 실제 `path`/`yellow_centers`는 `DLSlideWindow.roi_w`(BEV 캔버스 실측폭,
+`DL_USE_BEV=True`인 현재 기본값 기준 **585**, `da_mask.shape`에서 나옴) 좌표계다. 이 둘이 원래
+초기화 시점에만 값이 다를 뿐 이후 동기화되는 줄이 없어서(`yellow_centers`는 매 추론마다
+`self._slide.yellow_centers`로 갱신되는데 `roi_w`만 빠져있었음), `_lane_steer()`의
+`vehicle_x = self.lane_detector.roi_w/2.0`(320)와 `_update_lane_side()`의 판정 기준
+(`ld.roi_w/2.0`, 320)이 매 프레임 계속 틀린 값(640/2)을 썼다 — 실제 차량 중심은 585/2=**292.5**여야
+했다. 27.5px(≈13.75cm, `DL_PIXELS_PER_METER=200px/m` 기준) 만큼 조향 기준점이 어긋난 채로
+`DL_USE_BEV`가 실차 검증에 들어간 2026-08-05부터 계속 있었을 가능성이 높다.
+
+**실측(raw 카메라 재생 검증):** `lap_005` 2734프레임 중 304장 균등샘플로 `TwinLiteNetEngine`+
+`DLSlideWindow`를 실제로 돌려 `path`를 뽑고, 같은 `path`를 `vehicle_x=292.5`(정상)와
+`vehicle_x=320`(버그)로 각각 `PurePursuitController.control()`에 넣어 비교 — **238개 유효 프레임에서
+조향각 차이 평균 +24.05°, 표준편차 5.45°, 최대 +38.11°**(정상 기준 대비 버그 코드가 그만큼
+왼쪽으로 더 꺾도록 명령). 정상 계산 기준으로는 대부분 0°(차선 중앙에 있다고 올바르게 판단)인
+프레임에서 버그 코드는 -20~-30°대의 좌회전을 계속 명령하고 있었다.
+
+**수정:** `DLLaneDetector._worker()`가 매 추론마다 `self.roi_w = self._slide.roi_w`로 동기화하도록
+한 줄 추가(`yellow_centers`/`da_area_jump`와 동일한 관례). `__init__`의 `self.roi_w = DL_INPUT_W`는
+첫 프레임 처리 전까지만 쓰이는 초기 플레이스홀더로 남겨두되 주석으로 명시. 수정 후 같은
+standalone 검증 스크립트로 `DLLaneDetector.roi_w`가 첫 프레임부터 585로 정확히 갱신되는 것을
+확인했다.
+
+**영향 범위:** `LANE_DETECTOR_BACKEND='dl'`(현재 기본값) 전용 — `hough`/`classic_cv` 백엔드는 각자
+`roi_w`를 실제 처리 이미지 shape에서 직접 얻어써서 이 문제가 없다(`perception/hough_lane.py`/
+`perc_floor.py` 확인함). `_lane_steer()`(S1/S3 차선주행, B1 라바콘 — §3에서 동일 함수 재사용)와
+`_update_lane_side()`(회피 방향 판정, §4) 둘 다 `self.lane_detector.roi_w`를 쓰므로 이 수정 하나로
+같이 고쳐진다.
+
+**알려진 한계:**
+- 아직 실차 재검증 전이다 — 이번 검증은 raw 카메라 프레임을 오프라인 재생한 것이라 실제 피드백
+  루프(잘못된 조향이 다시 카메라 프레임을 바꾸는 폐루프 동역학)까지는 반영하지 못한다. 다만 버그
+  자체는 프레임 내용과 무관한 순수 상수 오차라, 폐루프에서도 방향(좌편향)과 대략적 크기는
+  그대로일 가능성이 높다.
+- 이 버그가 그동안 §0.5.x/§2.x에서 다뤄온 "진동"/"흔들림" 계열 증상들과 실제로 얼마나 섞여
+  있었는지는 분리해서 확인된 바 없다 — 이 수정 이후 실차 재테스트에서 기존 진동 대응
+  튜닝값(`PP_ALPHA`/`PP_DX_DEADZONE_PX`/§0.5.9 직진모드 임계값 등)이 여전히 최적인지 같이
+  재검토할 것. 상시 편향(이번 버그)과 프레임간 잔떨림(기존 진동 이슈)은 서로 다른 종류의
+  문제라 원래는 구분해서 봐야 하는데, 지금까지는 이 편향이 깔린 채로 진동만 따로 잡으려던
+  것일 수 있다.
+
 ---
 
 ## 3. 라바콘 (B1_LAVACON)

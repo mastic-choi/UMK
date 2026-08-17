@@ -2194,6 +2194,10 @@ class DLLaneDetector:
         self._slide = DLSlideWindow()
         self._logger = logger
 
+        # [2026-08-17] 첫 프레임 처리 전까지만 쓰이는 초기 플레이스홀더 — _worker()가 매
+        # 추론마다 self._slide.roi_w(실제 da_mask/path 좌표계 폭)로 덮어쓴다. 예전엔 이
+        # DL_INPUT_W(640, 모델 입력 고정폭)가 계속 유지돼서 _lane_steer()/_update_lane_side()가
+        # 잘못된 폭으로 vehicle_x/차선판정 기준을 잡는 버그가 있었다(위 _worker() 주석 참고).
         self.roi_w = DL_INPUT_W          # _update_lane_side()가 참조하는 정규화 분모
         self.yellow_centers = []         # _update_lane_side() 호환용, 워커가 매 추론마다 갱신
 
@@ -2282,6 +2286,18 @@ class DLLaneDetector:
 
             with self._lock:
                 self.yellow_centers = self._slide.yellow_centers
+                # [2026-08-17 버그 수정] self.roi_w를 __init__에서 DL_INPUT_W(640, 모델 입력
+                # 고정폭)로 하드코딩해뒀었는데, path/yellow_centers는 전부 self._slide.roi_w
+                # (BEV 캔버스 실측폭, DL_USE_BEV=True 기준 585 — da_mask.shape에서 나옴) 좌표계다.
+                # _lane_steer()의 vehicle_x = self.lane_detector.roi_w/2.0가 이 640을 그대로
+                # 썼던 탓에, 실제 차량 기준점(292.5)이 아니라 320을 기준으로 dx를 계산해 매
+                # 프레임 27.5px(≈13.75cm) 만큼 조향이 한쪽으로 밀리는 상시 편향이 있었다(raw
+                # 카메라 데이터셋(lap_005) 재생 검증 결과 평균 -24°/최대 -38° 좌편향 확인,
+                # 실차 미검증이었던 이유는 이 값이 조용히 항상 틀려서 "차선을 못 맞추는" 것과
+                # "진동"이 뒤섞여 보였을 가능성). _slide.roi_w는 첫 프레임부터 항상 실제
+                # da_mask 폭으로 정확하므로, 매 프레임 그대로 동기화한다 — _update_lane_side()도
+                # 같은 self.roi_w를 쓰므로 이 수정 하나로 조향/차선판정 둘 다 고쳐진다.
+                self.roi_w = self._slide.roi_w
                 self.da_area_jump = self._slide.da_area_jump_detected  # [2026-08-15] 적용2
                 self._latest_result = (lane_valid, offset, lookahead, lane_center, path, debug_img)
                 self._latest_debug = (
