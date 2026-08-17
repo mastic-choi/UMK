@@ -78,7 +78,13 @@ LANE_DETECTOR_BACKEND = 'dl'  # 'hough' | 'classic_cv' | 'dl'
 # #############################################################
 # 2. 차량 속도 / 조향 기본값
 # #############################################################
-SPEED_NORMAL  = 3.0    # [2026-08-13] 15.0 → 3.0(요청 반영, 조향 파라미터 재튜닝 테스트용 저속화).
+SPEED_NORMAL  = 10.0   # [2026-08-17f] 3.0 → 10.0(요청 반영, 저속 재튜닝 검증 완료 후 증속). 이 값이
+                        #   바뀌면 PP_LOOKAHEAD_MAX_PX(§0.5.6/§0.5.10 공식: BASE+GAIN*SPEED_NORMAL)도
+                        #   반드시 같이 재계산할 것 — 아래에서 130.0으로 갱신함. SPEED_CORNER_MIN(5.0) 등
+                        #   "즉시 cap" 계열 하한값은 모터 데드존 등 물리적 근거로 고정된 값이라 이번엔
+                        #   일부러 비례 조정하지 않았다(README §0.5.10 참고) — 실차에서 코너 진입/탈출
+                        #   속도 급변이 과하게 느껴지면 그때 올릴 것.
+                        # [2026-08-13] 15.0 → 3.0(요청 반영, 조향 파라미터 재튜닝 테스트용 저속화).
                         # [2026-08-10] 차선주행(S1) 기본(직진) 속도. 8.0 → 25.0 → 15.0(요청 반영,
                         #   DL_CENTER_MODE='ll' 기본 전환과 함께 하향 — ll 재설계가 아직 실차
                         #   미검증이라 우선 보수적으로 낮춤).
@@ -725,7 +731,10 @@ PP_LOOKAHEAD_SPEED_GAIN = 4.0      # 속도가 오를수록 lookahead를 늘리�
 #   README), 속도만 오르고 lookahead가 그만큼 못 늘어나면 고속에서 과민 반응→진동이 커진다.
 #   190은 SPEED_NORMAL=25를 그대로 대입한 값 — 실차 재검증 필요. 그래도 진동이 남으면
 #   PP_ALPHA(현재 0.5)를 낮춰 조향각 저역통과를 더 강하게 거는 쪽을 다음으로 볼 것.
-PP_LOOKAHEAD_MAX_PX = 190.0        # lookahead 상한
+# [2026-08-17f] SPEED_NORMAL 3.0→10.0 증속에 맞춰 같은 공식으로 재계산: BASE(90) + GAIN(4)*10 = 130.
+#   190(구 SPEED_NORMAL=25 기준)을 그대로 둬도 130<190이라 당장 클리핑되진 않지만, §0.5.6이 정한 관례
+#   (상한 = BASE+GAIN*현재 SPEED_NORMAL)를 그대로 따름 — 실차 재검증 필요.
+PP_LOOKAHEAD_MAX_PX = 130.0        # lookahead 상한
 PP_LOOKAHEAD_CURVATURE_GAIN = 100.0  # 직전 프레임 curvature가 클수록(코너) lookahead를 줄이는 게인
 PP_LOOKAHEAD_MIN_PX = 40.0         # 코너에서 lookahead가 줄어들 수 있는 하한
 # [2026-08-06] "곡률→조향각" 게인(pure_pursuit.py의 steer_deg = atan(curvature*wheelbase_px)).
