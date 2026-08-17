@@ -136,9 +136,7 @@ class TrackDriverNode(Node):
         self.right_clear_confirmed = True
         self._left_clear_cnt  = 0
         self._right_clear_cnt = 0
-        # [2026-08-13] 판정(임계값 비교) 이전에 원본 점개수 자체를 먼저 EMA로 스무딩한다 —
-        # 바로 아래 _ema_y(장애물 좌우 위치)와 같은 패턴을 left_cnt/right_cnt에도 적용한 것.
-        # 히스테리시스/디바운스가 "판정 이후" 안정화라면, 이건 "판정 이전" 안정화다.
+        # 판정 전 원본 점개수 EMA 스무딩용 (perc_obstacle() 참고)
         self._left_cnt_ema  = 0.0
         self._right_cnt_ema = 0.0
         self._ema_y         = 0.0     # 전방 장애물 횡위치 EMA(obstacle_side 안정화)
@@ -204,10 +202,7 @@ class TrackDriverNode(Node):
         self.mission_state  = START_STATE
         self.behavior_state = BehaviorState.B0_NORMAL
         self.phase          = Phase.LAVACON     # S1 내부 진행 순서(라바콘부터 시작)
-        # [2026-08-15] Phase.OBSTACLE_ZONE 통합(da_based_b2b3_proposal.md B안) —
-        # B2/B3 각각 최소 한 번 완료됐는지 추적. 둘 다 True가 돼야 Phase.DONE으로
-        # 넘어간다(_mark_behavior_passed() 참고) — 순서를 안 따지므로 어느 쪽이 먼저
-        # 끝나도 상관없다.
+        # B2/B3 각각 최소 한 번 완료됐는지 추적 (_mark_behavior_passed() 참고, README §2.34)
         self._b2_passed = False
         self._b3_passed = False
         self._behavior_enabled = TEST_FORCE_BEHAVIOR  # 원래 S2 교차로 "직진"으로 S1 재진입 시에만 True
@@ -265,9 +260,6 @@ class TrackDriverNode(Node):
         # 튜닝값은 전부 config.py의 PP_* 에서 가져온다 — 클래스 자체의 기본값은 config.py를
         # 안 거치고 pure_pursuit.py를 직접 쓸 때(단독 테스트 등)를 위한 fallback이라,
         # 여기서 명시적으로 넘기지 않으면 config.py를 고쳐도 반영이 안 된다.
-        # [2026-08-14] LQR 컨트롤러(self.lqr)와 그 사이를 고르던 STEERING_CONTROLLER는
-        # 실차 미검증 상태로 한 번도 켜본 적 없어 코드베이스에서 제거했다 — config.py
-        # section 4 주석 참고.
         self.pure_pursuit = PurePursuitController(
             lookahead_base_px=PP_LOOKAHEAD_BASE_PX,
             lookahead_speed_gain=PP_LOOKAHEAD_SPEED_GAIN,

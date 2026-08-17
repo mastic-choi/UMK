@@ -3,10 +3,7 @@ import itertools
 import numpy as np
 import cv2
 
-# Signal4 (4구) - 배치 좌→우 [빨강,노랑,좌회전,직진]
-#   대회 규정 변경(2026-07): 출발(S0)도 교차로(S2)와 동일한 4구 신호등을 재사용한다.
-#     S0: 초록(직진 위치)만 점등 → 출발
-#     S2: 초록만 점등 → 직진 / 초록+빨강 동시 점등 → 좌회전
+# Signal4 (4구) - 배치 좌→우 [빨강,노랑,좌회전,직진] — S0/S2 통합 규정은 README §1 참고.
 #   S0/S2 물리적 카메라-신호등 거리가 같아 ROI/반지름도 공유한다(실측 확인됨).
 #   기본 튜닝값(SIG4_ROI_*/MIN_RADIUS/MAX_RADIUS/BRIGHT_MARGIN/MAX_CANDIDATES,
 #   DEBUG_VIZ_SIGNAL)은 config.py에 있다 — 실차 테스트 중 값을 바꾸려면 이 파일이

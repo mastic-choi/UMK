@@ -706,10 +706,7 @@ FPS_LOG_PERIOD_SEC = 5.0   # dl_lane.py 워커 스레드 FPS/provider 로그 주
 # #############################################################
 #   track_drive.py의 _lane_steer()가 self.lane_path를 받아 controller/pure_pursuit.py의
 #   PurePursuitController.control(path, vehicle_xy)로 조향각(도)을 계산한다.
-# [2026-08-14] LQR 컨트롤러(controller/lqr.py)와 그 사이를 고르던 STEERING_CONTROLLER
-#   스위치를 코드베이스에서 완전히 제거했다 — 실차 미검증 상태로 한 번도 켜본 적 없이
-#   pure_pursuit만 계속 써온 죽은 분기라 유지보수 부담만 있었다. 과거 LQR 설계 배경/
-#   튜닝값 기록은 README §0.5, §6.7, §7에 남아있다.
+# LQR 컨트롤러/STEERING_CONTROLLER 스위치는 제거됨 — README §0.5 참고.
 
 # ── Pure Pursuit 튜닝값 (controller/pure_pursuit.py PurePursuitController) ──
 #   전부 실차 미검증 튜닝값. 각 값의 설계 배경은 pure_pursuit.py __init__ 상단
