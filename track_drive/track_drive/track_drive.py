@@ -1534,12 +1534,20 @@ class TrackDriverNode(Node):
                                 + (1.0 - CORNER_SIGN_EMA_ALPHA) * self._corner_signal)
         turn_now     = min(1.0, abs(self._corner_signal) / ANGLE_MAX)
         turn_preview = min(1.0, abs(self.lane_lookahead) / LANE_LOOKAHEAD_REF)
-        turn_for_speed = max(turn_now, turn_preview * 0.3)
+        # [2026-08-17] 명시적 직진 모드(README §0.5.9)를 코너 감속에도 병합 — pure_pursuit이
+        # (조향 출력과는 독립된 경로 curvature+IMU 신호로) "직진 확정"을 판단해준 프레임에는
+        # turn_now/turn_preview에 낀 잔여 노이즈로 인한 유령 감속을 무시하고 그대로 전속력을
+        # 낸다. is_straight가 아닌 프레임(코너 포함 전부)은 기존 연속값 로직을 그대로 쓴다 —
+        # 코너 감속 감도 자체는 전혀 안 바뀜.
+        is_straight = getattr(self.pure_pursuit, 'is_straight', False)
+        turn_for_speed = 0.0 if is_straight else max(turn_now, turn_preview * 0.3)
         target_speed = max(SPEED_CORNER_MIN,
                            SPEED_NORMAL * (1.0 - 0.90 * turn_for_speed ** 3))
         # 코너 진입(회전반경 감소) 시 추가 감속 — 기존 turn_for_speed 기반 감속과는 독립적으로
-        # 계산해서 더 낮은 쪽을 쓴다(대체가 아니라 추가 안전판).
-        target_speed = max(SPEED_CORNER_MIN, target_speed * self._corner_radius_speed_scale())
+        # 계산해서 더 낮은 쪽을 쓴다(대체가 아니라 추가 안전판). 직진 확정 중엔 이 반경 계산도
+        # 같은 이유로 건너뛴다(1.0 = 감속 없음).
+        corner_radius_scale = 1.0 if is_straight else self._corner_radius_speed_scale()
+        target_speed = max(SPEED_CORNER_MIN, target_speed * corner_radius_scale)
         # [2026-08-10] DL_CENTER_MODE='ll'에서 노란/흰선 중 하나를 저신뢰 추정(간격
         # 재구성 또는 잔상)으로 메운 프레임은 속도를 SPEED_LL_DEGRADED로 강제 제한한다
         # (요청 반영). 가/감속 모두 accel_step 램프 없이 즉시 적용 — 기존 코너 감속도
@@ -1702,16 +1710,16 @@ class TrackDriverNode(Node):
         lines.append((f'IMU curvature: {imu_text}', (10, 8 + 32 * len(lines)), imu_color, 18,
                        f'IMU curvature: {imu_text if imu_kappa is not None else "N/A"}'))
 
-        # [2026-08-17] 명시적 직진 모드(README §0.5.9) 상태 표시 — 확정까지 남은 프레임 수를
-        # 같이 보여줘서, 직전 몇 프레임이 이미 저곡률이었는지(곧 확정될지)를 실차에서 바로
-        # 확인할 수 있게 한다.
+        # [2026-08-17] 명시적 직진 모드(README §0.5.9, 조향 데드존 + 코너감속 둘 다 이 상태를
+        # 참고) 표시 — 확정까지 남은 프레임 수를 같이 보여줘서, 직전 몇 프레임이 이미
+        # 저곡률이었는지(곧 확정될지)를 실차에서 바로 확인할 수 있게 한다.
         is_straight = getattr(controller, 'is_straight', False)
         straight_frames = getattr(controller, '_straight_frames', 0)
         straight_confirm = getattr(controller, 'straight_confirm_frames', 0)
         straight_color = (0, 200, 0) if is_straight else (140, 140, 140)
-        straight_text = f'확정({straight_frames}프레임)' if is_straight else f'대기({straight_frames}/{straight_confirm})'
+        straight_text = f'확정({straight_frames}프레임, 조향+속도 적용)' if is_straight else f'대기({straight_frames}/{straight_confirm})'
         lines.append((f'직진모드: {straight_text}', (10, 8 + 32 * len(lines)), straight_color, 18,
-                       f'Straight mode: {"CONFIRMED" if is_straight else f"waiting({straight_frames}/{straight_confirm})"}'))
+                       f'Straight mode: {"CONFIRMED (steer+speed)" if is_straight else f"waiting({straight_frames}/{straight_confirm})"}'))
 
         # DA(주행가능영역) 면적 — DL_DA_MAX_AREA_PX 실측 튜닝용. 원래 da_debug라는 별도
         # 창이었는데 조향 상태랑 같이 한눈에 보고 싶다는 요청으로 이 창에 합쳤다(2026-08-06).
