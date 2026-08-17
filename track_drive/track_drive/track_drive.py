@@ -467,6 +467,11 @@ class TrackDriverNode(Node):
         # (config.py AVOID_HOLD_DIR_BIAS_PX 주석, perception/dl_lane.py _clip_da_by_ll() 참고).
         getattr(self.lane_detector, 'set_avoid_hold', lambda *_a, **_k: None)(
             self.avoid_hold_active, self.avoid_hold_side)
+        # [2026-08-17g] 현재 속도(m/s)도 같이 넘긴다 — DL 백엔드의 da 안전마진이 방해차량
+        # "뒤" 방향 추가 마진을 속도에 비례해 늘리는 데 쓴다(perception/dl_lane.py
+        # set_speed()/config.py DL_DA_REAR_MARGIN_* 주석 참고). hough/classic_cv처럼 이
+        # 메서드가 없는 백엔드는 set_avoid_hold()와 동일하게 getattr로 조용히 건너뛴다.
+        getattr(self.lane_detector, 'set_speed', lambda *_a, **_k: None)(self.v_mps)
 
         # hough_lane.py의 HoughLaneDetector를 사용하여 차선 인식 수행
         valid, offset, lookahead, lane_center, path, debug_img = self.lane_detector.detect(self.img_front)
@@ -483,8 +488,10 @@ class TrackDriverNode(Node):
         # (dl_lane.DLLaneDetector.show_debug_windows() 주석 참고) — lookahead_xy/px와 동일하게
         # 한 틱(0.05s) 지연 가능.
         is_straight = self.pure_pursuit.is_straight
+        # [2026-08-17g] dl_lane 창 맨 아래 yellow 패널이 속도+커브대응 상태 패널로
+        # 바뀌면서(perception/dl_lane.py show_debug_windows() 참고) v_mps도 같이 넘긴다.
         getattr(self.lane_detector, 'show_debug_windows', lambda *a, **k: None)(
-            lookahead_xy, lookahead_px, is_straight)
+            lookahead_xy, lookahead_px, is_straight, self.v_mps)
 
         # [2026-08-11] "재사용된 최신값"과 "완전히 안 갱신됨"을 구분 — DLLaneDetector가
         # 추론 1회 끝날 때마다 올리는 result_seq(dl_lane.py 참고)가 직전 틱에서 본 값과

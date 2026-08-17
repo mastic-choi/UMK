@@ -78,9 +78,12 @@ LANE_DETECTOR_BACKEND = 'dl'  # 'hough' | 'classic_cv' | 'dl'
 # #############################################################
 # 2. 차량 속도 / 조향 기본값
 # #############################################################
-SPEED_NORMAL  = 10.0   # [2026-08-17f] 3.0 → 10.0(요청 반영, 저속 재튜닝 검증 완료 후 증속). 이 값이
+SPEED_NORMAL  = 15.0   # [2026-08-17g] 10.0 → 15.0(요청 반영, 증속). 이 값이 바뀌면
+                        #   PP_LOOKAHEAD_MAX_PX(§0.5.6/§0.5.10 공식: BASE+GAIN*SPEED_NORMAL)도
+                        #   반드시 같이 재계산할 것 — 아래에서 150.0으로 갱신함.
+                        # [2026-08-17f] 3.0 → 10.0(요청 반영, 저속 재튜닝 검증 완료 후 증속). 이 값이
                         #   바뀌면 PP_LOOKAHEAD_MAX_PX(§0.5.6/§0.5.10 공식: BASE+GAIN*SPEED_NORMAL)도
-                        #   반드시 같이 재계산할 것 — 아래에서 130.0으로 갱신함. SPEED_CORNER_MIN(5.0) 등
+                        #   반드시 같이 재계산할 것 — 아래에서 130.0으로 갱신함. SPEED_CORNER_MIN 등
                         #   "즉시 cap" 계열 하한값은 모터 데드존 등 물리적 근거로 고정된 값이라 이번엔
                         #   일부러 비례 조정하지 않았다(README §0.5.10 참고) — 실차에서 코너 진입/탈출
                         #   속도 급변이 과하게 느껴지면 그때 올릴 것.
@@ -102,7 +105,13 @@ SPEED_STOP    = 0.0
 #   올렸다가, 이후 5.0으로 재상향(요청 반영) — 데드존 대비 여유를 더 두어 코너에서도 확실히
 #   전진하도록 함. SPEED_NORMAL이 25.0으로 오른 만큼 최고/최저 속도 폭이 넓어졌으니, 코너
 #   진입/탈출 시 속도 급변이 과하게 느껴지면 이 값을 올리는 쪽으로 완화할 것.
-SPEED_CORNER_MIN = 5.0
+# [2026-08-17g] 5.0 → 10.0(요청 반영, SPEED_NORMAL 15.0 증속과 함께 코너 속도도 상향).
+#   ★주의★ 이전엔 SPEED_NORMAL=3.0 구간에서 이 값이 SPEED_NORMAL보다 커서 코너 감속
+#   ([[project-track-drive-speed10-change]] 메모 참고)이 사실상 no-op이었던 이력이 있다 —
+#   SPEED_NORMAL(15.0) > SPEED_CORNER_MIN(10.0) 관계는 유지되므로 이번엔 그 문제가 재현되진
+#   않지만, 코너 감속 폭(15→10, 33%)이 이전(10→5, 50%)보다 완만해졌다는 점은 실차에서
+#   코너 진입 느낌으로 확인할 것 — 부족하면 이 값을 다시 낮출 것.
+SPEED_CORNER_MIN = 10.0
 # [2026-08-10] DL_CENTER_MODE='ll'에서 노란선/흰선 중 하나를 저신뢰 추정(간격 기반
 #   재구성 또는 잔상)으로 메운 프레임의 속도 상한 — perception/dl_lane.py
 #   DLSlideWindow.ll_degraded 플래그가 True면 _lane_drive()가 이 값으로 강제 제한한다
@@ -451,7 +460,22 @@ DL_DA_SKIP_LL_CLIP = True
 #   구간에서 침식이 과해 da가 DL_DA_MIN_COMPONENT_AREA 밑으로 꺼지면(=그 프레임 무효
 #   처리) 실차에서 확인 후 DL_DA_VEHICLE_MARGIN_M을 낮출 것. 실차 미검증 초기값.
 DL_DA_APPLY_VEHICLE_MARGIN = True
-DL_DA_VEHICLE_MARGIN_M = 0.05   # ASTAR_VEHICLE_MARGIN_M(라이다/Hybrid A* 쪽)과 동일 관례
+DL_DA_VEHICLE_MARGIN_M = 0.05   # ASTAR_VEHICLE_MARGIN_M(라이다/Hybrid A* 쪽)과 동일 관례 — 좌우 마진
+
+# [2026-08-17g] 위 DL_DA_VEHICLE_MARGIN_M(+VEHICLE_WIDTH_M/2)은 좌/우/전/후 모두 같은 반경으로
+#   침식하는 등방(isotropic) 원형 커널이라, 방해차량 뒤쪽(=지나간 뒤 재진입하는 da 영역)도
+#   좌우와 똑같은 폭만큼만 벌어져 있었다(질문 확인 결과 — _apply_vehicle_margin()이
+#   cv2.MORPH_ELLIPSE를 정사각형(반경 동일)으로 만들어 씀). 속도가 높을수록 접근 상대속도가
+#   커져 "앞코가 장애물 뒷꽁지를 긁는" 여유가 더 필요하다는 요청 반영 — da 마스크의 세로축
+#   (BEV 캔버스 row, DL_BEV_FAR_CROP_ROW 주석 참고: row가 작을수록 원거리=전방, 클수록
+#   근거리=차량 쪽)이 곧 진행방향이므로, 세로 반경만 v_mps에 비례해 더 키운다(가로=좌우 폭은
+#   DL_DA_VEHICLE_MARGIN_M 그대로). extra_m = min(DL_DA_REAR_MARGIN_REACT_SEC * v_mps,
+#   DL_DA_REAR_MARGIN_MAX_M) — REACT_SEC은 "제동/재계획까지 걸리는 시간"의 근사치로 삼은
+#   설계값(실측 아님), 단위가 s인 게 자연스럽도록 "속도(m/s) × 시간(s) = 거리(m)"로 뒀다.
+#   MAX_M은 da가 통째로 침식돼 사라지는 걸(§2.30, _apply_vehicle_margin() 폴백 참고) 막는 상한.
+#   실차 미검증 초기값 — 코너에서 da가 자주 무효 처리되면 REACT_SEC/MAX_M을 낮출 것.
+DL_DA_REAR_MARGIN_REACT_SEC = 0.2   # 속도(v_mps)에 비례해 "뒤" 방향 마진을 추가로 늘리는 반응시간(s)
+DL_DA_REAR_MARGIN_MAX_M = 0.5       # 위 추가 마진의 상한(m) — 대략 VEHICLE_LENGTH_M(0.64) 이내로 캡
 
 # ── [2026-08-14] 회피 "복귀 유예"(avoid-hold) — DL_CENTER_MODE='da' 전용 (README §2.32) ──
 #   위 안전마진 침식은 da에 뚫린 장애물 구멍 주변을 자연스럽게 우회하게 만들 뿐, "언제
@@ -734,7 +758,8 @@ PP_LOOKAHEAD_SPEED_GAIN = 4.0      # 속도가 오를수록 lookahead를 늘리�
 # [2026-08-17f] SPEED_NORMAL 3.0→10.0 증속에 맞춰 같은 공식으로 재계산: BASE(90) + GAIN(4)*10 = 130.
 #   190(구 SPEED_NORMAL=25 기준)을 그대로 둬도 130<190이라 당장 클리핑되진 않지만, §0.5.6이 정한 관례
 #   (상한 = BASE+GAIN*현재 SPEED_NORMAL)를 그대로 따름 — 실차 재검증 필요.
-PP_LOOKAHEAD_MAX_PX = 130.0        # lookahead 상한
+# [2026-08-17g] SPEED_NORMAL 10.0→15.0 증속에 맞춰 같은 공식으로 재계산: BASE(90) + GAIN(4)*15 = 150.
+PP_LOOKAHEAD_MAX_PX = 150.0        # lookahead 상한
 PP_LOOKAHEAD_CURVATURE_GAIN = 100.0  # 직전 프레임 curvature가 클수록(코너) lookahead를 줄이는 게인
 PP_LOOKAHEAD_MIN_PX = 40.0         # 코너에서 lookahead가 줄어들 수 있는 하한
 # [2026-08-06] "곡률→조향각" 게인(pure_pursuit.py의 steer_deg = atan(curvature*wheelbase_px)).

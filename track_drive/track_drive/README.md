@@ -359,6 +359,15 @@ PP_LOOKAHEAD_SPEED_GAIN*speed` 공식의 설계 관례(상한 = BASE+GAIN*현재
 실차 재검증 전 — 특히 코너 감속이 이제 실제로 걸리기 시작하므로, 3.0 저속 검증 때는 안 보였던 코너
 진입/탈출 거동을 새로 확인할 것.
 
+### 0.5.11 증속(`SPEED_NORMAL` 10.0→15.0) + 코너 속도(`SPEED_CORNER_MIN` 5.0→10.0) 상향 (2026-08-17)
+요청 반영으로 재증속. §0.5.10과 동일 관례로 `PP_LOOKAHEAD_MAX_PX`를 90+4*15=150으로 재계산했다.
+이번엔 §0.5.10에서 "비례 조정하지 않는다"고 못박았던 `SPEED_CORNER_MIN`도 요청으로 5.0→10.0 상향—
+`SPEED_NORMAL(15.0) > SPEED_CORNER_MIN(10.0)` 관계는 유지되므로 §0.5.10에서 겪은 "floor가 항상 이겨
+코너 감속이 죽어있는" 문제는 재현되지 않지만, 코너 감속 폭이 15→10(33%)로 이전(10→5, 50%)보다
+완만해졌다는 점은 실차에서 코너 진입 느낌으로 확인할 것. `SPEED_LL_DEGRADED`/`SPEED_LANE_STALE`/
+`SPEED_AVOID_HOLD_BLOCKED`(전부 5.0)는 이번에도 요청받지 않아 그대로 뒀다 — §0.5.10이 설명한 대로
+`SPEED_CORNER_MIN`과 의미가 다른 독립 상수라 같이 올릴 필요는 없다(config.py 상단 주석 참고).
+
 ---
 
 ## 1. 신호등 (S0 출발 / S2 교차로) — 통합 4구 신호등
@@ -651,6 +660,26 @@ BL=[60,333], 원본 640px 프레임 기준)을 찍어보면 근거리 변(BL–B
   자동 재계산되지만, 그 4점이 애초에 정확한지(카메라가 차량 중심에 마운트됐는지, 백선이 실제
   도로 중앙선 기준으로 평행한지)는 이 수정으로 검증되지 않는다 — 여전히 "실측 4점이 맞다"는
   전제 위에서의 기하 보정일 뿐이다.
+
+### 2.38 da 안전마진(§2.30) 등방 → 속도비례 비등방(세로만) 확장 + `dl_lane` 창 yellow 패널 → 속도 패널 (2026-08-17)
+"방해차량의 좌우 마진과 뒤 마진이 같은가"라는 질문에서 출발 — 확인 결과 §2.30의 `_apply_vehicle_margin()`
+침식 커널이 `cv2.MORPH_ELLIPSE`를 정사각형(가로반경=세로반경=`VEHICLE_WIDTH_M/2+DL_DA_VEHICLE_MARGIN_M`)
+으로 만들어 써서, 좌우와 전/후("방해차량 뒤" 포함) 마진이 항상 같은 값이었다(등방). 요청 반영으로
+세로(진행방향, BEV 캔버스 row축) 반경만 현재 속도(`v_mps`)에 비례해 추가로 늘리도록 변경 —
+`_dl_da_margin_kernel(v_mps)`(`perception/dl_lane.py`)가 `extra_m = min(DL_DA_REAR_MARGIN_REACT_SEC *
+v_mps, DL_DA_REAR_MARGIN_MAX_M)`만큼 세로 반경만 키운 타원 커널을 매 프레임 새로 만든다(가로=좌우는
+`DL_DA_VEHICLE_MARGIN_M` 그대로, 속도와 무관). `DL_DA_REAR_MARGIN_REACT_SEC=0.2`/`MAX_M=0.5`는 둘 다
+설계값(실측 아님) — config.py 주석 참고. `v_mps`는 `track_drive.py`가 매 틱
+`lane_detector.set_speed(self.v_mps)`로 넘기고(`set_avoid_hold()`와 동일한 락+워커 전달 관례),
+`DLSlideWindow.detect(..., v_mps=...)` → `_apply_vehicle_margin(da_mask, v_mps)`로 흘러간다.
+
+같은 요청에서 `dl_lane` 디버그 창(`show_debug_windows()`) 맨 아래 노란선(yellow) 전용 패널도 제거하고
+같은 자리에 현재 속도 + 직진/커브대응 상태(`is_straight`, §0.5.10d와 동일 텍스트/색)를 표시하도록
+바꿨다 — 노란선 자체는 result 패널에 이미 오버레이로 보이므로 정보 손실은 없다.
+
+**실차 미검증** — `DL_DA_REAR_MARGIN_REACT_SEC`/`MAX_M`은 첫 추정치. 코너에서 da가 §2.30이 이미 갖고
+있던 "과침식 시 원본 폴백"에 자주 걸리면(=da가 자주 무효 처리되면) 두 값을 낮출 것. §0.5.11의
+`SPEED_NORMAL=15.0` 증속과 함께 실차에서 같이 검증 필요.
 
 ---
 
