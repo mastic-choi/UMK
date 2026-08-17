@@ -744,8 +744,25 @@ FPS_LOG_PERIOD_SEC = 5.0   # dl_lane.py 워커 스레드 FPS/provider 로그 주
 # ── Pure Pursuit 튜닝값 (controller/pure_pursuit.py PurePursuitController) ──
 #   전부 실차 미검증 튜닝값. 각 값의 설계 배경은 pure_pursuit.py __init__ 상단
 #   주석 참고 — 여기는 "현재 적용값"만 모아둔다.
-PP_LOOKAHEAD_BASE_PX = 90.0        # lookahead 하한(직진/저속 기준값)
-PP_LOOKAHEAD_SPEED_GAIN = 4.0      # 속도가 오를수록 lookahead를 늘리는 게인
+# [2026-08-17h] 아래 14개 PP_* 값 전부 `pp_tune_gridsearch.py --speeds 15.0 10.0 --samples 400
+#   --seed 0`(SPEED_NORMAL=15.0/SPEED_CORNER_MIN=10.0 재증속 후 재실행, §0.5.11)의 speed=15.0
+#   best_params로 일괄 교체(요청 반영: "그리드서치 돌려서 파라미터가 적당한지 판단"). 직진은
+#   baseline도 이미 최적(cte_rms 0.6cm, 직진태그 100%)이었지만, 90도커브/S자커브는
+#   baseline cte_rms 7~9cm → best 1~1.6cm로 개선됨(score 24.37→3.53) — 특히 PP_WHEELBASE_PX가
+#   25.0→49.64로 거의 2배가 되면서 조향 게인 부족(atan(curvature*wheelbase_px))이 커브
+#   추종 오차의 가장 큰 원인이었던 것으로 나타남. 이제 이 14개 값은 더 이상 "PP_LOOKAHEAD_MAX_PX
+#   = BASE+GAIN*SPEED_NORMAL" 같은 개별 공식 관계를 만족하지 않는다 — 그리드서치가 14개를
+#   각각 독립적으로 샘플링한 조합이기 때문(§0.5.6~§0.5.11이 지켜온 수식 관례는 여기서부터 끊김,
+#   SPEED_NORMAL을 또 바꿀 땐 그 수식이 아니라 이 그리드서치를 다시 돌릴 것).
+#   ★★★ 실차 완전 미검증 ★★★ — pp_tune_gridsearch.py 자체가 화이트박스 합성 시뮬레이션(노이즈
+#   1.5px 가정, 트랙 곡률 반경 1.2~1.3m 가정 등 전부 설계값)이고, PP_WHEELBASE_PX는 과거
+#   저속(SPEED_NORMAL=3.0)에서 이보다 낮은 값(25.0)이 "진동 감소"로 실차 검증된 이력이 있다
+#   (아래 개별 주석 참고) — 이번 상향이 새 속도(15.0)에서도 진동을 안 키우는지 실차에서
+#   반드시 먼저 확인할 것. 문제 생기면 이 커밋 이전 값(BASE=90/GAIN=4/MAX=150/WHEELBASE=25/
+#   ALPHA=0.8/MIN_LOOKAHEAD=90/DEADZONE=6/CURV_GAIN=100/LOOKAHEAD_MIN=40/EPS=0.0035/
+#   CONFIRM=5/STRAIGHT_DEADZONE=20/STRAIGHT_ALPHA=0.4/BIAS_EMA=0.15)으로 되돌릴 것.
+PP_LOOKAHEAD_BASE_PX = 65.26       # lookahead 하한(직진/저속 기준값) — 90.0→65.26(그리드서치)
+PP_LOOKAHEAD_SPEED_GAIN = 3.305    # 속도가 오를수록 lookahead를 늘리는 게인 — 4.0→3.305(그리드서치)
 # [2026-08-07] 150 → 190. speed_lookahead_px = BASE + GAIN*speed 공식이 SPEED_NORMAL=5
 #   기준(90+4*5=110)으로 설계됐는데(pure_pursuit.py __init__ 주석), SPEED_NORMAL이 이후
 #   25까지 오르면서(config.py 상단 SPEED_NORMAL 주석) 이론상 필요한 lookahead(90+4*25=190)가
@@ -759,9 +776,11 @@ PP_LOOKAHEAD_SPEED_GAIN = 4.0      # 속도가 오를수록 lookahead를 늘리�
 #   190(구 SPEED_NORMAL=25 기준)을 그대로 둬도 130<190이라 당장 클리핑되진 않지만, §0.5.6이 정한 관례
 #   (상한 = BASE+GAIN*현재 SPEED_NORMAL)를 그대로 따름 — 실차 재검증 필요.
 # [2026-08-17g] SPEED_NORMAL 10.0→15.0 증속에 맞춰 같은 공식으로 재계산: BASE(90) + GAIN(4)*15 = 150.
-PP_LOOKAHEAD_MAX_PX = 150.0        # lookahead 상한
-PP_LOOKAHEAD_CURVATURE_GAIN = 100.0  # 직전 프레임 curvature가 클수록(코너) lookahead를 줄이는 게인
-PP_LOOKAHEAD_MIN_PX = 40.0         # 코너에서 lookahead가 줄어들 수 있는 하한
+# [2026-08-17h] 위 PP_LOOKAHEAD_BASE_PX/SPEED_GAIN 주석 참고 — 이제부터는 공식이 아니라
+#   그리드서치 독립 샘플값이라 90+4*15와 무관하게 180.7로 교체.
+PP_LOOKAHEAD_MAX_PX = 180.7        # lookahead 상한 — 150.0→180.7(그리드서치)
+PP_LOOKAHEAD_CURVATURE_GAIN = 224.8  # 직전 프레임 curvature가 클수록(코너) lookahead를 줄이는 게인 — 100.0→224.8(그리드서치)
+PP_LOOKAHEAD_MIN_PX = 62.61        # 코너에서 lookahead가 줄어들 수 있는 하한 — 40.0→62.61(그리드서치)
 # [2026-08-06] "곡률→조향각" 게인(pure_pursuit.py의 steer_deg = atan(curvature*wheelbase_px)).
 #   원래 80.0은 "실제 축거리 대신 쓰는" 임의 튜닝값이었다(pure_pursuit.py 상단 주석: "카메라
 #   픽셀→미터 변환이 아직 실측 전이라 wheelbase_px를 대신 쓴다, PIXELS_PER_METER가 실측되면
@@ -774,7 +793,12 @@ PP_LOOKAHEAD_MIN_PX = 40.0         # 코너에서 lookahead가 줄어들 수 있
 #   경험적으로 맞춰졌을 가능성이 있어(다른 근사 오차를 상쇄했을 수도 있음), 67.0로 바꾸면
 #   같은 curvature에도 조향각이 더 작게(atan 인자가 작아짐) 나와 코너링이 더 완만해질 수
 #   있다 — 너무 밋밋하게 느껴지면 이 값을 다시 올릴 것(단, 그때는 "튜닝값"임을 주석에 남길 것).
-PP_WHEELBASE_PX = 25.0             # [2026-08-13] 67.0 → 40.0 → 25.0(요청 반영, 튜닝값 — 조향을 더
+PP_WHEELBASE_PX = 49.64            # [2026-08-17h] 25.0→49.64(그리드서치) — 커브 추종 오차(cte_rms
+                                    #   7~9cm→1~1.6cm)를 가장 크게 줄인 값. ★주의★ 아래 [2026-08-13]
+                                    #   이력대로 25.0은 SPEED_NORMAL=3.0 저속에서 "진동 감소" 목적으로
+                                    #   실차 검증된 값이었다 — 이번 상향이 새 속도에서 진동을 다시
+                                    #   키우는지 최우선으로 실차 확인할 것(위 PP_* 블록 상단 주석 참고).
+                                    # [2026-08-13] 67.0 → 40.0 → 25.0(요청 반영, 튜닝값 — 조향을 더
                                     #   줄이는 방향). atan(curvature*wheelbase_px) 공식상 값이 작을수록
                                     #   같은 curvature에도 조향각이 더 작게 나옴(반응 약화) — 실차 재검증 필요.
                                     # 원래 = WHEELBASE_M(0.335) * DL_PIXELS_PER_METER(200) 실측 기반 계산값(67.0)
@@ -796,8 +820,9 @@ PP_WHEELBASE_PX = 25.0             # [2026-08-13] 67.0 → 40.0 → 25.0(요청 
 #   — corner_lag/scurve_amp_ratio 기준). 직진 잡음 억제는 더 이상 이 값이 아니라
 #   PP_STRAIGHT_ALPHA + PP_STRAIGHT_DEADZONE_PX + 아래 편향감지(bias EMA) 조합이 담당한다.
 #   실차 미검증 — 화이트박스 합성 시뮬레이션 결과이므로 실차 재검증 필수.
-PP_ALPHA = 0.8                     # 프레임간 조향각 저역통과 필터(1=필터없음, 0=반응없음) — "코너/S자"(비직진) 상태 전용
-PP_MIN_LOOKAHEAD_PX = 90.0         # curvature 분모(ld) 바닥값 — 노이즈 증폭 방지용. PP_LOOKAHEAD_MIN_PX와 다른 값이니 헷갈리지 말 것
+# [2026-08-17h] 0.8→0.5244(그리드서치, PP_WHEELBASE_PX 상향과 함께 재탐색된 조합).
+PP_ALPHA = 0.5244                  # 프레임간 조향각 저역통과 필터(1=필터없음, 0=반응없음) — "코너/S자"(비직진) 상태 전용
+PP_MIN_LOOKAHEAD_PX = 86.95        # curvature 분모(ld) 바닥값 — 노이즈 증폭 방지용. PP_LOOKAHEAD_MIN_PX와 다른 값이니 헷갈리지 말 것. 90.0→86.95(그리드서치)
 # [2026-08-12] 6.0 → 15.0. 직진 진동 대응 세 번째 레버 — 원래 값이 중앙 부근 잔떨림을
 #   죽이기엔 너무 작아서(픽셀 몇 개짜리 노이즈도 그대로 통과) 직진에서도 매 프레임 미세한
 #   조향이 나갔던 것으로 추정. LANE_DEADZONE(구 PID 전용, 40px)보다는 여전히 훨씬 작게
@@ -809,7 +834,8 @@ PP_MIN_LOOKAHEAD_PX = 90.0         # curvature 분모(ld) 바닥값 — 노이�
 # [2026-08-17c] PP_ALPHA와 같은 이유로 의미가 "코너/S자(비직진) 상태 전용"으로 좁혀졌다 —
 #   직진 잡음 억제는 PP_STRAIGHT_DEADZONE_PX가 담당하므로, 이 값은 이제 코너/S자 추종
 #   반응성 쪽으로 다시 낮췄다(12.0 → 6.0, 그리드서치 상위권 조합). 실차 미검증.
-PP_DX_DEADZONE_PX = 6.0            # 이 이하 픽셀오차는 0으로 죽여 중앙 부근 잔떨림 제거 — "코너/S자"(비직진) 상태 전용
+# [2026-08-17h] 6.0→4.445(재증속 후 재실행한 그리드서치, pp_tune_gridsearch.py).
+PP_DX_DEADZONE_PX = 4.445          # 이 이하 픽셀오차는 0으로 죽여 중앙 부근 잔떨림 제거 — "코너/S자"(비직진) 상태 전용
 
 # [2026-08-17] 명시적 "직진 모드"(README §0.5.9) — 지금까지의 진동 억제(PP_ALPHA/
 #   PP_DX_DEADZONE_PX)는 전부 "연속값을 더 세게 누르는" 방식이라 코너 반응성과 항상
@@ -828,9 +854,10 @@ PP_DX_DEADZONE_PX = 6.0            # 이 이하 픽셀오차는 0으로 죽여 �
 #   "거의 직진"으로 불렸다는 걸 기준 삼아 0.0035로 3.5배 완화 — 해제는 여전히 즉시(단일
 #   프레임 디바운스 없음)라 실제 코너 진입 반응성엔 영향 없다(위 PP_STRAIGHT_CONFIRM_FRAMES
 #   주석 참고). 실차 재검증 필요.
-PP_STRAIGHT_CURVATURE_EPS = 0.0035  # 이 미만이면 "사실상 직진"(회전반경 환산 시 약 286px 이상)
-PP_STRAIGHT_CONFIRM_FRAMES = 5      # 연속 이 프레임 수만큼 유지돼야 직진 확정(20Hz 기준 0.25초). 해제는 즉시(디바운스 없음) — 코너 진입 반응이 늦어지면 안 되므로
-PP_STRAIGHT_DEADZONE_PX = 20.0      # 직진 확정 중에만 적용하는 넓은 데드존 — PP_DX_DEADZONE_PX보다 커야 함
+# [2026-08-17h] 셋 다 pp_tune_gridsearch.py 재실행(SPEED_NORMAL=15.0) 결과로 교체.
+PP_STRAIGHT_CURVATURE_EPS = 0.003283  # 이 미만이면 "사실상 직진" — 0.0035→0.003283(그리드서치)
+PP_STRAIGHT_CONFIRM_FRAMES = 10       # 연속 이 프레임 수만큼 유지돼야 직진 확정(20Hz 기준 0.5초, 5→10). 해제는 즉시(디바운스 없음) — 코너 진입 반응이 늦어지면 안 되므로
+PP_STRAIGHT_DEADZONE_PX = 21.64       # 직진 확정 중에만 적용하는 넓은 데드존 — PP_DX_DEADZONE_PX보다 커야 함. 20.0→21.64(그리드서치)
 
 # [2026-08-17c] "직진(A)/코너+S자(B) 2상태 분기" 확장 — 원래 직진모드는 PP_DX_DEADZONE_PX
 #   하나만 넓혔는데(위), PP_ALPHA(저역통과)도 직진과 코너/S자가 원하는 값이 정반대라는 게
@@ -838,7 +865,10 @@ PP_STRAIGHT_DEADZONE_PX = 20.0      # 직진 확정 중에만 적용하는 넓�
 #   그래서 직진 확정 중에는 PP_ALPHA 대신 이 값을 쓴다(pure_pursuit.py control()의
 #   filter_alpha 분기). PP_WHEELBASE_PX는 두 상태 그리드서치에서 공통으로 25.0을
 #   선호해 굳이 분리하지 않았다. 실차 미검증 — 화이트박스 합성 시뮬레이션 추정치.
-PP_STRAIGHT_ALPHA = 0.4             # 직진 확정 중 조향각 저역통과 필터 — PP_ALPHA보다 낮게(강한 필터)
+# [2026-08-17h] 0.4→0.5096(그리드서치 재실행) — 더 이상 "PP_ALPHA(0.8)보다 낮게"가 아니게
+#   됐다(PP_ALPHA 자체도 0.5244로 낮아짐, 둘이 거의 같은 값) — 직진/코너 필터 차등 자체는
+#   유지되지만 격차가 좁혀졌다는 뜻.
+PP_STRAIGHT_ALPHA = 0.5096          # 직진 확정 중 조향각 저역통과 필터
 
 # [2026-08-17c] "코너 탈출 직후 살짝 틀어진 채 직진 진입" 대응 — 위 PP_STRAIGHT_DEADZONE_PX
 #   (넓은 데드존)는 곡률만 보고 확정되므로, 곡률은 0인데 dx만 한쪽으로 계속 쏠려있는
@@ -847,7 +877,9 @@ PP_STRAIGHT_ALPHA = 0.4             # 직진 확정 중 조향각 저역통과 �
 #   보고 곡률 조건과 무관하게 직진확정을 해제한다(pure_pursuit.py __init__/control() 상단
 #   주석 참고). 실차 미검증 첫 구현 — 편향 회복이 너무 느리면 이 값을 올릴 것(반응은
 #   빨라지지만 노이즈에도 더 민감해짐).
-PP_STRAIGHT_BIAS_EMA_ALPHA = 0.15
+# [2026-08-17h] 0.15→0.06785(그리드서치 재실행) — 편향 감지가 더 느려짐(반응은 느려지지만
+#   노이즈에는 덜 민감).
+PP_STRAIGHT_BIAS_EMA_ALPHA = 0.06785
 
 # ── 차량 물리 상수 ──
 # [2026-08-14] 옛 이름 LQR_WHEELBASE_M → WHEELBASE_M. LQR 컨트롤러 제거로 "LQR 전용"이

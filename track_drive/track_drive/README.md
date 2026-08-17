@@ -368,6 +368,43 @@ PP_LOOKAHEAD_SPEED_GAIN*speed` 공식의 설계 관례(상한 = BASE+GAIN*현재
 `SPEED_AVOID_HOLD_BLOCKED`(전부 5.0)는 이번에도 요청받지 않아 그대로 뒀다 — §0.5.10이 설명한 대로
 `SPEED_CORNER_MIN`과 의미가 다른 독립 상수라 같이 올릴 필요는 없다(config.py 상단 주석 참고).
 
+### 0.5.12 `pp_tune_gridsearch.py` 재실행(SPEED_NORMAL=15.0) → PP_* 14개 값 일괄 교체 (2026-08-17)
+"그리드서치 돌려서 우리 파라미터값이 적당한지 판단"이라는 요청으로 `pp_tune_gridsearch.py --speeds
+15.0 10.0 --samples 400 --seed 0`을 실행. 결과: 직진은 baseline(§0.5.9~11 값)도 이미 최적(cte_rms
+0.6cm, 직진태그 100%)이었지만, 90도커브/S자커브는 cte_rms가 baseline 7~9cm에서 best 1~1.6cm로
+크게 개선됨(score 24.37→3.53 @speed=15, 19.08→4.86 @speed=10=SPEED_CORNER_MIN). 사용자 확인 후
+best_params(speed=15 기준) 14개를 전부 config.py에 반영:
+
+| 파라미터 | 이전 | 신규 |
+|---|---|---|
+| `PP_LOOKAHEAD_BASE_PX` | 90.0 | 65.26 |
+| `PP_LOOKAHEAD_SPEED_GAIN` | 4.0 | 3.305 |
+| `PP_LOOKAHEAD_MAX_PX` | 150.0 | 180.7 |
+| `PP_LOOKAHEAD_CURVATURE_GAIN` | 100.0 | 224.8 |
+| `PP_LOOKAHEAD_MIN_PX` | 40.0 | 62.61 |
+| `PP_WHEELBASE_PX` | 25.0 | 49.64 |
+| `PP_ALPHA` | 0.8 | 0.5244 |
+| `PP_MIN_LOOKAHEAD_PX` | 90.0 | 86.95 |
+| `PP_DX_DEADZONE_PX` | 6.0 | 4.445 |
+| `PP_STRAIGHT_CURVATURE_EPS` | 0.0035 | 0.003283 |
+| `PP_STRAIGHT_CONFIRM_FRAMES` | 5 | 10 |
+| `PP_STRAIGHT_DEADZONE_PX` | 20.0 | 21.64 |
+| `PP_STRAIGHT_ALPHA` | 0.4 | 0.5096 |
+| `PP_STRAIGHT_BIAS_EMA_ALPHA` | 0.15 | 0.06785 |
+
+가장 큰 기여는 `PP_WHEELBASE_PX`(25→49.64, 거의 2배) — `atan(curvature*wheelbase_px)` 조향 게인
+부족이 커브 추종 오차의 주 원인으로 나타남. **§0.5.6~§0.5.11이 지켜온 "PP_LOOKAHEAD_MAX_PX =
+BASE+GAIN*SPEED_NORMAL" 수식 관례는 여기서부터 끊긴다** — 그리드서치가 14개 값을 각각 독립
+샘플링한 조합이라 더 이상 그 공식이 성립하지 않는다. `SPEED_NORMAL`을 또 바꿀 땐 수식 재계산이
+아니라 이 그리드서치를 다시 돌릴 것.
+
+**★★★ 실차 완전 미검증 ★★★** — `pp_tune_gridsearch.py`는 화이트박스 합성 시뮬레이션(세그멘테이션
+잡음 1.5px 가정, 트랙 곡률 반경 1.2~1.3m 가정 등 전부 설계값, 스크립트 상단 주석 참고)이고,
+`PP_WHEELBASE_PX`는 과거 저속(`SPEED_NORMAL=3.0`) 구간에서 이보다 낮은 값(25.0)이 "진동(와리가리)
+감소" 목적으로 이미 실차 검증된 이력이 있다(§0.5.7, config.py `PP_WHEELBASE_PX` 2026-08-13 주석) —
+이번 상향이 새 속도(15.0)에서 그 진동을 다시 키우는지가 최우선 실차 확인 대상이다. 문제가 생기면
+config.py `PP_*` 블록 상단 주석에 남겨둔 "이 커밋 이전 값"으로 되돌릴 것.
+
 ---
 
 ## 1. 신호등 (S0 출발 / S2 교차로) — 통합 4구 신호등
