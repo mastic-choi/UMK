@@ -765,6 +765,16 @@ PP_MIN_LOOKAHEAD_PX = 90.0         # curvature 분모(ld) 바닥값 — 노이�
 #   "데드존이 너무 크면 완만한 조향까지 죽는다" 우려와 절충한 값이다. 실차 재검증 필요.
 PP_DX_DEADZONE_PX = 12.0           # 이 이하 픽셀오차는 0으로 죽여 중앙 부근 잔떨림 제거
 
+# [2026-08-17] 명시적 "직진 모드"(README §0.5.9) — 지금까지의 진동 억제(PP_ALPHA/
+#   PP_DX_DEADZONE_PX)는 전부 "연속값을 더 세게 누르는" 방식이라 코너 반응성과 항상
+#   트레이드오프였다. probe_curvature(코너 판단 신호, pure_pursuit.py control())가 연속
+#   PP_STRAIGHT_CONFIRM_FRAMES 프레임 동안 이 값 미만이면 "직진 확정" 상태로 보고, 그
+#   동안만 데드존을 PP_STRAIGHT_DEADZONE_PX로 넓힌다 — 코너 중엔 이 조건 자체가 안
+#   걸리므로 코너 추종 감도는 그대로다. 셋 다 실차 미검증 첫 추정치.
+PP_STRAIGHT_CURVATURE_EPS = 0.001   # 이 미만이면 "사실상 직진"(회전반경 환산 시 약 1000px 이상)
+PP_STRAIGHT_CONFIRM_FRAMES = 5      # 연속 이 프레임 수만큼 유지돼야 직진 확정(20Hz 기준 0.25초). 해제는 즉시(디바운스 없음) — 코너 진입 반응이 늦어지면 안 되므로
+PP_STRAIGHT_DEADZONE_PX = 20.0      # 직진 확정 중에만 적용하는 넓은 데드존 — PP_DX_DEADZONE_PX보다 커야 함
+
 # ── 차량 물리 상수 ──
 # [2026-08-14] 옛 이름 LQR_WHEELBASE_M → WHEELBASE_M. LQR 컨트롤러 제거로 "LQR 전용"이
 #   아니라 EncoderPoseEstimator(localization/pose_estimator.py)가 쓰는 일반 차량 상수임을

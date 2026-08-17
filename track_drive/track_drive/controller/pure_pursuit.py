@@ -36,7 +36,8 @@ class PurePursuitController:
     def __init__(self, lookahead_base_px=90.0, lookahead_speed_gain=4.0, lookahead_max_px=150.0,
                  wheelbase_px=67.0, angle_max_deg=100.0, alpha=0.5,
                  min_lookahead_px=90.0, dx_deadzone_px=6.0, lookahead_curvature_gain=100.0,
-                 lookahead_min_px=40.0):
+                 lookahead_min_px=40.0, straight_curvature_eps=0.001,
+                 straight_confirm_frames=5, straight_deadzone_px=20.0):
         # [2026-08-05, 속도 적응형 lookahead — 1차 시도 후 수정]
         #   curvature ≈ 2*dx/ld^2 (작은각 근사)라서 ld가 짧을수록 같은 dx도 1/ld^2로
         #   증폭된다. 처음엔 PythonRobotics/Autoware 관례(Ld=k*v+Lfc, 저속일수록 lookahead도
@@ -93,6 +94,20 @@ class PurePursuitController:
         #   값을 쓴다 — Pure Pursuit은 목표점 자체가 이미 lookahead 앞의 실제 경로점이라
         #   LANE_DEADZONE만큼 크게 죽이면 완만한 커브 진입까지 무시하게 된다. 실차 미검증.
         self.dx_deadzone_px = dx_deadzone_px
+
+        # [2026-08-17] 명시적 "직진 모드"(README §0.5.9) — 위 dx_deadzone_px는 매 프레임
+        #   고정폭이라 코너 반응성과 항상 트레이드오프였다. damp_curvature(아래 control()의
+        #   probe_curvature/IMU curvature 중 큰 쪽 — 이미 §0.5.5에서 코너 감쇠에 쓰던 신호를
+        #   재사용, 새 신호 추가 아님)가 straight_curvature_eps 미만인 프레임이
+        #   straight_confirm_frames 연속되면 self.is_straight=True로 확정하고, 그 동안만
+        #   dx_deadzone_px 대신 straight_deadzone_px(더 넓음)를 써서 잔떨림을 더 세게
+        #   죽인다. 코너 중엔 damp_curvature가 커서 이 조건 자체가 안 걸리므로 코너 추종
+        #   감도는 그대로다. 해제는 즉시(디바운스 없음) — 코너 진입 반응이 늦어지면 안 됨.
+        self.straight_curvature_eps = straight_curvature_eps
+        self.straight_confirm_frames = straight_confirm_frames
+        self.straight_deadzone_px = straight_deadzone_px
+        self._straight_frames = 0
+        self.is_straight = False
 
         # "곡률→조향각" 게인. 표준 Pure Pursuit 공식 steer = atan(2*L*sin(alpha)/Ld)에서
         # L 자리에 들어간다 — 크게 잡을수록 같은 곡률에도 조향각이 커진다(더 공격적).
@@ -163,6 +178,8 @@ class PurePursuitController:
         self.last_target_xy = None
         self.last_lookahead_px = None
         self.last_imu_curvature_px = None
+        self._straight_frames = 0
+        self.is_straight = False
 
     def _target_point(self, path, vehicle_xy, lookahead_px):
         """path를 따라 vehicle_xy로부터 누적 호길이가 lookahead_px를 넘는 첫 지점을
@@ -195,7 +212,8 @@ class PurePursuitController:
            반환 : 조향각(도), ±angle_max_deg로 클램프.
            호출 후 self.held로 이번 호출이 "새로 계산"(False)했는지 "직전값 유지"(True)
            했는지, self.last_curvature로 이번(혹은 마지막 유효) curvature를 확인할 수
-           있다(디버그 창/코너 감속용)."""
+           있다(디버그 창/코너 감속용). self.is_straight로 명시적 직진 모드(§0.5.9)가
+           확정 중인지도 확인 가능하다."""
         if not path:
             self.held = True
             return self.prev_steer_deg
@@ -230,6 +248,17 @@ class PurePursuitController:
             damp_curvature = max(damp_curvature, abs(imu_curvature_px))
         self.last_imu_curvature_px = imu_curvature_px
         curvature_damp = 1.0 / (1.0 + self.lookahead_curvature_gain * damp_curvature)
+
+        # [2026-08-17] 명시적 직진 모드 판정 — damp_curvature(비전+IMU 중 더 큰 쪽, 위에서
+        # 이미 계산됨)를 그대로 재사용한다. 확정에는 straight_confirm_frames 디바운스를
+        # 걸어 순간 노이즈로 오확정되지 않게 하고, 해제는 즉시라 실제 코너 진입 시 데드존이
+        # 넓어진 채로 남아있는 프레임이 없다.
+        if damp_curvature < self.straight_curvature_eps:
+            self._straight_frames += 1
+        else:
+            self._straight_frames = 0
+        self.is_straight = self._straight_frames >= self.straight_confirm_frames
+        dx_deadzone_px = self.straight_deadzone_px if self.is_straight else self.dx_deadzone_px
         lookahead_px = float(np.clip(
             speed_lookahead_px * curvature_damp,
             self.lookahead_min_px, self.lookahead_max_px
@@ -238,7 +267,7 @@ class PurePursuitController:
         self.last_target_xy = (tx, ty)
         self.last_lookahead_px = lookahead_px
         dx = tx - vehicle_xy[0]
-        if abs(dx) < self.dx_deadzone_px:
+        if abs(dx) < dx_deadzone_px:
             dx = 0.0
         # 이미지 y는 아래로 증가하므로 "전방으로 이만큼"은 vehicle_xy[1]-ty(위로 갈수록 +).
         # 목표점이 차량과 같은 행(dy<=0)에 있는 뒤틀린 경로라도 나눗셈이 죽지 않도록

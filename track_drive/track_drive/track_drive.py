@@ -279,6 +279,9 @@ class TrackDriverNode(Node):
             dx_deadzone_px=PP_DX_DEADZONE_PX,
             lookahead_curvature_gain=PP_LOOKAHEAD_CURVATURE_GAIN,
             lookahead_min_px=PP_LOOKAHEAD_MIN_PX,
+            straight_curvature_eps=PP_STRAIGHT_CURVATURE_EPS,
+            straight_confirm_frames=PP_STRAIGHT_CONFIRM_FRAMES,
+            straight_deadzone_px=PP_STRAIGHT_DEADZONE_PX,
         )
 
         self.path = None
@@ -1698,6 +1701,17 @@ class TrackDriverNode(Node):
         imu_text = f'{imu_kappa:+.4f}' if imu_kappa is not None else '미반영(IMU/VESC 확인)'
         lines.append((f'IMU curvature: {imu_text}', (10, 8 + 32 * len(lines)), imu_color, 18,
                        f'IMU curvature: {imu_text if imu_kappa is not None else "N/A"}'))
+
+        # [2026-08-17] 명시적 직진 모드(README §0.5.9) 상태 표시 — 확정까지 남은 프레임 수를
+        # 같이 보여줘서, 직전 몇 프레임이 이미 저곡률이었는지(곧 확정될지)를 실차에서 바로
+        # 확인할 수 있게 한다.
+        is_straight = getattr(controller, 'is_straight', False)
+        straight_frames = getattr(controller, '_straight_frames', 0)
+        straight_confirm = getattr(controller, 'straight_confirm_frames', 0)
+        straight_color = (0, 200, 0) if is_straight else (140, 140, 140)
+        straight_text = f'확정({straight_frames}프레임)' if is_straight else f'대기({straight_frames}/{straight_confirm})'
+        lines.append((f'직진모드: {straight_text}', (10, 8 + 32 * len(lines)), straight_color, 18,
+                       f'Straight mode: {"CONFIRMED" if is_straight else f"waiting({straight_frames}/{straight_confirm})"}'))
 
         # DA(주행가능영역) 면적 — DL_DA_MAX_AREA_PX 실측 튜닝용. 원래 da_debug라는 별도
         # 창이었는데 조향 상태랑 같이 한눈에 보고 싶다는 요청으로 이 창에 합쳤다(2026-08-06).
