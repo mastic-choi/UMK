@@ -37,7 +37,8 @@ class PurePursuitController:
                  wheelbase_px=67.0, angle_max_deg=100.0, alpha=0.5,
                  min_lookahead_px=90.0, dx_deadzone_px=6.0, lookahead_curvature_gain=100.0,
                  lookahead_min_px=40.0, straight_curvature_eps=0.001,
-                 straight_confirm_frames=5, straight_deadzone_px=20.0):
+                 straight_confirm_frames=5, straight_deadzone_px=20.0,
+                 straight_alpha=None, straight_bias_ema_alpha=0.15):
         # [2026-08-05, 속도 적응형 lookahead — 1차 시도 후 수정]
         #   curvature ≈ 2*dx/ld^2 (작은각 근사)라서 ld가 짧을수록 같은 dx도 1/ld^2로
         #   증폭된다. 처음엔 PythonRobotics/Autoware 관례(Ld=k*v+Lfc, 저속일수록 lookahead도
@@ -108,6 +109,22 @@ class PurePursuitController:
         self.straight_deadzone_px = straight_deadzone_px
         self._straight_frames = 0
         self.is_straight = False
+
+        # [2026-08-17b] "코너 탈출 직후 살짝 틀어진 채 직진 진입" 대응 — 위 직진 확정은
+        #   damp_curvature(경로가 얼마나 휘었는가)만 본다. 그런데 코너를 빠져나오며 경로
+        #   자체는 이미 곧게 폈지만(curvature≈0) 차량이 차선 중앙에서 옆으로 몇 px 밀려난
+        #   채(=dx가 0이 아닌 채) 남아있는 경우, curvature 기준으로는 "직진 확정"되어 넓은
+        #   straight_deadzone_px가 걸리고, 그 잔여 dx가 이 데드존보다 작으면 영원히 0으로
+        #   죽어서 절대 중앙으로 안 돌아온다 — 실차 미검증 상태에서 발견된 설계 공백(대화
+        #   중 시뮬레이션으로 재현: 노이즈가 우연히 curvature를 깨워 좁은 dx_deadzone_px로
+        #   되돌아갈 때만 우연히 교정됨). raw dx(데드존 적용 전 값)의 EMA를
+        #   straight_bias_ema_alpha로 누적해뒀다가, 그 크기가 straight_deadzone_px를
+        #   넘으면(=데드존 폭만큼 지속적으로 쏠려있으면 노이즈가 아니라 진짜 편향으로 판단)
+        #   damp_curvature와 무관하게 즉시 직진확정을 해제한다 — curvature 조건과 동일하게
+        #   "확정은 느리게(디바운스), 해제는 즉시" 철학을 따른다. 실차 미검증 첫 구현.
+        self.straight_alpha = straight_alpha if straight_alpha is not None else alpha
+        self.straight_bias_ema_alpha = straight_bias_ema_alpha
+        self._dx_bias_ema = 0.0
 
         # "곡률→조향각" 게인. 표준 Pure Pursuit 공식 steer = atan(2*L*sin(alpha)/Ld)에서
         # L 자리에 들어간다 — 크게 잡을수록 같은 곡률에도 조향각이 커진다(더 공격적).
@@ -180,6 +197,7 @@ class PurePursuitController:
         self.last_imu_curvature_px = None
         self._straight_frames = 0
         self.is_straight = False
+        self._dx_bias_ema = 0.0
 
     def _target_point(self, path, vehicle_xy, lookahead_px):
         """path를 따라 vehicle_xy로부터 누적 호길이가 lookahead_px를 넘는 첫 지점을
@@ -249,16 +267,16 @@ class PurePursuitController:
         self.last_imu_curvature_px = imu_curvature_px
         curvature_damp = 1.0 / (1.0 + self.lookahead_curvature_gain * damp_curvature)
 
-        # [2026-08-17] 명시적 직진 모드 판정 — damp_curvature(비전+IMU 중 더 큰 쪽, 위에서
-        # 이미 계산됨)를 그대로 재사용한다. 확정에는 straight_confirm_frames 디바운스를
-        # 걸어 순간 노이즈로 오확정되지 않게 하고, 해제는 즉시라 실제 코너 진입 시 데드존이
-        # 넓어진 채로 남아있는 프레임이 없다.
+        # [2026-08-17] 명시적 직진 모드 판정(1/2: 곡률 조건) — damp_curvature(비전+IMU 중
+        # 더 큰 쪽, 위에서 이미 계산됨)를 그대로 재사용한다. 확정에는 straight_confirm_frames
+        # 디바운스를 걸어 순간 노이즈로 오확정되지 않게 하고, 해제는 즉시라 실제 코너 진입 시
+        # 데드존이 넓어진 채로 남아있는 프레임이 없다.
         if damp_curvature < self.straight_curvature_eps:
             self._straight_frames += 1
         else:
             self._straight_frames = 0
-        self.is_straight = self._straight_frames >= self.straight_confirm_frames
-        dx_deadzone_px = self.straight_deadzone_px if self.is_straight else self.dx_deadzone_px
+        curvature_confirmed_straight = self._straight_frames >= self.straight_confirm_frames
+
         lookahead_px = float(np.clip(
             speed_lookahead_px * curvature_damp,
             self.lookahead_min_px, self.lookahead_max_px
@@ -267,6 +285,19 @@ class PurePursuitController:
         self.last_target_xy = (tx, ty)
         self.last_lookahead_px = lookahead_px
         dx = tx - vehicle_xy[0]
+
+        # [2026-08-17b] 명시적 직진 모드 판정(2/2: 잔여 편향 조건) — dx_deadzone_px로
+        # 자르기 전의 raw dx를 EMA로 누적해서 "곡률은 0인데 dx만 계속 한쪽으로 쏠려있는"
+        # 경우(코너 탈출 직후 잔여 오프셋 등)를 잡아낸다. __init__ 상단 주석 참고 — 이
+        # EMA가 straight_deadzone_px 폭을 넘으면 노이즈가 아니라 진짜 편향으로 보고
+        # curvature 조건과 무관하게 직진확정을 해제한다.
+        self._dx_bias_ema = (self.straight_bias_ema_alpha * dx
+                              + (1.0 - self.straight_bias_ema_alpha) * self._dx_bias_ema)
+        bias_ok = abs(self._dx_bias_ema) < self.straight_deadzone_px
+        self.is_straight = curvature_confirmed_straight and bias_ok
+
+        dx_deadzone_px = self.straight_deadzone_px if self.is_straight else self.dx_deadzone_px
+        filter_alpha = self.straight_alpha if self.is_straight else self.alpha
         if abs(dx) < dx_deadzone_px:
             dx = 0.0
         # 이미지 y는 아래로 증가하므로 "전방으로 이만큼"은 vehicle_xy[1]-ty(위로 갈수록 +).
@@ -291,7 +322,7 @@ class PurePursuitController:
         curvature = 2.0 * math.sin(alpha) / ld
         steer_deg = math.degrees(math.atan(curvature * self.wheelbase_px))
 
-        steer_deg = self.alpha * steer_deg + (1.0 - self.alpha) * self.prev_steer_deg
+        steer_deg = filter_alpha * steer_deg + (1.0 - filter_alpha) * self.prev_steer_deg
         steer_deg = float(np.clip(steer_deg, -self.angle_max_deg, self.angle_max_deg))
         self.prev_steer_deg = steer_deg
         self.held = False

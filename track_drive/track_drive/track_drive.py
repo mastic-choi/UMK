@@ -282,6 +282,8 @@ class TrackDriverNode(Node):
             straight_curvature_eps=PP_STRAIGHT_CURVATURE_EPS,
             straight_confirm_frames=PP_STRAIGHT_CONFIRM_FRAMES,
             straight_deadzone_px=PP_STRAIGHT_DEADZONE_PX,
+            straight_alpha=PP_STRAIGHT_ALPHA,
+            straight_bias_ema_alpha=PP_STRAIGHT_BIAS_EMA_ALPHA,
         )
 
         self.path = None
