@@ -479,7 +479,12 @@ class TrackDriverNode(Node):
         #   엄밀히는 직전 틱 값(0.05s 이내 오차, 디버깅 목적엔 무시 가능).
         lookahead_xy = self.pure_pursuit.last_target_xy
         lookahead_px = self.pure_pursuit.last_lookahead_px
-        getattr(self.lane_detector, 'show_debug_windows', lambda *a, **k: None)(lookahead_xy, lookahead_px)
+        # [2026-08-17d] 직전 틱의 직진/커브대응 상태도 같이 넘겨서 result 패널에 표시한다
+        # (dl_lane.DLLaneDetector.show_debug_windows() 주석 참고) — lookahead_xy/px와 동일하게
+        # 한 틱(0.05s) 지연 가능.
+        is_straight = self.pure_pursuit.is_straight
+        getattr(self.lane_detector, 'show_debug_windows', lambda *a, **k: None)(
+            lookahead_xy, lookahead_px, is_straight)
 
         # [2026-08-11] "재사용된 최신값"과 "완전히 안 갱신됨"을 구분 — DLLaneDetector가
         # 추론 1회 끝날 때마다 올리는 result_seq(dl_lane.py 참고)가 직전 틱에서 본 값과

@@ -75,6 +75,7 @@ import cv2
 import numpy as np
 
 from .lane_util import SlideWindow
+from ..kr_text import put_text_kr
 
 try:
     import onnxruntime as ort
@@ -2320,7 +2321,7 @@ class DLLaneDetector:
         with self._lock:
             return self._latest_result
 
-    def show_debug_windows(self, lookahead_xy=None, lookahead_px=None):
+    def show_debug_windows(self, lookahead_xy=None, lookahead_px=None, is_straight=None):
         """da(초록)/ll(흰선=흰색·노란선=노랑) 오버레이 + (모드에 따라) 좌우 슬라이딩
         윈도우/corridor 경계가 그려진 result에 da/ll/노란선 원본 이진마스크를 위→아래로
         이어붙여 창 하나(`dl_lane`)로 띄운다 — result/da/ll/yellow 순서로 세로 스택.
@@ -2345,6 +2346,14 @@ class DLLaneDetector:
         엄밀히는 "이번에 그려진 result"가 아니라 "직전 틱까지 계산된 최신 목표점"이다(한
         프레임 이내 오차, 디버깅 목적엔 무시 가능). path가 아직 없으면(첫 프레임) 호출측이
         None을 넘기고, 이 경우 마커를 그리지 않는다.
+
+        is_straight(있으면) : pure_pursuit.PurePursuitController.is_straight — 직전 틱
+        기준(lookahead_xy와 동일한 이유로 한 틱 지연 가능, 무시 가능) "직진 확정" 여부.
+        [2026-08-17d] result 패널 우상단에 초록 "직진"/주황 "커브대응"으로 표시 — PP_ALPHA/
+        PP_DX_DEADZONE_PX가 이제 이 상태에 따라 실제로 바뀌므로(config.py PP_STRAIGHT_*
+        참고), 지금 어느 파라미터 세트가 적용 중인지 화면만 보고 바로 알 수 있게 한다.
+        None이면(호출측이 안 넘기거나 pure_pursuit이 아직 없는 초기 프레임) 아무것도 안
+        그린다.
         ★ 반드시 메인 스레드(ROS 콜백/타이머가 도는 스레드)에서만 호출할 것 ★ — 워커
         스레드가 cv2.imshow를 직접 부르지 않는 이유는 _worker()/DLSlideWindow.visualize()
         주석 참고. track_drive.py의 perc_lane()이 detect() 직후 이 메서드를 호출한다
@@ -2365,6 +2374,12 @@ class DLLaneDetector:
                     vis, f'ld:{lookahead_px:.0f}px', (lx + 8, ly - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1
                 )
+        if is_straight is not None:
+            state_text = '직진' if is_straight else '커브대응'
+            state_color = (0, 220, 0) if is_straight else (0, 140, 255)  # 초록/주황
+            state_x = max(vis.shape[1] - 90, 0)
+            put_text_kr(vis, state_text, (state_x, 6), font_size=18, color_bgr=state_color,
+                        fallback='STRAIGHT' if is_straight else 'CURVE')
         da_bgr = cv2.cvtColor(da_mask, cv2.COLOR_GRAY2BGR)
         ll_bgr = cv2.cvtColor(ll_mask, cv2.COLOR_GRAY2BGR)
         # 노란선 패널만 실제 노란색(BGR 0,255,255)으로 칠해서 흰/회색인 다른 패널과
