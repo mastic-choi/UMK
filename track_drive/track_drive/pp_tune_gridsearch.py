@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #=============================================
-# pp_tune_gridsearch.py — Pure Pursuit 파라미터 화이트박스 시뮬레이션 튜닝 도구
-# (2026-08-17)
+# pp_tune_gridsearch.py — Pure Pursuit + 코너감속 파라미터 화이트박스 시뮬레이션
+# 튜닝 도구 (2026-08-17)
 #
 # ── 왜 필요한가 ──
 #   실차 회피 영상(2026-08-17 14:00)에서 "직진을 커브로 오판" 문제를 잡던 중,
@@ -12,6 +12,20 @@
 #   존재했던 것으로 보인다. SPEED_NORMAL이 이제 10.0으로 올랐고(§config.py
 #   2026-08-17f) 나중에 더 올릴 계획이라, 이번엔 그 시뮬레이션 방법론을 코드로
 #   남겨 재사용 가능하게 만들고 속도 10/20(모터단위)에서 다시 튜닝한다.
+#
+# ── [2026-08-17 2차] 코너 감속 로직까지 폐루프에 통합 ──
+#   1차 버전은 시나리오 내내 speed_units를 상수로 고정해서 돌렸다 — 실제
+#   track_drive.py._lane_drive()가 하는 "코너에서 조향 신호 기반으로 목표속도를
+#   깎는" 로직(turn_for_speed 3제곱 감속식 + _corner_radius_speed_scale() 회전반경
+#   기반 추가감속 + SPEED_ACCEL_STEP 가속램프 + CORNER_HOLD_DECAY 코너직후 감속유지)
+#   이 전혀 반영 안 됐던 것. 조향(PP_*)과 감속(SPEED_*/CORNER_*)은 서로 커플링돼
+#   있다 — 조향이 세지면 corner_signal이 커져 더 세게 감속하고, 감속하면 다음 틱
+#   lookahead가 줄어 조향이 또 달라진다. 이번 버전은 simulate()가 _lane_drive()의
+#   감속 공식을 그대로 재현해 매 틱 목표속도를 다시 계산하고, 그 값으로 물리
+#   전진 + 다음 틱 lookahead 기준(speed_for_lookahead)까지 같이 갱신한다. 그리드서치
+#   대상도 PP_*(조향) + SPEED_CORNER_MIN/CORNER_SIGN_EMA_ALPHA/LANE_LOOKAHEAD_REF/
+#   SPEED_ACCEL_STEP/CORNER_HOLD_DECAY_LO·HI/CORNER_MIN_RADIUS_PX/
+#   CORNER_MIN_SPEED_SCALE(감속)까지 22개 전부로 넓혔다.
 #
 # ── 방법론(화이트박스 합성 시뮬레이션 — 실측 아님) ──
 #   controller/pure_pursuit.py의 PurePursuitController를 코드 수정 없이 그대로
@@ -24,10 +38,12 @@
 #        "dx=3px가 육안상 거의 직진"과 같은 자릿수)을 얹어 실제 ROI 픽셀
 #        웨이포인트 배열(가까운점→먼점, PATH_N_WAYPOINTS=12개)을 합성
 #     3) PurePursuitController.control()을 그대로 호출해 조향각(도)을 얻고
-#     4) 실측 WHEELBASE_M(0.335m, PP_WHEELBASE_PX와는 다른 값 — 아래 주의 참고)
-#        기반 바이시클 모델로 차량을 실제로 전진시킨다
+#     4) track_drive.py._lane_drive()/_corner_radius_speed_scale()과 동일한
+#        공식으로 이번 틱 목표속도(모터단위)를 다시 계산하고(가속램프 포함)
+#     5) 실측 WHEELBASE_M(0.335m, PP_WHEELBASE_PX와는 다른 값 — 아래 주의 참고)
+#        기반 바이시클 모델로 그 속도만큼 차량을 실제로 전진시킨다
 #   는 폐루프 시뮬레이션을 돌려, 기준경로 대비 횡편차(cross-track error)/조향
-#   잔떨림을 채점한다.
+#   잔떨림/평균속도를 채점한다.
 #
 #   ★ 중요한 주의 — PP_WHEELBASE_PX ≠ WHEELBASE_M ★
 #   PP_WHEELBASE_PX(현재 25.0)는 "곡률→조향각" 변환에 쓰이는 튜닝된 게인이지
@@ -36,7 +52,9 @@
 #   PP_WHEELBASE_PX를 쓰지만, 시뮬레이터가 차량을 실제로 움직일 때는 반드시
 #   WHEELBASE_M(실측 축거)*바이시클 모델을 써야 한다 — 이 둘을 같은 값으로
 #   섞으면 "튜닝된 게인이 물리적으로도 맞다"고 잘못 가정하게 되어 그리드서치가
-#   자기 자신과 짜고 치는 꼴이 된다.
+#   자기 자신과 짜고 치는 꼴이 된다. _corner_radius_speed_scale()의 회전반경
+#   계산은 실제 코드처럼 PP_WHEELBASE_PX(pp.wheelbase_px)를 그대로 쓴다 — 이건
+#   물리 반경이 아니라 "그 함수가 보는" 반경이라 실제 코드와 똑같이 맞춰야 한다.
 #
 # ── 실차 미검증 명시 ──
 #   이 도구가 찾아내는 "최적 파라미터"는 전부 화이트박스 합성 시뮬레이션
@@ -51,9 +69,20 @@
 #   차량을 실제로 전진시킬 때 쓰는 물리 속도(m/s)는 METERS_PER_SPEED_UNIT=0.1347
 #   (config.py, speed=5~10 구간 실측 회귀)로 변환한다. speed=20은 이 회귀 구간
 #   (5~10) 밖으로 외삽한 값이라 결과 해석 시 감안할 것 — README 6.5절 참고.
+#   시나리오의 "speed=N"은 이제 SPEED_NORMAL(순항 목표속도) 역할이다 — 실제
+#   순간속도는 코너에서 그보다 낮게 동적으로 깎인다(_lane_drive() 재현).
+#
+# ── VESC/IMU 미시뮬레이션 ──
+#   실차의 _speed_for_lookahead()는 VESC 실측이 살아있으면 그걸 쓰지만, 이
+#   시뮬레이터는 VESC/IMU를 흉내내지 않는다 — 실제 코드의 "VESC 죽었을 때" 폴백
+#   경로(self._prev_speed 사용, imu_curvature_px=None)를 그대로 탄다. 즉 이
+#   시뮬레이션은 "센서가 없거나 신뢰 못 할 때"의 동작을 검증하는 셈이고, VESC/IMU가
+#   붙었을 때의 실제 거동은 여기서 다루지 않는다.
 #
 # ── 사용법 ──
-#   numpy가 있는 환경에서: python3 pp_tune_gridsearch.py [--samples N] [--seed S]
+#   numpy가 있는 환경에서:
+#     python3 pp_tune_gridsearch.py --samples 3000 --speeds 10 20
+#     python3 pp_tune_gridsearch.py --sensitivity --speeds 5 10 15 20 25
 #=============================================
 import argparse
 import math
@@ -175,12 +204,32 @@ def _cross_track_error(world_pts, vx, vy):
     return math.sqrt(float(np.min(d2)))
 
 
-def simulate(pp, world_pts, speed_units, rng):
-    v_mps = MPS_PER_UNIT * speed_units
+def _corner_radius_speed_scale(corner_signal_deg, wheelbase_px, corner_min_radius_px, corner_min_speed_scale):
+    """track_drive.py._corner_radius_speed_scale()과 동일 공식. wheelbase_px는
+    PP_WHEELBASE_PX(pp.wheelbase_px) — 실제 코드가 물리 축거가 아니라 이 게인으로
+    반경을 역산하므로 그대로 맞춘다(위 모듈 주석 참고)."""
+    curvature = math.tan(math.radians(corner_signal_deg)) / wheelbase_px
+    if curvature == 0.0:
+        return 1.0
+    radius = abs(1.0 / curvature)
+    if radius >= corner_min_radius_px:
+        return 1.0
+    return max(corner_min_speed_scale, radius / corner_min_radius_px)
+
+
+def simulate(pp, world_pts, speed_norm, sp, rng):
+    """speed_norm: 이 시나리오의 SPEED_NORMAL(모터단위, 순항 목표속도).
+    sp: 감속 관련 파라미터 dict(SPEED_KEYS 참고) — track_drive.py._lane_drive()의
+    코너 감속 로직을 그대로 재현한다."""
     vx, vy, vth = float(world_pts[0, 0]), float(world_pts[0, 1]), math.pi / 2
     pp.reset()
 
-    ctes, steers, straight_flags = [], [], []
+    prev_speed = 0.0        # track_drive.py __init__의 self._prev_speed=0.0과 동일 출발
+    corner_signal = 0.0     # self._corner_signal
+    corner_hold = 0.0       # self._corner_hold
+    lookahead_ema = 0.0     # self.lane_lookahead(EMA, dl_lane far_ref 근사)
+
+    ctes, steers, straight_flags, speeds = [], [], [], []
     path_end = world_pts[-1]
     n_ticks = int(MAX_SIM_T / DT)
     completed = False
@@ -188,16 +237,40 @@ def simulate(pp, world_pts, speed_units, rng):
     for _ in range(n_ticks):
         local_path = _local_path_px(world_pts, vx, vy, vth, rng)
         vehicle_xy = (ROI_W_PX / 2.0, ROI_H_PX)
+        # _speed_for_lookahead(): VESC 미시뮬레이션이라 항상 self._prev_speed 폴백 경로.
         if local_path is None:
             steer_deg = pp.prev_steer_deg
         else:
-            steer_deg = pp.control(local_path, vehicle_xy, speed=speed_units)
+            steer_deg = pp.control(local_path, vehicle_xy, speed=prev_speed, imu_curvature_px=None)
+            far_offset_px = local_path[-1][0] - ROI_W_PX / 2.0
+            lookahead_ema = 0.5 * lookahead_ema + 0.5 * far_offset_px
+
+        # ── track_drive.py._lane_drive() 코너 감속 재현 ──
+        corner_signal = (sp['corner_sign_ema_alpha'] * steer_deg
+                          + (1.0 - sp['corner_sign_ema_alpha']) * corner_signal)
+        turn_now = min(1.0, abs(corner_signal) / ANGLE_MAX_DEG)
+        turn_preview = min(1.0, abs(lookahead_ema) / sp['lane_lookahead_ref'])
+        is_straight = bool(pp.is_straight)
+        turn_for_speed = 0.0 if is_straight else max(turn_now, turn_preview * 0.3)
+        target_speed = max(sp['speed_corner_min'], speed_norm * (1.0 - 0.90 * turn_for_speed ** 3))
+        corner_radius_scale = 1.0 if is_straight else _corner_radius_speed_scale(
+            corner_signal, pp.wheelbase_px, sp['corner_min_radius_px'], sp['corner_min_speed_scale'])
+        target_speed = max(sp['speed_corner_min'], target_speed * corner_radius_scale)
+
+        speed_ratio = min(1.0, prev_speed / speed_norm) if speed_norm > 1e-6 else 0.0
+        corner_decay = sp['corner_hold_decay_lo'] + (sp['corner_hold_decay_hi'] - sp['corner_hold_decay_lo']) * speed_ratio
+        corner_hold = max(turn_now, corner_hold * corner_decay)
+        accel_step = sp['speed_accel_step'] * max(0.25, 1.0 - corner_hold)
+        if target_speed > prev_speed + accel_step:
+            target_speed = prev_speed + accel_step
+        prev_speed = target_speed
 
         # steer_deg는 "우측+"(control()의 alpha=atan2(dx,dy), dx>0=목표가 이미지 오른쪽일 때
         # 양수) 관례다. 월드 프레임 th는 표준 수학각(ccw+)이라, 오른쪽으로 꺾을수록(양의
         # steer) 헤딩은 시계방향=th가 "감소"해야 한다 — 부호를 안 뒤집으면 좌/우가 반대로
         # 시뮬레이션되어(첫 구현에서 실제로 발생: 커브가 좌회전인데 차가 우회전해 발산)
         # 그리드서치 전체가 무의미해진다.
+        v_mps = MPS_PER_UNIT * prev_speed
         steer_rad = math.radians(steer_deg)
         vth -= (v_mps / WHEELBASE_M) * math.tan(steer_rad) * DT
         vx += v_mps * math.cos(vth) * DT
@@ -206,7 +279,8 @@ def simulate(pp, world_pts, speed_units, rng):
         cte = _cross_track_error(world_pts, vx, vy)
         ctes.append(cte)
         steers.append(steer_deg)
-        straight_flags.append(bool(pp.is_straight))
+        straight_flags.append(is_straight)
+        speeds.append(prev_speed)
 
         if cte > DIVERGE_CTE_M:
             break
@@ -218,6 +292,7 @@ def simulate(pp, world_pts, speed_units, rng):
 
     ctes = np.array(ctes) if ctes else np.array([DIVERGE_CTE_M])
     steers = np.array(steers) if steers else np.array([0.0])
+    speeds = np.array(speeds) if speeds else np.array([0.0])
     sign_changes = int(np.sum(np.diff(np.sign(steers)) != 0)) if len(steers) > 1 else 0
     osc_per_sec = sign_changes / max(len(steers) * DT, 1e-6)
 
@@ -234,14 +309,18 @@ def simulate(pp, world_pts, speed_units, rng):
         'steer_rms': float(np.sqrt(np.mean(steers ** 2))),
         'osc_per_sec': osc_per_sec,
         'straight_frac': straight_frac,
+        'avg_speed': float(np.mean(speeds)),
+        'elapsed_s': len(ctes) * DT,
         'completed': completed,
     }
 
 
 # ─────────────────────────── 채점 ───────────────────────────
 # 가중치는 이 스크립트만의 설계값(실측/이론적 근거 없음) — 직진은 "잔떨림 억제"를,
-# 커브/S자는 "경로를 얼마나 잘 따라가는가(횡편차)"를 우선한다는 방향성만 반영.
-# 필요하면 이 함수만 고쳐서 재실행하면 된다.
+# 커브/S자는 "경로를 얼마나 잘 따라가는가(횡편차)"를 우선하되, elapsed_s에 작은
+# 페널티를 줘서 "코너에서 무조건 기어가면 이긴다"는 퇴화해를 막는다(이 튜닝을
+# 시작한 이유 자체가 "나중에 속도를 더 올리고 싶다"였으므로, 과도한 감속도
+# 나쁜 해로 취급).
 def score(results):
     s = results['직진']
     c = results['90도커브']
@@ -256,12 +335,26 @@ def score(results):
     # 직접 벌점화한다 — steer_rms/osc/cte만으론 "라벨이 맞았는지"가 안 잡혀서 따로 추가.
     straight_score = (s['steer_rms'] * 3.0 + s['osc_per_sec'] * 2.0 + s['cte_rms'] * 50.0
                       + (1.0 - s['straight_frac']) * 10.0)
-    curve_score = c['cte_rms'] * 80.0 + c['cte_max'] * 40.0
-    scurve_score = w['cte_rms'] * 80.0 + w['cte_max'] * 40.0
+    curve_score = c['cte_rms'] * 80.0 + c['cte_max'] * 40.0 + c['elapsed_s'] * 0.5
+    scurve_score = w['cte_rms'] * 80.0 + w['cte_max'] * 40.0 + w['elapsed_s'] * 0.5
     return straight_score + curve_score + scurve_score + penalty
 
 
 # ─────────────────────────── 파라미터 공간 (baseline = 현재 config.py 값) ───────────────────────────
+# PurePursuitController 생성자로 그대로 들어가는 키(조향) — evaluate()가 이 이름으로 필터링.
+PP_CTOR_KEYS = (
+    'lookahead_base_px', 'lookahead_speed_gain', 'lookahead_max_px', 'wheelbase_px',
+    'alpha', 'min_lookahead_px', 'dx_deadzone_px', 'lookahead_curvature_gain',
+    'lookahead_min_px', 'straight_curvature_eps', 'straight_confirm_frames',
+    'straight_deadzone_px', 'straight_alpha', 'straight_bias_ema_alpha',
+)
+# track_drive.py._lane_drive()의 코너 감속 로직에 쓰이는 키(감속) — simulate()가 직접 읽음.
+SPEED_KEYS = (
+    'speed_corner_min', 'corner_sign_ema_alpha', 'lane_lookahead_ref',
+    'speed_accel_step', 'corner_hold_decay_lo', 'corner_hold_decay_hi',
+    'corner_min_radius_px', 'corner_min_speed_scale',
+)
+
 BASELINE = dict(
     lookahead_base_px=cfg.PP_LOOKAHEAD_BASE_PX,
     lookahead_speed_gain=cfg.PP_LOOKAHEAD_SPEED_GAIN,
@@ -277,10 +370,18 @@ BASELINE = dict(
     straight_deadzone_px=cfg.PP_STRAIGHT_DEADZONE_PX,
     straight_alpha=cfg.PP_STRAIGHT_ALPHA,
     straight_bias_ema_alpha=cfg.PP_STRAIGHT_BIAS_EMA_ALPHA,
+    speed_corner_min=cfg.SPEED_CORNER_MIN,
+    corner_sign_ema_alpha=cfg.CORNER_SIGN_EMA_ALPHA,
+    lane_lookahead_ref=cfg.LANE_LOOKAHEAD_REF,
+    speed_accel_step=cfg.SPEED_ACCEL_STEP,
+    corner_hold_decay_lo=cfg.CORNER_HOLD_DECAY_LO,
+    corner_hold_decay_hi=cfg.CORNER_HOLD_DECAY_HI,
+    corner_min_radius_px=cfg.CORNER_MIN_RADIUS_PX,
+    corner_min_speed_scale=cfg.CORNER_MIN_SPEED_SCALE,
 )
 
-# (lo_factor, hi_factor) — baseline 대비 탐색 범위 배율. 정수/이산값(straight_confirm_frames)은
-# 별도 처리.
+# (lo_factor, hi_factor) — baseline 대비 탐색 범위 배율. 정수/이산값(straight_confirm_frames)과
+# 절대범위가 필요한 decay 두 값은 별도 처리(ABSOLUTE_RANGES).
 RANGE_FACTORS = dict(
     lookahead_base_px=(0.7, 1.4),
     lookahead_speed_gain=(0.4, 1.8),
@@ -295,8 +396,31 @@ RANGE_FACTORS = dict(
     straight_deadzone_px=(0.3, 2.0),
     straight_alpha=(0.4, 1.0 / max(cfg.PP_STRAIGHT_ALPHA, 1e-6) * 0.95 if cfg.PP_STRAIGHT_ALPHA < 0.95 else 1.0),
     straight_bias_ema_alpha=(0.4, 2.5),
+    speed_corner_min=(0.4, 1.6),
+    corner_sign_ema_alpha=(0.3, 3.0),
+    lane_lookahead_ref=(0.5, 2.0),
+    speed_accel_step=(0.3, 4.0),
+    corner_min_radius_px=(0.4, 2.0),
+    corner_min_speed_scale=(0.3, 2.5),
+)
+# 배율이 아니라 절대 범위가 필요한 파라미터 — (0,1) 안에 있어야 하고 baseline*factor로
+# 다루면 방향에 따라 1을 넘거나 뒤집힐 수 있어서 따로 뺐다.
+ABSOLUTE_RANGES = dict(
+    corner_hold_decay_lo=(0.80, 0.95),
+    corner_hold_decay_hi=(0.90, 0.99),
 )
 CONFIRM_FRAMES_CHOICES = [2, 3, 5, 7, 10]
+
+
+def _candidate_range(name):
+    if name in ABSOLUTE_RANGES:
+        return ABSOLUTE_RANGES[name]
+    lo_f, hi_f = RANGE_FACTORS[name]
+    base = BASELINE[name]
+    lo, hi = base * lo_f, base * hi_f
+    if lo > hi:
+        lo, hi = hi, lo
+    return lo, hi
 
 
 def sample_params(rng):
@@ -305,42 +429,105 @@ def sample_params(rng):
         if k == 'straight_confirm_frames':
             p[k] = int(rng.choice(CONFIRM_FRAMES_CHOICES))
             continue
-        lo_f, hi_f = RANGE_FACTORS[k]
-        lo, hi = base * lo_f, base * hi_f
-        if lo > hi:
-            lo, hi = hi, lo
+        lo, hi = _candidate_range(k)
         val = rng.uniform(lo, hi)
-        if k == 'alpha' or k == 'straight_alpha':
+        if k in ('alpha', 'straight_alpha'):
             val = float(np.clip(val, 0.05, 1.0))
         p[k] = float(val)
+    # corner_hold_decay_hi가 lo보다 낮게 뽑히면(별개 절대범위라 드물게 역전 가능)
+    # 원래 설계 의도("고속일수록 느리게 회복")가 깨지므로 스왑해 방지.
+    if p['corner_hold_decay_hi'] < p['corner_hold_decay_lo']:
+        p['corner_hold_decay_lo'], p['corner_hold_decay_hi'] = p['corner_hold_decay_hi'], p['corner_hold_decay_lo']
     return p
 
 
-def evaluate(params, speed_units, paths, rng):
-    pp = PurePursuitController(angle_max_deg=ANGLE_MAX_DEG, **params)
-    results = {name: simulate(pp, pts, speed_units, rng) for name, pts in paths.items()}
+def evaluate(params, speed_norm, paths, rng):
+    pp_kwargs = {k: params[k] for k in PP_CTOR_KEYS}
+    sp_kwargs = {k: params[k] for k in SPEED_KEYS}
+    pp = PurePursuitController(angle_max_deg=ANGLE_MAX_DEG, **pp_kwargs)
+    results = {name: simulate(pp, pts, speed_norm, sp_kwargs, rng) for name, pts in paths.items()}
     return score(results), results
 
 
-def run_search(speed_units, n_samples, seed, paths):
+def run_search(speed_norm, n_samples, seed, paths):
     rng = np.random.default_rng(seed)
-    baseline_score, baseline_results = evaluate(BASELINE, speed_units, paths, rng)
+    baseline_score, baseline_results = evaluate(BASELINE, speed_norm, paths, rng)
 
     best_score, best_params, best_results = baseline_score, dict(BASELINE), baseline_results
     for i in range(n_samples):
         params = sample_params(rng)
-        s, results = evaluate(params, speed_units, paths, rng)
+        s, results = evaluate(params, speed_norm, paths, rng)
         if s < best_score:
             best_score, best_params, best_results = s, params, results
 
     return {
-        'speed_units': speed_units,
+        'speed_norm': speed_norm,
         'baseline_score': baseline_score,
         'baseline_results': baseline_results,
         'best_score': best_score,
         'best_params': best_params,
         'best_results': best_results,
     }
+
+
+def sweep_param_vs_speed(param_name, speeds, grid_n, repeats, paths):
+    """다른 파라미터는 전부 BASELINE에 고정하고 param_name 하나만 촘촘히 스윕해,
+    speed별로 그 파라미터의 1차원 최적값을 찾는다(partial-dependence 근사 —
+    파라미터 간 상호작용은 무시).
+
+    [왜 조인트 랜덤서치 argmin 대신 이 방식인가] run_search()의 argmin은 22차원
+    비볼록 공간에서 뽑은 단일 샘플이라, 같은 속도라도 시드만 바꾸면 전혀 다른
+    조합이 "1등"으로 나올 만큼 분산이 크다(거의 동점인 국소 최적점이 많음).
+    그런 고분산 추정치를 이어붙여 speed에 대한 추세선을 피팅하면 우연을 추세로
+    착각하기 쉽다(실제로 speed=10/20 두 점만으로 봤을 때 PP_STRAIGHT_CURVATURE_EPS가
+    방향이 뒤집혔던 게 그 예). 한 번에 파라미터 하나만 바꾸면 비교가 훨씬
+    저분산이라 speed에 따른 진짜 추세를 보기에 더 적합하다."""
+    if param_name == 'straight_confirm_frames':
+        candidates = CONFIRM_FRAMES_CHOICES
+    else:
+        lo, hi = _candidate_range(param_name)
+        candidates = np.linspace(lo, hi, grid_n)
+
+    best_per_speed = []
+    for sp in speeds:
+        cand_scores = []
+        for v in candidates:
+            params = dict(BASELINE)
+            params[param_name] = int(v) if param_name == 'straight_confirm_frames' else float(v)
+            total = 0.0
+            for rep in range(repeats):
+                rng = np.random.default_rng(hash((param_name, sp, v, rep)) & 0xFFFFFFFF)
+                s, _ = evaluate(params, sp, paths, rng)
+                total += s
+            cand_scores.append(total / repeats)
+        best_idx = int(np.argmin(cand_scores))
+        best_per_speed.append(float(candidates[best_idx]))
+    return best_per_speed
+
+
+def fit_linear(speeds, values):
+    speeds_a, values_a = np.array(speeds, dtype=float), np.array(values, dtype=float)
+    slope, intercept = np.polyfit(speeds_a, values_a, 1)
+    pred = slope * speeds_a + intercept
+    ss_res = float(np.sum((values_a - pred) ** 2))
+    ss_tot = float(np.sum((values_a - np.mean(values_a)) ** 2))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 1e-12 else 1.0
+    return slope, intercept, r2
+
+
+def run_sensitivity(speeds, grid_n, repeats, paths):
+    print(f"[민감도 분석] 파라미터 1개씩만 스윕(다른 값은 BASELINE 고정), speed={speeds}, "
+          f"grid_n={grid_n}, repeats={repeats}\n")
+    fits = {}
+    for name in BASELINE:
+        best_vals = sweep_param_vs_speed(name, speeds, grid_n, repeats, paths)
+        slope, intercept, r2 = fit_linear(speeds, best_vals)
+        fits[name] = {'speeds': speeds, 'best_vals': best_vals,
+                      'slope': slope, 'intercept': intercept, 'r2': r2}
+        vals_str = ', '.join(f'{v:.4g}' for v in best_vals)
+        print(f"  {name:26s} baseline={BASELINE[name]:<8.4g} @speeds→[{vals_str}]  "
+              f"fit: y={slope:.5g}*speed+{intercept:.5g}  R²={r2:.2f}")
+    return fits
 
 
 def fmt_results(results):
@@ -350,7 +537,8 @@ def fmt_results(results):
         lines.append(
             f"    {name:6s}: cte_rms={r['cte_rms']*100:5.1f}cm cte_max={r['cte_max']*100:5.1f}cm "
             f"steer_rms={r['steer_rms']:5.2f}도 osc={r['osc_per_sec']:4.1f}/s "
-            f"직진태그={r['straight_frac']*100:5.1f}% 완주={'Y' if r['completed'] else 'N'}"
+            f"직진태그={r['straight_frac']*100:5.1f}% avg_speed={r['avg_speed']:5.2f} "
+            f"소요={r['elapsed_s']:4.1f}s 완주={'Y' if r['completed'] else 'N'}"
         )
     return '\n'.join(lines)
 
@@ -360,16 +548,24 @@ def main():
     ap.add_argument('--samples', type=int, default=400, help='속도별 랜덤 샘플 수(기본 400)')
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--speeds', type=float, nargs='+', default=[10.0, 20.0])
+    ap.add_argument('--sensitivity', action='store_true',
+                     help='조인트 랜덤서치 대신 파라미터별 1D 속도 민감도 분석(추세선 피팅용)')
+    ap.add_argument('--grid-n', type=int, default=21, help='--sensitivity의 파라미터별 그리드 촘촘함')
+    ap.add_argument('--repeats', type=int, default=3, help='--sensitivity의 후보값별 반복 평가 횟수(잡음 평균)')
     args = ap.parse_args()
 
     paths = build_paths()
+
+    if args.sensitivity:
+        return run_sensitivity(args.speeds, args.grid_n, args.repeats, paths)
+
     print(f"[설정] ROI_W={ROI_W_PX}px ROI_H≈{ROI_H_PX:.0f}px(DL_BEV_FAR_LIMIT_M={ROI_DEPTH_M}m 기준) "
           f"noise_std={NOISE_STD_PX}px WHEELBASE_M={WHEELBASE_M} MPS_PER_UNIT={MPS_PER_UNIT}")
     print(f"[baseline] SPEED_NORMAL=3.0 재튜닝 시점 config.py 현재값: {BASELINE}\n")
 
     all_out = {}
     for sp in args.speeds:
-        print(f"===== speed={sp} (motor unit, ≈{sp*MPS_PER_UNIT:.2f}m/s"
+        print(f"===== speed={sp} (SPEED_NORMAL 역할, 모터unit, ≈{sp*MPS_PER_UNIT:.2f}m/s"
               f"{' — 5~10 회귀범위 밖 외삽' if sp > 10 else ''}) =====")
         out = run_search(sp, args.samples, args.seed, paths)
         all_out[sp] = out
