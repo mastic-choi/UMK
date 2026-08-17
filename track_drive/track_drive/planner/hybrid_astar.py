@@ -2,7 +2,9 @@ import math, heapq, time
 import numpy as np
 
 from .node import Node
-# 차량 풋프린트는 실측값(config.py §6.1) + ASTAR_VEHICLE_MARGIN_M 여유 — README §5.1 참고.
+# [2026-08-11] 차량 풋프린트를 실측값으로 — 예전엔 vehicle_width=0.45/vehicle_length=0.70을
+#   하드코딩했는데 xycar 실측(VEHICLE_WIDTH_M=0.31, VEHICLE_LENGTH_M=0.64, config.py §6.1)과
+#   다른 추정치였다. ASTAR_VEHICLE_MARGIN_M은 실측 풋프린트에 더하는 편도 여유(설계값).
 from ..config import VEHICLE_WIDTH_M, VEHICLE_LENGTH_M, ASTAR_VEHICLE_MARGIN_M
 
 class HybridAStar:

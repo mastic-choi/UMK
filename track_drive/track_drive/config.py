@@ -706,7 +706,10 @@ FPS_LOG_PERIOD_SEC = 5.0   # dl_lane.py 워커 스레드 FPS/provider 로그 주
 # #############################################################
 #   track_drive.py의 _lane_steer()가 self.lane_path를 받아 controller/pure_pursuit.py의
 #   PurePursuitController.control(path, vehicle_xy)로 조향각(도)을 계산한다.
-# LQR 컨트롤러/STEERING_CONTROLLER 스위치는 제거됨 — README §0.5 참고.
+# [2026-08-14] LQR 컨트롤러(controller/lqr.py)와 그 사이를 고르던 STEERING_CONTROLLER
+#   스위치를 코드베이스에서 완전히 제거했다 — 실차 미검증 상태로 한 번도 켜본 적 없이
+#   pure_pursuit만 계속 써온 죽은 분기라 유지보수 부담만 있었다. 과거 LQR 설계 배경/
+#   튜닝값 기록은 README §0.5, §6.7, §7에 남아있다.
 
 # ── Pure Pursuit 튜닝값 (controller/pure_pursuit.py PurePursuitController) ──
 #   전부 실차 미검증 튜닝값. 각 값의 설계 배경은 pure_pursuit.py __init__ 상단
@@ -879,11 +882,11 @@ DEBUG_PERIOD = 0.5     # 위 로그 주기(s)
 # [2026-08-11] 라바콘 실차 테스트 중엔 라이다 창만 보고 싶다는 요청으로, 아래 DEBUG_VIZ_LIDAR만
 #   켜고 나머지는 전부 잠시 끔. 다른 디버그창이 다시 필요하면(예: 차선 인식 디버깅) 개별적으로
 #   다시 True로 되돌릴 것 — 서로 독립적인 스위치라 다른 항목엔 영향 없음.
-DEBUG_VIZ_LIDAR    = True   # 라이다 BEV 장애물 감지 디버그 창 (track_drive.py)
-DEBUG_VIZ_LAVACON  = True  # 라바콘 트리거 좌우 클러스터 BEV 디버그 창 (track_drive.py)
+DEBUG_VIZ_LIDAR    = False   # 라이다 BEV 장애물 감지 디버그 창 (track_drive.py)
+DEBUG_VIZ_LAVACON  = False  # 라바콘 트리거 좌우 클러스터 BEV 디버그 창 (track_drive.py)
 DEBUG_PLANNER      = False  # Hybrid A* OccupancyGrid 디버그 창 (track_drive.py, USE_HYBRID_ASTAR_FOR_B3=True일 때만 의미있음)
-DEBUG_VIZ_STEER    = True  # 조향 컨트롤러(직전값유지/현재값반영) 한글 디버그 창 (track_drive.py)
-DEBUG_VIZ_VESC     = True  # VESC 실측속도(/vesc_speed_erpm) 연동 상태(수신중/끊김/미수신) 디버그 창
+DEBUG_VIZ_STEER    = False  # 조향 컨트롤러(직전값유지/현재값반영) 한글 디버그 창 (track_drive.py)
+DEBUG_VIZ_VESC     = False  # VESC 실측속도(/vesc_speed_erpm) 연동 상태(수신중/끊김/미수신) 디버그 창
                              #   (track_drive.py, 2026-08-06 LQR 브랜치에서 이식)
 
 DEBUG_VIZ_DL_LANE    = True  # 차선 — 기본 백엔드('dl') 디버그 창 (perception/dl_lane.py)
@@ -896,13 +899,13 @@ DEBUG_VIZ_DL_LANE    = True  # 차선 — 기본 백엔드('dl') 디버그 창 (
 #   으로 시작.
 DL_DEBUG_HISTORY_LEN = 90
 DEBUG_VIZ_HOUGH_LANE = False  # 차선 — 대안 백엔드('hough') 디버그 창 (perception/hough_lane.py)
-DEBUG_VIZ_LANE       = True  # 차선 — 대안 백엔드('classic_cv') 디버그 창 (perception/lane_util.py)
+DEBUG_VIZ_LANE       = False  # 차선 — 대안 백엔드('classic_cv') 디버그 창 (perception/lane_util.py)
 DEBUG_VIZ_STOPLINE   = False  # 정지선 디버그 창, 백엔드 무관 항상 동작 (perception/perc_floor.py)
 # [2026-08-13] 신호등(S0/S2) 디버그 강화 — ROI 좌표/HoughCircles 원(후보 전체+선택된 4개)/
 #   현재 인식 상태(정지·직진·좌회전·미검출)를 창 하나에 다 보여주도록 확장
 #   (perception/traffic_signal.py detect_s2()). 요청에 따라 기본 True로 켜둠 — 다른 항목과
 #   달리(위 2026-08-11 라바콘 테스트 메모 참고) 이 스위치는 독립적으로 True 유지할 것.
-DEBUG_VIZ_SIGNAL     = True   # 신호등 ROI/HoughCircles 디버그 창 (perception/traffic_signal.py)
+DEBUG_VIZ_SIGNAL     = False   # 신호등 ROI/HoughCircles 디버그 창 (perception/traffic_signal.py)
 # DEBUG_LOG_SIGNAL: 신호등 전용 상세 진단 로그. 전역 DEBUG_LOG(0.5초 주기 요약 [SIG] 한 줄)와는
 #   별개로, 이 플래그가 켜지면 S0/S2 상태에서 매 프레임 "왜 못 잡았는지"(원 개수 부족/배치 불량/
 #   밝기 대비 부족 등) 원인을 자세히 찍는다 — DEBUG_LOG를 꺼도 이것만 켜서 신호등만 디버깅 가능.
