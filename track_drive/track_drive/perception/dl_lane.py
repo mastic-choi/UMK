@@ -448,6 +448,14 @@ class DLSlideWindow(SlideWindow):
             stable_frame_min=DL_STABLE_FRAME_MIN, stable_jump_max=DL_STABLE_JUMP_MAX,
         )
         self.ll_coverage = 0.0     # 최근 프레임 ROI 내 ll foreground 비율(sanity check/디버그용)
+        # [2026-08-17n] 경로(self.path) 갱신 허용 여부 전용 디바운스 상태 — 아래
+        # _debounce_path_ok() 참고. self.stable_frame_min(=DL_STABLE_FRAME_MIN, __init__
+        # 인자로 이미 받음)을 그대로 재사용해 offset 디바운스(self._confirmed 등)와 같은
+        # "N프레임 연속 확인" 강도를 쓴다.
+        self._path_ok_confirmed = None
+        self._path_ok_pending = None
+        self._path_ok_pending_count = 0
+        self.path_ok = False
         self.da_mask_roi = None    # 시각화용(가장 큰 덩어리만 남긴 이후의 da 마스크 — 실제 waypoint 추출에 쓰는 것)
         self.da_mask_all_roi = None  # 시각화용(이진화 직후, 덩어리 선택/ll클리핑 전 da 전체 — visualize()가 파란색으로 그림)
         self.ll_mask_roi = None    # 시각화용
@@ -1589,6 +1597,44 @@ class DLSlideWindow(SlideWindow):
 
         return results, used
 
+    def _debounce_path_ok(self, path_ok_raw):
+        """self.path(자홍색 경로, pure_pursuit이 그대로 쓰는 값) 갱신을 허용해도 되는지를
+        lane_valid(근접 밴드 필수, offset/lane_center용)와 별도로 판단한다.
+
+        [2026-08-17n, README §2.36 후속] 원래는 lane_valid 하나로 self.path 갱신까지
+        같이 막았다(§2.36 "룩어헤드 점프" 크래시 수정) — 내부 self.path와 외부
+        track_drive.py의 self.lane_path가 서로 다른 조건으로 얼고 풀리면 그 틈에 내부만
+        몰래 흘러가다 한 틱에 점프하는 문제였다. 그런데 lane_valid는 근접 밴드
+        (near_center)가 반드시 있어야 하는데, 급커브 진입처럼 "근접만 일시적으로 안
+        보이고 원거리는 있는" 상황(실차 재현: 좌회전 진입에서 근접 밴드가 몇 초간
+        비어 그동안 경로 전체가 필요 이상으로 얼어붙음, 카카오톡 영상 2026-08-17
+        15:44)에서 원거리 정보를 아예 못 쓰게 만들어버린다는 게 뒤늦게 드러났다.
+
+        그래서 "경로 갱신 허용"은 근접 OR 원거리 둘 중 하나만 있어도(+ll sanity 통과)
+        허용하는 별도의 raw 신호로 만들고, 여기서 offset과 동일한 강도(stable_frame_min
+        연속 확인)로 디바운스한다 — 2026-08-10에 고쳤던 "밴드 판정이 프레임마다
+        흔들려 조향이 그 흔들림을 그대로 흡수하는" 문제가 되돌아오지 않게 하기 위함.
+        detect()가 이 디바운스된 값(self.path_ok)으로 내부 _update_path() 호출을
+        가드하고, DLLaneDetector._worker()가 그대로 읽어 밖으로 노출하면
+        track_drive.py도 같은 값으로 self.lane_path 갱신을 가드한다(perc_lane() 참고) —
+        내부/외부가 항상 같은 신호를 보므로 §2.36 크래시가 재발할 여지가 없다."""
+        if self._path_ok_confirmed is None:
+            self._path_ok_confirmed = path_ok_raw
+            self._path_ok_pending = path_ok_raw
+            self._path_ok_pending_count = self.stable_frame_min
+            return self._path_ok_confirmed
+
+        if path_ok_raw == self._path_ok_pending:
+            self._path_ok_pending_count += 1
+        else:
+            self._path_ok_pending = path_ok_raw
+            self._path_ok_pending_count = 1
+
+        if self._path_ok_pending_count >= self.stable_frame_min:
+            self._path_ok_confirmed = self._path_ok_pending
+
+        return self._path_ok_confirmed
+
     def detect(self, raw_bgr, da_prob, ll_prob, yellow_mask, avoid_hold=False, direction_hint=0, v_mps=0.0):
         """입력 : raw_bgr — 원본 카메라 프레임 그대로의 (H,W,3) BGR(크롭/리사이즈 없음)
                  da_prob, ll_prob — 위와 같은 (H,W) float32 foreground 확률(모델은 360행
@@ -1883,20 +1929,29 @@ class DLSlideWindow(SlideWindow):
         # 마지막 값 유지" 원칙을 따른다. 유효할 때도 그대로 대입하지 않고 직전 경로와
         # EMA 블렌딩한다(lane_util.PATH_EMA_ALPHA 주석 참고) — 조향이 매 프레임 새로
         # 피팅된 경로에 과민하게 반응하는 걸 막기 위함.
-        # [2026-08-17][중대 버그 수정] 위 두 문단 주석은 원래 "fitted_path 존재 여부 =
-        # lane_valid"라고 가정하고 있었는데 실제로는 서로 다른 조건이다 — fitted_path는
-        # near_slices가 비어도(근접 밴드 미검출) far_slices만으로 2점 이상만 있으면
-        # 만들어진다. 그 결과 lane_valid=False(track_drive.py가 self.lane_path를 얼려
-        # 보관 중)인 프레임에도 self.path는 계속 EMA로 움직이고 있었다 — 회피 중 장애물이
-        # 근접 밴드를 몇 프레임 가리는 동안 self.path가 몰래 딴 곳으로 흘러가다가, 유효
-        # 판정이 복귀하는 순간 track_drive.py의 self.lane_path가 이 이미 흘러간 값으로
-        # 한 틱 만에 그대로 점프해 룩어헤드 목표점이 갑자기 튀는 형태로 실차 회피 중
-        # 벽 충돌로 재현됐다(카카오톡 녹화, 2026-08-17 13:03). lane_valid일 때만 EMA를
-        # 갱신해서 내부 self.path가 외부에서 얼어있는 동안엔 같이 얼어있게 한다.
+        # [2026-08-17][중대 버그 수정, §2.36] 원래 lane_valid(근접 밴드 필수)로 이 갱신을
+        # 가드했다 — fitted_path는 근접 없이 원거리만으로도 만들어지는데(2점 이상이면
+        # 충분) lane_valid는 그걸 몰라서, 내부 self.path가 외부 track_drive.py의
+        # self.lane_path(lane_valid로 얼림)와 다른 조건으로 계속 흘러가다 유효 판정이
+        # 복귀하는 순간 한 틱 만에 점프해 룩어헤드가 튀는 형태로 벽 충돌까지 재현됐었다
+        # (카카오톡 녹화, 2026-08-17 13:03) — 그래서 lane_valid로 가드했었다.
+        # [2026-08-17n 후속, §2.36 재발] 그런데 lane_valid를 그대로 쓰면 "근접만 일시
+        # 안 보이고 원거리는 있는" 상황(급커브 진입)에서 원거리 정보를 아예 못 써서
+        # 경로가 필요 이상으로 오래 얼어붙는 게 실차로 확인됐다(카카오톡 녹화,
+        # 2026-08-17 15:44 — 좌회전 진입에서 근접 밴드만 몇 초간 비었는데 경로 전체가
+        # 그동안 멈춤). self.path_ok(아래, _debounce_path_ok() 참고)는 근접 OR 원거리
+        # 둘 중 하나만 있어도 통과시키면서도 offset과 같은 강도로 디바운스해 예전
+        # 크래시 원인(내부/외부 조건 불일치)은 재발하지 않게 한다 — DLLaneDetector가
+        # 이 값을 그대로 밖으로 노출해 track_drive.py의 self.lane_path도 같은 값으로
+        # 가드한다(perc_lane() 참고), 이제 lane_valid는 offset/lane_center 전용이다.
+        path_ok_raw = ((near_center is not None or far_center is not None)
+                       and self.ll_coverage >= DL_LL_SANITY_MIN_RATIO)
+        self.path_ok = self._debounce_path_ok(path_ok_raw)
+
         fitted_path = self._fit_and_sample_path(
             [c for c in self.centerline if c is not None]
         )
-        if lane_valid:
+        if self.path_ok:
             self._update_path(fitted_path)
 
         lane_valid, offset, lookahead, lane_center = self._debounce(
@@ -2338,6 +2393,12 @@ class DLLaneDetector:
         # GIL 하에서 원자적이므로 별도 락 없이 읽는다(track_drive.py _update_avoid_hold()가
         # getattr(self.lane_detector, 'da_area_jump', False)로 조회).
         self.da_area_jump = False
+        # [2026-08-17n] self._slide.path_ok(§2.36 재발 수정)를 그대로 복사해 노출 —
+        # da_area_jump와 동일한 관례(getattr로 조회, GIL 하에서 원자적이라 락 불필요).
+        # track_drive.py perc_lane()이 getattr(self.lane_detector, 'path_ok', valid)로
+        # 읽어 self.lane_path 갱신을 가드한다 — hough/classic_cv처럼 이 속성이 없는
+        # 백엔드는 getattr 기본값(valid)으로 조용히 폴백해 기존 동작 그대로 유지된다.
+        self.path_ok = False
         self._latest_result = (False, 0.0, 0.0, default_center, [], None)
         # 디버그 창에 띄울 최근 프레임(초록/빨강 오버레이가 이미 그려진 vis, da/ll 원본 마스크).
         # 워커 스레드가 여기 값만 갱신하고, 실제 cv2.imshow()는 show_debug_windows()가
@@ -2428,6 +2489,7 @@ class DLLaneDetector:
                 self.roi_w = self._slide.roi_w
                 self.vehicle_center_x = self._slide.vehicle_center_x
                 self.da_area_jump = self._slide.da_area_jump_detected  # [2026-08-15] 적용2
+                self.path_ok = self._slide.path_ok  # [2026-08-17n] §2.36 재발 수정 참고
                 self._latest_result = (lane_valid, offset, lookahead, lane_center, path, debug_img)
                 self._latest_debug = (
                     self._slide.vis, self._slide.da_mask_roi, self._slide.ll_mask_roi,

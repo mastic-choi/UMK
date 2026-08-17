@@ -530,17 +530,20 @@ class TrackDriverNode(Node):
             # 기존 제어 코드와 호환되도록 필터링 적용
             self.lane_offset = 0.7 * self.lane_offset + 0.3 * offset
             self.lane_lookahead = 0.5 * self.lane_lookahead + 0.5 * lookahead
-        # [2026-08-10] `if path:`만 보던 예전 조건은 주석상으론 "lane_offset의 '무효
-        # 프레임엔 직전 값 유지' 폴백과 동일"이라 적혀있었지만 실제로는 그렇지 않았다 —
-        # lane_offset은 위에서 `valid`(디바운스: DL_STABLE_FRAME_MIN=3 프레임 연속 안정돼야
-        # 갱신, lane_util._debounce() 참고)로 보호되는데, path는 "이번 프레임에 fit이
-        # 됐는지"(유효 슬라이스 2개 이상)만 봐서 디바운스를 완전히 건너뛰고 있었다. 그
-        # 결과 offset/lane_center는 안정화돼 보여도, 실제 조향에 쓰이는 self.lane_path는
-        # 밴드 판정이 프레임마다 흔들릴 때(예: 급조향 후 직진 복귀 구간, ②-1의 탐색창
-        # 지연 문제와 겹치면 특히) 그 흔들림을 거의 그대로 흡수해 조향에 전달했다.
-        # `valid`도 같이 요구해서 path 갱신에 lane_offset과 동일한 3프레임 안정성 검증을
-        # 적용한다 — 무효/불안정 구간엔 주석 원래 의도대로 직전 경로를 그대로 유지한다.
-        if valid and path:
+        # [2026-08-10] `if path:`만 보던 예전 조건은 디바운스가 전혀 없어서, 밴드 판정이
+        # 프레임마다 흔들릴 때 그 흔들림을 거의 그대로 조향에 전달했다 — 그래서 `valid`도
+        # 같이 요구하도록 바꿨었다(offset과 동일한 안정성 검증).
+        # [2026-08-17n, §2.36 재발 수정] 그런데 `valid`(=lane_valid, 근접 밴드 필수)를
+        # 그대로 쓰면 급커브 진입처럼 근접만 일시적으로 안 보이는 구간에서 원거리 정보가
+        # 있어도 경로 자체가 못 갱신되는 문제가 실차로 확인됐다(perception/dl_lane.py
+        # DLSlideWindow._debounce_path_ok() 주석 참고). `path_ok`는 근접 OR 원거리 중
+        # 하나만 있어도 통과하는 별도 신호를, `valid`와 동일한 디바운스 강도로 걸러낸
+        # 것 — dl_lane.py 내부 self.path 갱신도 이제 이 값으로 가드하므로(같은 값을
+        # 안팎이 같이 봄) §2.36의 "내부/외부 조건 불일치로 인한 점프" 크래시가 재발할
+        # 여지는 없다. hough/classic_cv처럼 이 속성이 없는 백엔드는 getattr가 `valid`로
+        # 폴백해 기존 동작 그대로다.
+        path_ok = getattr(self.lane_detector, 'path_ok', valid)
+        if path_ok and path:
             self.lane_path = path
 
         self._update_lane_side()
