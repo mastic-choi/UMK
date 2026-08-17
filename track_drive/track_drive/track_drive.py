@@ -106,6 +106,18 @@ class TrackDriverNode(Node):
         self._lane_seq_seen = None
         self._lane_fresh_t = time.time()  # 마지막으로 result_seq가 바뀐 걸 확인한 시각
         self.lane_stale = False     # LANE_STALE_SEC 이상 새 추론 결과가 안 나온 상태 — _lane_drive()가 SPEED_LANE_STALE로 강제 감속
+        # [2026-08-17m] lane_stale은 "추론 워커가 완전히 죽었을 때"(result_seq가 안 바뀜)만
+        # 잡는다 — 워커는 매 틱 살아서 새 결과를 내는데 그 결과 자체가 계속 무효(lane_valid=
+        # False)인 경우(예: 커브 진입부에서 da 밴드 핏이 몇 틱 연속 실패)는 여기 안 걸려서
+        # 아무 감속도 안 걸렸다. 실차 재현: 좌회전 진입에서 da 검출이 약 2초간 반복
+        # 실패하는 동안 SPEED_CORNER_MIN이 SPEED_NORMAL에 거의 붙어있어(§speed15 프리셋)
+        # 감속이 사실상 없었고, 그 블라인드 구간에서 트랙 밖으로 튀어나감(카카오톡 영상
+        # 2026-08-17 15:44). lane_valid가 연속으로 False인 프레임 수를 따로 세서
+        # _lane_drive()가 LANE_UNSTABLE_FRAMES 이상이면 SPEED_LANE_STALE과 동일한 캡을
+        # 걸도록 보강한다 — "워커가 죽었나"가 아니라 "지금 이 프레임을 믿을 수 있나"
+        # 자체를 보는 게 원래 목적에 더 맞다.
+        self._lane_invalid_streak = 0
+        self.lane_unstable = False
         self._lane_prev_width = 448.0  # 도로폭 직전값(px, EMA)
         self.lane_side   = LANE_SIDE   # 현재 주행 차선: +1=우측차선(노란선이 왼쪽) / -1=좌측차선
                                         #   노란 중앙선 위치로 매 프레임 갱신(_update_lane_side)
@@ -454,6 +466,8 @@ class TrackDriverNode(Node):
         if self.img_front is None:
             self.lane_valid = False
             self.lane_stale = True   # 카메라 프레임 자체가 아직/더 이상 없음 — 당연히 신선하지 않음
+            self._lane_invalid_streak += 1
+            self.lane_unstable = self._lane_invalid_streak >= LANE_UNSTABLE_FRAMES
             return
 
         # [2026-08-14] avoid-hold(§2.32) 상태를 이번 detect() 호출 전에 DL 백엔드로 넘긴다 —
@@ -510,6 +524,8 @@ class TrackDriverNode(Node):
 
         self.lane_center = lane_center
         self.lane_valid = valid
+        self._lane_invalid_streak = 0 if valid else self._lane_invalid_streak + 1
+        self.lane_unstable = self._lane_invalid_streak >= LANE_UNSTABLE_FRAMES
         if valid:
             # 기존 제어 코드와 호환되도록 필터링 적용
             self.lane_offset = 0.7 * self.lane_offset + 0.3 * offset
@@ -1586,6 +1602,13 @@ class TrackDriverNode(Node):
         # dl_lane.py 모듈 상단 주석의 의도된 동작)은 result_seq가 계속 바뀌므로 여기 안 걸림 —
         # 진짜로 갱신이 멈춘 경우에만 발동한다.
         if self.lane_stale:
+            target_speed = min(target_speed, SPEED_LANE_STALE)
+        # [2026-08-17m] lane_stale은 "워커가 죽었을 때"만 잡고, "워커는 살아서 매 틱 새
+        # 결과를 내지만 그 결과가 연속으로 무효"인 경우는 못 잡는다(위 self.lane_unstable
+        # 주석, config.py LANE_UNSTABLE_FRAMES 주석 참고) — 커브 진입에서 da 밴드 핏이
+        # 몇 틱 연속 실패하는 실패모드가 실차에서 이 갭으로 빠져나가 무감속으로 트랙을
+        # 이탈했다. lane_stale과 같은 SPEED_LANE_STALE 캡을 여기도 건다.
+        if self.lane_unstable:
             target_speed = min(target_speed, SPEED_LANE_STALE)
         # [2026-08-15] avoid-hold 적용4(안전판) — 회피 유예가 걸려있는 동안 choose_side()가
         # 0(양쪽 다 막혀 어느 쪽으로도 못 피함)을 반환하면 강제로 감속한다. avoid_hold_side는

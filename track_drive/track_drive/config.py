@@ -949,6 +949,15 @@ IMU_YAW_RATE_EMA_ALPHA = 0.3  # [2026-08-06] _imu_curvature_px() 전용 저역�
 #   더 정확하게(너무 크면 진짜 고장 감지가 늦어짐) 재조정할 것.
 LANE_STALE_SEC = 2.0
 
+# [2026-08-17m] LANE_STALE_SEC(위)은 "추론 워커가 죽어서 결과 자체가 안 바뀌는" 경우만
+#   잡는다 — 워커는 매 틱 새 결과를 내지만 그 결과가 계속 무효(lane_valid=False)인 경우엔
+#   이 게이트를 안 거쳐서 감속이 전혀 안 걸렸다(실차 재현: 커브 진입에서 da 밴드 핏이
+#   연속 실패하는 동안 무감속으로 트랙 이탈, track_drive.py self._lane_invalid_streak
+#   주석 참고). lane_valid가 연속으로 이 프레임 수 이상 False면 SPEED_LANE_STALE과 동일한
+#   캡을 건다 — 20Hz 기준 0.5초, LANE_STALE_SEC(2.0초)보다 훨씬 짧게 잡아 "워커 고장"보다
+#   훨씬 흔할 "이번 프레임을 못 믿겠다" 상황에 더 빨리 반응하게 한다. 실차 미검증 첫 추정치.
+LANE_UNSTABLE_FRAMES = 10
+
 
 # #############################################################
 # 5. 디버깅 ON/OFF
@@ -1245,9 +1254,14 @@ OBSTACLE_VEHICLE_WIDTH_M = 0.24
 #   시뮬레이션이 가정한 트랙 곡률(반경 1.2~1.3m)/세그멘테이션 잡음(1.5px)에
 #   의존하므로 그대로 믿지 말고 반드시 서행 가능한 상황에서 개입 준비하고 켤 것.
 #
-#   ★ speed15 프리셋 주의 ★ SPEED_CORNER_MIN=14.05로 나왔다 — SPEED_NORMAL=15와
-#   거의 같은 값이라 사실상 "코너에서 거의 안 늦춤"을 뜻한다. 시뮬레이션 트랙보다
-#   실제 코너가 더 급하면 위험할 수 있는 값이니 첫 테스트는 특히 주의.
+#   [2026-08-17m] speed15 프리셋의 SPEED_CORNER_MIN이 그리드서치 원값 14.05
+#   (SPEED_NORMAL=15와 거의 같음 = 사실상 코너 무감속)였던 게 실제 위험으로 확인됨 —
+#   실차에서 좌회전 진입 중 da 밴드 핏이 몇 초간 반복 실패하는 동안 이 값 때문에
+#   감속이 사실상 없어서 트랙 밖으로 튀어나갔다(카카오톡 영상 2026-08-17 15:44,
+#   같은 구간에서 dl_lane 경로가 13~15초 사이 반복적으로 사라짐/재검출됨). 프리셋
+#   활성화 전 baseline이었던 10.0으로 되돌림 — 아래 dict 안 SPEED_CORNER_MIN 참고.
+#   같이 추가한 LANE_UNSTABLE_FRAMES(위 "6. 미션..." 절)도 같은 실패모드에 대한
+#   구조적 보강이다.
 #
 #   사용법: 아래 PP_TUNE_ACTIVE_PRESET을 None(기존 개별 값 그대로) / 'speed15' /
 #   'speed25' 중 하나로 바꾸고 colcon build 후 실차에서 테스트. 프리셋이 활성화되면
@@ -1280,10 +1294,17 @@ PP_TUNE_PRESETS = {
         PP_STRAIGHT_DEADZONE_PX=7.084,
         PP_STRAIGHT_ALPHA=0.9243,
         PP_STRAIGHT_BIAS_EMA_ALPHA=0.3405,
-        SPEED_CORNER_MIN=14.05,
+        # [2026-08-17m] 14.05(그리드서치 원값) → 10.0(프리셋 활성화 전 baseline)로 완화 —
+        # 실차에서 트랙 이탈 원인으로 확인됨(위 §8 도입부 주석 참고).
+        SPEED_CORNER_MIN=10.0,
         CORNER_SIGN_EMA_ALPHA=0.3575,
         LANE_LOOKAHEAD_REF=291.3,
-        SPEED_ACCEL_STEP=1.014,
+        # [2026-08-17l] 1.014(그리드서치 원값, 기존 0.4의 2.5배)로 실차 테스트 중 LVC
+        # 트립(위 §2 SPEED_ACCEL_STEP 주석 — ctrl_speed는 14.1 그대로 발행되는데 VESC
+        # 실측 v_mps만 0으로 떨어졌다 회복되는 패턴, 카카오톡 로그 영상 2026-08-17
+        # 15:38로 재확인됨) 재현돼 원래 검증됐던 0.4로 되돌림. 조향 쪽(WHEELBASE_PX 등)은
+        # 이 문제와 무관해 그대로 둠.
+        SPEED_ACCEL_STEP=0.4,
         CORNER_HOLD_DECAY_LO=0.8375,
         CORNER_HOLD_DECAY_HI=0.9444,
         CORNER_MIN_RADIUS_PX=460.8,
@@ -1316,10 +1337,13 @@ PP_TUNE_PRESETS = {
         SPEED_NORMAL=25.0,
     ),
 }
-# [2026-08-17i] None → 'speed15'(요청 반영, 실차 테스트 활성화). ★주의★ 위 "speed15 프리셋
-#   주의" 문단대로 SPEED_CORNER_MIN=14.05(SPEED_NORMAL=15와 거의 같음 = 사실상 코너 무감속)
-#   + SPEED_ACCEL_STEP=1.014(기존 0.4의 2.5배, 배터리 LVC 트립 위험 미검증)로 바뀐다 —
-#   서행 가능한 곳에서 개입 준비하고 첫 실차 테스트할 것. 문제 생기면 None으로 되돌릴 것.
+# [2026-08-17i] None → 'speed15'(요청 반영, 실차 테스트 활성화). 서행 가능한 곳에서
+#   개입 준비하고 테스트할 것. 문제 생기면 None으로 되돌릴 것.
+#   [2026-08-17l] SPEED_ACCEL_STEP=1.014로 실차에서 LVC 트립 재현돼 0.4로 되돌림.
+#   [2026-08-17m] SPEED_CORNER_MIN=14.05로 실차에서 트랙 이탈 재현돼 10.0으로 되돌림
+#   (둘 다 위 speed15 dict 안 해당 값 옆 주석 참고) — 이 시점 기준으로 알려진 두 위험
+#   요인은 다 완화됐지만, 나머지 값들도 여전히 화이트박스 시뮬레이션 산출물이라
+#   실차 미검증인 건 그대로다.
 PP_TUNE_ACTIVE_PRESET = 'speed15'   # None / 'speed15' / 'speed25' — 실차 A/B 테스트용 스위치
 if PP_TUNE_ACTIVE_PRESET is not None:
     globals().update(PP_TUNE_PRESETS[PP_TUNE_ACTIVE_PRESET])
