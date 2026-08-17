@@ -523,14 +523,62 @@ standalone 검증 스크립트로 `DLLaneDetector.roi_w`가 첫 프레임부터 
   문제라 원래는 구분해서 봐야 하는데, 지금까지는 이 편향이 깔린 채로 진동만 따로 잡으려던
   것일 수 있다.
 
-### 2.36 §2.35가 되돌린 `roi_w/2.0`(292.5) 자체도 진짜 차량 중심이 아니었던 문제 — BEV
+### 2.36 [중대 버그] 회피 중 근접 밴드 미검출 몇 프레임 사이 `self.path`가 몰래 흘러가다
+룩어헤드가 한 틱 만에 점프해 벽 충돌 — 카카오톡 회피 녹화로 발견 (2026-08-17)
+
+**배경:** 사용자가 공유한 실차 회피 녹화(`KakaoTalk_Video_2026-08-17-13-03-53.mp4`)에서
+17초경부터 사물/차량 회피 기동이 시작됐고, 21초경 `dl_lane` 디버그창의 룩어헤드 표시점
+(`ld:XXpx`)이 그 직전 프레임과 전혀 다른 위치로 순간이동한 직후 그대로 벽에 충돌.
+`ffmpeg`로 해당 구간을 프레임 단위 추출해 확인 — offset/lane_center 표시값이 정상 범위
+(+5.8~+25.9)에서 갑자기 정확히 0.0/292.5(=roi_w/2, "화면 정중앙")로 튀는 순간과 룩어헤드
+점프 시점이 일치했다.
+
+**원인:** `DLSlideWindow.detect()`에서 `lane_valid`(근접 밴드 중심 `near_center` 존재 +
+`ll_coverage` sanity 통과)와 `self.path`를 갱신하는 `_fit_and_sample_path()`/
+`_update_path()`가 서로 다른 조건으로 동작했다 — `_fit_and_sample_path()`는 근접 밴드가
+없어도 원거리 밴드만 2개 이상 있으면 경로를 만들어내므로, `lane_valid=False`인 프레임에도
+`self.path`는 계속 EMA로 움직이고 있었다. 반면 track_drive.py `perc_lane()`은
+`if valid and path: self.lane_path = path`로 **디바운스된 `lane_valid`가 True일 때만**
+실제 조향에 쓰는 `self.lane_path`를 갱신한다(2026-08-10 커밋에서 명시적으로 의도한
+"무효 구간엔 마지막 경로 유지" 정책, 위 §2.35 인접 커밋 참고). 즉 외부(`self.lane_path`)는
+얼려서 보관 중인데 내부(`self.path`)는 몰래 계속 흘러가는 이원화 상태였다 — 회피 중
+장애물이 근접 밴드를 몇 프레임 가리는 동안 이 상태가 지속되다가, 근접 밴드가 다시 잡혀
+`lane_valid`가 True로 복귀하는 순간 `self.lane_path`가 그동안 몰래 흘러간 `self.path`
+값으로 EMA 완충 없이 한 틱 만에 통째로 점프했다. `_update_path()` 자체의 `PATH_EMA_ALPHA`
+블렌딩은 "매 프레임 새로 피팅된 경로"에는 완충 효과가 있지만, "여러 프레임 누적된 채
+얼려뒀다가 한 번에 노출되는 값"에는 완충이 전혀 되지 않는다는 게 맹점이었다.
+
+**수정:** `perception/dl_lane.py` `DLSlideWindow.detect()`에서 `_update_path(fitted_path)`
+호출을 `if lane_valid:`로 감쌌다 — 이번 프레임 `lane_valid`가 False면 내부 `self.path`도
+갱신을 건너뛰어 외부 `self.lane_path`와 동일한 시점에 얼어붙는다. 이러면 무효 구간이 끝난
+후에도 `_update_path()`가 "마지막으로 얼어붙은 값 → 새 값" 사이를 원래 의도대로
+`PATH_EMA_ALPHA`로 한 프레임씩 완충하며 따라가므로, 다시 한 번에 점프하는 대신 매끄럽게
+수렴한다.
+
+**알려진 한계:**
+- 실차 재검증 전이다(오프라인 코드 리뷰 + 녹화 재생 기반 진단). ROS2 툴체인이 이 환경에
+  없어 `python3 -m py_compile`까지만 확인했다(`CLAUDE.md` "이 환경엔 ROS2 툴체인이 없음"
+  참고).
+- 이번 진단은 "무엇이 룩어헤드를 점프시켰는지"에 집중했고, 애초에 근접 밴드가 몇 프레임
+  동안 안 잡힌 근본 원인(장애물 자체의 시야 가림인지, avoid-hold da 처리와 상호작용인지)은
+  따로 확인하지 않았다 — `DL_DA_SKIP_LL_CLIP=True`(현재 기본값, §해당 config.py 주석)라
+  이번 녹화 구간에서 avoid-hold의 `_clip_da_by_ll()` 강제 클리핑 자체는 매 프레임
+  건너뛰어지고 있었을 가능성이 높아, 밴드 미검출은 da 세그멘테이션 자체의 순간적 실패일
+  개연성이 크다(단, `avoid_hold_active` 중 `DL_DA_SKIP_LL_CLIP` 예외를 되살릴지는 별개
+  판단 필요 — 위 config.py `avoid_hold_improvement_proposal.md` 참고).
+- `dl_lane` 디버그창에 avoid-hold ll클리핑이 밴드별로 실제 몇 px를 잘랐는지 보여주는
+  시각화(초록/주황 세로선 + 바이어스 px 텍스트, `visualize()`)와, 화면의 빨간 세로선이
+  `_lane_steer()`의 `vehicle_x` 기준점과 동일한 값임을 알려주는 `vehicle_x` 라벨을 이번에
+  같이 추가했다 — 둘 다 실차 미검증 순수 디버그 오버레이(판단 로직에는 영향 없음).
+
+### 2.37 §2.35가 되돌린 `roi_w/2.0`(292.5) 자체도 진짜 차량 중심이 아니었던 문제 — BEV
 사다리꼴 실측 기하로 재계산 (2026-08-17)
 
-**배경:** 사용자가 `ll` 디버그창의 빨간 세로선(차량 중심 표시)이 실제로 어떤 기준으로
-그려지는지 질문 — 확인해보니 §2.35가 "정상값"으로 되돌린 292.5(`DL_BEV_CANVAS_W/2.0`)도
-캔버스 폭을 단순히 반으로 나눈 값일 뿐, `DL_BEV_SRC_PX`(좌/우 백선을 실측으로 손으로 찍은
-4점, `config.py DL_BEV_SRC_PX_RAW` 참고)가 카메라 광축 기준 좌우 대칭이란 보장은 어디에도
-없었다는 걸 재확인했다.
+**배경:** 사용자가 `ll` 디버그창의 빨간 세로선(차량 중심 표시, 위 §2.36에서 `vehicle_x`
+라벨을 붙인 바로 그 선)이 실제로 어떤 기준으로 그려지는지 질문 — 확인해보니 §2.35가
+"정상값"으로 되돌린 292.5(`DL_BEV_CANVAS_W/2.0`)도 캔버스 폭을 단순히 반으로 나눈 값일
+뿐, `DL_BEV_SRC_PX`(좌/우 백선을 실측으로 손으로 찍은 4점, `config.py DL_BEV_SRC_PX_RAW`
+참고)가 카메라 광축 기준 좌우 대칭이란 보장은 어디에도 없었다는 걸 재확인했다.
 
 **증상/원인:** 실제 `DL_BEV_SRC_PX_RAW` 4점(TL=[246,257], TR=[455,257], BR=[635,333],
 BL=[60,333], 원본 640px 프레임 기준)을 찍어보면 근거리 변(BL–BR)조차 화면 중앙(x=320)
@@ -546,7 +594,8 @@ BL=[60,333], 원본 640px 프레임 기준)을 찍어보면 근거리 변(BL–B
 `DLSlideWindow.detect()`가 매 프레임 `self.vehicle_center_x`로 노출하고, `DLLaneDetector`가
 `roi_w`와 동일한 방식(`_worker()`에서 동기화)으로 이걸 그대로 복사해 노출한다.
 `_lane_steer()`/`_update_lane_side()`는 `getattr(ld, 'vehicle_center_x', None)`으로 이 값을
-우선 쓰고, 없으면(`hough`/`classic_cv` 백엔드) 기존처럼 `roi_w/2.0`로 폴백한다.
+우선 쓰고, 없으면(`hough`/`classic_cv` 백엔드) 기존처럼 `roi_w/2.0`로 폴백한다. 위 §2.36의
+`vehicle_x` 빨간선/라벨도 이제 이 값을 그대로 가리키도록 같이 옮겼다.
 
 **실측(계산값):** `DL_BEV_CANVAS_W=585`(§2.35와 동일) 기준, 새로 계산한
 `DL_BEV_VEHICLE_CENTER_X ≈ 320.18` — §2.35가 "버그"라고 되돌렸던 `DL_INPUT_W/2=320`과
