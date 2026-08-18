@@ -2514,7 +2514,8 @@ class DLLaneDetector:
         with self._lock:
             return self._latest_result
 
-    def show_debug_windows(self, lookahead_xy=None, lookahead_px=None, is_straight=None, v_mps=None):
+    def show_debug_windows(self, lookahead_xy=None, lookahead_px=None, v_mps=None,
+                            steer_deg_raw=None, steer_deg_final=None):
         """da(초록)/ll(흰선=흰색·노란선=노랑) 오버레이 + (모드에 따라) 좌우 슬라이딩
         윈도우/corridor 경계가 그려진 result에 da/ll/노란선 원본 이진마스크를 위→아래로
         이어붙여 창 하나(`dl_lane`)로 띄운다 — result/da/ll/yellow 순서로 세로 스택.
@@ -2540,18 +2541,22 @@ class DLLaneDetector:
         프레임 이내 오차, 디버깅 목적엔 무시 가능). path가 아직 없으면(첫 프레임) 호출측이
         None을 넘기고, 이 경우 마커를 그리지 않는다.
 
-        is_straight(있으면) : pure_pursuit.PurePursuitController.is_straight — 직전 틱
-        기준(lookahead_xy와 동일한 이유로 한 틱 지연 가능, 무시 가능) "직진 확정" 여부.
-        [2026-08-17d] result 패널 우상단에 초록 "직진"/주황 "커브대응"으로 표시 — PP_ALPHA/
-        PP_DX_DEADZONE_PX가 이제 이 상태에 따라 실제로 바뀌므로(config.py PP_STRAIGHT_*
-        참고), 지금 어느 파라미터 세트가 적용 중인지 화면만 보고 바로 알 수 있게 한다.
-        None이면(호출측이 안 넘기거나 pure_pursuit이 아직 없는 초기 프레임) 아무것도 안
-        그린다.
-
         v_mps(있으면) : 현재 실측 속도(m/s, track_drive.py self.v_mps) — [2026-08-17g]
-        맨 아래 노란선(yellow) 전용 패널을 없애고 그 자리에 이 값과 is_straight 상태를 함께
-        표시한다(요청 반영: "yellow 부분을 제거하고 현 속도를 거기에 표시"). 노란선 자체는
-        result 패널에 이미 색으로 겹쳐 그려지므로 정보 손실은 없다.
+        맨 아래 노란선(yellow) 전용 패널을 없애고 그 자리에 이 값을 표시한다(요청 반영:
+        "yellow 부분을 제거하고 현 속도를 거기에 표시"). 노란선 자체는 result 패널에 이미
+        색으로 겹쳐 그려지므로 정보 손실은 없다. [2026-08-19] 직진/커브대응 2상태 분기
+        (pure_pursuit의 명시적 직진 모드, README §0.5.9) 자체를 제거하면서 이 패널이
+        같이 표시하던 상태 텍스트도 함께 뺐다(요청 반영) — 이제 컨트롤러는 항상
+        "커브대응" 파라미터 하나만 쓴다.
+
+        steer_deg_raw/steer_deg_final(있으면) : [2026-08-19, 요청 반영] pure_pursuit의
+        wheelbase 부스트(controller/pure_pursuit.py PP_WHEELBASE_BOOST_* 참고) "전" 1차
+        조향각(last_pre_boost_steer_deg)과 "후"(필터+클램프까지 다 거쳐 실제로 차에 나가는
+        prev_steer_deg)를 ll 패널 상단에 같이 찍는다 — 부스트가 지금 실제로 얼마나 개입
+        중인지 화면만 보고 바로 비교할 수 있게. lookahead_xy와 동일하게 _lane_steer()가
+        이번 틱에 아직 안 돌았을 때는 직전 틱 값(0.05s 이내 오차, 무시 가능). 둘 다
+        None이면(호출측이 안 넘기거나 pure_pursuit이 아직 없는 초기 프레임) 아무것도
+        안 그린다.
         ★ 반드시 메인 스레드(ROS 콜백/타이머가 도는 스레드)에서만 호출할 것 ★ — 워커
         스레드가 cv2.imshow를 직접 부르지 않는 이유는 _worker()/DLSlideWindow.visualize()
         주석 참고. track_drive.py의 perc_lane()이 detect() 직후 이 메서드를 호출한다
@@ -2572,25 +2577,27 @@ class DLLaneDetector:
                     vis, f'ld:{lookahead_px:.0f}px', (lx + 8, ly - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1
                 )
-        if is_straight is not None:
-            state_text = '직진' if is_straight else '커브대응'
-            state_color = (0, 220, 0) if is_straight else (0, 140, 255)  # 초록/주황
-            state_x = max(vis.shape[1] - 90, 0)
-            put_text_kr(vis, state_text, (state_x, 6), font_size=18, color_bgr=state_color,
-                        fallback='STRAIGHT' if is_straight else 'CURVE')
         da_bgr = cv2.cvtColor(da_mask, cv2.COLOR_GRAY2BGR)
         ll_bgr = cv2.cvtColor(ll_mask, cv2.COLOR_GRAY2BGR)
+        # [2026-08-19] ll 패널 상단에 조향각 원본(부스트 전)/최종(부스트+필터+클램프,
+        # 실제로 나가는 값)을 같이 표시 — 위 show_debug_windows() docstring 참고. 값이
+        # 다르면(=지금 부스트가 개입 중) 최종값을 주황으로 강조해 한눈에 띄게 한다.
+        if steer_deg_raw is not None and steer_deg_final is not None:
+            boosted = abs(steer_deg_final - steer_deg_raw) > 1e-3
+            final_color = (0, 140, 255) if boosted else (255, 255, 255)  # 주황=부스트 개입중
+            steer_text = f'조향 원본:{steer_deg_raw:+.1f}도 -> 최종:{steer_deg_final:+.1f}도'
+            put_text_kr(ll_bgr, steer_text, (5, 24), font_size=18, color_bgr=final_color,
+                        fallback=f'raw:{steer_deg_raw:+.1f}deg -> final:{steer_deg_final:+.1f}deg')
         # [2026-08-17g] 예전엔 여기 노란선(ll_yellow_mask) 전용 패널이 있었다(노란선만
         # 100% 불투명하게 보여 dash 끊김 확인용, ll_yellow_mask.shape 크기). 요청 반영으로
-        # 제거하고 같은 크기 패널에 속도+직진/커브대응 상태를 표시한다 — 노란선 자체는
-        # result 패널 오버레이에 이미 보이므로 이 패널이 없어져도 정보 손실은 없다.
+        # 제거하고 같은 크기 패널에 속도를 표시한다 — 노란선 자체는 result 패널 오버레이에
+        # 이미 보이므로 이 패널이 없어져도 정보 손실은 없다. [2026-08-19] 직진/커브대응
+        # 상태 텍스트는 그 2상태 분기 자체를 제거하면서 함께 뺐다(요청 반영).
         speed_bgr = np.zeros((*ll_yellow_mask.shape, 3), dtype=np.uint8)
         if v_mps is not None:
-            state_text = '직진' if is_straight else '커브대응' if is_straight is not None else '?'
-            state_color = (0, 220, 0) if is_straight else (0, 140, 255) if is_straight is not None else (200, 200, 200)
-            speed_text = f'speed: {v_mps:+.2f} m/s  {state_text}'
-            put_text_kr(speed_bgr, speed_text, (10, 8), font_size=22, color_bgr=state_color,
-                        fallback=f'speed:{v_mps:+.2f}m/s {"STRAIGHT" if is_straight else "CURVE"}')
+            speed_text = f'speed: {v_mps:+.2f} m/s'
+            put_text_kr(speed_bgr, speed_text, (10, 8), font_size=22, color_bgr=(255, 255, 255),
+                        fallback=f'speed:{v_mps:+.2f}m/s')
         for label, panel in (('result', vis), ('da', da_bgr), ('ll', ll_bgr), ('speed', speed_bgr)):
             cv2.putText(panel, label, (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
         stack = [vis, da_bgr, ll_bgr, speed_bgr]

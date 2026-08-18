@@ -36,9 +36,10 @@ class PurePursuitController:
     def __init__(self, lookahead_base_px=90.0, lookahead_speed_gain=4.0, lookahead_max_px=150.0,
                  wheelbase_px=67.0, angle_max_deg=100.0, alpha=0.5,
                  ld_floor_px=90.0, dx_deadzone_px=6.0, lookahead_curvature_gain=100.0,
-                 lookahead_min_px=40.0, straight_curvature_eps=0.001,
-                 straight_confirm_frames=5, straight_deadzone_px=20.0,
-                 straight_alpha=None, straight_bias_ema_alpha=0.15):
+                 lookahead_min_px=40.0,
+                 wheelbase_boost_enable=False,
+                 wheelbase_boost_gain_per_deg=0.02, wheelbase_boost_max_scale=1.5,
+                 lookahead_alpha=1.0):
         # [2026-08-05, 속도 적응형 lookahead — 1차 시도 후 수정]
         #   curvature ≈ 2*dx/ld^2 (작은각 근사)라서 ld가 짧을수록 같은 dx도 1/ld^2로
         #   증폭된다. 처음엔 PythonRobotics/Autoware 관례(Ld=k*v+Lfc, 저속일수록 lookahead도
@@ -88,6 +89,18 @@ class PurePursuitController:
         # 실차에서 코너 추종이 여전히 둔하면 더 낮출 것.
         self.lookahead_min_px = lookahead_min_px
 
+        # [2026-08-19] lookahead_px 자체에 거는 프레임간 저역통과(요청 반영) — self.alpha가
+        # 이미 steer_deg에 필터를 걸고 있지만, lookahead_px는 그 필터를 타기 "전" 단계라
+        # curvature_damp가 한 프레임 만에 base(예: 155px)에서 min_px(예: 90px)로 뚝 떨어질
+        # 수 있고, 그 좁아진 lookahead가 같은 dx도 더 큰 curvature로 증폭시켜(curvature=
+        # 2*sin(alpha)/ld) 스파이크를 오히려 키우거나 복귀 중 재흔들림을 만들 수 있다(위
+        # lookahead_curvature_gain 주석 참고). 1.0(기본값)이면 필터 없음 — 기존 동작과
+        # 완전히 동일. 1보다 작게 주면 lookahead_px가 한 프레임에 확 튀지 못하고 여러
+        # 프레임에 걸쳐 서서히 줄었다 늘었다 하게 된다. control() 하단에서 적용, prev는
+        # self.last_lookahead_px(다른 last_* 필드와 동일하게 held=True 프레임엔 유지).
+        # 실차 미검증.
+        self.lookahead_alpha = lookahead_alpha
+
         # [2026-08-05] dx(waypoint-차량중앙 픽셀오차)가 이 값 미만이면 0으로 죽인다 —
         #   차량이 차선 중앙에 사실상 있는데도(카메라/세그멘테이션의 서브픽셀 단위 흔들림) 매
         #   프레임 미세하게 다른 조향이 나가 중앙 부근에서 계속 잔떨림하는 것을 막는다.
@@ -95,36 +108,6 @@ class PurePursuitController:
         #   값을 쓴다 — Pure Pursuit은 목표점 자체가 이미 lookahead 앞의 실제 경로점이라
         #   LANE_DEADZONE만큼 크게 죽이면 완만한 커브 진입까지 무시하게 된다. 실차 미검증.
         self.dx_deadzone_px = dx_deadzone_px
-
-        # [2026-08-17] 명시적 "직진 모드"(README §0.5.9) — 위 dx_deadzone_px는 매 프레임
-        #   고정폭이라 코너 반응성과 항상 트레이드오프였다. damp_curvature(아래 control()의
-        #   probe_curvature/IMU curvature 중 큰 쪽 — 이미 §0.5.5에서 코너 감쇠에 쓰던 신호를
-        #   재사용, 새 신호 추가 아님)가 straight_curvature_eps 미만인 프레임이
-        #   straight_confirm_frames 연속되면 self.is_straight=True로 확정하고, 그 동안만
-        #   dx_deadzone_px 대신 straight_deadzone_px(더 넓음)를 써서 잔떨림을 더 세게
-        #   죽인다. 코너 중엔 damp_curvature가 커서 이 조건 자체가 안 걸리므로 코너 추종
-        #   감도는 그대로다. 해제는 즉시(디바운스 없음) — 코너 진입 반응이 늦어지면 안 됨.
-        self.straight_curvature_eps = straight_curvature_eps
-        self.straight_confirm_frames = straight_confirm_frames
-        self.straight_deadzone_px = straight_deadzone_px
-        self._straight_frames = 0
-        self.is_straight = False
-
-        # [2026-08-17b] "코너 탈출 직후 살짝 틀어진 채 직진 진입" 대응 — 위 직진 확정은
-        #   damp_curvature(경로가 얼마나 휘었는가)만 본다. 그런데 코너를 빠져나오며 경로
-        #   자체는 이미 곧게 폈지만(curvature≈0) 차량이 차선 중앙에서 옆으로 몇 px 밀려난
-        #   채(=dx가 0이 아닌 채) 남아있는 경우, curvature 기준으로는 "직진 확정"되어 넓은
-        #   straight_deadzone_px가 걸리고, 그 잔여 dx가 이 데드존보다 작으면 영원히 0으로
-        #   죽어서 절대 중앙으로 안 돌아온다 — 실차 미검증 상태에서 발견된 설계 공백(대화
-        #   중 시뮬레이션으로 재현: 노이즈가 우연히 curvature를 깨워 좁은 dx_deadzone_px로
-        #   되돌아갈 때만 우연히 교정됨). raw dx(데드존 적용 전 값)의 EMA를
-        #   straight_bias_ema_alpha로 누적해뒀다가, 그 크기가 straight_deadzone_px를
-        #   넘으면(=데드존 폭만큼 지속적으로 쏠려있으면 노이즈가 아니라 진짜 편향으로 판단)
-        #   damp_curvature와 무관하게 즉시 직진확정을 해제한다 — curvature 조건과 동일하게
-        #   "확정은 느리게(디바운스), 해제는 즉시" 철학을 따른다. 실차 미검증 첫 구현.
-        self.straight_alpha = straight_alpha if straight_alpha is not None else alpha
-        self.straight_bias_ema_alpha = straight_bias_ema_alpha
-        self._dx_bias_ema = 0.0
 
         # "곡률→조향각" 게인. 표준 Pure Pursuit 공식 steer = atan(2*L*sin(alpha)/Ld)에서
         # L 자리에 들어간다 — 크게 잡을수록 같은 곡률에도 조향각이 커진다(더 공격적).
@@ -138,6 +121,22 @@ class PurePursuitController:
         #   그대로 곱해지므로 ld 범위 전체에서 균일하게 민감도를 낮춘다(단, 실제 코너에서도
         #   반응이 약해지니 함께 재확인할 것).
         self.wheelbase_px = wheelbase_px
+
+        # [2026-08-19] 조향각이 클수록 wheelbase_px를 비례해서 키우는 "부스트"(요청 반영,
+        # config.py PP_WHEELBASE_BOOST_* 주석 참고) — 1차 steer_deg의 절댓값에 그대로
+        # 비례해서(도당 gain_per_deg 비율) wheelbase_px를 키워 atan 포화 쪽으로 더
+        # 밀어붙인다(max_scale로 상한). [2026-08-19 재수정] 원래는 문턱각(angle_th_deg)을
+        # 넘어야만 부스트가 시작되는 계단형이었는데, "조향각이 작을 땐 증폭도 작고 커지면
+        # 증폭도 커지게"(요청 반영)로 바꾸면서 문턱 자체를 없앴다 — 이제 각도 0에서부터
+        # 연속적으로(선형) 커진다(각도 0이면 배율도 정확히 1.0, 즉 무보정과 동일). 계단이
+        # 없어져 "임계 넘는 순간 갑자기 세짐" 현상도 같이 사라진다.
+        # wheelbase_boost_enable은 "speed15" 프리셋(PP_TUNE_ACTIVE_PRESET)이 켜져 있을
+        # 때만 track_drive.py가 True로 넘긴다 — 순간 명령/실측 속도값이 아니라 어떤 튜닝
+        # 프리셋을 쓰고 있는지로 켜고 끈다(2026-08-19 피드백: 처음엔 런타임 speed==15로
+        # 잘못 구현했었음). 실차 미검증.
+        self.wheelbase_boost_enable = wheelbase_boost_enable
+        self.wheelbase_boost_gain_per_deg = wheelbase_boost_gain_per_deg
+        self.wheelbase_boost_max_scale = wheelbase_boost_max_scale
 
         self.angle_max_deg = angle_max_deg
 
@@ -187,6 +186,13 @@ class PurePursuitController:
         # 바로 확인할 수 있게 노출한다 — control()에 매번 넘어와도 probe_curvature가 더
         # 크면 반영이 안 될 수 있으니 last_curvature만으로는 구분이 안 됨.
         self.last_imu_curvature_px = None
+        # [2026-08-19] wheelbase 부스트(위 wheelbase_boost_* 주석 참고) 적용 "전" 1차
+        # steer_deg — track_drive.py가 dl_lane.py 'll' 패널에 "보정 전/후" 조향각을 같이
+        # 찍어서 부스트가 실제로 얼마나 개입 중인지 한눈에 보여주는 데 쓴다. prev_steer_deg는
+        # 부스트+필터+클램프까지 다 거친 "실제로 나가는" 값이라, 부스트 자체의 기여도만
+        # 따로 보려면 이 값과 같이 봐야 한다. held=True인 프레임에는 갱신하지 않는다(다른
+        # last_* 필드와 동일 원칙).
+        self.last_pre_boost_steer_deg = 0.0
 
     def reset(self):
         self.prev_steer_deg = 0.0
@@ -195,9 +201,7 @@ class PurePursuitController:
         self.last_target_xy = None
         self.last_lookahead_px = None
         self.last_imu_curvature_px = None
-        self._straight_frames = 0
-        self.is_straight = False
-        self._dx_bias_ema = 0.0
+        self.last_pre_boost_steer_deg = 0.0
 
     def _target_point(self, path, vehicle_xy, lookahead_px):
         """path를 따라 vehicle_xy로부터 누적 호길이가 lookahead_px를 넘는 첫 지점을
@@ -230,8 +234,7 @@ class PurePursuitController:
            반환 : 조향각(도), ±angle_max_deg로 클램프.
            호출 후 self.held로 이번 호출이 "새로 계산"(False)했는지 "직전값 유지"(True)
            했는지, self.last_curvature로 이번(혹은 마지막 유효) curvature를 확인할 수
-           있다(디버그 창/코너 감속용). self.is_straight로 명시적 직진 모드(§0.5.9)가
-           확정 중인지도 확인 가능하다."""
+           있다(디버그 창/코너 감속용)."""
         if not path:
             self.held = True
             return self.prev_steer_deg
@@ -267,45 +270,25 @@ class PurePursuitController:
         self.last_imu_curvature_px = imu_curvature_px
         curvature_damp = 1.0 / (1.0 + self.lookahead_curvature_gain * damp_curvature)
 
-        # [2026-08-17] 명시적 직진 모드 판정(1/2: 곡률 조건) — damp_curvature(비전+IMU 중
-        # 더 큰 쪽, 위에서 이미 계산됨)를 그대로 재사용한다. 확정에는 straight_confirm_frames
-        # 디바운스를 걸어 순간 노이즈로 오확정되지 않게 하고, 해제는 즉시라 실제 코너 진입 시
-        # 데드존이 넓어진 채로 남아있는 프레임이 없다.
-        if damp_curvature < self.straight_curvature_eps:
-            self._straight_frames += 1
-        else:
-            self._straight_frames = 0
-        curvature_confirmed_straight = self._straight_frames >= self.straight_confirm_frames
-
-        lookahead_px = float(np.clip(
+        lookahead_px_raw = float(np.clip(
             speed_lookahead_px * curvature_damp,
             self.lookahead_min_px, self.lookahead_max_px
         ))
+        # [2026-08-19] lookahead_px 저역통과(__init__ lookahead_alpha 주석 참고) — 직전
+        # 프레임에 새로 계산됐던 lookahead(self.last_lookahead_px)와 블렌딩한다. held=True로
+        # 건너뛴 프레임 직후에는 last_lookahead_px가 "몇 프레임 전" 값일 수 있지만, 그것도
+        # "직전에 유효했던 값"이라는 점에서 prev_steer_deg와 같은 원칙이라 문제 없다.
+        if self.last_lookahead_px is None:
+            lookahead_px = lookahead_px_raw
+        else:
+            lookahead_px = (self.lookahead_alpha * lookahead_px_raw
+                             + (1.0 - self.lookahead_alpha) * self.last_lookahead_px)
         tx, ty = self._target_point(path, vehicle_xy, lookahead_px)
         self.last_target_xy = (tx, ty)
         self.last_lookahead_px = lookahead_px
         dx = tx - vehicle_xy[0]
 
-        # [2026-08-17b] 명시적 직진 모드 판정(2/2: 잔여 편향 조건) — dx_deadzone_px로
-        # 자르기 전의 raw dx를 EMA로 누적해서 "곡률은 0인데 dx만 계속 한쪽으로 쏠려있는"
-        # 경우(코너 탈출 직후 잔여 오프셋 등)를 잡아낸다. __init__ 상단 주석 참고.
-        #   [2026-08-17d 버그 수정] 판정 기준을 straight_deadzone_px(=dx를 0으로 죽이는
-        #   그 데드존 폭, 20px)로 잡았었는데, 이러면 20px 미만의 모든 지속 편향이
-        #   "진짜 편향"으로 절대 감지되지 않는다 — bias_ema가 그 데드존 자체에 막혀 20px를
-        #   못 넘으므로 판정 기준을 원천적으로 못 넘는 자기모순. 실차 재현: 차량이 차선
-        #   중앙에서 10~15px 우측으로 치우친 채(육안으론 "평행하게 직진") 영원히 안
-        #   돌아옴 — waypoint는 매 프레임 정확히 중앙(dx≈편향값)을 가리키는데도 그 dx가
-        #   20px 데드존에 걸려 0으로 죽어버려 조향 보정이 아예 안 나간 것. 판정 기준을
-        #   dx_deadzone_px(코너/S자용 좁은 데드존, 6px)로 낮춰 6px 넘게 지속되는 편향은
-        #   반드시 잡히게 한다.
-        self._dx_bias_ema = (self.straight_bias_ema_alpha * dx
-                              + (1.0 - self.straight_bias_ema_alpha) * self._dx_bias_ema)
-        bias_ok = abs(self._dx_bias_ema) < self.dx_deadzone_px
-        self.is_straight = curvature_confirmed_straight and bias_ok
-
-        dx_deadzone_px = self.straight_deadzone_px if self.is_straight else self.dx_deadzone_px
-        filter_alpha = self.straight_alpha if self.is_straight else self.alpha
-        if abs(dx) < dx_deadzone_px:
+        if abs(dx) < self.dx_deadzone_px:
             dx = 0.0
         # 이미지 y는 아래로 증가하므로 "전방으로 이만큼"은 vehicle_xy[1]-ty(위로 갈수록 +).
         # 목표점이 차량과 같은 행(dy<=0)에 있는 뒤틀린 경로라도 나눗셈이 죽지 않도록
@@ -328,8 +311,19 @@ class PurePursuitController:
         alpha = math.atan2(dx, dy)
         curvature = 2.0 * math.sin(alpha) / ld
         steer_deg = math.degrees(math.atan(curvature * self.wheelbase_px))
+        self.last_pre_boost_steer_deg = steer_deg
 
-        steer_deg = filter_alpha * steer_deg + (1.0 - filter_alpha) * self.prev_steer_deg
+        # [2026-08-19] wheelbase 부스트(위 __init__ 주석 참고) — "speed15" 프리셋일 때만
+        # (wheelbase_boost_enable) 1차 steer_deg의 절댓값에 비례해서(문턱 없음, 각도 0이면
+        # boost_scale도 정확히 1.0=무보정) wheelbase_px를 키워 같은 curvature로 다시
+        # 계산한다. 아래 필터(self.alpha)/클램프는 이 boosted steer_deg에 그대로 이어서
+        # 적용된다 — 기존 흐름과 동일.
+        if self.wheelbase_boost_enable:
+            boost_scale = min(self.wheelbase_boost_max_scale,
+                               1.0 + self.wheelbase_boost_gain_per_deg * abs(steer_deg))
+            steer_deg = math.degrees(math.atan(curvature * self.wheelbase_px * boost_scale))
+
+        steer_deg = self.alpha * steer_deg + (1.0 - self.alpha) * self.prev_steer_deg
         steer_deg = float(np.clip(steer_deg, -self.angle_max_deg, self.angle_max_deg))
         self.prev_steer_deg = steer_deg
         self.held = False

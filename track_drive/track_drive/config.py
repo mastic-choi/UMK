@@ -185,9 +185,9 @@ CORNER_MIN_SPEED_SCALE = 0.35  # 반경이 0에 가까워져도 속도가 0으�
 
 # [2026-08-18] "직선인데 커브로 오검출돼 속도가 안 오른다" 대응 — turn_now(조향각 signed
 #   EMA)/turn_preview(lane_lookahead)는 전부 비전+조향출력에서만 나오는 신호라, 세그멘테이션
-#   잡음이나 조향 잔떨림만으로도 코너로 오인될 수 있다. is_straight(§0.5.9, PP_STRAIGHT_*)가
-#   이미 이 문제를 다루긴 하지만 여러 프레임 연속 확정이 필요한 이진 게이트라, 아직
-#   확정 전인 애매한 프레임에서는 turn_now/turn_preview가 잡음만으로 감속을 걸어도 못 막는다.
+#   잡음이나 조향 잔떨림만으로도 코너로 오인될 수 있다. [2026-08-19] 한때 is_straight
+#   (§0.5.9, PP_STRAIGHT_*, "직진 확정" 이진 게이트)가 이 문제를 같이 다뤘으나 요청 반영으로
+#   그 기능 자체가 제거됐다 — 이제 아래 IMU 교차검증이 이 문제를 다루는 유일한 수단이다.
 #   2023 KMU 대회 AuTURBO rookie 팀 저장소(ModeController.py, github.com/AuTURBO/
 #   2023_KMU_Autonomous_team_AuTURBO_rookie)의 모드전환 로직을 참고 — 거기서도 비전(픽셀
 #   오차 평균)만으로는 "커브"를 확정하지 않고, diff_degree(IMU yaw 변화량 > 47도)로 실제
@@ -839,6 +839,15 @@ PP_LOOKAHEAD_SPEED_GAIN = 3.305    # 속도가 오를수록 lookahead를 늘리�
 PP_LOOKAHEAD_MAX_PX = 180.7        # lookahead 상한 — 150.0→180.7(그리드서치)
 PP_LOOKAHEAD_CURVATURE_GAIN = 224.8  # 직전 프레임 curvature가 클수록(코너) lookahead를 줄이는 게인 — 100.0→224.8(그리드서치)
 PP_LOOKAHEAD_MIN_PX = 62.61        # 코너에서 lookahead가 줄어들 수 있는 하한 — 40.0→62.61(그리드서치)
+
+# [2026-08-19] lookahead_px 자체에 거는 프레임간 저역통과(요청 반영, pure_pursuit.py
+#   lookahead_alpha 주석 참고) — curvature_damp가 한 프레임 만에 lookahead를 base 근처에서
+#   MIN_PX까지 확 끌어내리면, 좁아진 lookahead가 같은 dx도 더 큰 curvature로 증폭시켜
+#   (curvature=2*sin(alpha)/ld) 급조향 스파이크를 키우거나 복귀 중 재흔들림을 만들 수
+#   있다는 관찰에서 추가. 1.0(기본값)=필터 없음, 기존 동작과 완전히 동일 — 프리셋에서
+#   명시적으로 낮춰야 켜진다. 실차 미검증.
+PP_LOOKAHEAD_ALPHA = 1.0
+
 # [2026-08-06] "곡률→조향각" 게인(pure_pursuit.py의 steer_deg = atan(curvature*wheelbase_px)).
 #   원래 80.0은 "실제 축거리 대신 쓰는" 임의 튜닝값이었다(pure_pursuit.py 상단 주석: "카메라
 #   픽셀→미터 변환이 아직 실측 전이라 wheelbase_px를 대신 쓴다, PIXELS_PER_METER가 실측되면
@@ -860,6 +869,31 @@ PP_WHEELBASE_PX = 49.64            # [2026-08-17h] 25.0→49.64(그리드서치)
                                     #   줄이는 방향). atan(curvature*wheelbase_px) 공식상 값이 작을수록
                                     #   같은 curvature에도 조향각이 더 작게 나옴(반응 약화) — 실차 재검증 필요.
                                     # 원래 = WHEELBASE_M(0.335) * DL_PIXELS_PER_METER(200) 실측 기반 계산값(67.0)
+
+# [2026-08-19] 조향각이 클수록 wheelbase_px를 비례해서 키우는 "부스트"(요청 반영).
+#   atan(curvature*wheelbase_px) 공식상 wheelbase_px를 키우면 같은 curvature에도 조향각이
+#   atan 포화 쪽으로 더 밀린다 — 1차 steer_deg의 절댓값에 그대로 비례해서(GAIN_PER_DEG)
+#   wheelbase_px를 키운다(MAX_SCALE로 상한). [2026-08-19 재수정] 원래는 문턱각
+#   (PP_WHEELBASE_BOOST_ANGLE_TH_DEG)을 넘어야만 부스트가 시작되는 계단형이었는데,
+#   "조향각이 작을 땐 증폭도 작고 커지면 증폭도 커지게"(요청 반영) — 즉 문턱 없이 각도 0부터
+#   연속적으로 커지는 형태로 바꾸면서 문턱각 파라미터 자체를 없앴다. GAIN_PER_DEG도 그에 맞춰
+#   재조정했다 — 문턱이 있을 때는 "문턱을 넘은 초과분"에만 곱해졌지만 이제는 "전체 각도"에
+#   곱해지므로, 예전과 같은 숫자를 쓰면 훨씬 작은 각도에서 MAX_SCALE에 도달해버린다(예:
+#   GAIN=0.15면 MAX_SCALE=1.5 도달 각도가 (1.5-1)/0.15≈3.3°로, 사실상 상시 최대 부스트가
+#   걸리는 것과 다름없어져 "미미할 땐 작게"라는 요청과 어긋난다). 0.03으로 낮춰
+#   (1.5-1)/0.03≈16.7°에서 MAX_SCALE에 닿도록 재설정 — 순전히 추정치, 실차에서 체감보고
+#   재조정할 것.
+#   "speed15 프리셋일 때만 적용" 요청대로(2026-08-19 — 처음엔 런타임 speed==15로, 그 다음엔
+#   별도 계산식으로 잘못/우회적으로 구현했었음) 셋 다 PP_WHEELBASE_PX처럼 "여기 top-level엔
+#   기본값(비활성)만 두고, 아래 PP_TUNE_PRESETS['speed15']가 실제 값으로 덮어쓴다"는 이 파일의
+#   기존 프리셋 관례를 그대로 따른다. PP_TUNE_ACTIVE_PRESET이 'speed15'가 아니거나 None이면
+#   아래 ENABLE 기본값(False)이 그대로 남아 부스트가 꺼진다.
+#   ★ 실차 완전 미검증 ★ — 부스트가 과하면 급코너에서 오버스티어처럼 느껴질 수 있으니
+#   실차에서는 MAX_SCALE부터 낮춰가며 확인할 것.
+PP_WHEELBASE_BOOST_ENABLE = False        # 기본값(비활성) — speed15 프리셋만 아래서 True로 덮어씀
+PP_WHEELBASE_BOOST_GAIN_PER_DEG = 0.03   # 조향각 1도당 wheelbase_px를 이 비율만큼 확대(문턱 없음, 각도 0부터 연속 적용)
+PP_WHEELBASE_BOOST_MAX_SCALE = 1.5       # wheelbase_px 배율 상한(최대 +50%) — 폭주 방지
+
 # [2026-08-12] 직진 구간에서도 계속 진동("와리가리")한다는 보고 대응 — §0.5.3 "알려진
 #   한계"에서 이미 "PP_ALPHA를 낮춰 조향각 저역통과를 더 강하게 거는 쪽을 다음으로 볼 것"
 #   이라고 못박아뒀던 그 다음 단계. 0.5 → 0.35로 낮춰 프레임간 저역통과를 더 세게 건다
@@ -870,16 +904,16 @@ PP_WHEELBASE_PX = 49.64            # [2026-08-17h] 25.0→49.64(그리드서치)
 #   게 뒤늦게 드러났다(원인 분석 대화 참고). 저속(SPEED_NORMAL=3.0 그대로)일수록
 #   speed_lookahead_px가 하한(90px)에 가까워 픽셀노이즈 증폭이 가장 심한 구간이라, 필터를
 #   더 강하게 걸어야 하는 상황에서 반대로 완화했던 것이 원인일 가능성이 높다.
-# [2026-08-17c] 위 문제는 이제 아래 PP_STRAIGHT_ALPHA가 직진 확정 중에만 담당하도록
-#   분리했다(pure_pursuit.py의 "직진(A)/코너+S자(B) 2상태 분기" — is_straight일 때만
-#   PP_STRAIGHT_ALPHA, 그 외엔 이 값을 쓴다). 그래서 이 값은 이제 "코너/S자 등 직진이
-#   아닐 때"의 필터로 그 의미가 좁혀졌고, 그 조건에서는 진동 억제보다 반응성이 우선이라
-#   0.35 → 0.8로 다시 올렸다(대화 중 코너90도/S자커브 합성 시뮬레이션 그리드서치 상위권
-#   — corner_lag/scurve_amp_ratio 기준). 직진 잡음 억제는 더 이상 이 값이 아니라
-#   PP_STRAIGHT_ALPHA + PP_STRAIGHT_DEADZONE_PX + 아래 편향감지(bias EMA) 조합이 담당한다.
-#   실차 미검증 — 화이트박스 합성 시뮬레이션 결과이므로 실차 재검증 필수.
+# [2026-08-17c] 한때 아래 PP_STRAIGHT_ALPHA가 직진 확정 중 필터를 따로 담당하도록
+#   분리했던 적이 있다("직진(A)/코너+S자(B) 2상태 분기") — 그 동안 이 값은 "코너/S자
+#   등 직진이 아닐 때" 전용으로 좁혀져 반응성 우선으로 0.35→0.8까지 올라갔었다.
 # [2026-08-17h] 0.8→0.5244(그리드서치, PP_WHEELBASE_PX 상향과 함께 재탐색된 조합).
-PP_ALPHA = 0.5244                  # 프레임간 조향각 저역통과 필터(1=필터없음, 0=반응없음) — "코너/S자"(비직진) 상태 전용
+# [2026-08-19] 요청 반영 — "직진(A)/코너+S자(B) 2상태 분기" 자체(PP_STRAIGHT_*, README
+#   §0.5.9)를 완전히 제거했다. 이제 이 값이 모든 상황(직진 포함)에서 유일하게 쓰이는
+#   저역통과 필터다 — 위 [2026-08-17c] 이전(2026-08-12~17 사이)의 "직진 진동 대응"
+#   문제로 되돌아갈 수 있으니, 직진에서 다시 "와리가리"가 보이면 이 값을 낮추는 쪽으로
+#   대응할 것(위 [2026-08-12]/[2026-08-13] 이력 참고).
+PP_ALPHA = 0.5244                  # 프레임간 조향각 저역통과 필터(1=필터없음, 0=반응없음)
 PP_LD_FLOOR_PX = 86.95        # curvature 분모(ld) 바닥값 — 노이즈 증폭 방지용. lookahead_px 자체의 하한인 PP_LOOKAHEAD_MIN_PX와는 다른 값(개명 전 이름: PP_MIN_LOOKAHEAD_PX)이니 헷갈리지 말 것. 90.0→86.95(그리드서치)
 # [2026-08-12] 6.0 → 15.0. 직진 진동 대응 세 번째 레버 — 원래 값이 중앙 부근 잔떨림을
 #   죽이기엔 너무 작아서(픽셀 몇 개짜리 노이즈도 그대로 통과) 직진에서도 매 프레임 미세한
@@ -889,55 +923,21 @@ PP_LD_FLOOR_PX = 86.95        # curvature 분모(ld) 바닥값 — 노이즈 증
 # [2026-08-13] 15.0 → 5.0(요청 반영, PP_WHEELBASE_PX를 67→40으로 줄여 조향 반응 자체가
 #   약해진 만큼 데드존도 같이 줄임 — 노란선 흔들림 대응) 했었으나, [2026-08-17] PP_ALPHA와
 #   같은 이유로 12.0으로 절충 원복.
-# [2026-08-17c] PP_ALPHA와 같은 이유로 의미가 "코너/S자(비직진) 상태 전용"으로 좁혀졌다 —
-#   직진 잡음 억제는 PP_STRAIGHT_DEADZONE_PX가 담당하므로, 이 값은 이제 코너/S자 추종
-#   반응성 쪽으로 다시 낮췄다(12.0 → 6.0, 그리드서치 상위권 조합). 실차 미검증.
+# [2026-08-17c] 한때 PP_ALPHA와 같은 이유로 "코너/S자(비직진) 상태 전용"으로 좁혀져
+#   12.0→6.0으로 낮아졌던 적이 있다(직진 잡음 억제는 PP_STRAIGHT_DEADZONE_PX가 담당).
 # [2026-08-17h] 6.0→4.445(재증속 후 재실행한 그리드서치, pp_tune_gridsearch.py).
-PP_DX_DEADZONE_PX = 4.445          # 이 이하 픽셀오차는 0으로 죽여 중앙 부근 잔떨림 제거 — "코너/S자"(비직진) 상태 전용
+# [2026-08-19] 요청 반영 — 위 PP_ALPHA와 동일하게 "직진(A)/코너+S자(B) 2상태 분기"를
+#   완전히 제거했다. 이제 이 값이 모든 상황(직진 포함)에서 유일하게 쓰이는 데드존이다.
+PP_DX_DEADZONE_PX = 4.445          # 이 이하 픽셀오차는 0으로 죽여 중앙 부근 잔떨림 제거
 
-# [2026-08-17] 명시적 "직진 모드"(README §0.5.9) — 지금까지의 진동 억제(PP_ALPHA/
-#   PP_DX_DEADZONE_PX)는 전부 "연속값을 더 세게 누르는" 방식이라 코너 반응성과 항상
-#   트레이드오프였다. probe_curvature(코너 판단 신호, pure_pursuit.py control())가 연속
-#   PP_STRAIGHT_CONFIRM_FRAMES 프레임 동안 이 값 미만이면 "직진 확정" 상태로 보고, 그
-#   동안만 데드존을 PP_STRAIGHT_DEADZONE_PX로 넓힌다 — 코너 중엔 이 조건 자체가 안
-#   걸리므로 코너 추종 감도는 그대로다. 셋 다 실차 미검증 첫 추정치.
-
-# [2026-08-17e] 0.001은 너무 타이트했다 — 실차 녹화(카카오톡 영상, 2026-08-17 14:00)에서
-#   육안으론 명백한 직진 구간이 계속 "커브대응"(주황)으로 표시됨을 확인. probe_curvature=
-#   2*sin(alpha)/probe_ld 공식상 0.001은 probe_ld=90~150px(PP_LOOKAHEAD_BASE_PX~MAX_PX,
-#   일반 주행 중 실제 쓰이는 범위) 구간에서 dx 약 5~11px만 넘어도 넘는 값이다 — 이 정도
-#   dx 흔들림은 이 파일 위쪽 ld_floor_px 주석이 직접 든 실측 예("ld=42px, dx=3px
-#   (육안으론 거의 직진)여도 curvature≈0.0034")보다도 작아, 세그멘테이션의 프레임 간
-#   서브픽셀~픽셀 단위 잡음만으로도 상시 초과했을 가능성이 높다. 그 실측 예(0.0034)가
-#   "거의 직진"으로 불렸다는 걸 기준 삼아 0.0035로 3.5배 완화 — 해제는 여전히 즉시(단일
-#   프레임 디바운스 없음)라 실제 코너 진입 반응성엔 영향 없다(위 PP_STRAIGHT_CONFIRM_FRAMES
-#   주석 참고). 실차 재검증 필요.
-# [2026-08-17h] 셋 다 pp_tune_gridsearch.py 재실행(SPEED_NORMAL=15.0) 결과로 교체.
-PP_STRAIGHT_CURVATURE_EPS = 0.003283  # 이 미만이면 "사실상 직진" — 0.0035→0.003283(그리드서치)
-PP_STRAIGHT_CONFIRM_FRAMES = 10       # 연속 이 프레임 수만큼 유지돼야 직진 확정(20Hz 기준 0.5초, 5→10). 해제는 즉시(디바운스 없음) — 코너 진입 반응이 늦어지면 안 되므로
-PP_STRAIGHT_DEADZONE_PX = 21.64       # 직진 확정 중에만 적용하는 넓은 데드존 — PP_DX_DEADZONE_PX보다 커야 함. 20.0→21.64(그리드서치)
-
-# [2026-08-17c] "직진(A)/코너+S자(B) 2상태 분기" 확장 — 원래 직진모드는 PP_DX_DEADZONE_PX
-#   하나만 넓혔는데(위), PP_ALPHA(저역통과)도 직진과 코너/S자가 원하는 값이 정반대라는 게
-#   대화 중 시뮬레이션으로 확인됐다(직진: 강한 필터가 유리, 코너/S자: 약한 필터가 유리).
-#   그래서 직진 확정 중에는 PP_ALPHA 대신 이 값을 쓴다(pure_pursuit.py control()의
-#   filter_alpha 분기). PP_WHEELBASE_PX는 두 상태 그리드서치에서 공통으로 25.0을
-#   선호해 굳이 분리하지 않았다. 실차 미검증 — 화이트박스 합성 시뮬레이션 추정치.
-# [2026-08-17h] 0.4→0.5096(그리드서치 재실행) — 더 이상 "PP_ALPHA(0.8)보다 낮게"가 아니게
-#   됐다(PP_ALPHA 자체도 0.5244로 낮아짐, 둘이 거의 같은 값) — 직진/코너 필터 차등 자체는
-#   유지되지만 격차가 좁혀졌다는 뜻.
-PP_STRAIGHT_ALPHA = 0.5096          # 직진 확정 중 조향각 저역통과 필터
-
-# [2026-08-17c] "코너 탈출 직후 살짝 틀어진 채 직진 진입" 대응 — 위 PP_STRAIGHT_DEADZONE_PX
-#   (넓은 데드존)는 곡률만 보고 확정되므로, 곡률은 0인데 dx만 한쪽으로 계속 쏠려있는
-#   잔여 오프셋을 영원히 못 지울 위험이 있다(대화 중 시뮬레이션으로 재현). raw dx(데드존
-#   적용 전)의 EMA가 PP_STRAIGHT_DEADZONE_PX 폭을 넘으면 노이즈가 아니라 진짜 편향으로
-#   보고 곡률 조건과 무관하게 직진확정을 해제한다(pure_pursuit.py __init__/control() 상단
-#   주석 참고). 실차 미검증 첫 구현 — 편향 회복이 너무 느리면 이 값을 올릴 것(반응은
-#   빨라지지만 노이즈에도 더 민감해짐).
-# [2026-08-17h] 0.15→0.06785(그리드서치 재실행) — 편향 감지가 더 느려짐(반응은 느려지지만
-#   노이즈에는 덜 민감).
-PP_STRAIGHT_BIAS_EMA_ALPHA = 0.06785
+# [2026-08-19] 명시적 "직진 모드"(README §0.5.9, 2026-08-17 도입) 제거(요청 반영: "직진모드,
+#   커브모드는 빼자 — 파라미터는 모두 커브대응상태만 남기고 날려줘"). pure_pursuit이
+#   probe_curvature/dx 편향으로 "직진 확정" 상태를 판정해 그 동안만 더 넓은 데드존
+#   (PP_STRAIGHT_DEADZONE_PX)과 다른 필터(PP_STRAIGHT_ALPHA)를 쓰던 2상태 분기였는데,
+#   이제 위 PP_ALPHA/PP_DX_DEADZONE_PX 하나로 통일했다(코너/S자 대응 값이 상시 적용) —
+#   PP_STRAIGHT_CURVATURE_EPS/CONFIRM_FRAMES/DEADZONE_PX/ALPHA/BIAS_EMA_ALPHA 5개
+#   상수와 pure_pursuit.py의 판정 로직(is_straight, _straight_frames, _dx_bias_ema)을
+#   전부 삭제했다. 되돌리려면 이 커밋 이전(2026-08-17h) 이력을 참고할 것.
 
 # ── 차량 물리 상수 ──
 # [2026-08-14] 옛 이름 LQR_WHEELBASE_M → WHEELBASE_M. LQR 컨트롤러 제거로 "LQR 전용"이
@@ -1383,8 +1383,6 @@ PP_TUNE_PRESETS = {
         PP_LOOKAHEAD_BASE_PX=90.0, PP_LOOKAHEAD_SPEED_GAIN=4.0, PP_LOOKAHEAD_MAX_PX=190.0,
         PP_WHEELBASE_PX=25.0, PP_ALPHA=0.8, PP_LD_FLOOR_PX=90.0, PP_DX_DEADZONE_PX=6.0,
         PP_LOOKAHEAD_CURVATURE_GAIN=100.0, PP_LOOKAHEAD_MIN_PX=40.0,
-        PP_STRAIGHT_CURVATURE_EPS=0.0035, PP_STRAIGHT_CONFIRM_FRAMES=5, PP_STRAIGHT_DEADZONE_PX=20.0,
-        PP_STRAIGHT_ALPHA=0.4, PP_STRAIGHT_BIAS_EMA_ALPHA=0.15,
         SPEED_CORNER_MIN=5.0, CORNER_SIGN_EMA_ALPHA=0.15, LANE_LOOKAHEAD_REF=220.0,
         SPEED_ACCEL_STEP=0.4, CORNER_HOLD_DECAY_LO=0.92, CORNER_HOLD_DECAY_HI=0.97,
         CORNER_MIN_RADIUS_PX=250.0, CORNER_MIN_SPEED_SCALE=0.35,
@@ -1395,8 +1393,6 @@ PP_TUNE_PRESETS = {
         PP_LOOKAHEAD_BASE_PX=78.61, PP_LOOKAHEAD_SPEED_GAIN=1.476, PP_LOOKAHEAD_MAX_PX=263.7,
         PP_WHEELBASE_PX=49.39, PP_ALPHA=0.7678, PP_LD_FLOOR_PX=63.26, PP_DX_DEADZONE_PX=1.626,
         PP_LOOKAHEAD_CURVATURE_GAIN=446.4, PP_LOOKAHEAD_MIN_PX=41.66,
-        PP_STRAIGHT_CURVATURE_EPS=0.008086, PP_STRAIGHT_CONFIRM_FRAMES=5, PP_STRAIGHT_DEADZONE_PX=5.222,
-        PP_STRAIGHT_ALPHA=0.9083, PP_STRAIGHT_BIAS_EMA_ALPHA=0.5997,
         # [2026-08-18 배포 직후 수정] 그리드서치 원값 14.16이 SPEED_NORMAL(10.0)보다 커서
         # max(SPEED_CORNER_MIN, ...) 공식상 코너감속 경로가 완전히 죽어있었다(§0.5.10과
         # 동일 실패모드, 실차 테스트로 재현됨 — "속도 5 고정" 증상은 이거 때문이 아니라
@@ -1412,8 +1408,6 @@ PP_TUNE_PRESETS = {
         PP_LOOKAHEAD_BASE_PX=78.44, PP_LOOKAHEAD_SPEED_GAIN=1.808, PP_LOOKAHEAD_MAX_PX=180.1,
         PP_WHEELBASE_PX=49.17, PP_ALPHA=0.2258, PP_LD_FLOOR_PX=52.63, PP_DX_DEADZONE_PX=10.56,
         PP_LOOKAHEAD_CURVATURE_GAIN=490.4, PP_LOOKAHEAD_MIN_PX=34.59,
-        PP_STRAIGHT_CURVATURE_EPS=0.01194, PP_STRAIGHT_CONFIRM_FRAMES=7, PP_STRAIGHT_DEADZONE_PX=2.582,
-        PP_STRAIGHT_ALPHA=0.8493, PP_STRAIGHT_BIAS_EMA_ALPHA=0.434,
         # [2026-08-18 배포 직후 수정] 위 speed10과 동일 버그(14.17 > SPEED_NORMAL 12.5) —
         # SPEED_NORMAL*0.7로 완화.
         SPEED_CORNER_MIN=8.75, CORNER_SIGN_EMA_ALPHA=1.0, LANE_LOOKAHEAD_REF=405.9,
@@ -1430,22 +1424,25 @@ PP_TUNE_PRESETS = {
         # 버그가 재현되지 않았다 — SPEED_NORMAL*0.7 클램프 불필요, 그리드서치 원값 그대로 적용.
         # 실차 재검증 전.
         PP_LOOKAHEAD_BASE_PX=110.38, PP_LOOKAHEAD_SPEED_GAIN=3.01, PP_LOOKAHEAD_MAX_PX=265.4,
-        PP_WHEELBASE_PX=45, PP_ALPHA=0.45, PP_LD_FLOOR_PX=120.19, PP_DX_DEADZONE_PX=5.204,
-        PP_LOOKAHEAD_CURVATURE_GAIN=602.3, PP_LOOKAHEAD_MIN_PX=110.74,  # [2026-08-18] 70.74→110.74(+40px, 요청 반영)
-        PP_STRAIGHT_CURVATURE_EPS=0.01142, PP_STRAIGHT_CONFIRM_FRAMES=10, PP_STRAIGHT_DEADZONE_PX=3.439,
-        PP_STRAIGHT_ALPHA=0.889, PP_STRAIGHT_BIAS_EMA_ALPHA=0.8182,
-        SPEED_CORNER_MIN=13.34, CORNER_SIGN_EMA_ALPHA=0.8113, LANE_LOOKAHEAD_REF=331.3,
-        SPEED_ACCEL_STEP=3.851, CORNER_HOLD_DECAY_LO=0.9301, CORNER_HOLD_DECAY_HI=0.9753,
-        CORNER_MIN_RADIUS_PX=1227, CORNER_MIN_SPEED_SCALE=0.4969,
-        PATH_EMA_ALPHA=0.9, DL_STABLE_FRAME_MIN=1, DL_STABLE_JUMP_MAX=37.44,
-        SPEED_NORMAL=12.0,
+        PP_WHEELBASE_PX=25, PP_ALPHA=0.70, PP_LD_FLOOR_PX=120.19, PP_DX_DEADZONE_PX=5,
+        PATH_EMA_ALPHA=0.5, DL_STABLE_FRAME_MIN=1, DL_STABLE_JUMP_MAX=37.44,
+        SPEED_NORMAL=12.0, #직진 잘한 상태
+        # [2026-08-19] 조향각 wheelbase 부스트(요청 반영) — "speed15 프리셋일 때만 적용"이라
+        # 여기(=speed15 프리셋)에만 켜서(ENABLE=True) 넣는다. 다른 프리셋으로 바꾸면 이 키가
+        # 아예 없어서 top-level 기본값(ENABLE=False)이 그대로 남아 자동으로 꺼진다.
+        # [2026-08-19 재수정] 문턱각(구 PP_WHEELBASE_BOOST_ANGLE_TH_DEG=15.0) 없이 각도 0부터
+        # 연속 비례하는 방식으로 바꾸면서(요청 반영, config.py 위 PP_WHEELBASE_BOOST_* 주석
+        # 참고) 이 프리셋에 있던 GAIN_PER_DEG=0.15도 top-level 기본값(0.03)과 같은 값으로
+        # 재조정했다 — 0.15를 문턱 없이 그대로 쓰면 (1.5-1)/0.15≈3.3°만 넘어도 MAX_SCALE에
+        # 도달해 사실상 상시 최대 부스트가 걸린다(요청("미미할 땐 작게")과 어긋남). 순전히
+        # 추정치, 실차에서 체감보고 재조정할 것.
+        PP_WHEELBASE_BOOST_ENABLE=True, PP_WHEELBASE_BOOST_GAIN_PER_DEG=0.03,
+        PP_WHEELBASE_BOOST_MAX_SCALE=2,
     ),
     'speed17_5': dict(
         PP_LOOKAHEAD_BASE_PX=82.53, PP_LOOKAHEAD_SPEED_GAIN=1.162, PP_LOOKAHEAD_MAX_PX=253.4,
         PP_WHEELBASE_PX=45.0, PP_ALPHA=0.5642, PP_LD_FLOOR_PX=56.15, PP_DX_DEADZONE_PX=1.694,
         PP_LOOKAHEAD_CURVATURE_GAIN=478.8, PP_LOOKAHEAD_MIN_PX=30.73,
-        PP_STRAIGHT_CURVATURE_EPS=0.002449, PP_STRAIGHT_CONFIRM_FRAMES=5, PP_STRAIGHT_DEADZONE_PX=10.34,
-        PP_STRAIGHT_ALPHA=0.75, PP_STRAIGHT_BIAS_EMA_ALPHA=0.4548,
         SPEED_CORNER_MIN=15.61, CORNER_SIGN_EMA_ALPHA=0.4682, LANE_LOOKAHEAD_REF=314.7,
         SPEED_ACCEL_STEP=1.518, CORNER_HOLD_DECAY_LO=0.8894, CORNER_HOLD_DECAY_HI=0.9731,
         CORNER_MIN_RADIUS_PX=551.4, CORNER_MIN_SPEED_SCALE=0.06394,
@@ -1461,8 +1458,6 @@ PP_TUNE_PRESETS = {
         PP_LOOKAHEAD_BASE_PX=99.6, PP_LOOKAHEAD_SPEED_GAIN=0.8793, PP_LOOKAHEAD_MAX_PX=331.9,
         PP_WHEELBASE_PX=38.19, PP_ALPHA=0.9274, PP_LD_FLOOR_PX=59.4, PP_DX_DEADZONE_PX=3.577,
         PP_LOOKAHEAD_CURVATURE_GAIN=840.7, PP_LOOKAHEAD_MIN_PX=61.31,
-        PP_STRAIGHT_CURVATURE_EPS=0.006292, PP_STRAIGHT_CONFIRM_FRAMES=5, PP_STRAIGHT_DEADZONE_PX=3.746,
-        PP_STRAIGHT_ALPHA=0.9339, PP_STRAIGHT_BIAS_EMA_ALPHA=0.349,
         SPEED_CORNER_MIN=15.83, CORNER_SIGN_EMA_ALPHA=0.7536, LANE_LOOKAHEAD_REF=459.4,
         SPEED_ACCEL_STEP=4.678, CORNER_HOLD_DECAY_LO=0.9445, CORNER_HOLD_DECAY_HI=0.9143,
         CORNER_MIN_RADIUS_PX=678.6, CORNER_MIN_SPEED_SCALE=0.261,
@@ -1473,8 +1468,6 @@ PP_TUNE_PRESETS = {
         PP_LOOKAHEAD_BASE_PX=82.36, PP_LOOKAHEAD_SPEED_GAIN=1.23, PP_LOOKAHEAD_MAX_PX=283.5,
         PP_WHEELBASE_PX=49.29, PP_ALPHA=0.7039, PP_LD_FLOOR_PX=56.8, PP_DX_DEADZONE_PX=1.904,
         PP_LOOKAHEAD_CURVATURE_GAIN=442.0, PP_LOOKAHEAD_MIN_PX=46.28,
-        PP_STRAIGHT_CURVATURE_EPS=0.002509, PP_STRAIGHT_CONFIRM_FRAMES=2, PP_STRAIGHT_DEADZONE_PX=4.695,
-        PP_STRAIGHT_ALPHA=0.4509, PP_STRAIGHT_BIAS_EMA_ALPHA=0.6679,
         SPEED_CORNER_MIN=15.71, CORNER_SIGN_EMA_ALPHA=0.1762, LANE_LOOKAHEAD_REF=246.7,
         SPEED_ACCEL_STEP=1.433, CORNER_HOLD_DECAY_LO=0.8567, CORNER_HOLD_DECAY_HI=0.9191,
         CORNER_MIN_RADIUS_PX=208.0, CORNER_MIN_SPEED_SCALE=0.3496,
@@ -1487,8 +1480,6 @@ PP_TUNE_PRESETS = {
         PP_LOOKAHEAD_BASE_PX=80.26, PP_LOOKAHEAD_SPEED_GAIN=1.231, PP_LOOKAHEAD_MAX_PX=250.9,
         PP_WHEELBASE_PX=49.99, PP_ALPHA=0.7777, PP_LD_FLOOR_PX=73.1, PP_DX_DEADZONE_PX=1.989,
         PP_LOOKAHEAD_CURVATURE_GAIN=517.9, PP_LOOKAHEAD_MIN_PX=49.07,
-        PP_STRAIGHT_CURVATURE_EPS=0.001982, PP_STRAIGHT_CONFIRM_FRAMES=5, PP_STRAIGHT_DEADZONE_PX=6.251,
-        PP_STRAIGHT_ALPHA=0.6336, PP_STRAIGHT_BIAS_EMA_ALPHA=0.3725,
         SPEED_CORNER_MIN=13.1, CORNER_SIGN_EMA_ALPHA=0.3186, LANE_LOOKAHEAD_REF=568.9,
         SPEED_ACCEL_STEP=1.57, CORNER_HOLD_DECAY_LO=0.9392, CORNER_HOLD_DECAY_HI=0.9318,
         CORNER_MIN_RADIUS_PX=202.0, CORNER_MIN_SPEED_SCALE=0.137,

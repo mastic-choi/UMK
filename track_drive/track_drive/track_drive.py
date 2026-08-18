@@ -295,11 +295,10 @@ class TrackDriverNode(Node):
             dx_deadzone_px=PP_DX_DEADZONE_PX,
             lookahead_curvature_gain=PP_LOOKAHEAD_CURVATURE_GAIN,
             lookahead_min_px=PP_LOOKAHEAD_MIN_PX,
-            straight_curvature_eps=PP_STRAIGHT_CURVATURE_EPS,
-            straight_confirm_frames=PP_STRAIGHT_CONFIRM_FRAMES,
-            straight_deadzone_px=PP_STRAIGHT_DEADZONE_PX,
-            straight_alpha=PP_STRAIGHT_ALPHA,
-            straight_bias_ema_alpha=PP_STRAIGHT_BIAS_EMA_ALPHA,
+            wheelbase_boost_enable=PP_WHEELBASE_BOOST_ENABLE,
+            wheelbase_boost_gain_per_deg=PP_WHEELBASE_BOOST_GAIN_PER_DEG,
+            wheelbase_boost_max_scale=PP_WHEELBASE_BOOST_MAX_SCALE,
+            lookahead_alpha=PP_LOOKAHEAD_ALPHA,
         )
 
         self.path = None
@@ -502,14 +501,14 @@ class TrackDriverNode(Node):
         #   엄밀히는 직전 틱 값(0.05s 이내 오차, 디버깅 목적엔 무시 가능).
         lookahead_xy = self.pure_pursuit.last_target_xy
         lookahead_px = self.pure_pursuit.last_lookahead_px
-        # [2026-08-17d] 직전 틱의 직진/커브대응 상태도 같이 넘겨서 result 패널에 표시한다
-        # (dl_lane.DLLaneDetector.show_debug_windows() 주석 참고) — lookahead_xy/px와 동일하게
-        # 한 틱(0.05s) 지연 가능.
-        is_straight = self.pure_pursuit.is_straight
-        # [2026-08-17g] dl_lane 창 맨 아래 yellow 패널이 속도+커브대응 상태 패널로
-        # 바뀌면서(perception/dl_lane.py show_debug_windows() 참고) v_mps도 같이 넘긴다.
+        # [2026-08-19] wheelbase 부스트 전/후 조향각도 같이 넘겨서 ll 패널 상단에 표시한다
+        # (perception/dl_lane.py show_debug_windows() steer_deg_raw/steer_deg_final 주석,
+        # 요청 반영) — lookahead_xy와 동일하게 이번 틱 _lane_steer() 실행 전 시점이라
+        # 직전 틱 값(0.05s 이내 오차, 무시 가능).
         getattr(self.lane_detector, 'show_debug_windows', lambda *a, **k: None)(
-            lookahead_xy, lookahead_px, is_straight, self.v_mps)
+            lookahead_xy, lookahead_px, self.v_mps,
+            steer_deg_raw=self.pure_pursuit.last_pre_boost_steer_deg,
+            steer_deg_final=self.pure_pursuit.prev_steer_deg)
 
         # [2026-08-11] "재사용된 최신값"과 "완전히 안 갱신됨"을 구분 — DLLaneDetector가
         # 추론 1회 끝날 때마다 올리는 result_seq(dl_lane.py 참고)가 직전 틱에서 본 값과
@@ -1615,23 +1614,16 @@ class TrackDriverNode(Node):
                                 + (1.0 - CORNER_SIGN_EMA_ALPHA) * self._corner_signal)
         turn_now     = min(1.0, abs(self._corner_signal) / ANGLE_MAX)
         turn_preview = min(1.0, abs(self.lane_lookahead) / LANE_LOOKAHEAD_REF)
-        # [2026-08-17] 명시적 직진 모드(README §0.5.9)를 코너 감속에도 병합 — pure_pursuit이
-        # (조향 출력과는 독립된 경로 curvature+IMU 신호로) "직진 확정"을 판단해준 프레임에는
-        # turn_now/turn_preview에 낀 잔여 노이즈로 인한 유령 감속을 무시하고 그대로 전속력을
-        # 낸다. is_straight가 아닌 프레임(코너 포함 전부)은 기존 연속값 로직을 그대로 쓴다 —
-        # 코너 감속 감도 자체는 전혀 안 바뀜.
-        is_straight = getattr(self.pure_pursuit, 'is_straight', False)
-        # [2026-08-18] IMU 실측 회전량으로 "비전이 본 코너가 진짜인가" 교차검증(위
-        # _imu_corner_confirm_scale() 주석 참고) — is_straight가 아직 확정 전인 애매한
-        # 프레임에서 turn_now/turn_preview가 비전 잡음만으로 감속을 거는 걸 막는다.
+        # [2026-08-18] IMU 실측 회전량으로 "비전이 본 코너가 진짜인가" 교차검증
+        # (_imu_corner_confirm_scale() 주석 참고) — turn_now/turn_preview가 비전 잡음만으로
+        # 감속을 거는 걸 막는다.
         imu_corner_scale = self._imu_corner_confirm_scale()
-        turn_for_speed = 0.0 if is_straight else max(turn_now, turn_preview * 0.3) * imu_corner_scale
+        turn_for_speed = max(turn_now, turn_preview * 0.3) * imu_corner_scale
         target_speed = max(SPEED_CORNER_MIN,
                            SPEED_NORMAL * (1.0 - 0.90 * turn_for_speed ** 3))
         # 코너 진입(회전반경 감소) 시 추가 감속 — 기존 turn_for_speed 기반 감속과는 독립적으로
-        # 계산해서 더 낮은 쪽을 쓴다(대체가 아니라 추가 안전판). 직진 확정 중엔 이 반경 계산도
-        # 같은 이유로 건너뛴다(1.0 = 감속 없음).
-        corner_radius_scale = 1.0 if is_straight else self._corner_radius_speed_scale()
+        # 계산해서 더 낮은 쪽을 쓴다(대체가 아니라 추가 안전판).
+        corner_radius_scale = self._corner_radius_speed_scale()
         target_speed = max(SPEED_CORNER_MIN, target_speed * corner_radius_scale)
         # [2026-08-18] SPEED_LL_DEGRADED 캡 제거 — DL_CENTER_MODE='ll'일 때만 의미있던
         # 로직인데 현재 DL_CENTER_MODE='da'로 완전히 전환되어 차선(ll) 기반 주행을
@@ -1822,17 +1814,6 @@ class TrackDriverNode(Node):
         imu_text = f'{imu_kappa:+.4f}' if imu_kappa is not None else '미반영(IMU/VESC 확인)'
         lines.append((f'IMU curvature: {imu_text}', (10, 8 + 32 * len(lines)), imu_color, 18,
                        f'IMU curvature: {imu_text if imu_kappa is not None else "N/A"}'))
-
-        # [2026-08-17] 명시적 직진 모드(README §0.5.9, 조향 데드존 + 코너감속 둘 다 이 상태를
-        # 참고) 표시 — 확정까지 남은 프레임 수를 같이 보여줘서, 직전 몇 프레임이 이미
-        # 저곡률이었는지(곧 확정될지)를 실차에서 바로 확인할 수 있게 한다.
-        is_straight = getattr(controller, 'is_straight', False)
-        straight_frames = getattr(controller, '_straight_frames', 0)
-        straight_confirm = getattr(controller, 'straight_confirm_frames', 0)
-        straight_color = (0, 200, 0) if is_straight else (140, 140, 140)
-        straight_text = f'확정({straight_frames}프레임, 조향+속도 적용)' if is_straight else f'대기({straight_frames}/{straight_confirm})'
-        lines.append((f'직진모드: {straight_text}', (10, 8 + 32 * len(lines)), straight_color, 18,
-                       f'Straight mode: {"CONFIRMED (steer+speed)" if is_straight else f"waiting({straight_frames}/{straight_confirm})"}'))
 
         # DA(주행가능영역) 면적 — DL_DA_MAX_AREA_PX 실측 튜닝용. 원래 da_debug라는 별도
         # 창이었는데 조향 상태랑 같이 한눈에 보고 싶다는 요청으로 이 창에 합쳤다(2026-08-06).

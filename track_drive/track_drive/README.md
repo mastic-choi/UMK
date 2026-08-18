@@ -333,6 +333,19 @@ curvature+IMU)라 더 신뢰도가 높으므로, `_lane_drive()`가 `is_straight
   줄임)와 반대 방향이다 — 그 부분은 가져오지 않았고 "이산 분류로 직진 구간에 별도 처리를 준다"는
   아이디어만 차용했다.
 
+**[2026-08-19] 기능 전체 제거(요청 반영: "직진모드, 커브모드는 빼자 — 파라미터는 모두 커브대응상태만
+남기고 날려줘").** 위 "알려진 한계"가 실차 검증 없이 계속 쌓여만 있었고, 명시적 2상태 분기 자체가
+복잡도만 늘린다는 판단으로 되돌렸다. `controller/pure_pursuit.py`에서 `is_straight`/`_straight_frames`/
+`_dx_bias_ema` 판정 로직과 `straight_*` 생성자 인자를 전부 삭제했고, `config.py`의
+`PP_STRAIGHT_CURVATURE_EPS`/`PP_STRAIGHT_CONFIRM_FRAMES`/`PP_STRAIGHT_DEADZONE_PX`/`PP_STRAIGHT_ALPHA`/
+`PP_STRAIGHT_BIAS_EMA_ALPHA`(top-level 기본값 + `PP_TUNE_PRESETS`의 9개 프리셋 전부)도 함께 삭제했다.
+이제 `PP_ALPHA`/`PP_DX_DEADZONE_PX` 하나씩만 남아 직진 포함 모든 상황에 상시 적용된다("커브대응" 값이
+유일한 값). `track_drive.py._lane_drive()`의 코너감속 `is_straight` 바이패스(`turn_for_speed=0.0`/
+`corner_radius_scale=1.0` 강제)도 제거해 항상 연속값 감속 로직만 쓴다. `steer_debug`/`dl_lane` 창의
+"직진모드"/"직진·커브대응" 표시도 함께 뺐다. **알려진 한계:** `pp_tune_gridsearch.py`는 아직
+`cfg.PP_STRAIGHT_*`와 `pp.is_straight`를 참조하는 옛 시뮬레이션 코드를 그대로 갖고 있어 이 삭제 이후
+그대로 실행하면 깨진다 — 다음에 그 스크립트를 쓸 일이 생기면 같이 정리할 것.
+
 ### 0.5.10 증속(`SPEED_NORMAL` 3.0→10.0) + lookahead 상한 재계산 (2026-08-17)
 저속(3.0) 재튜닝값이 안정 검증된 뒤, 요청 반영으로 `SPEED_NORMAL`을 10.0으로 올림. §0.5.6과 같은 이유로
 `PP_LOOKAHEAD_MAX_PX`도 같이 재계산해야 한다 — `speed_lookahead_px = PP_LOOKAHEAD_BASE_PX +
