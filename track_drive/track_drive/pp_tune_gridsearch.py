@@ -116,7 +116,7 @@
 #   control_loop()과 동일 주기)마다
 #     1) 차량의 현재 위치/헤딩 기준으로 기준경로를 차량 상대좌표로 변환
 #     2) DL_PIXELS_PER_METER(200px/m)로 픽셀 변환 + 세그멘테이션 잡음(가우시안,
-#        기본 표준편차 1.5px — config.py min_lookahead_px 주석의 실측 예
+#        기본 표준편차 1.5px — config.py ld_floor_px 주석의 실측 예
 #        "dx=3px가 육안상 거의 직진"과 같은 자릿수)을 얹어 실제 ROI 픽셀
 #        웨이포인트 배열(가까운점→먼점, PATH_N_WAYPOINTS=12개)을 합성
 #     3) PurePursuitController.control()을 그대로 호출해 조향각(도)을 얻고
@@ -811,7 +811,7 @@ def score(results):
 # PurePursuitController 생성자로 그대로 들어가는 키(조향) — evaluate()가 이 이름으로 필터링.
 PP_CTOR_KEYS = (
     'lookahead_base_px', 'lookahead_speed_gain', 'lookahead_max_px', 'wheelbase_px',
-    'alpha', 'min_lookahead_px', 'dx_deadzone_px', 'lookahead_curvature_gain',
+    'alpha', 'ld_floor_px', 'dx_deadzone_px', 'lookahead_curvature_gain',
     'lookahead_min_px', 'straight_curvature_eps', 'straight_confirm_frames',
     'straight_deadzone_px', 'straight_alpha', 'straight_bias_ema_alpha',
 )
@@ -839,7 +839,7 @@ BASELINE = dict(
     lookahead_max_px=cfg.PP_LOOKAHEAD_MAX_PX,
     wheelbase_px=cfg.PP_WHEELBASE_PX,
     alpha=cfg.PP_ALPHA,
-    min_lookahead_px=cfg.PP_MIN_LOOKAHEAD_PX,
+    ld_floor_px=cfg.PP_LD_FLOOR_PX,
     dx_deadzone_px=cfg.PP_DX_DEADZONE_PX,
     lookahead_curvature_gain=cfg.PP_LOOKAHEAD_CURVATURE_GAIN,
     lookahead_min_px=cfg.PP_LOOKAHEAD_MIN_PX,
@@ -869,7 +869,7 @@ RANGE_FACTORS = dict(
     lookahead_max_px=(0.8, 1.3),
     wheelbase_px=(0.5, 2.0),
     alpha=(0.4, 1.0 / max(cfg.PP_ALPHA, 1e-6) * 0.95 if cfg.PP_ALPHA < 0.95 else 1.0),
-    min_lookahead_px=(0.7, 1.3),
+    ld_floor_px=(0.7, 1.3),
     dx_deadzone_px=(0.3, 3.0),
     lookahead_curvature_gain=(0.3, 2.5),
     lookahead_min_px=(0.5, 1.8),

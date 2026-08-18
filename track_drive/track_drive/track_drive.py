@@ -291,7 +291,7 @@ class TrackDriverNode(Node):
             wheelbase_px=PP_WHEELBASE_PX,
             angle_max_deg=ANGLE_MAX,
             alpha=PP_ALPHA,
-            min_lookahead_px=PP_MIN_LOOKAHEAD_PX,
+            ld_floor_px=PP_LD_FLOOR_PX,
             dx_deadzone_px=PP_DX_DEADZONE_PX,
             lookahead_curvature_gain=PP_LOOKAHEAD_CURVATURE_GAIN,
             lookahead_min_px=PP_LOOKAHEAD_MIN_PX,

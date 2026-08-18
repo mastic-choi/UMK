@@ -35,19 +35,19 @@ class PurePursuitController:
 
     def __init__(self, lookahead_base_px=90.0, lookahead_speed_gain=4.0, lookahead_max_px=150.0,
                  wheelbase_px=67.0, angle_max_deg=100.0, alpha=0.5,
-                 min_lookahead_px=90.0, dx_deadzone_px=6.0, lookahead_curvature_gain=100.0,
+                 ld_floor_px=90.0, dx_deadzone_px=6.0, lookahead_curvature_gain=100.0,
                  lookahead_min_px=40.0, straight_curvature_eps=0.001,
                  straight_confirm_frames=5, straight_deadzone_px=20.0,
                  straight_alpha=None, straight_bias_ema_alpha=0.15):
         # [2026-08-05, 속도 적응형 lookahead — 1차 시도 후 수정]
         #   curvature ≈ 2*dx/ld^2 (작은각 근사)라서 ld가 짧을수록 같은 dx도 1/ld^2로
         #   증폭된다. 처음엔 PythonRobotics/Autoware 관례(Ld=k*v+Lfc, 저속일수록 lookahead도
-        #   짧게)를 그대로 따라 lookahead_base_px를 65(=기존 min_lookahead_px 가드값과 동일)로
+        #   짧게)를 그대로 따라 lookahead_base_px를 65(=기존 ld_floor_px 가드값과 동일)로
         #   낮췄는데, 실차에서 "waypoint가 살짝만 틀어져도(dx≈50px) ang=50도 가까이 찍힌다"는
         #   증상으로 재현됨 — ld=65, dx=50이면 steer≈50°(계산 확인됨), ld=90(구 고정값)이면
         #   같은 dx에도 steer≈32°로 훨씬 덜 민감하다. 즉 "저속=깨끗한 경로를 촘촘히 추종"을
         #   가정하는 PythonRobotics류 관례가, 매 프레임 픽셀 노이즈가 있는 비전 기반 경로에는
-        #   그대로 안 맞았다(짧은 lookahead가 노이즈까지 증폭). 게다가 base와 min_lookahead_px
+        #   그대로 안 맞았다(짧은 lookahead가 노이즈까지 증폭). 게다가 base와 ld_floor_px
         #   가드가 같은 값(65)이라 이 위험구간에서 가드도 사실상 작동을 안 했다.
         #   → 하한을 기존에 검증된 고정값(90)으로 되돌리고, 속도가 오르면 그 "위로만" 늘어나게
         #   바꿨다(절대 90 밑으로는 안 내려감). 여전히 저속에서 tight-tracking 이점은 없지만,
@@ -81,7 +81,7 @@ class PurePursuitController:
         #   probe_curvature를 매 프레임 "댐핑 적용 전 고정 기준 lookahead"로 새로 계산해서
         #   이 순환을 끊는다 — 아래 control() 내부 주석 참고.
         self.lookahead_curvature_gain = lookahead_curvature_gain
-        # 위 감쇠가 당길 수 있는 하한 — min_lookahead_px(curvature 계산의 ld 분모 바닥값,
+        # 위 감쇠가 당길 수 있는 하한 — ld_floor_px(curvature 계산의 ld 분모 바닥값,
         # 완전히 다른 용도)와 절대 헷갈리지 말 것. 둘 다 90.0이면 damp가 아무리 작아져도
         # lookahead_px가 base(90)로 다시 clip돼서 이 기능 자체가 무효화된다 — 그래서
         # 반드시 lookahead_base_px보다 뚜렷이 작은 값으로 따로 둔다. 40px은 추정치,
@@ -148,7 +148,7 @@ class PurePursuitController:
         # 큰 곡률로 증폭된다. 실측 예: ld=42px, dx=3px(육안으론 거의 직진)여도 alpha≈4.1°,
         # curvature≈0.0034 → atan(curvature*wheelbase_px=220)≈37° — 픽셀 몇 개짜리 잡음이
         # 30도대 조향 스파이크로 증폭되는 걸 실제로 재현 가능.
-        #   [2026-08-06] 예전엔 ld<min_lookahead_px일 때 계산 자체를 건너뛰고 직전 조향각을
+        #   [2026-08-06] 예전엔 ld<ld_floor_px일 때 계산 자체를 건너뛰고 직전 조향각을
         #   그대로 반환했는데(freeze), 이러면 "ld가 짧은 상태"(주로 dx 자체가 작을 때 걸림,
         #   ld≥|dx|라서)가 진동 중 우연히 한 번 걸리는 순간 그때의 조향각에 영원히 고정돼
         #   버렸다 — 그 뒤로는 실제 편차가 계속 커져도 재계산을 아예 안 해서 차가 한쪽으로
@@ -159,7 +159,7 @@ class PurePursuitController:
         #   목표점이 아주 가까우면서 옆으로도 벌어져 있는 극단적인 경우엔(alpha 자체가
         #   크면) 여전히 큰 조향각이 나올 수 있다 — alpha는 이 바닥값의 영향을 안 받기
         #   때문. 실차 미검증 튜닝값, 저속·개입 가능 상태로 재검증할 것.
-        self.min_lookahead_px = min_lookahead_px
+        self.ld_floor_px = ld_floor_px
 
         # 프레임 간 조향각 스파이크 저역통과 — controller/stanley.py의 self.alpha와
         # 동일한 패턴(1프레임짜리 경로 튐이 조향에 그대로 실리지 않도록).
@@ -251,7 +251,7 @@ class PurePursuitController:
         probe_tx, probe_ty = self._target_point(path, vehicle_xy, probe_px)
         probe_dx = probe_tx - vehicle_xy[0]
         probe_dy = max(vehicle_xy[1] - probe_ty, 1e-3)
-        probe_ld = max(math.hypot(probe_dx, probe_dy), min(self.min_lookahead_px, probe_px))
+        probe_ld = max(math.hypot(probe_dx, probe_dy), min(self.ld_floor_px, probe_px))
         probe_curvature = 2.0 * math.sin(math.atan2(probe_dx, probe_dy)) / probe_ld
         # [2026-08-06] IMU 실측 curvature 반영 — probe_curvature는 "아직 안 가본 앞쪽
         # 경로가 얼마나 휘었는지"에 대한 비전 추정치라, 경로 자체가 흔들리면 같이
@@ -311,19 +311,19 @@ class PurePursuitController:
         # 목표점이 차량과 같은 행(dy<=0)에 있는 뒤틀린 경로라도 나눗셈이 죽지 않도록
         # 최소값을 준다.
         dy = max(vehicle_xy[1] - ty, 1e-3)
-        # ld가 너무 짧으면(위 min_lookahead_px 주석 참고) 분모만 바닥을 깐다 — 계산 자체를
+        # ld가 너무 짧으면(위 ld_floor_px 주석 참고) 분모만 바닥을 깐다 — 계산 자체를
         # 건너뛰지 않는다. 짧은 ld에서 픽셀 노이즈가 조향각으로 증폭되는 건 막으면서도,
         # 매 프레임 계속 보정하므로 "얼어붙어서 못 돌아오는" 문제가 없다.
-        #   [2026-08-06] 바닥값을 min_lookahead_px로 고정하면 안 된다 — _target_point()가
+        #   [2026-08-06] 바닥값을 ld_floor_px로 고정하면 안 된다 — _target_point()가
         #   찾는 ld는 항상 lookahead_px 이하다(호길이 ≥ 직선거리라서). curvature 기반
         #   감쇠(위 lookahead_curvature_gain 주석 참고)로 이번 프레임 lookahead_px가
-        #   min_lookahead_px(90)보다 작게(코너에서 의도적으로) 정해졌는데 바닥을 그대로
+        #   ld_floor_px(90)보다 작게(코너에서 의도적으로) 정해졌는데 바닥을 그대로
         #   90으로 두면, ld가 거의 항상 그 90으로 다시 눌려서 "코너에서 더 촘촘히
-        #   추종한다"는 효과가 없어진다. 그래서 바닥을 min(min_lookahead_px, lookahead_px)로
-        #   잡는다 — 직진처럼 lookahead_px가 min_lookahead_px 이상이면 기존과 동일하게
+        #   추종한다"는 효과가 없어진다. 그래서 바닥을 min(ld_floor_px, lookahead_px)로
+        #   잡는다 — 직진처럼 lookahead_px가 ld_floor_px 이상이면 기존과 동일하게
         #   90이 바닥이고, 코너처럼 lookahead_px를 일부러 줄였으면 그 줄어든 값 자체가
         #   바닥이 된다(더 줄어들진 않되, 의도한 값 밑으로 인위적으로 다시 늘어나지도 않음).
-        ld = max(math.hypot(dx, dy), min(self.min_lookahead_px, lookahead_px))
+        ld = max(math.hypot(dx, dy), min(self.ld_floor_px, lookahead_px))
 
         alpha = math.atan2(dx, dy)
         curvature = 2.0 * math.sin(alpha) / ld
