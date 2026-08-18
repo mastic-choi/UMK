@@ -931,7 +931,7 @@ def sample_params(rng, speed_norm):
             if lo >= hi:
                 lo = hi * 0.5
         val = rng.uniform(lo, hi)
-        if k in ('alpha', 'straight_alpha', 'path_ema_alpha'):
+        if k in ('alpha', 'straight_alpha', 'path_ema_alpha', 'corner_sign_ema_alpha'):
             val = float(np.clip(val, 0.05, 1.0))
         p[k] = float(val)
     # corner_hold_decay_hi가 lo보다 낮게 뽑히면(별개 절대범위라 드물게 역전 가능)
@@ -1053,7 +1053,7 @@ def _params_from_trial(trial, speed_norm):
             p[k] = trial.suggest_categorical(k, STABLE_FRAME_MIN_CHOICES)
             continue
         lo, hi = _candidate_range(k)
-        if k in ('alpha', 'straight_alpha', 'path_ema_alpha'):
+        if k in ('alpha', 'straight_alpha', 'path_ema_alpha', 'corner_sign_ema_alpha'):
             lo, hi = max(lo, 0.05), min(hi, 1.0)
         if k == 'speed_corner_min':
             # sample_params()와 동일 제약(위 [2026-08-18 6차] 주석 참고) — Optuna 쪽에도
