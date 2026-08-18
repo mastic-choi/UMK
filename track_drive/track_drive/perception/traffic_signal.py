@@ -25,6 +25,10 @@ from ..config import (
     SIG4_BOARD_MAX_ASPECT, SIG4_BOARD_MAX_CANDIDATES, SIG4_BOARD_CROP_MARGIN,
     SIG4_CIRCLE_ENGINE, SIG4_FRST_RADIUS_STEP, SIG4_FRST_ALPHA,
     SIG4_FRST_STD_FACTOR, SIG4_FRST_REL_THRESHOLD, SIG4_FRST_PEAK_MIN_DIST,
+    SIG4_HOUGH_PARAM1, SIG4_HOUGH_PARAM2,
+    SIG4_UNSHARP_ENABLE, SIG4_UNSHARP_AMOUNT, SIG4_UNSHARP_SIGMA,
+    SIG4_CIRCLE_SAT_MAX,
+    SIG4_FALLBACK_MAX_BOARD_FRAC,
     DEBUG_VIZ_SIGNAL,
 )
 SIG4_VERT_DIFF_MAX  = SIG4_MAX_RADIUS * 2
@@ -72,6 +76,20 @@ class SignalDetector:
         y0, y1 = max(0, y - r // 2), y + r // 2
         x0, x1 = max(0, x - r // 2), x + r // 2
         patch = gray[y0:y1, x0:x1]
+
+        if patch.size == 0:
+            return 0.0
+        return float(np.mean(patch))
+
+    def circle_saturation(self, hsv, x, y, r):
+        """[2026-08-18, §1.9] 원 내부 평균 채도(S). RAW 실측(신호등 rig 근접 캡처, lap_001보다
+        블러 적음) 결과 진짜 램프 원은 S가 거의 항상 34 이하(회백색 렌즈/기판)인 반면, 천장
+        조명 크롭에서 Hough가 잘못 잡은 원은 배경(사람 옷/잡다한 물체)이 섞여 S가 40~96까지
+        자주 튄다 — board 블롭 단위 Hue검사(§1.4~§1.6)로 못 거른 걸 원 단위로 한 번 더 거르기
+        위함."""
+        y0, y1 = max(0, y - r // 2), y + r // 2
+        x0, x1 = max(0, x - r // 2), x + r // 2
+        patch = hsv[y0:y1, x0:x1, 1]
 
         if patch.size == 0:
             return 0.0
@@ -125,6 +143,28 @@ class SignalDetector:
         if best is None:
             return None, 'no_valid_4subset'
         return list(best), ''
+
+    def _dominant_blob_frac(self, crop):
+        """[2026-08-18, §1.10] crop 안에서 배경판 후보 마스크(HSV Hue/S/V, _board_candidates()와
+        동일 기준)를 적용했을 때 가장 큰 연결 블롭 하나가 crop 면적의 몇 %를 차지하는지 반환.
+        고정폴백(SIG4_ROI_*)은 지금까지 이 마스크/컨투어 검사를 안 거치고(auto 후보만 검사)
+        무조건 시도됐는데, RAW(사용자 제공 근접 캡처) vs lap_001 실측 결과 이 값으로 "고정폴백
+        위치에 지금 진짜 배경판이 있는지"를 가른다 — 진짜 배경판은 크롭 안에서 여백을 두고
+        적당히만 차지하는데(7.5~12.2%), 천장 형광등 패널처럼 넓게 이어진 저채도 광원이 크롭
+        대부분을 채우면 13.2~38.5%까지 올라간다. 원 단위 특징(위치/채도/엣지, §1.6~§1.9)은
+        전부 두 데이터셋 사이에서 안 옮겨갔지만, 이 "크롭 대비 블롭 점유율"은 두 데이터셋
+        모두에서 진짜 범위와 겹치지 않았다."""
+        if crop.size == 0:
+            return 1.0
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, (SIG4_BOARD_HUE_MIN, 0, SIG4_BOARD_V_MIN),
+                            (SIG4_BOARD_HUE_MAX, SIG4_BOARD_SAT_MAX, SIG4_BOARD_V_MAX))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return 0.0
+        largest = max(cv2.contourArea(c) for c in contours)
+        return largest / (crop.shape[0] * crop.shape[1])
 
     def _board_candidates(self, frame):
         """흰 배경판(신호등 rig) 후보 사각형을 탐색범위(SIG4_SEARCH_ROI_*) 안에서 찾아
@@ -205,9 +245,13 @@ class SignalDetector:
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
 
+        if SIG4_UNSHARP_ENABLE:
+            soft = cv2.GaussianBlur(blur, (0, 0), SIG4_UNSHARP_SIGMA)
+            blur = cv2.addWeighted(blur, 1 + SIG4_UNSHARP_AMOUNT, soft, -SIG4_UNSHARP_AMOUNT, 0)
+
         circles = cv2.HoughCircles(
             blur, cv2.HOUGH_GRADIENT, 1, 20,
-            param1=40, param2=20,
+            param1=SIG4_HOUGH_PARAM1, param2=SIG4_HOUGH_PARAM2,
             minRadius=min_r, maxRadius=max_r
         )
 
@@ -289,10 +333,24 @@ class SignalDetector:
         roi_boxes = list(self._board_candidates(frame)) if SIG4_AUTOCROP_ENABLE else []
         fixed_t, fixed_b = int(h * SIG4_ROI_T), int(h * SIG4_ROI_B)
         fixed_l, fixed_r = int(w * SIG4_ROI_L), int(w * SIG4_ROI_R)
-        roi_boxes.append((fixed_t, fixed_b, fixed_l, fixed_r))  # 항상 마지막 안전망
+        # [2026-08-18, §1.10] 고정폴백도 _dominant_blob_frac()로 "지금 이 위치에 진짜 배경판
+        # 다운 블롭이 있는지" 확인한 뒤에만 후보로 추가한다 — 넘으면(천장조명 등이 크롭 대부분을
+        # 채운 경우) 안전망 자체를 포기하고 이 프레임은 정직하게 실패 처리한다.
+        fixed_frac = self._dominant_blob_frac(frame[fixed_t:fixed_b, fixed_l:fixed_r])
+        if fixed_frac <= SIG4_FALLBACK_MAX_BOARD_FRAC:
+            roi_boxes.append((fixed_t, fixed_b, fixed_l, fixed_r))
 
         self.s2_board_candidates = roi_boxes
         self.s2_chosen_idx = -1
+
+        if not roi_boxes:
+            self.s2_roi_px        = (fixed_t, fixed_b, fixed_l, fixed_r)
+            self.s2_circle_count  = 0
+            self.s2_reject_reason = f'no_board_candidates(fixed_frac={fixed_frac:.2f}>{SIG4_FALLBACK_MAX_BOARD_FRAC})'
+            self.s2_brightness    = []
+            self.s2_lit           = []
+            self.red_on = self.straight_on = self.left_on = False
+            return self.red_on, self.straight_on, self.left_on
 
         self.red_on = self.straight_on = self.left_on = False
         all_circles = chosen = gray = None
@@ -323,6 +381,14 @@ class SignalDetector:
 
             if raw_circles is not None:
                 all_circles = np.round(raw_circles[0, :]).astype(int)
+
+                if SIG4_CIRCLE_SAT_MAX is not None:
+                    hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+                    kept = [c for c in all_circles
+                            if self.circle_saturation(hsv_roi, c[0], c[1], c[2]) <= SIG4_CIRCLE_SAT_MAX]
+                    all_circles = np.array(kept, dtype=int) if kept else np.empty((0, 3), dtype=int)
+                    self.s2_circle_count = len(all_circles)
+
                 n = len(all_circles)
 
                 if n < 4:

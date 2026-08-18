@@ -55,12 +55,16 @@ def _default_lap_dir():
 
 
 def _list_frames(frames_dir, start, end):
-    paths = sorted(glob.glob(os.path.join(frames_dir, 'frame_*.png')))
+    # lap_001류(frame_NNNNNN.png)와 RAW류(NNNNNN_<timestamp>.jpg) 두 명명 규칙 다 지원.
+    paths = sorted(glob.glob(os.path.join(frames_dir, 'frame_*.png')) +
+                   glob.glob(os.path.join(frames_dir, '*.jpg')))
     if not paths:
-        raise SystemExit(f'프레임을 못 찾음: {frames_dir}/frame_*.png')
+        raise SystemExit(f'프레임을 못 찾음: {frames_dir} (frame_*.png 또는 *.jpg)')
 
     def idx_of(p):
-        return int(os.path.splitext(os.path.basename(p))[0].split('_')[-1])
+        base = os.path.splitext(os.path.basename(p))[0]
+        first = base.split('_')[0]
+        return int(base.split('_')[1]) if first == 'frame' else int(first)
 
     picked = [(idx_of(p), p) for p in paths
               if (start is None or idx_of(p) >= start) and (end is None or idx_of(p) <= end)]
@@ -69,10 +73,14 @@ def _list_frames(frames_dir, start, end):
     return picked
 
 
-def _category(chosen_idx, n_boxes):
+def _category(chosen_idx, n_boxes, chosen_box, fixed_box):
+    # [2026-08-18, §1.10] "마지막 인덱스=고정폴백" 가정이 깨졌다 — SIG4_FALLBACK_MAX_BOARD_FRAC
+    # 도입 후 고정폴백이 아예 후보 목록에서 빠질 수 있어(천장처럼 큰 블롭이 그 자리를 채운
+    # 경우), auto 후보 1개만 남으면 그게 "마지막"이 되어 fallback으로 잘못 집계됐었다. 좌표
+    # 비교로 실제 고정폴백 박스인지 직접 확인한다.
     if chosen_idx < 0:
         return 'FAIL'
-    return 'fallback' if chosen_idx == n_boxes - 1 else 'auto'
+    return 'fallback' if chosen_box == fixed_box else 'auto'
 
 
 def _state_label(red, straight, left):
@@ -134,7 +142,11 @@ def main():
 
         n_boxes = len(detector.s2_board_candidates)
         chosen = detector.s2_chosen_idx
-        cat = _category(chosen, n_boxes)
+        h, w = frame.shape[:2]
+        fixed_box = (int(h * cfg.SIG4_ROI_T), int(h * cfg.SIG4_ROI_B),
+                     int(w * cfg.SIG4_ROI_L), int(w * cfg.SIG4_ROI_R))
+        chosen_box = detector.s2_board_candidates[chosen] if 0 <= chosen < n_boxes else None
+        cat = _category(chosen, n_boxes, chosen_box, fixed_box)
         if cat == 'auto':
             n_auto += 1
         elif cat == 'fallback':
