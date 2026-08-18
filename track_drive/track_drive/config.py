@@ -105,6 +105,10 @@ SPEED_STOP    = 0.0
 #   올렸다가, 이후 5.0으로 재상향(요청 반영) — 데드존 대비 여유를 더 두어 코너에서도 확실히
 #   전진하도록 함. SPEED_NORMAL이 25.0으로 오른 만큼 최고/최저 속도 폭이 넓어졌으니, 코너
 #   진입/탈출 시 속도 급변이 과하게 느껴지면 이 값을 올리는 쪽으로 완화할 것.
+# [2026-08-19] 7.0 → 5.0(요청 반영). 현재 활성 프리셋(speed15)은 SPEED_CORNER_MIN을
+#   따로 덮어쓰지 않아 이 기본값이 그대로 쓰인다 — 실효 SPEED_NORMAL(프리셋이 12.0으로
+#   덮어씀)보다 여전히 낮아(5.0 < 12.0) 아래 no-op 버그 재발 없음. 모터 데드존(~1.4)보다도
+#   충분히 위. 실차 재검증 필요.
 # [2026-08-17j] 15.0 → 7.0(요청 반영). SPEED_CORNER_MIN < SPEED_NORMAL(15.0) 관계가
 #   다시 확보돼 코너 감속이 실제로 걸린다(직전 [2026-08-17i]에서 15.0으로 올려 SPEED_NORMAL과
 #   같아지는 바람에 코너 감속이 no-op이었던 문제 해소). 단, SPEED_LANE_STALE(5.0, 아래
@@ -121,7 +125,7 @@ SPEED_STOP    = 0.0
 #   SPEED_NORMAL(15.0) > SPEED_CORNER_MIN(10.0) 관계는 유지되므로 이번엔 그 문제가 재현되진
 #   않지만, 코너 감속 폭(15→10, 33%)이 이전(10→5, 50%)보다 완만해졌다는 점은 실차에서
 #   코너 진입 느낌으로 확인할 것 — 부족하면 이 값을 다시 낮출 것.
-SPEED_CORNER_MIN = 7.0
+SPEED_CORNER_MIN = 8.0
 # [2026-08-18] SPEED_LL_DEGRADED(DL_CENTER_MODE='ll' 전용 속도 상한) 삭제 — 이제
 #   DL_CENTER_MODE='da'로 완전히 전환되어 차선(ll) 기반 주행 자체를 쓰지 않는다(요청
 #   반영). track_drive.py _lane_drive()/​_debug_viz_steer()의 소비부도 함께 제거.
@@ -1436,15 +1440,13 @@ PP_TUNE_PRESETS = {
         # 버그가 재현되지 않았다 — SPEED_NORMAL*0.7 클램프 불필요, 그리드서치 원값 그대로 적용.
         # 실차 재검증 전.
         PP_LOOKAHEAD_BASE_PX=110.38, PP_LOOKAHEAD_SPEED_GAIN=3.01, PP_LOOKAHEAD_MAX_PX=265.4,
-        # [2026-08-19] 요청 반영 — WHEELBASE_PX를 낮추고(25→16) 대신 boost 폭을 넓혀서
-        # (GAIN_PER_DEG 0.03→0.06, MAX_SCALE 2→2.75) "조향 안 필요할 땐 낮은 게인, 필요할
-        # 땐 확 커지는" 형태로 재분배 — 최종 실효 wheelbase 상한(WB*MAX_SCALE)은 16*2.75=44로
-        # 기존(25*2=50)과 비슷하게 유지하면서 steer1이 작은 구간(노이즈/직진)의 게인만 낮춤.
-        # boost가 steer1(=이미 WB_base로 1차 계산된 값) 크기로 트리거되므로, WB_base만
-        # 낮추고 GAIN/MAX_SCALE을 같이 안 올리면 코너에서도 이중으로 약해지니 주의(위
-        # PP_WHEELBASE_BOOST_* 주석 참고). 실차 미검증, 저속부터 오버/언더스티어 확인할 것.
-        PP_WHEELBASE_PX=16, PP_ALPHA=0.70, PP_LD_FLOOR_PX=120.19, PP_DX_DEADZONE_PX=3,
-        PATH_EMA_ALPHA=0.5, DL_STABLE_FRAME_MIN=1, DL_STABLE_JUMP_MAX=37.44,
+        PP_WHEELBASE_PX=20, PP_ALPHA=0.80, PP_LD_FLOOR_PX=120.19, PP_DX_DEADZONE_PX=3,
+
+        PP_LOOKAHEAD_CURVATURE_GAIN=224.8, PP_LOOKAHEAD_MIN_PX=102.61,
+        SPEED_CORNER_MIN=8.0, CORNER_SIGN_EMA_ALPHA=0.15, LANE_LOOKAHEAD_REF=220.0,
+        SPEED_ACCEL_STEP=0.4, CORNER_HOLD_DECAY_LO=0.92, CORNER_HOLD_DECAY_HI=0.97,
+        CORNER_MIN_RADIUS_PX=250.0, CORNER_MIN_SPEED_SCALE=0.35,
+        PATH_EMA_ALPHA=0.7, DL_STABLE_FRAME_MIN=1, DL_STABLE_JUMP_MAX=37.44,
         SPEED_NORMAL=12.0, #직진 잘한 상태
         # [2026-08-19] 조향각 wheelbase 부스트(요청 반영) — "speed15 프리셋일 때만 적용"이라
         # 여기(=speed15 프리셋)에만 켜서(ENABLE=True) 넣는다. 다른 프리셋으로 바꾸면 이 키가
@@ -1455,7 +1457,7 @@ PP_TUNE_PRESETS = {
         # 재조정했다 — 0.15를 문턱 없이 그대로 쓰면 (1.5-1)/0.15≈3.3°만 넘어도 MAX_SCALE에
         # 도달해 사실상 상시 최대 부스트가 걸린다(요청("미미할 땐 작게")과 어긋남). 순전히
         # 추정치, 실차에서 체감보고 재조정할 것.
-        PP_WHEELBASE_BOOST_ENABLE=True, PP_WHEELBASE_BOOST_GAIN_PER_DEG=0.06,
+        PP_WHEELBASE_BOOST_ENABLE=True, PP_WHEELBASE_BOOST_GAIN_PER_DEG=0.1,
         PP_WHEELBASE_BOOST_MAX_SCALE=2.75,
     ),
     'speed17_5': dict(

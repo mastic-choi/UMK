@@ -1625,8 +1625,11 @@ class TrackDriverNode(Node):
         # 감속을 거는 걸 막는다.
         imu_corner_scale = self._imu_corner_confirm_scale()
         turn_for_speed = max(turn_now, turn_preview * 0.3) * imu_corner_scale
+        # [2026-08-19] 0.90 → 0.80(요청 반영) — 조향(turn_for_speed)에 따른 감속이 너무 강하게
+        #   느껴진다는 피드백으로 소폭 완화. turn_for_speed=1(최대 코너 신호)일 때 SPEED_NORMAL
+        #   대비 90%가 아니라 80%까지만 깎이도록 함. 실차 재검증 필요 — 여전히 과하면 더 낮출 것.
         target_speed = max(SPEED_CORNER_MIN,
-                           SPEED_NORMAL * (1.0 - 0.90 * turn_for_speed ** 3))
+                           SPEED_NORMAL * (1.0 - 0.80 * turn_for_speed ** 3))
         # 코너 진입(회전반경 감소) 시 추가 감속 — 기존 turn_for_speed 기반 감속과는 독립적으로
         # 계산해서 더 낮은 쪽을 쓴다(대체가 아니라 추가 안전판).
         corner_radius_scale = self._corner_radius_speed_scale()
