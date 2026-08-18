@@ -1019,6 +1019,11 @@ DEBUG_PLANNER      = False  # Hybrid A* OccupancyGrid 디버그 창 (track_drive
 DEBUG_VIZ_STEER    = False  # 조향 컨트롤러(직전값유지/현재값반영) 한글 디버그 창 (track_drive.py)
 DEBUG_VIZ_VESC     = False  # VESC 실측속도(/vesc_speed_erpm) 연동 상태(수신중/끊김/미수신) 디버그 창
                              #   (track_drive.py, 2026-08-06 LQR 브랜치에서 이식)
+# [2026-08-18] 좌회전(_do_left_turn())을 IMU yaw closed-loop로 바꾼 뒤(TURN_YAW_TARGET_DEG류
+#   실측 튜닝용) — IMU(/imu) 연동이 실제로 살아있는지 + 지금 imu_yaw 값이 얼마인지 +
+#   좌회전 진행 중이면 목표각까지 얼마나 남았는지를 한 창에서 보여준다. DEBUG_VIZ_VESC와
+#   동일한 3단계 상태(미수신/끊김/정상표시) 패턴(track_drive.py _debug_viz_imu()).
+DEBUG_VIZ_IMU      = False  # IMU(/imu) 연동 상태 + 현재 yaw값 + 좌회전 진행상황 디버그 창
 
 DEBUG_VIZ_DL_LANE    = True  # 차선 — 기본 백엔드('dl') 디버그 창 (perception/dl_lane.py)
 # [2026-08-10] offset 스파크라인이 몇 프레임을 보여줄지 — [2026-08-11] 원래 별도

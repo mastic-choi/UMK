@@ -1923,6 +1923,63 @@ class TrackDriverNode(Node):
         cv2.imshow('vesc_debug', canvas)
         cv2.waitKey(1)
 
+    # [DEBUG_VIZ_IMU] IMU(/imu) 연동이 실제로 살아있는지 + 지금 imu_yaw 값이 얼마인지를
+    # 한눈에 보여주는 창(2026-08-18, _debug_viz_vesc()와 동일 패턴). 좌회전(_do_left_turn())을
+    # IMU yaw closed-loop로 바꾼 뒤, 실차에서 "IMU가 진짜 살아있는지"와 "좌회전 중 목표각까지
+    # 얼마나 남았는지"를 눈으로 볼 수단이 없어서 추가 — TURN_YAW_TARGET_DEG류 실측 튜닝 때
+    # 이 창을 보면서 좌회전이 실제로 몇 도에서 끝나는지, yaw 부호가 기대한 방향인지 확인할 것
+    # (부호 규약 자체가 pose_estimator.py 기준 "실차 미검증"이라 이 창으로 처음 확인해야 함).
+    # control_loop()에서 매 주기 호출.
+    def _debug_viz_imu(self):
+        now = time.time()
+        if self._imu_t is None:
+            color = (0, 0, 220)
+            text_kr, text_en = '/imu 메시지 수신 안 됨', 'NO MESSAGE RECEIVED YET'
+        else:
+            age = now - self._imu_t
+            if age > IMU_STALE_SEC:
+                color = (0, 140, 255)
+                text_kr, text_en = f'수신 끊김 (마지막 {age:.1f}초 전)', f'STALE (last {age:.1f}s ago)'
+            else:
+                color = (0, 200, 0)
+                text_kr, text_en = f'정상 수신 중 ({age*1000:.0f}ms 전)', f'LIVE ({age*1000:.0f}ms ago)'
+
+        yaw_deg = math.degrees(self.imu_yaw)
+        canvas = np.full((360, 380, 3), 30, dtype=np.uint8)
+        lines = [
+            (f'IMU 연동: {text_kr}', (10, 8), color, 16, f'IMU link: {text_en}'),
+            (f'imu_yaw: {yaw_deg:+7.2f}° ({self.imu_yaw:+.3f} rad)', (10, 44),
+             (255, 255, 255), 18, f'imu_yaw: {yaw_deg:+7.2f} deg'),
+        ]
+
+        turn_active = self._turn_yaw_start is not None
+        if turn_active:
+            yaw_target = (TURN_YAW_TARGET_DEG if self.mission_state == MissionState.S2_INTERSECTION
+                          else TURN_EXIT_YAW_TARGET_DEG)
+            turned_deg = math.degrees(self._yaw_delta(self._turn_yaw_start))
+            lines.append((
+                f'좌회전 중: {abs(turned_deg):5.1f}° / {yaw_target:.1f}° (부호 {turned_deg:+.1f}°)',
+                (10, 76), (0, 255, 255), 16,
+                f'TURNING: {abs(turned_deg):5.1f} / {yaw_target:.1f} deg (signed {turned_deg:+.1f})'))
+        else:
+            lines.append(('좌회전 진행 중 아님', (10, 76), (150, 150, 150), 14, 'not turning'))
+
+        put_text_kr_multi(canvas, lines)
+        cv2.rectangle(canvas, (0, 0), (canvas.shape[1] - 1, canvas.shape[0] - 1), color, 3)
+
+        # 방위 다이얼 — atan2(y,x) 규약 그대로(0도=+x축, 반시계 증가) 그린 것뿐이라 실제
+        # 좌/우회전과 화살표 회전방향이 맞는지는 이 창으로 실차에서 직접 봐야 한다(부호
+        # 규약 미검증, 위 주석 참고). "값이 지금 이거다"를 시각적으로 보여주는 용도.
+        cx, cy, r = canvas.shape[1] // 2, 250, 90
+        cv2.circle(canvas, (cx, cy), r, (90, 90, 90), 2)
+        cv2.circle(canvas, (cx, cy), 3, (255, 255, 255), -1)
+        nx = int(cx + r * math.cos(self.imu_yaw))
+        ny = int(cy - r * math.sin(self.imu_yaw))
+        cv2.arrowedLine(canvas, (cx, cy), (nx, ny), (0, 255, 0), 2, tipLength=0.15)
+
+        cv2.imshow('imu_debug', canvas)
+        cv2.waitKey(1)
+
     # [DEBUG_VIZ_AVOID_HOLD] avoid-hold(§2.32, avoid_hold_improvement_proposal.md) 전용
     # 상태창 — 2026-08-15에 추가. 지금 유예가 걸려있는지/왜 걸렸는지/직전엔 왜 풀렸는지/
     # 방향 힌트가 뭔지를 실차에서 한눈에 보기 위한 것과 동시에, 이 기능이 새로 들여온
@@ -2349,6 +2406,8 @@ class TrackDriverNode(Node):
             self._debug_viz_steer()
         if DEBUG_VIZ_VESC:
             self._debug_viz_vesc()
+        if DEBUG_VIZ_IMU:
+            self._debug_viz_imu()
         if DEBUG_VIZ_AVOID_HOLD:
             self._debug_viz_avoid_hold()
 
