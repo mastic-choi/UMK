@@ -1440,7 +1440,7 @@ PP_TUNE_PRESETS = {
         # 버그가 재현되지 않았다 — SPEED_NORMAL*0.7 클램프 불필요, 그리드서치 원값 그대로 적용.
         # 실차 재검증 전.
         PP_LOOKAHEAD_BASE_PX=110.38, PP_LOOKAHEAD_SPEED_GAIN=3.01, PP_LOOKAHEAD_MAX_PX=265.4,
-        PP_WHEELBASE_PX=20, PP_ALPHA=0.80, PP_LD_FLOOR_PX=120.19, PP_DX_DEADZONE_PX=5,
+        PP_WHEELBASE_PX=20, PP_ALPHA=0.7, PP_LD_FLOOR_PX=120.19, PP_DX_DEADZONE_PX=5,
 
         PP_LOOKAHEAD_CURVATURE_GAIN=224.8, PP_LOOKAHEAD_MIN_PX=102.61,
         SPEED_CORNER_MIN=10.0, CORNER_SIGN_EMA_ALPHA=0.15, LANE_LOOKAHEAD_REF=220.0,
@@ -1457,7 +1457,7 @@ PP_TUNE_PRESETS = {
         # 재조정했다 — 0.15를 문턱 없이 그대로 쓰면 (1.5-1)/0.15≈3.3°만 넘어도 MAX_SCALE에
         # 도달해 사실상 상시 최대 부스트가 걸린다(요청("미미할 땐 작게")과 어긋남). 순전히
         # 추정치, 실차에서 체감보고 재조정할 것.
-        PP_WHEELBASE_BOOST_ENABLE=True, PP_WHEELBASE_BOOST_GAIN_PER_DEG=0.1,
+        PP_WHEELBASE_BOOST_ENABLE=True, PP_WHEELBASE_BOOST_GAIN_PER_DEG=0.11,
         PP_WHEELBASE_BOOST_MAX_SCALE=2.75,
     ),
     'speed17_5': dict(
