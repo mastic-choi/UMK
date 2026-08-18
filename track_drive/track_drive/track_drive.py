@@ -116,6 +116,10 @@ class TrackDriverNode(Node):
         # _lane_drive()가 LANE_UNSTABLE_FRAMES 이상이면 SPEED_LANE_STALE과 동일한 캡을
         # 걸도록 보강한다 — "워커가 죽었나"가 아니라 "지금 이 프레임을 믿을 수 있나"
         # 자체를 보는 게 원래 목적에 더 맞다.
+        # [2026-08-18] 기준을 lane_valid(근접 전용)에서 path_ok(근접 OR 원거리)로 통일
+        # (perc_lane() 참고, 요청 반영) — 실제 조향 경로(self.lane_path) 갱신 조건과
+        # 정확히 같은 신호를 보게 되어, "경로는 갱신되는데 속도만 이유 없이 깎이는"
+        # 불일치가 사라진다. 근접+원거리 둘 다 없어야(=path_ok=False) 스트릭이 쌓인다.
         self._lane_invalid_streak = 0
         self.lane_unstable = False
         self._lane_prev_width = 448.0  # 도로폭 직전값(px, EMA)
@@ -524,12 +528,6 @@ class TrackDriverNode(Node):
 
         self.lane_center = lane_center
         self.lane_valid = valid
-        self._lane_invalid_streak = 0 if valid else self._lane_invalid_streak + 1
-        self.lane_unstable = self._lane_invalid_streak >= LANE_UNSTABLE_FRAMES
-        if valid:
-            # 기존 제어 코드와 호환되도록 필터링 적용
-            self.lane_offset = 0.7 * self.lane_offset + 0.3 * offset
-            self.lane_lookahead = 0.5 * self.lane_lookahead + 0.5 * lookahead
         # [2026-08-10] `if path:`만 보던 예전 조건은 디바운스가 전혀 없어서, 밴드 판정이
         # 프레임마다 흔들릴 때 그 흔들림을 거의 그대로 조향에 전달했다 — 그래서 `valid`도
         # 같이 요구하도록 바꿨었다(offset과 동일한 안정성 검증).
@@ -543,6 +541,18 @@ class TrackDriverNode(Node):
         # 여지는 없다. hough/classic_cv처럼 이 속성이 없는 백엔드는 getattr가 `valid`로
         # 폴백해 기존 동작 그대로다.
         path_ok = getattr(self.lane_detector, 'path_ok', valid)
+        # [2026-08-18] lane_unstable(SPEED_LANE_STALE 트리거)의 기준을 `valid`(근접 전용)
+        # 에서 `path_ok`(근접 OR 원거리, 위와 동일)로 통일 — 요청 반영: "경로만 있으면
+        # 충분하다, 경로가 안 찍힐 때 속도를 낮추는 것처럼 둘의 검출조건을 일치시키자".
+        # 실제 조향 경로(self.lane_path, 바로 아래)도 path_ok로 갱신되므로, 이제 "경로가
+        # 갱신 안 되는 시점"과 "속도가 깎이는 시점"이 정확히 같은 조건을 본다 — 근접만
+        # 비고 원거리로 경로가 계속 갱신되는 동안에는 더 이상 속도가 깎이지 않는다.
+        self._lane_invalid_streak = 0 if path_ok else self._lane_invalid_streak + 1
+        self.lane_unstable = self._lane_invalid_streak >= LANE_UNSTABLE_FRAMES
+        if valid:
+            # 기존 제어 코드와 호환되도록 필터링 적용
+            self.lane_offset = 0.7 * self.lane_offset + 0.3 * offset
+            self.lane_lookahead = 0.5 * self.lane_lookahead + 0.5 * lookahead
         if path_ok and path:
             self.lane_path = path
 
