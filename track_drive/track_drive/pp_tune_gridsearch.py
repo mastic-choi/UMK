@@ -89,6 +89,26 @@
 #   config.py 현재값(2, 20.0)을 채워 25차원 시드로 확장해 재탐색을 이어간다(값을
 #   버리지 않고 Optuna seed로 재사용 — 4차 탐색 방법론 참고).
 #
+# ── [2026-08-18 6차] 조향 변화율 제한(ANGLE_RATE_MAX) 반영 + speed_corner_min 제약 추가 ──
+#   실차에 5차 결과를 배포해 첫 테스트를 해본 뒤 발견한 두 가지를 반영한다.
+#   1) [조향 변화율 제한] 실제 track_drive.py.drive()는 발행 직전에
+#      ANGLE_RATE_MAX(12도/틱, 20Hz 기준 초당 240도) 슬루 제한을 건다 — 서보가
+#      물리적으로 그 이상은 못 돈다는 하드웨어 제약인데, simulate()가 지금까지 이걸
+#      전혀 반영 안 하고 PurePursuit이 계산한 각도를 그 틱에 곧바로 물리 구동에
+#      적용해왔다(사용자 확인 요청으로 발견). 실측 확인 결과 이미 찾은 조합의 약
+#      20%가 이 제한을 초과(최대 21.7도/틱, 한계의 거의 2배)했다 — 실전트랙의
+#      전환구간(급커브/지그재그)처럼 조향각이 급변해야 하는 순간에 특히 위험한
+#      가정이었다. 중요한 건 이 제한이 "결정 로직"(corner_signal 등, 실제 코드도
+#      self.ctrl_angle=raw PP 출력을 그대로 코너 판단에 쓴다)엔 안 걸리고 "물리
+#      구동"에만 걸린다는 것 — simulate()에도 steer_deg(결정용, 원본)와
+#      actuated_steer(구동용, rate-limit 통과)를 분리해서 반영했다.
+#   2) [speed_corner_min 제약] 5차 결과를 실차에 배포한 뒤 speed10/12.5/15 3개
+#      프리셋이 SPEED_CORNER_MIN > SPEED_NORMAL이라 코너감속 경로가 완전히
+#      죽어있던 버그를 발견(config.py §8, README §0.5.10과 동일 실패모드) — 그리드
+#      서치의 탐색공간이 이 둘을 서로 무관하게 독립 샘플링해서 생긴 문제였다.
+#      sample_params()/_params_from_trial() 둘 다 speed_corner_min의 샘플링 상한을
+#      speed_norm*0.9로 제한해 이 조합 자체가 다시 나오지 않게 했다.
+#
 # ── 방법론(화이트박스 합성 시뮬레이션 — 실측 아님) ──
 #   controller/pure_pursuit.py의 PurePursuitController를 코드 수정 없이 그대로
 #   가져다 쓴다(알고리즘 자체는 건드리지 않고 파라미터만 바꿔가며 평가). 직진/
@@ -164,6 +184,14 @@ PX_PER_M = cfg.DL_PIXELS_PER_METER          # 200.0
 WHEELBASE_M = cfg.WHEELBASE_M               # 0.335 (실측 — PP_WHEELBASE_PX와 혼동 금지, 위 주석 참고)
 MPS_PER_UNIT = cfg.METERS_PER_SPEED_UNIT    # 0.1347 (speed=5~10 실측 회귀)
 ANGLE_MAX_DEG = cfg.ANGLE_MAX               # 80.0 — 안전 클램프, 그리드서치 대상 아님(고정)
+# [2026-08-18 6차] track_drive.py.drive()가 발행 직전에 거는 조향 변화율(슬루) 제한 —
+# 서보가 물리적으로 한 틱(0.05s)에 이 이상은 못 돈다. 지금까지 simulate()가 이걸 전혀
+# 반영 안 하고 있었다(사용자 확인 요청으로 발견 — 실측 결과 이미 찾은 조합의 약 20%가
+# 이 제한을 초과, 최대 21.7도/틱으로 12도 한계의 거의 2배). 실제 코드처럼 "결정
+# 로직"(corner_signal 등)에는 안 걸고 "물리 구동"(바이시클 모델)에만 적용한다 —
+# 아래 simulate()의 actuated_steer 참고. 그리드서치 대상 아님(고정, ANGLE_MAX_DEG와
+# 동일 취급).
+ANGLE_RATE_MAX_DEG = cfg.ANGLE_RATE_MAX     # 12.0 — 도/틱(20Hz 기준 초당 240도)
 
 ROI_W_PX = 585.0                            # README §2.35 실측: BEV 캔버스 실측폭
 ROI_DEPTH_M = cfg.DL_BEV_FAR_LIMIT_M        # 0.7 — 원거리 크롭 한계(전방 가시거리 근사)
@@ -457,6 +485,7 @@ def simulate(pp, world_pts, speed_norm, sp, rng, meta=None):
     debounce_pending_count = 0
     stable_frame_min = sp['stable_frame_min']
     stable_jump_max = sp['stable_jump_max']
+    prev_actuated_steer = 0.0  # drive()의 self._prev_angle_out과 동일 역할 — 아래 [조향 변화율 제한] 참고
 
     ctes, steers, straight_flags, speeds = [], [], [], []
     mode_hits, transition_ctes = [], []
@@ -539,13 +568,23 @@ def simulate(pp, world_pts, speed_norm, sp, rng, meta=None):
             target_speed = prev_speed + accel_step
         prev_speed = target_speed
 
-        # steer_deg는 "우측+"(control()의 alpha=atan2(dx,dy), dx>0=목표가 이미지 오른쪽일 때
+        # [조향 변화율 제한, 2026-08-18 6차] 실제 drive()는 결정 로직(위 corner_signal 등,
+        # self.ctrl_angle=raw PP 출력을 그대로 씀)과 무관하게, 발행 직전에만
+        # ANGLE_RATE_MAX_DEG(도/틱) 슬루 제한을 건다 — 서보가 물리적으로 한 틱에 이 이상은
+        # 못 돈다. steer_deg(위 corner_signal 계산에 쓴 원본)는 그대로 두고, 실제로 차량을
+        # 움직이는 물리 구동에는 이 제한을 통과한 actuated_steer만 반영한다.
+        actuated_steer = float(np.clip(steer_deg,
+                                        prev_actuated_steer - ANGLE_RATE_MAX_DEG,
+                                        prev_actuated_steer + ANGLE_RATE_MAX_DEG))
+        prev_actuated_steer = actuated_steer
+
+        # actuated_steer는 "우측+"(control()의 alpha=atan2(dx,dy), dx>0=목표가 이미지 오른쪽일 때
         # 양수) 관례다. 월드 프레임 th는 표준 수학각(ccw+)이라, 오른쪽으로 꺾을수록(양의
         # steer) 헤딩은 시계방향=th가 "감소"해야 한다 — 부호를 안 뒤집으면 좌/우가 반대로
         # 시뮬레이션되어(첫 구현에서 실제로 발생: 커브가 좌회전인데 차가 우회전해 발산)
         # 그리드서치 전체가 무의미해진다.
         v_mps = MPS_PER_UNIT * prev_speed
-        steer_rad = math.radians(steer_deg)
+        steer_rad = math.radians(actuated_steer)
         vth -= (v_mps / WHEELBASE_M) * math.tan(steer_rad) * DT
         vx += v_mps * math.cos(vth) * DT
         vy += v_mps * math.sin(vth) * DT
@@ -553,7 +592,10 @@ def simulate(pp, world_pts, speed_norm, sp, rng, meta=None):
         idx, cte = _nearest_point(world_pts, vx, vy, prev_idx=prev_idx, window_pts=window_pts)
         prev_idx = idx
         ctes.append(cte)
-        steers.append(steer_deg)
+        # steer_rms/osc_per_sec는 "실제 바퀴가 얼마나 움직였는가"를 재는 지표라 rate-limit
+        # 적용 후 값(actuated_steer)을 쓴다 — corner_signal(위)은 결정 로직이라 원본을 쓰고,
+        # 이 기록은 물리적으로 실제 벌어진 일을 쓰는 것으로 역할이 다르다.
+        steers.append(actuated_steer)
         straight_flags.append(is_straight)
         speeds.append(prev_speed)
         if meta is not None:
@@ -759,7 +801,7 @@ def _candidate_range(name):
     return lo, hi
 
 
-def sample_params(rng):
+def sample_params(rng, speed_norm):
     p = {}
     for k, base in BASELINE.items():
         if k == 'straight_confirm_frames':
@@ -769,6 +811,15 @@ def sample_params(rng):
             p[k] = int(rng.choice(STABLE_FRAME_MIN_CHOICES))
             continue
         lo, hi = _candidate_range(k)
+        if k == 'speed_corner_min':
+            # [2026-08-18 6차] speed_corner_min >= speed_norm이면
+            # max(speed_corner_min, speed_norm*(1-...)) 공식상 코너감속 경로 자체가
+            # 죽는다 — 실차 배포(speed10/12.5/15 프리셋) 후 실제로 발견된 버그
+            # (config.py §8 상단 경고 참고). 샘플링 단계에서부터 speed_norm보다 뚜렷이
+            # 낮게 상한을 잡아 이 조합 자체가 나오지 않게 한다.
+            hi = min(hi, speed_norm * 0.9)
+            if lo >= hi:
+                lo = hi * 0.5
         val = rng.uniform(lo, hi)
         if k in ('alpha', 'straight_alpha', 'path_ema_alpha'):
             val = float(np.clip(val, 0.05, 1.0))
@@ -797,7 +848,7 @@ def run_search(speed_norm, n_samples, seed, paths, path_meta):
 
     best_score, best_params, best_results = baseline_score, dict(BASELINE), baseline_results
     for i in range(n_samples):
-        params = sample_params(rng)
+        params = sample_params(rng, speed_norm)
         s, results = evaluate(params, speed_norm, paths, path_meta, rng)
         if s < best_score:
             best_score, best_params, best_results = s, params, results
@@ -879,7 +930,7 @@ def run_sensitivity(speeds, grid_n, repeats, paths, path_meta):
 # 점 주변"과 "나쁜 점 주변"의 분포를 추정해 다음 시도를 그 사이 유망한 영역에서 고른다 —
 # 같은 evaluate()/score()를 objective로 그대로 재사용하므로 랜덤서치와 결과가 직접
 # 비교 가능하다.
-def _params_from_trial(trial):
+def _params_from_trial(trial, speed_norm):
     """optuna Trial → BASELINE과 동일한 키 구조의 params dict. sample_params()와 동일한
     범위(_candidate_range()/CONFIRM_FRAMES_CHOICES)를 그대로 재사용해 랜덤서치와 동일한
     탐색공간에서 TPE가 다음 시도를 고르게 한다."""
@@ -894,6 +945,12 @@ def _params_from_trial(trial):
         lo, hi = _candidate_range(k)
         if k in ('alpha', 'straight_alpha', 'path_ema_alpha'):
             lo, hi = max(lo, 0.05), min(hi, 1.0)
+        if k == 'speed_corner_min':
+            # sample_params()와 동일 제약(위 [2026-08-18 6차] 주석 참고) — Optuna 쪽에도
+            # 똑같이 걸어야 두 탐색 방식이 같은 공간을 본다.
+            hi = min(hi, speed_norm * 0.9)
+            if lo >= hi:
+                lo = hi * 0.5
         p[k] = trial.suggest_float(k, lo, hi)
     if p['corner_hold_decay_hi'] < p['corner_hold_decay_lo']:
         p['corner_hold_decay_lo'], p['corner_hold_decay_hi'] = p['corner_hold_decay_hi'], p['corner_hold_decay_lo']
@@ -915,20 +972,34 @@ def run_optuna_search(speed_norm, n_trials, seed, paths, path_meta, seed_points=
     rng = np.random.default_rng(seed)  # run_search()와 동일 — 전체 트라이얼이 한 스트림을 공유
 
     def objective(trial):
-        params = _params_from_trial(trial)
+        params = _params_from_trial(trial, speed_norm)
         s, results = evaluate(params, speed_norm, paths, path_meta, rng)
         trial.set_user_attr('results', results)
         return s
 
+    def _sanitize_seed(params):
+        # [2026-08-18 6차] speed_corner_min < speed_norm 제약(위 _params_from_trial()
+        # 주석 참고)이 새로 생겨서, 그 제약이 없던 시절에 나온 시드(BASELINE 포함 — 이전
+        # 라운드 config.py 값이 이번 speed_norm 기준으로 위반할 수 있다)는 enqueue_trial()이
+        # suggest_float()의 [lo, hi] 밖 값이라며 에러를 낼 수 있다. 여기서 미리 같은 방식으로
+        # 클립해 넣는다.
+        params = dict(params)
+        lo, hi = _candidate_range('speed_corner_min')
+        hi = min(hi, speed_norm * 0.9)
+        if lo >= hi:
+            lo = hi * 0.5
+        params['speed_corner_min'] = float(np.clip(params['speed_corner_min'], lo, hi))
+        return params
+
     sampler = optuna.samplers.TPESampler(seed=seed)
     study = optuna.create_study(direction='minimize', sampler=sampler)
-    study.enqueue_trial(dict(BASELINE))
+    study.enqueue_trial(_sanitize_seed(BASELINE))
     for sp in (seed_points or []):
         # sp.get(k, BASELINE[k]): 4차(디바운스) 이전 라운드가 남긴 시드는
         # stable_frame_min/stable_jump_max 키가 없을 수 있다 — 없으면 BASELINE(=config.py
         # 현재값)로 채워 넣는다. 매번 손으로 JSON을 갱신하지 않아도 구버전 시드 파일을
         # 그대로 재사용할 수 있게 하는 안전장치.
-        study.enqueue_trial({k: sp.get(k, BASELINE[k]) for k in BASELINE})
+        study.enqueue_trial(_sanitize_seed({k: sp.get(k, BASELINE[k]) for k in BASELINE}))
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
 
     # BASELINE은 항상 첫 enqueue_trial이라 study.trials[0]이 그 결과다 — run_search()가
