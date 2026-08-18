@@ -177,6 +177,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from controller.pure_pursuit import PurePursuitController  # noqa: E402
 import config as cfg  # noqa: E402
+import f1tenth_dynamics as dyn  # noqa: E402
 
 
 # ─────────────────────────── 물리/스케일 상수 (config.py에서 그대로 가져옴) ───────────────────────────
@@ -192,6 +193,22 @@ ANGLE_MAX_DEG = cfg.ANGLE_MAX               # 80.0 — 안전 클램프, 그리�
 # 아래 simulate()의 actuated_steer 참고. 그리드서치 대상 아님(고정, ANGLE_MAX_DEG와
 # 동일 취급).
 ANGLE_RATE_MAX_DEG = cfg.ANGLE_RATE_MAX     # 12.0 — 도/틱(20Hz 기준 초당 240도)
+
+# [2026-08-18] "물리 스텝 교체" — 기존 simulate()는 타이어 슬립을 표현 못 하는 순수
+#   기구학 모델만 썼다(아래 kinematic 분기). --physics st로 f1tenth_dynamics.py의
+#   F1TENTH Gym Single Track Dynamic 모델(타이어 코너링 강성 기반 슬립 반영)을 선택할
+#   수 있게 했다 — "고속 코너에서 술취한 듯 도는" 진동이 슬립/조향지연에서 온다면
+#   kinematic 모델로는 원리상 재현 불가능했던 실패모드다(대화 중 원인 진단 참고).
+#   기본값은 기존과 완전히 동일한 'kinematic' — 지금까지의 PP_TUNE_PRESETS 탐색
+#   이력과의 재현성/하위호환을 깨지 않기 위해 명시적으로 --physics st를 줘야만
+#   바뀐다. main()이 argparse로 이 전역을 덮어쓴다.
+PHYSICS_MODE = 'kinematic'   # 'kinematic'(기존) | 'st'(F1TENTH ST 동역학, f1tenth_dynamics.py)
+# [2026-08-18, 실행 중 발견] physics='st'의 상태적분 세분화 스텝 수 — simulate() 안 physics
+# 스텝 주석 참고. DT=0.05s 그대로 1스텝 Euler로 적분하면 저속(v≈0.5~1.2m/s, KS→ST 전환
+# 직후) 구간에서 yaw_rate가 몇 틱 만에 발산했다(stiff ODE + explicit Euler 큰 스텝의 전형적
+# 증상). 표본 실험(가감속+30도 조향 고정, 10초)에서 1은 발산, 5부터 안정, 10은
+# substep=100(수렴값) 대비 오차 0.15%라 여유를 둬 10으로 정함.
+ST_PHYSICS_SUBSTEPS = 10
 
 ROI_W_PX = 585.0                            # README §2.35 실측: BEV 캔버스 실측폭
 ROI_DEPTH_M = cfg.DL_BEV_FAR_LIMIT_M        # 0.7 — 원거리 크롭 한계(전방 가시거리 근사)
@@ -471,6 +488,15 @@ def simulate(pp, world_pts, speed_norm, sp, rng, meta=None):
     vx, vy, vth = float(world_pts[0, 0]), float(world_pts[0, 1]), math.pi / 2
     pp.reset()
 
+    # [2026-08-18] physics='st'일 때는 f1tenth_dynamics.vehicle_dynamics_st가 요구하는
+    # 7-state([x, y, 앞바퀴 조향각, 속도, yaw, yaw rate, 슬립각])를 별도로 들고 간다 —
+    # vx/vy/vth는 아래에서 st_state[0]/[1]/[4]로 매 틱 동기화되는 "뷰"로만 쓴다(cte 계산
+    # 등 나머지 코드는 vx/vy/vth만 보므로 kinematic 분기와 호환된다). 조향각(st_state[2])과
+    # 속도(st_state[3])는 처음엔 0에서 시작 — 실차도 정지상태에서 출발(prev_speed=0.0과
+    # 동일 전제).
+    st_state = [vx, vy, 0.0, 0.0, vth, 0.0, 0.0]
+    dyn_params = dyn.F1TENTH_DEFAULT_PARAMS
+
     prev_speed = 0.0        # track_drive.py __init__의 self._prev_speed=0.0과 동일 출발
     corner_signal = 0.0     # self._corner_signal
     corner_hold = 0.0       # self._corner_hold
@@ -517,7 +543,13 @@ def simulate(pp, world_pts, speed_norm, sp, rng, meta=None):
                     (a * nx + (1.0 - a) * px, a * ny + (1.0 - a) * py)
                     for (px, py), (nx, ny) in zip(smoothed_path, fitted_path)
                 ]
-            steer_deg = pp.control(smoothed_path, vehicle_xy, speed=prev_speed, imu_curvature_px=None)
+            # [2026-08-18] physics='st'에서는 track_drive.py._speed_for_lookahead()가
+            # VESC 실측이 살아있을 때 하는 것과 동일하게 "실제로 지금 얼마나 빨리 달리는가"
+            # (st_state[3], m/s → 모터unit 환산)를 쓴다 — kinematic 분기는 VESC 미시뮬레이션
+            # 전제 그대로 prev_speed(명령값) 근사를 유지한다(기존 동작 불변, 위 모듈 상단
+            # "VESC 미시뮬레이션이라..." 주석 참고).
+            lookahead_speed = (abs(st_state[3]) / MPS_PER_UNIT) if PHYSICS_MODE == 'st' else prev_speed
+            steer_deg = pp.control(smoothed_path, vehicle_xy, speed=lookahead_speed, imu_curvature_px=None)
             # lookahead_ema(코너 프리뷰 신호)는 실제 코드처럼 스무딩 이전의 원시 far_center
             # 기반이다 — 실제 self.lane_lookahead는 self.path(스무딩됨)가 아니라 슬라이스
             # 그룹평균(피팅 이전 원시값)에서 나온다. 스무딩된 값을 쓰면 두 신호가 같은
@@ -583,11 +615,51 @@ def simulate(pp, world_pts, speed_norm, sp, rng, meta=None):
         # steer) 헤딩은 시계방향=th가 "감소"해야 한다 — 부호를 안 뒤집으면 좌/우가 반대로
         # 시뮬레이션되어(첫 구현에서 실제로 발생: 커브가 좌회전인데 차가 우회전해 발산)
         # 그리드서치 전체가 무의미해진다.
-        v_mps = MPS_PER_UNIT * prev_speed
         steer_rad = math.radians(actuated_steer)
-        vth -= (v_mps / WHEELBASE_M) * math.tan(steer_rad) * DT
-        vx += v_mps * math.cos(vth) * DT
-        vy += v_mps * math.sin(vth) * DT
+        if PHYSICS_MODE == 'st':
+            # [2026-08-18] F1TENTH ST 동역학 — pid()가 "목표 속도/조향각"을 조향서보/모터
+            # 반응한계(sv_max/a_max) 안에서 도달 가능한 조향각속도/가속도로 바꿔주고,
+            # vehicle_dynamics_st가 타이어 코너링강성(C_Sf/C_Sr) 기반 슬립까지 반영한
+            # 상태미분을 계산한다. actuated_steer(위 ANGLE_RATE_MAX_DEG 슬루 제한 통과값)를
+            # 쓴다 — 서보 반응지연은 이미 그쪽에서 반영되고, pid()의 sv_max는 그 안에서
+            # "이번 틱 동안 실제로 얼마나 더 돌 수 있는가"를 추가로 제약한다(이중 제약이지만
+            # 서로 다른 두 물리적 한계 — 명령 슬루레이트 vs 서보 최대 각속도 — 라 자연스럽다).
+            # 부호주의: pure_pursuit의 steer_deg는 "우측+"인데 F1TENTH 모델의 조향각(x[2])은
+            # 표준 자전거모델 부호(+=좌회전/yaw 증가) — 안 뒤집으면 코너가 반대로 돌아
+            # 발산한다(kinematic 분기가 vth에 '-='를 쓰는 것과 동일한 이유, 위 부호 주석
+            # 참고). 그래서 pid()에 넘기는 목표 조향각은 -steer_rad다.
+            target_speed_mps = MPS_PER_UNIT * prev_speed
+            accl, sv = dyn.pid(target_speed_mps, -steer_rad, st_state[3], st_state[2],
+                               dyn_params['sv_max'], dyn_params['a_max'],
+                               dyn_params['v_max'], dyn_params['v_min'])
+            # [2026-08-18, 실행 중 발견] DT=0.05s 그대로 1스텝 Euler로 적분하면 저속
+            # (v≈0.5~1.2m/s, KS→ST 전환 직후) 구간에서 yaw_rate가 몇 틱 만에 발산했다
+            # (vehicle_dynamics_st의 yaw_rate/slip ODE 계수가 mu*m/(x[3]*I*(lr+lf)) 형태라
+            # 이 저속 구간에서 매우 커짐 — stiff ODE를 큰 스텝 explicit Euler로 풀 때 생기는
+            # 전형적 수치발산이지 로직 버그가 아니다. vehicle_dynamics_st는 F1TENTH 원본
+            # 유닛테스트 ground truth와 대조해 오차 ~1e-17로 이미 검증됨). 원본 F1TENTH
+            # Gym도 이래서 RK4/odeint를 쓴다 — 여기선 제어입력[sv,accl]은 이번 20Hz 틱
+            # 동안 고정하고 내부적으로 ST_PHYSICS_SUBSTEPS번 더 잘게 쪼갠 Euler로 적분하는
+            # 방식을 썼다(위 ST_PHYSICS_SUBSTEPS 주석 — 표본 실험으로 충분히 수렴 확인).
+            sub_dt = DT / ST_PHYSICS_SUBSTEPS
+            u = [sv, accl]
+            for _ in range(ST_PHYSICS_SUBSTEPS):
+                f = dyn.vehicle_dynamics_st(
+                    st_state, u,
+                    dyn_params['mu'], dyn_params['C_Sf'], dyn_params['C_Sr'],
+                    dyn_params['lf'], dyn_params['lr'], dyn_params['h'],
+                    dyn_params['m'], dyn_params['I'],
+                    dyn_params['s_min'], dyn_params['s_max'],
+                    dyn_params['sv_min'], dyn_params['sv_max'],
+                    dyn_params['v_switch'], dyn_params['a_max'],
+                    dyn_params['v_min'], dyn_params['v_max'])
+                st_state = [s + fi * sub_dt for s, fi in zip(st_state, f)]
+            vx, vy, vth = st_state[0], st_state[1], st_state[4]
+        else:
+            v_mps = MPS_PER_UNIT * prev_speed
+            vth -= (v_mps / WHEELBASE_M) * math.tan(steer_rad) * DT
+            vx += v_mps * math.cos(vth) * DT
+            vy += v_mps * math.sin(vth) * DT
 
         idx, cte = _nearest_point(world_pts, vx, vy, prev_idx=prev_idx, window_pts=window_pts)
         prev_idx = idx
@@ -1063,7 +1135,14 @@ def main():
     ap.add_argument('--seed-file', type=str, default=None,
                      help='--optuna 전용: 이전 탐색이 찾은 best_params dict 리스트가 담긴 JSON 파일 — '
                           'study.enqueue_trial()로 맨 앞 트라이얼로 먼저 평가해 이어서 탐색한다')
+    ap.add_argument('--physics', choices=['kinematic', 'st'], default='kinematic',
+                     help="'kinematic'(기존, 슬립 없음, 기본값) | "
+                          "'st'(F1TENTH Gym Single Track 동역학, 타이어 슬립+조향/가속 반응지연 반영 — "
+                          "f1tenth_dynamics.py 참고, 물리 파라미터는 xycar 미실측 F1TENTH 대체값)")
     args = ap.parse_args()
+
+    global PHYSICS_MODE
+    PHYSICS_MODE = args.physics
 
     paths, path_meta = build_paths()
 
@@ -1076,7 +1155,7 @@ def main():
             with open(args.seed_file) as f:
                 seed_points = json.load(f)
         print(f"[Optuna] TPE 베이지안 최적화, trials={args.trials}, seed_points={len(seed_points)}개 "
-              f"(기존 탐색 결과에서 이어감)\n")
+              f"(기존 탐색 결과에서 이어감), physics={PHYSICS_MODE}\n")
         all_out = {}
         for sp in args.speeds:
             print(f"===== speed={sp} (SPEED_NORMAL 역할, 모터unit, ≈{sp*MPS_PER_UNIT:.2f}m/s"
@@ -1094,7 +1173,8 @@ def main():
         return all_out
 
     print(f"[설정] ROI_W={ROI_W_PX}px ROI_H≈{ROI_H_PX:.0f}px(DL_BEV_FAR_LIMIT_M={ROI_DEPTH_M}m 기준) "
-          f"noise_std={NOISE_STD_PX}px WHEELBASE_M={WHEELBASE_M} MPS_PER_UNIT={MPS_PER_UNIT}")
+          f"noise_std={NOISE_STD_PX}px WHEELBASE_M={WHEELBASE_M} MPS_PER_UNIT={MPS_PER_UNIT} "
+          f"physics={PHYSICS_MODE}")
     print(f"[baseline] SPEED_NORMAL=3.0 재튜닝 시점 config.py 현재값: {BASELINE}\n")
 
     all_out = {}
