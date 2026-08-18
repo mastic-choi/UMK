@@ -177,6 +177,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from controller.pure_pursuit import PurePursuitController  # noqa: E402
 import config as cfg  # noqa: E402
+import f1tenth_dynamics as dyn  # noqa: E402
 
 
 # ─────────────────────────── 물리/스케일 상수 (config.py에서 그대로 가져옴) ───────────────────────────
@@ -192,6 +193,22 @@ ANGLE_MAX_DEG = cfg.ANGLE_MAX               # 80.0 — 안전 클램프, 그리�
 # 아래 simulate()의 actuated_steer 참고. 그리드서치 대상 아님(고정, ANGLE_MAX_DEG와
 # 동일 취급).
 ANGLE_RATE_MAX_DEG = cfg.ANGLE_RATE_MAX     # 12.0 — 도/틱(20Hz 기준 초당 240도)
+
+# [2026-08-18] "물리 스텝 교체" — 기존 simulate()는 타이어 슬립을 표현 못 하는 순수
+#   기구학 모델만 썼다(아래 kinematic 분기). --physics st로 f1tenth_dynamics.py의
+#   F1TENTH Gym Single Track Dynamic 모델(타이어 코너링 강성 기반 슬립 반영)을 선택할
+#   수 있게 했다 — "고속 코너에서 술취한 듯 도는" 진동이 슬립/조향지연에서 온다면
+#   kinematic 모델로는 원리상 재현 불가능했던 실패모드다(대화 중 원인 진단 참고).
+#   기본값은 기존과 완전히 동일한 'kinematic' — 지금까지의 PP_TUNE_PRESETS 탐색
+#   이력과의 재현성/하위호환을 깨지 않기 위해 명시적으로 --physics st를 줘야만
+#   바뀐다. main()이 argparse로 이 전역을 덮어쓴다.
+PHYSICS_MODE = 'kinematic'   # 'kinematic'(기존) | 'st'(F1TENTH ST 동역학, f1tenth_dynamics.py)
+# [2026-08-18, 실행 중 발견] physics='st'의 상태적분 세분화 스텝 수 — simulate() 안 physics
+# 스텝 주석 참고. DT=0.05s 그대로 1스텝 Euler로 적분하면 저속(v≈0.5~1.2m/s, KS→ST 전환
+# 직후) 구간에서 yaw_rate가 몇 틱 만에 발산했다(stiff ODE + explicit Euler 큰 스텝의 전형적
+# 증상). 표본 실험(가감속+30도 조향 고정, 10초)에서 1은 발산, 5부터 안정, 10은
+# substep=100(수렴값) 대비 오차 0.15%라 여유를 둬 10으로 정함.
+ST_PHYSICS_SUBSTEPS = 10
 
 ROI_W_PX = 585.0                            # README §2.35 실측: BEV 캔버스 실측폭
 ROI_DEPTH_M = cfg.DL_BEV_FAR_LIMIT_M        # 0.7 — 원거리 크롭 한계(전방 가시거리 근사)
@@ -215,7 +232,13 @@ DT = 0.05                                   # control_loop() 주기와 동일
 # 더 걸리는 조합은 30초를 넘겨 부당하게 미완주 판정될 수 있다. 0.1347 기준으로 캘리브레이션한
 # 30.0을 METERS_PER_SPEED_UNIT 비율로 그대로 스케일링 — 나중에 이 상수가 또 바뀌어도 자동으로
 # 맞춰지도록 하드코딩 대신 수식으로 둔다.
-MAX_SIM_T = 30.0 * (0.1347 / cfg.METERS_PER_SPEED_UNIT)
+# [2026-08-18, 도면 사진 재확인] 위 30.0은 옛 실전트랙(직선 길이 임의 근사, 총 ~23m)
+# 기준이었다. TRACK_LEFT_STRAIGHT_M/TRACK_TOP_BOTTOM_STRAIGHT_M을 도면 실측치로
+# 교체하면서 실전트랙 총길이가 41.8m로 약 1.82배 늘었다(실측: build_paths()['실전트랙']
+# 폴리라인 길이 합) — 그대로 두면 baseline speed=10에서 소요 46.95s vs 한계 47.65s로
+# 여유가 0.7초밖에 안 남아 그리드서치 중 정상 조합도 미완주로 오판될 위험이 있다.
+# 트랙 길이 비율(41.8/23≈1.82)만큼 base를 30.0→55.0으로 올려 다시 여유를 확보했다.
+MAX_SIM_T = 55.0 * (0.1347 / cfg.METERS_PER_SPEED_UNIT)
 DIVERGE_CTE_M = 1.0                         # 이 이상 벗어나면 "발산"으로 보고 그 즉시 종료+페널티
 PATH_DS = 0.02                              # 기준경로 점 간격(m) — build_paths()/build_track_path()
                                              # 둘 다 이 값을 기본값으로 쓴다(아래 NEAREST_WINDOW_M을
@@ -252,6 +275,21 @@ TRACK_ZIGZAG_RADII_M = (1.615, 1.530, 1.595, 1.470)
 ZIGZAG_WIGGLE_DEG = 20.0                    # 위 "알려진 한계" 참고 — 임의 가정값
 TRANSITION_ZONE_M = 0.4                     # 모드 경계 앞뒤 이 거리(m) 안쪽을 "전환구간"으로
                                              # 별도 채점(모드 전환 시 손실 파악용) — 임의 설계값
+
+# [2026-08-18, 도면 사진 재확인] 이전엔 직선 길이를 "각 모드를 관찰하기 충분한" 임의값
+# (좌측 4.0m/상하 6.0m, build_track_path() 기본 인자)으로 뒀는데, 사용자가 도면 사진을
+# 직접 보여줘서 실측 치수를 다시 읽었다 — 이전 근사가 실제 비율과 3~4배 차이나서 시각화가
+# "완전히 다르다"는 지적을 받음(곡률 반경은 이미 정확했으니 문제는 직선 비율이었다).
+#   - 좌측 직선(그림 왼쪽, "8,260" 치수선) ≈ 8.26m → build_track_path()가 시작/끝에서
+#     반씩(lead_in_m) 나눠 쌓아 루프를 닫으므로 lead_in_m = 8.26/2 ≈ 4.13m.
+#   - 상/하단 직선(그림 하단, "10,140" 치수선 — 해당 변에서 가장 크고 뚜렷한 구간) ≈ 10.14m.
+#     상/하단이 같은 길이라는 전제는 도면상 오벌 대칭 형태로 봤을 때 합리적인 근사.
+#   [알려진 한계] 도면 치수선이 벽/기둥/통로 폭까지 잘게 쪼개 표기돼 있어서(예: 하단은
+#   580/450/2,820/1,795/10,140/1,815/940/1,615로 8분할), "어느 구간이 정확히 트랙
+#   직선부인가"는 그림에서 가장 크고 대표적인 값으로 판단한 것이지 좌표 단위 실측은
+#   아니다 — 여전히 근사치. 픽셀 단위로 도면을 다시 재는 것보다는 훨씬 실제에 가깝다.
+TRACK_LEFT_STRAIGHT_M = 8.26                # 좌측 직선 전체 길이(도면 "8,260" 치수)
+TRACK_TOP_BOTTOM_STRAIGHT_M = 10.14         # 상/하단 직선 길이(도면 "10,140" 치수, 대칭 가정)
 
 
 # ─────────────────────────── 기준경로 생성 (월드 좌표, 미터, 표준 수학각) ───────────────────────────
@@ -320,13 +358,17 @@ def build_paths(ds=PATH_DS):
     return paths, path_meta
 
 
-def build_track_path(ds=PATH_DS, lead_in_m=2.0, straight_mid_m=3.0):
+def build_track_path(ds=PATH_DS, lead_in_m=TRACK_LEFT_STRAIGHT_M / 2.0,
+                      straight_mid_m=TRACK_TOP_BOTTOM_STRAIGHT_M):
     """직진→커브(R1.95,90도)→직진→지그재그(4원호, 실측반경)→직진→커브(R1.95,90도)→직진
-    순서로 이어지는 연속 경로 — 트랙 도면(위 TRACK_* 상수 주석 참고)의 곡률을 그대로 쓰되,
-    직선 길이는 도면 실측이 아니라 "각 모드에서 정상상태에 도달하고 전환을 관찰하기에
-    충분한" 근사값이다(실제 길이를 맞추는 게 목적이 아니라 각 모드가 순서대로 이어지는
-    과정 자체를 보는 게 목적). 코너1(90도)+지그재그(net 180도)+코너2(90도)=360도라 방향이
-    제자리로 돌아오는 닫힌 루프가 된다(도면이 실제로 폐루프 트랙인 것과 일치).
+    순서로 이어지는 연속 경로 — 트랙 도면(위 TRACK_* 상수 주석 참고)의 곡률과 직선 길이를
+    그대로 쓴다(2026-08-18 도면 재확인 전에는 직선 길이가 임의 근사값이라 실제 비율과
+    3~4배 차이났었다 — 위 TRACK_LEFT_STRAIGHT_M/TRACK_TOP_BOTTOM_STRAIGHT_M 주석 참고).
+    lead_in_m은 좌측 직선 전체 길이의 절반이다 — 이 함수가 좌측 직선 중간 지점에서
+    시작해 한 바퀴 돌고 다시 좌측 직선 중간으로 돌아오는 구조라, 시작 부분(lead_in_m)과
+    끝 부분(lead_in_m)을 합쳐야 좌측 직선 실제 총길이가 된다. 코너1(90도)+지그재그(net
+    180도)+코너2(90도)=360도라 방향이 제자리로 돌아오는 닫힌 루프가 된다(도면이 실제로
+    폐루프 트랙인 것과 일치).
 
     반환: (pts, segments). segments는 (start_idx, end_idx_exclusive, mode_name) 리스트로,
     simulate()가 모드별/전환구간별 성능을 따로 채점할 수 있게 해준다."""
@@ -460,16 +502,28 @@ def _corner_radius_speed_scale(corner_signal_deg, wheelbase_px, corner_min_radiu
     return max(corner_min_speed_scale, radius / corner_min_radius_px)
 
 
-def simulate(pp, world_pts, speed_norm, sp, rng, meta=None):
+def simulate(pp, world_pts, speed_norm, sp, rng, meta=None, record_trajectory=False):
     """speed_norm: 이 시나리오의 SPEED_NORMAL(모터단위, 순항 목표속도).
     sp: 감속+경로스무딩+디바운스 관련 파라미터 dict(SPEED_KEYS/PATH_KEYS/DEBOUNCE_KEYS 참고)
     — track_drive.py의 _lane_drive() 코너 감속, perception/lane_util.py._update_path()의
     PATH_EMA_ALPHA 경로 스무딩, _debounce()의 N프레임 확정 게이트를 그대로 재현한다.
     meta: build_paths()가 '실전트랙'에 대해서만 채워주는 {'mode_arr','transition_mask'} —
     있으면 모드별/전환구간별 cte도 추가로 집계한다(없으면 기존 3개 시나리오처럼 집계 없이
-    진행)."""
+    진행).
+    record_trajectory: [2026-08-18, 시각화용] True면 매 틱 (vx, vy)를 결과 dict의
+    'trajectory' 키에 리스트로 담아 반환한다 — 그리드서치/스코어링에는 전혀 쓰이지 않는
+    순수 부가기능(기본 False, 기존 호출부 전부 무영향)."""
     vx, vy, vth = float(world_pts[0, 0]), float(world_pts[0, 1]), math.pi / 2
     pp.reset()
+
+    # [2026-08-18] physics='st'일 때는 f1tenth_dynamics.vehicle_dynamics_st가 요구하는
+    # 7-state([x, y, 앞바퀴 조향각, 속도, yaw, yaw rate, 슬립각])를 별도로 들고 간다 —
+    # vx/vy/vth는 아래에서 st_state[0]/[1]/[4]로 매 틱 동기화되는 "뷰"로만 쓴다(cte 계산
+    # 등 나머지 코드는 vx/vy/vth만 보므로 kinematic 분기와 호환된다). 조향각(st_state[2])과
+    # 속도(st_state[3])는 처음엔 0에서 시작 — 실차도 정지상태에서 출발(prev_speed=0.0과
+    # 동일 전제).
+    st_state = [vx, vy, 0.0, 0.0, vth, 0.0, 0.0]
+    dyn_params = dyn.F1TENTH_DEFAULT_PARAMS
 
     prev_speed = 0.0        # track_drive.py __init__의 self._prev_speed=0.0과 동일 출발
     corner_signal = 0.0     # self._corner_signal
@@ -488,6 +542,7 @@ def simulate(pp, world_pts, speed_norm, sp, rng, meta=None):
     prev_actuated_steer = 0.0  # drive()의 self._prev_angle_out과 동일 역할 — 아래 [조향 변화율 제한] 참고
 
     ctes, steers, straight_flags, speeds = [], [], [], []
+    trajectory = []
     mode_hits, transition_ctes = [], []
     path_end = world_pts[-1]
     n_ticks = int(MAX_SIM_T / DT)
@@ -517,7 +572,13 @@ def simulate(pp, world_pts, speed_norm, sp, rng, meta=None):
                     (a * nx + (1.0 - a) * px, a * ny + (1.0 - a) * py)
                     for (px, py), (nx, ny) in zip(smoothed_path, fitted_path)
                 ]
-            steer_deg = pp.control(smoothed_path, vehicle_xy, speed=prev_speed, imu_curvature_px=None)
+            # [2026-08-18] physics='st'에서는 track_drive.py._speed_for_lookahead()가
+            # VESC 실측이 살아있을 때 하는 것과 동일하게 "실제로 지금 얼마나 빨리 달리는가"
+            # (st_state[3], m/s → 모터unit 환산)를 쓴다 — kinematic 분기는 VESC 미시뮬레이션
+            # 전제 그대로 prev_speed(명령값) 근사를 유지한다(기존 동작 불변, 위 모듈 상단
+            # "VESC 미시뮬레이션이라..." 주석 참고).
+            lookahead_speed = (abs(st_state[3]) / MPS_PER_UNIT) if PHYSICS_MODE == 'st' else prev_speed
+            steer_deg = pp.control(smoothed_path, vehicle_xy, speed=lookahead_speed, imu_curvature_px=None)
             # lookahead_ema(코너 프리뷰 신호)는 실제 코드처럼 스무딩 이전의 원시 far_center
             # 기반이다 — 실제 self.lane_lookahead는 self.path(스무딩됨)가 아니라 슬라이스
             # 그룹평균(피팅 이전 원시값)에서 나온다. 스무딩된 값을 쓰면 두 신호가 같은
@@ -583,11 +644,51 @@ def simulate(pp, world_pts, speed_norm, sp, rng, meta=None):
         # steer) 헤딩은 시계방향=th가 "감소"해야 한다 — 부호를 안 뒤집으면 좌/우가 반대로
         # 시뮬레이션되어(첫 구현에서 실제로 발생: 커브가 좌회전인데 차가 우회전해 발산)
         # 그리드서치 전체가 무의미해진다.
-        v_mps = MPS_PER_UNIT * prev_speed
         steer_rad = math.radians(actuated_steer)
-        vth -= (v_mps / WHEELBASE_M) * math.tan(steer_rad) * DT
-        vx += v_mps * math.cos(vth) * DT
-        vy += v_mps * math.sin(vth) * DT
+        if PHYSICS_MODE == 'st':
+            # [2026-08-18] F1TENTH ST 동역학 — pid()가 "목표 속도/조향각"을 조향서보/모터
+            # 반응한계(sv_max/a_max) 안에서 도달 가능한 조향각속도/가속도로 바꿔주고,
+            # vehicle_dynamics_st가 타이어 코너링강성(C_Sf/C_Sr) 기반 슬립까지 반영한
+            # 상태미분을 계산한다. actuated_steer(위 ANGLE_RATE_MAX_DEG 슬루 제한 통과값)를
+            # 쓴다 — 서보 반응지연은 이미 그쪽에서 반영되고, pid()의 sv_max는 그 안에서
+            # "이번 틱 동안 실제로 얼마나 더 돌 수 있는가"를 추가로 제약한다(이중 제약이지만
+            # 서로 다른 두 물리적 한계 — 명령 슬루레이트 vs 서보 최대 각속도 — 라 자연스럽다).
+            # 부호주의: pure_pursuit의 steer_deg는 "우측+"인데 F1TENTH 모델의 조향각(x[2])은
+            # 표준 자전거모델 부호(+=좌회전/yaw 증가) — 안 뒤집으면 코너가 반대로 돌아
+            # 발산한다(kinematic 분기가 vth에 '-='를 쓰는 것과 동일한 이유, 위 부호 주석
+            # 참고). 그래서 pid()에 넘기는 목표 조향각은 -steer_rad다.
+            target_speed_mps = MPS_PER_UNIT * prev_speed
+            accl, sv = dyn.pid(target_speed_mps, -steer_rad, st_state[3], st_state[2],
+                               dyn_params['sv_max'], dyn_params['a_max'],
+                               dyn_params['v_max'], dyn_params['v_min'])
+            # [2026-08-18, 실행 중 발견] DT=0.05s 그대로 1스텝 Euler로 적분하면 저속
+            # (v≈0.5~1.2m/s, KS→ST 전환 직후) 구간에서 yaw_rate가 몇 틱 만에 발산했다
+            # (vehicle_dynamics_st의 yaw_rate/slip ODE 계수가 mu*m/(x[3]*I*(lr+lf)) 형태라
+            # 이 저속 구간에서 매우 커짐 — stiff ODE를 큰 스텝 explicit Euler로 풀 때 생기는
+            # 전형적 수치발산이지 로직 버그가 아니다. vehicle_dynamics_st는 F1TENTH 원본
+            # 유닛테스트 ground truth와 대조해 오차 ~1e-17로 이미 검증됨). 원본 F1TENTH
+            # Gym도 이래서 RK4/odeint를 쓴다 — 여기선 제어입력[sv,accl]은 이번 20Hz 틱
+            # 동안 고정하고 내부적으로 ST_PHYSICS_SUBSTEPS번 더 잘게 쪼갠 Euler로 적분하는
+            # 방식을 썼다(위 ST_PHYSICS_SUBSTEPS 주석 — 표본 실험으로 충분히 수렴 확인).
+            sub_dt = DT / ST_PHYSICS_SUBSTEPS
+            u = [sv, accl]
+            for _ in range(ST_PHYSICS_SUBSTEPS):
+                f = dyn.vehicle_dynamics_st(
+                    st_state, u,
+                    dyn_params['mu'], dyn_params['C_Sf'], dyn_params['C_Sr'],
+                    dyn_params['lf'], dyn_params['lr'], dyn_params['h'],
+                    dyn_params['m'], dyn_params['I'],
+                    dyn_params['s_min'], dyn_params['s_max'],
+                    dyn_params['sv_min'], dyn_params['sv_max'],
+                    dyn_params['v_switch'], dyn_params['a_max'],
+                    dyn_params['v_min'], dyn_params['v_max'])
+                st_state = [s + fi * sub_dt for s, fi in zip(st_state, f)]
+            vx, vy, vth = st_state[0], st_state[1], st_state[4]
+        else:
+            v_mps = MPS_PER_UNIT * prev_speed
+            vth -= (v_mps / WHEELBASE_M) * math.tan(steer_rad) * DT
+            vx += v_mps * math.cos(vth) * DT
+            vy += v_mps * math.sin(vth) * DT
 
         idx, cte = _nearest_point(world_pts, vx, vy, prev_idx=prev_idx, window_pts=window_pts)
         prev_idx = idx
@@ -598,6 +699,8 @@ def simulate(pp, world_pts, speed_norm, sp, rng, meta=None):
         steers.append(actuated_steer)
         straight_flags.append(is_straight)
         speeds.append(prev_speed)
+        if record_trajectory:
+            trajectory.append((vx, vy))
         if meta is not None:
             mode_hits.append(meta['mode_arr'][idx])
             if meta['transition_mask'][idx]:
@@ -634,6 +737,13 @@ def simulate(pp, world_pts, speed_norm, sp, rng, meta=None):
         'elapsed_s': len(ctes) * DT,
         'completed': completed,
     }
+    if record_trajectory:
+        result['trajectory'] = trajectory
+        # ctes/speeds는 위에서 이미 매 틱 쌓아온 배열을 그대로 노출 — 새로 추적하지 않는다.
+        result['cte_seq'] = ctes.tolist()
+        result['speed_seq'] = speeds.tolist()
+        if meta is not None:
+            result['mode_seq'] = mode_hits
 
     if meta is not None:
         # ctes/mode_hits/transition_ctes는 매 틱 동시에 append되므로(위 루프) 길이가
@@ -821,7 +931,7 @@ def sample_params(rng, speed_norm):
             if lo >= hi:
                 lo = hi * 0.5
         val = rng.uniform(lo, hi)
-        if k in ('alpha', 'straight_alpha', 'path_ema_alpha'):
+        if k in ('alpha', 'straight_alpha', 'path_ema_alpha', 'corner_sign_ema_alpha'):
             val = float(np.clip(val, 0.05, 1.0))
         p[k] = float(val)
     # corner_hold_decay_hi가 lo보다 낮게 뽑히면(별개 절대범위라 드물게 역전 가능)
@@ -943,7 +1053,7 @@ def _params_from_trial(trial, speed_norm):
             p[k] = trial.suggest_categorical(k, STABLE_FRAME_MIN_CHOICES)
             continue
         lo, hi = _candidate_range(k)
-        if k in ('alpha', 'straight_alpha', 'path_ema_alpha'):
+        if k in ('alpha', 'straight_alpha', 'path_ema_alpha', 'corner_sign_ema_alpha'):
             lo, hi = max(lo, 0.05), min(hi, 1.0)
         if k == 'speed_corner_min':
             # sample_params()와 동일 제약(위 [2026-08-18 6차] 주석 참고) — Optuna 쪽에도
@@ -1063,7 +1173,14 @@ def main():
     ap.add_argument('--seed-file', type=str, default=None,
                      help='--optuna 전용: 이전 탐색이 찾은 best_params dict 리스트가 담긴 JSON 파일 — '
                           'study.enqueue_trial()로 맨 앞 트라이얼로 먼저 평가해 이어서 탐색한다')
+    ap.add_argument('--physics', choices=['kinematic', 'st'], default='kinematic',
+                     help="'kinematic'(기존, 슬립 없음, 기본값) | "
+                          "'st'(F1TENTH Gym Single Track 동역학, 타이어 슬립+조향/가속 반응지연 반영 — "
+                          "f1tenth_dynamics.py 참고, 물리 파라미터는 xycar 미실측 F1TENTH 대체값)")
     args = ap.parse_args()
+
+    global PHYSICS_MODE
+    PHYSICS_MODE = args.physics
 
     paths, path_meta = build_paths()
 
@@ -1076,7 +1193,7 @@ def main():
             with open(args.seed_file) as f:
                 seed_points = json.load(f)
         print(f"[Optuna] TPE 베이지안 최적화, trials={args.trials}, seed_points={len(seed_points)}개 "
-              f"(기존 탐색 결과에서 이어감)\n")
+              f"(기존 탐색 결과에서 이어감), physics={PHYSICS_MODE}\n")
         all_out = {}
         for sp in args.speeds:
             print(f"===== speed={sp} (SPEED_NORMAL 역할, 모터unit, ≈{sp*MPS_PER_UNIT:.2f}m/s"
@@ -1094,7 +1211,8 @@ def main():
         return all_out
 
     print(f"[설정] ROI_W={ROI_W_PX}px ROI_H≈{ROI_H_PX:.0f}px(DL_BEV_FAR_LIMIT_M={ROI_DEPTH_M}m 기준) "
-          f"noise_std={NOISE_STD_PX}px WHEELBASE_M={WHEELBASE_M} MPS_PER_UNIT={MPS_PER_UNIT}")
+          f"noise_std={NOISE_STD_PX}px WHEELBASE_M={WHEELBASE_M} MPS_PER_UNIT={MPS_PER_UNIT} "
+          f"physics={PHYSICS_MODE}")
     print(f"[baseline] SPEED_NORMAL=3.0 재튜닝 시점 config.py 현재값: {BASELINE}\n")
 
     all_out = {}

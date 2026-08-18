@@ -183,6 +183,25 @@ LANE_LOOKAHEAD_REF = 220.0   # 예측감속 최대가 되는 lookahead 편차(px
 CORNER_MIN_RADIUS_PX = 250.0
 CORNER_MIN_SPEED_SCALE = 0.35  # 반경이 0에 가까워져도 속도가 0으로 죽지 않게 하는 하한 배율
 
+# [2026-08-18] "직선인데 커브로 오검출돼 속도가 안 오른다" 대응 — turn_now(조향각 signed
+#   EMA)/turn_preview(lane_lookahead)는 전부 비전+조향출력에서만 나오는 신호라, 세그멘테이션
+#   잡음이나 조향 잔떨림만으로도 코너로 오인될 수 있다. is_straight(§0.5.9, PP_STRAIGHT_*)가
+#   이미 이 문제를 다루긴 하지만 여러 프레임 연속 확정이 필요한 이진 게이트라, 아직
+#   확정 전인 애매한 프레임에서는 turn_now/turn_preview가 잡음만으로 감속을 걸어도 못 막는다.
+#   2023 KMU 대회 AuTURBO rookie 팀 저장소(ModeController.py, github.com/AuTURBO/
+#   2023_KMU_Autonomous_team_AuTURBO_rookie)의 모드전환 로직을 참고 — 거기서도 비전(픽셀
+#   오차 평균)만으로는 "커브"를 확정하지 않고, diff_degree(IMU yaw 변화량 > 47도)로 실제
+#   회전량을 교차검증한 뒤에야 realcurve로 카운트한다. 그 아이디어를 연속값 버전으로
+#   가져와 track_drive.py._imu_corner_confirm_scale()에서 쓴다 — "비전은 코너라는데 IMU
+#   실측 회전율이 거의 0"이면 코너감속(turn_for_speed)을 절반 이하로 깎는다.
+#   CORNER_IMU_CONFIRM_KAPPA_PX = 1/CORNER_MIN_RADIUS_PX로 잡은 이유: 반경기반 추가감속
+#   (_corner_radius_speed_scale())이 작동을 시작하는 커브(반경<=250px)에서는 IMU 신뢰도가
+#   이미 1.0(무감쇠)에 도달해 있어야, 진짜 코너에서까지 이 게이트가 감속을 방해하지 않는다.
+#   IMU/VESC가 죽어있거나(_imu_curvature_px()가 None) dl+BEV 조합이 아니면 기존처럼 비전
+#   신호만으로 판단(무감쇠, 1.0)한다. 실차 미검증 첫 추정치.
+CORNER_IMU_CONFIRM_KAPPA_PX = 1.0 / CORNER_MIN_RADIUS_PX  # = 0.004 — 이 이상 IMU curvature면 코너감속 100% 신뢰
+CORNER_IMU_MIN_SCALE = 0.5  # IMU가 "회전 거의 없음"을 보고해도 비전신호 기반 감속을 최소 이만큼은 남겨두는 하한
+
 # ── 좌회전 공통 (S2→S3 진입, S3→S1 진출) — 전부 실차 튜닝 필요한 임시값 ──
 #   [2026-08-18] 종료 판정을 프레임 카운트(open-loop)에서 IMU yaw 실측 기반(closed-loop)으로
 #   변경. 같은 (TURN_ANGLE, TURN_SPEED) 명령이어도 배터리 전압 강하·노면·속도 변동에 따라
