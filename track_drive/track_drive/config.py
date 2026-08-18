@@ -379,8 +379,9 @@ DL_DA_VELOCITY_EMA_ALPHA = 0.3      # 밴드 간 이동 속도(px/밴드) EMA �
 DL_DA_VELOCITY_MAX_PX = 40.0        # 예측 이동량 클램프
 DL_DA_BAND_ANCHOR_ALPHA = 0.35      # 밴드별 탐색창 중심 계산 시 "직전 프레임 그 밴드 위치"에 주는 가중치
 
-# ll sanity check — ROI 내 ll(차선) foreground 비율이 이 미만이면 da 결과와 무관하게 무효 처리
-DL_LL_SANITY_MIN_RATIO = 0.005
+# [2026-08-18] DL_LL_SANITY_MIN_RATIO(ll sanity check) 삭제 — lane_valid/path_ok 모두
+#   da 중심점 유무로만 판정하도록 바꿈(perception/dl_lane.py 참고, ll 미사용 확정에 따른
+#   정리, README §2.42 연장선).
 # da가 옆 차선과 이어붙었을 때 ll 라인 바깥(옆 차선 쪽) 픽셀을 잘라내는 여유폭(px)
 #   8 = 실측 라인 두께 2.5cm(=5px @200px/m) + 세그멘테이션 경계 흔들림(1~2px) 여유
 #   (위 [LQR 브랜치 이식] 주석 참고). 옛 값 15px은 필요 이상으로 넓게 잘라내 정상
