@@ -1569,6 +1569,20 @@ class TrackDriverNode(Node):
             return 1.0
         return max(CORNER_MIN_SPEED_SCALE, radius / CORNER_MIN_RADIUS_PX)
 
+    def _imu_corner_confirm_scale(self):
+        """turn_now/turn_preview(비전+조향출력 신호)가 코너라고 판단해도, IMU 실측
+        회전량(self.pure_pursuit.last_imu_curvature_px)이 이를 뒷받침하지 않으면 코너감속을
+        절반 이하로 깎는다(config.py CORNER_IMU_CONFIRM_KAPPA_PX/CORNER_IMU_MIN_SCALE 주석 —
+        2023 KMU AuTURBO rookie 팀의 ModeController가 IMU yaw 변화량으로 "진짜 커브"를
+        확인하던 패턴 참고). last_imu_curvature_px는 _lane_steer()가 이번 틱에 이미
+        갱신해뒀다(_imu_curvature_px() 호출 순서 참고) — 여기서 다시 계산하지 않는다.
+        None이면(IMU/VESC 죽었거나 dl+BEV 조합이 아니면) 기존처럼 비전 신호만 믿도록
+        1.0(무감쇠)을 반환한다. 실차 미검증 첫 추정치."""
+        imu_kappa = getattr(self.pure_pursuit, 'last_imu_curvature_px', None)
+        if imu_kappa is None:
+            return 1.0
+        return max(CORNER_IMU_MIN_SCALE, min(1.0, abs(imu_kappa) / CORNER_IMU_CONFIRM_KAPPA_PX))
+
     def _lane_drive(self):
         """S1/S3 공통 차선 조향+감속 로직. ctrl_angle·ctrl_speed·_prev_speed·_corner_hold 갱신."""
         self.ctrl_angle = self._lane_steer()
@@ -1597,7 +1611,11 @@ class TrackDriverNode(Node):
         # 낸다. is_straight가 아닌 프레임(코너 포함 전부)은 기존 연속값 로직을 그대로 쓴다 —
         # 코너 감속 감도 자체는 전혀 안 바뀜.
         is_straight = getattr(self.pure_pursuit, 'is_straight', False)
-        turn_for_speed = 0.0 if is_straight else max(turn_now, turn_preview * 0.3)
+        # [2026-08-18] IMU 실측 회전량으로 "비전이 본 코너가 진짜인가" 교차검증(위
+        # _imu_corner_confirm_scale() 주석 참고) — is_straight가 아직 확정 전인 애매한
+        # 프레임에서 turn_now/turn_preview가 비전 잡음만으로 감속을 거는 걸 막는다.
+        imu_corner_scale = self._imu_corner_confirm_scale()
+        turn_for_speed = 0.0 if is_straight else max(turn_now, turn_preview * 0.3) * imu_corner_scale
         target_speed = max(SPEED_CORNER_MIN,
                            SPEED_NORMAL * (1.0 - 0.90 * turn_for_speed ** 3))
         # 코너 진입(회전반경 감소) 시 추가 감속 — 기존 turn_for_speed 기반 감속과는 독립적으로
