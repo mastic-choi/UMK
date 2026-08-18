@@ -1318,15 +1318,21 @@ OBSTACLE_VEHICLE_WIDTH_M = 0.24
 #       진동"(카카오톡 영상 2026-08-17 16:31)으로 25.0으로 되돌려졌던 것과 거의 같은
 #       크기. 이번엔 실전트랙(실측 곡률)+더 넓은 탐색으로 독립적으로 재확인된 값이라
 #       방향성은 신뢰할 만하지만, 진동 재현 여부는 반드시 실차에서 최우선 확인할 것.
-#     - `SPEED_ACCEL_STEP`(전 속도 1.08~1.58)/`SPEED_CORNER_MIN`(대부분 13~16, 일부
-#       5.8) — 각각 과거 1.014(LVC 배터리 트립, 카카오톡 로그 2026-08-17 15:38)와
-#       14.05(트랙 이탈, 카카오톡 영상 2026-08-17 15:44)로 인해 0.4/10.0으로 되돌려진
-#       이력이 있는 구간과 겹친다. 이 두 문제(배터리/트랙이탈)는 시뮬레이터가 아예
-#       모델링하지 않는 영역(배터리 전류, da 밴드 핏 실패)이라 시뮬 점수가 좋다고 해서
+#     - `SPEED_ACCEL_STEP`(전 속도 1.08~1.58) — 과거 1.014(LVC 배터리 트립, 카카오톡
+#       로그 2026-08-17 15:38)로 인해 0.4로 되돌려진 이력이 있는 구간과 겹친다. 이건
+#       시뮬레이터가 아예 모델링하지 않는 영역(배터리 전류)이라 시뮬 점수가 좋다고 해서
 #       재발 안 한다는 보장이 없다 — 첫 실차 테스트에서 최우선으로 지켜볼 것.
 #     - `ANGLE_RATE_MAX`(조향 변화율 제한)는 이 시뮬레이터가 아직 반영하지 않은
 #       상태에서 나온 값이다 — 급커브/지그재그 전환 구간에서 시뮬이 가정한 조향
 #       반응이 실제 서보보다 빠를 수 있다(추가 검증 예정).
+#   [2026-08-18 배포 직후 수정] `SPEED_CORNER_MIN`이 speed10/12.5/15 3개 프리셋에서
+#   그리드서치 원값 그대로 `SPEED_NORMAL`보다 커서(예: speed15는 15.77 vs 15.0)
+#   `max(SPEED_CORNER_MIN, ...)` 공식상 코너감속 경로가 완전히 죽어있던 버그를 실차
+#   테스트로 발견 — §0.5.10과 동일 실패모드. 세 프리셋 다 `SPEED_NORMAL*0.7`로 완화
+#   (아래 dict 안 해당 값 옆 주석 참고). 이 그리드서치(pp_tune_gridsearch.py)의 탐색
+#   공간이 SPEED_CORNER_MIN을 SPEED_NORMAL과 무관하게 독립 샘플링해서 생긴 문제라,
+#   재발 방지하려면 그 스크립트에 "speed_corner_min < speed_norm" 제약을 추가하는 게
+#   근본 해결책 — 아직 미반영.
 #
 #   사용법: 아래 PP_TUNE_ACTIVE_PRESET을 None(기존 개별 값 그대로) 또는 7개 속도
 #   프리셋 중 하나로 바꾸고 colcon build 후 실차에서 테스트. 프리셋이 활성화되면
@@ -1340,7 +1346,12 @@ PP_TUNE_PRESETS = {
         PP_LOOKAHEAD_CURVATURE_GAIN=446.4, PP_LOOKAHEAD_MIN_PX=41.66,
         PP_STRAIGHT_CURVATURE_EPS=0.008086, PP_STRAIGHT_CONFIRM_FRAMES=5, PP_STRAIGHT_DEADZONE_PX=5.222,
         PP_STRAIGHT_ALPHA=0.9083, PP_STRAIGHT_BIAS_EMA_ALPHA=0.5997,
-        SPEED_CORNER_MIN=14.16, CORNER_SIGN_EMA_ALPHA=0.6406, LANE_LOOKAHEAD_REF=449.4,
+        # [2026-08-18 배포 직후 수정] 그리드서치 원값 14.16이 SPEED_NORMAL(10.0)보다 커서
+        # max(SPEED_CORNER_MIN, ...) 공식상 코너감속 경로가 완전히 죽어있었다(§0.5.10과
+        # 동일 실패모드, 실차 테스트로 재현됨 — "속도 5 고정" 증상은 이거 때문이 아니라
+        # LL_DEGRADED/LANE_STALE/AVOID_HOLD_BLOCKED 캡이 원인이었지만, 이 버그 자체는
+        # 별개로 진짜였음). SPEED_NORMAL*0.7로 완화.
+        SPEED_CORNER_MIN=7.0, CORNER_SIGN_EMA_ALPHA=0.6406, LANE_LOOKAHEAD_REF=449.4,
         SPEED_ACCEL_STEP=1.562, CORNER_HOLD_DECAY_LO=0.9363, CORNER_HOLD_DECAY_HI=0.9278,
         CORNER_MIN_RADIUS_PX=582.4, CORNER_MIN_SPEED_SCALE=0.2266,
         PATH_EMA_ALPHA=0.4719, DL_STABLE_FRAME_MIN=10, DL_STABLE_JUMP_MAX=43.24,
@@ -1352,7 +1363,9 @@ PP_TUNE_PRESETS = {
         PP_LOOKAHEAD_CURVATURE_GAIN=490.4, PP_LOOKAHEAD_MIN_PX=34.59,
         PP_STRAIGHT_CURVATURE_EPS=0.01194, PP_STRAIGHT_CONFIRM_FRAMES=7, PP_STRAIGHT_DEADZONE_PX=2.582,
         PP_STRAIGHT_ALPHA=0.8493, PP_STRAIGHT_BIAS_EMA_ALPHA=0.434,
-        SPEED_CORNER_MIN=14.17, CORNER_SIGN_EMA_ALPHA=1.0, LANE_LOOKAHEAD_REF=405.9,
+        # [2026-08-18 배포 직후 수정] 위 speed10과 동일 버그(14.17 > SPEED_NORMAL 12.5) —
+        # SPEED_NORMAL*0.7로 완화.
+        SPEED_CORNER_MIN=8.75, CORNER_SIGN_EMA_ALPHA=1.0, LANE_LOOKAHEAD_REF=405.9,
         SPEED_ACCEL_STEP=1.084, CORNER_HOLD_DECAY_LO=0.8675, CORNER_HOLD_DECAY_HI=0.9038,
         CORNER_MIN_RADIUS_PX=460.3, CORNER_MIN_SPEED_SCALE=0.126,
         PATH_EMA_ALPHA=0.5028, DL_STABLE_FRAME_MIN=7, DL_STABLE_JUMP_MAX=10.55,
@@ -1364,7 +1377,14 @@ PP_TUNE_PRESETS = {
         PP_LOOKAHEAD_CURVATURE_GAIN=508.0, PP_LOOKAHEAD_MIN_PX=45.14,
         PP_STRAIGHT_CURVATURE_EPS=0.00574, PP_STRAIGHT_CONFIRM_FRAMES=5, PP_STRAIGHT_DEADZONE_PX=11.35,
         PP_STRAIGHT_ALPHA=0.411, PP_STRAIGHT_BIAS_EMA_ALPHA=0.7405,
-        SPEED_CORNER_MIN=15.77, CORNER_SIGN_EMA_ALPHA=0.7895, LANE_LOOKAHEAD_REF=477.6,
+        # [2026-08-18 배포 직후 수정] 실차 테스트 중 발견 — 그리드서치 원값 15.77이
+        # SPEED_NORMAL(15.0)보다 커서 max(SPEED_CORNER_MIN, SPEED_NORMAL*(1-...)) 공식상
+        # 코너감속 경로가 완전히 죽어있었다(§0.5.10과 동일 실패모드). 실차에서 관찰된
+        # "속도 5 고정" 증상 자체의 원인은 아니었음(그건 LL_DEGRADED/LANE_STALE/
+        # AVOID_HOLD_BLOCKED 캡 — 전부 5.0 — 이 원인으로 추정, 인식 불안정 쪽 별도 확인
+        # 필요) — 다만 이 버그도 별개로 진짜였고 방치하면 실제 코너에서 무감속 위험이
+        # 있어 SPEED_NORMAL*0.7(=10.5)로 완화.
+        SPEED_CORNER_MIN=10.5, CORNER_SIGN_EMA_ALPHA=0.7895, LANE_LOOKAHEAD_REF=477.6,
         SPEED_ACCEL_STEP=1.476, CORNER_HOLD_DECAY_LO=0.9196, CORNER_HOLD_DECAY_HI=0.9215,
         CORNER_MIN_RADIUS_PX=678.3, CORNER_MIN_SPEED_SCALE=0.345,
         PATH_EMA_ALPHA=0.6403, DL_STABLE_FRAME_MIN=5, DL_STABLE_JUMP_MAX=35.35,
