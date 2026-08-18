@@ -20,6 +20,7 @@ from ..config import (
     SIG4_AUTOCROP_ENABLE, SIG4_SEARCH_ROI_T, SIG4_SEARCH_ROI_B,
     SIG4_SEARCH_ROI_L, SIG4_SEARCH_ROI_R,
     SIG4_BOARD_SAT_MAX, SIG4_BOARD_V_MIN, SIG4_BOARD_V_MAX,
+    SIG4_BOARD_HUE_MIN, SIG4_BOARD_HUE_MAX, SIG4_BOARD_HUE_STD_MAX,
     SIG4_BOARD_MIN_AREA_PX, SIG4_BOARD_MAX_AREA_PX, SIG4_BOARD_MIN_ASPECT,
     SIG4_BOARD_MAX_ASPECT, SIG4_BOARD_MAX_CANDIDATES, SIG4_BOARD_CROP_MARGIN,
     SIG4_CIRCLE_ENGINE, SIG4_FRST_RADIUS_STEP, SIG4_FRST_ALPHA,
@@ -138,7 +139,22 @@ class SignalDetector:
         config.py 주석 참고) — HSV로 바꿔 채도(S)를 낮게 제한하니(무채색=배경판 특징)
         분리가 됐다. 채도만으론 완전하지 않아(형광등 주변도 저채도인 경우가 있음)
         면적 상한을 훨씬 타이트하게 잡고, MORPH_OPEN으로 형광등 반사가 만드는 가늘고
-        긴 줄무늬를 끊어낸다(MORPH_CLOSE는 오히려 그런 줄무늬를 서로 이어붙여 역효과)."""
+        긴 줄무늬를 끊어낸다(MORPH_CLOSE는 오히려 그런 줄무늬를 서로 이어붙여 역효과).
+
+        [2026-08-18 2차] Hue(H) 밴드도 추가. lap_001 실측 히스토그램(config.py
+        SIG4_BOARD_HUE_MIN/MAX 주석 참고)상 진짜 배경판은 H가 좁게(80~110대) 몰리는데
+        예전 오탐 블롭(frame_062)은 훨씬 넓게 퍼져 있어, 이 범위 밖 픽셀을 마스크
+        단계에서 미리 제외하면 이종 색상이 섞인 병합 블롭을 더 작게/더 쪼개서 잡을
+        가능성이 있다 — 정상 프레임 손실은 실측상 1% 미만.
+
+        [2026-08-18 3차] 블롭 단위 Hue 표준편차(균질성) 필터 추가. §1.4/§1.5(README) 실험 중
+        면적/위치로는 오염된 블롭(진짜 배경판+엉뚱한 물체가 병합)과 깨끗한 블롭을 못 갈랐지만,
+        Hue 표준편차는 갈렸다 — lap_001 chosen 후보 기준 정상(52/53/55/56) 16.5~19.8인데
+        예전 오탐(frame_062, 큰 블롭이 쪼개진 뒤에도) 25.5~30.1로 뚜렷이 높았다(config.py
+        SIG4_BOARD_HUE_STD_MAX 주석 참고). 색상이 여러 물체가 섞여 들쭉날쭉한 블롭을 여기서
+        미리 걸러 원 4개 패턴검사(circle_count/shape_ok)까지 가지도 못하게 한다 — 등간격검사
+        (§1.3)가 "원의 배치"로 걸러내는 오탐을, 이건 "블롭의 색상 균질성"으로 한 단계 앞에서
+        거른다는 점에서 서로 다른 근거의 독립적 필터."""
         h, w = frame.shape[:2]
         st, sb = int(h * SIG4_SEARCH_ROI_T), int(h * SIG4_SEARCH_ROI_B)
         sl, sr = int(w * SIG4_SEARCH_ROI_L), int(w * SIG4_SEARCH_ROI_R)
@@ -147,7 +163,8 @@ class SignalDetector:
             return []
 
         hsv = cv2.cvtColor(band, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, (0, 0, SIG4_BOARD_V_MIN), (179, SIG4_BOARD_SAT_MAX, SIG4_BOARD_V_MAX))
+        mask = cv2.inRange(hsv, (SIG4_BOARD_HUE_MIN, 0, SIG4_BOARD_V_MIN),
+                            (SIG4_BOARD_HUE_MAX, SIG4_BOARD_SAT_MAX, SIG4_BOARD_V_MAX))
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -162,6 +179,15 @@ class SignalDetector:
                 continue
             aspect = cw / ch
             if not (SIG4_BOARD_MIN_ASPECT <= aspect <= SIG4_BOARD_MAX_ASPECT):
+                continue
+
+            # 블롭(컨투어) 내부 픽셀만의 Hue 표준편차 — bbox 전체가 아니라 mask(색상 조건)를
+            # 통과한 픽셀만 대상으로 해야 배경(마진)에 섞여드는 걸 피할 수 있다.
+            local_mask = np.zeros((ch, cw), dtype=np.uint8)
+            cv2.drawContours(local_mask, [c], -1, 255, -1, offset=(-x, -y))
+            local_mask = cv2.bitwise_and(local_mask, mask[y:y + ch, x:x + cw])
+            hue_vals = hsv[y:y + ch, x:x + cw, 0][local_mask > 0]
+            if hue_vals.size == 0 or float(hue_vals.std()) > SIG4_BOARD_HUE_STD_MAX:
                 continue
 
             mx, my = int(cw * SIG4_BOARD_CROP_MARGIN), int(ch * SIG4_BOARD_CROP_MARGIN)
