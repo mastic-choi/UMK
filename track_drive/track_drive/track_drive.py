@@ -299,6 +299,7 @@ class TrackDriverNode(Node):
             wheelbase_boost_gain_per_deg=PP_WHEELBASE_BOOST_GAIN_PER_DEG,
             wheelbase_boost_max_scale=PP_WHEELBASE_BOOST_MAX_SCALE,
             lookahead_alpha=PP_LOOKAHEAD_ALPHA,
+            lookahead_speed_anchor=PP_LOOKAHEAD_SPEED_ANCHOR,
         )
 
         self.path = None

@@ -844,6 +844,19 @@ PP_LOOKAHEAD_MAX_PX = 180.7        # lookahead 상한 — 150.0→180.7(그리�
 PP_LOOKAHEAD_CURVATURE_GAIN = 224.8  # 직전 프레임 curvature가 클수록(코너) lookahead를 줄이는 게인 — 100.0→224.8(그리드서치)
 PP_LOOKAHEAD_MIN_PX = 62.61        # 코너에서 lookahead가 줄어들 수 있는 하한 — 40.0→62.61(그리드서치)
 
+# [2026-08-19] speed_lookahead_px = BASE + GAIN*(speed - ANCHOR)의 ANCHOR(요청 반영) —
+#   기존엔 ANCHOR가 암묵적으로 0(=BASE가 "speed=0일 때" 값)이라, 실제로는 절대 안 나오는
+#   speed=0 지점을 기준으로 삼다 보니 config.py만 봐서는 "지금 주행속도에서 lookahead가
+#   대충 얼마인지"가 바로 안 보이는 문제가 있었다(예: speed15 프리셋 BASE=110.38인데 실제
+#   SPEED_NORMAL=12에서 나오는 값은 146.5 — 숫자가 전혀 안 겹쳐서 헷갈림). ANCHOR를
+#   SPEED_NORMAL로 두면 BASE 자체가 "주행속도에서의 lookahead값"이 되어 더 직관적이다.
+#   기본값 0.0 = 기존과 완전히 동일한 동작(하위호환) — 이 전역 기본값과 speed15를 뺀
+#   나머지 프리셋(None 포함)은 전부 이 0.0을 그대로 쓰므로 안 건드림. speed15 프리셋만
+#   아래서 SPEED_NORMAL(12.0)로 덮어쓰고, 그에 맞춰 BASE_PX도 같이 재계산했다(아래
+#   PP_TUNE_PRESETS['speed15'] 주석 참고) — 다른 프리셋으로 바꿔 쓰려면 그 프리셋도
+#   같은 방식으로 ANCHOR+BASE_PX를 맞춰야 한다(아직 안 함).
+PP_LOOKAHEAD_SPEED_ANCHOR = 0.0
+
 # [2026-08-19] lookahead_px 자체에 거는 프레임간 저역통과(요청 반영, pure_pursuit.py
 #   lookahead_alpha 주석 참고) — curvature_damp가 한 프레임 만에 lookahead를 base 근처에서
 #   MIN_PX까지 확 끌어내리면, 좁아진 lookahead가 같은 dx도 더 큰 curvature로 증폭시켜
@@ -1439,14 +1452,20 @@ PP_TUNE_PRESETS = {
         # 프리셋에서 겪은 "그리드서치 원값이 SPEED_NORMAL보다 커서 코너감속이 no-op"
         # 버그가 재현되지 않았다 — SPEED_NORMAL*0.7 클램프 불필요, 그리드서치 원값 그대로 적용.
         # 실차 재검증 전.
-        PP_LOOKAHEAD_BASE_PX=110.38, PP_LOOKAHEAD_SPEED_GAIN=3.01, PP_LOOKAHEAD_MAX_PX=265.4,
+        # [2026-08-19] BASE_PX를 "speed=0 기준"에서 "SPEED_NORMAL(=12.0) 기준"으로 재해석
+        #   (요청 반영, 위 전역 PP_LOOKAHEAD_SPEED_ANCHOR 주석 참고) — 실동작은 그대로 유지한 채
+        #   숫자만 다시 계산: 구 BASE_PX(110.38) + GAIN(3.01)*ANCHOR(12.0) = 146.50.
+        #   즉 speed=SPEED_NORMAL(12)일 때 speed_lookahead_px는 여전히 146.5로 그리드서치
+        #   원값과 동일 — PP_LOOKAHEAD_SPEED_ANCHOR를 12.0으로 같이 지정해야 이 등가성이 성립한다.
+        PP_LOOKAHEAD_BASE_PX=146.50, PP_LOOKAHEAD_SPEED_GAIN=3.01, PP_LOOKAHEAD_MAX_PX=265.4,
+        PP_LOOKAHEAD_SPEED_ANCHOR=12.0,
         PP_WHEELBASE_PX=20, PP_ALPHA=0.9, PP_LD_FLOOR_PX=120.19, PP_DX_DEADZONE_PX=5,
 
-        PP_LOOKAHEAD_CURVATURE_GAIN=224.8, PP_LOOKAHEAD_MIN_PX=102.61,
+        PP_LOOKAHEAD_CURVATURE_GAIN=224.8, PP_LOOKAHEAD_MIN_PX=110,
         SPEED_CORNER_MIN=10.0, CORNER_SIGN_EMA_ALPHA=0.15, LANE_LOOKAHEAD_REF=220.0,
         SPEED_ACCEL_STEP=0.4, CORNER_HOLD_DECAY_LO=0.92, CORNER_HOLD_DECAY_HI=0.97,
         CORNER_MIN_RADIUS_PX=250.0, CORNER_MIN_SPEED_SCALE=0.35,
-        PATH_EMA_ALPHA=0.8, DL_STABLE_FRAME_MIN=1, DL_STABLE_JUMP_MAX=37.44,
+        PATH_EMA_ALPHA=0.7, DL_STABLE_FRAME_MIN=1, DL_STABLE_JUMP_MAX=37.44,
         SPEED_NORMAL=12.0, #직진 잘한 상태
         # [2026-08-19] 조향각 wheelbase 부스트(요청 반영) — "speed15 프리셋일 때만 적용"이라
         # 여기(=speed15 프리셋)에만 켜서(ENABLE=True) 넣는다. 다른 프리셋으로 바꾸면 이 키가
@@ -1457,7 +1476,7 @@ PP_TUNE_PRESETS = {
         # 재조정했다 — 0.15를 문턱 없이 그대로 쓰면 (1.5-1)/0.15≈3.3°만 넘어도 MAX_SCALE에
         # 도달해 사실상 상시 최대 부스트가 걸린다(요청("미미할 땐 작게")과 어긋남). 순전히
         # 추정치, 실차에서 체감보고 재조정할 것.
-        PP_WHEELBASE_BOOST_ENABLE=True, PP_WHEELBASE_BOOST_GAIN_PER_DEG=0.13,
+        PP_WHEELBASE_BOOST_ENABLE=True, PP_WHEELBASE_BOOST_GAIN_PER_DEG=0.15,
         PP_WHEELBASE_BOOST_MAX_SCALE=2.75,
     ),
     'speed17_5': dict(

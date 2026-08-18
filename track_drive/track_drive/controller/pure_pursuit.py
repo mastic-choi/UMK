@@ -39,7 +39,7 @@ class PurePursuitController:
                  lookahead_min_px=40.0,
                  wheelbase_boost_enable=False,
                  wheelbase_boost_gain_per_deg=0.02, wheelbase_boost_max_scale=1.5,
-                 lookahead_alpha=1.0):
+                 lookahead_alpha=1.0, lookahead_speed_anchor=0.0):
         # [2026-08-05, 속도 적응형 lookahead — 1차 시도 후 수정]
         #   curvature ≈ 2*dx/ld^2 (작은각 근사)라서 ld가 짧을수록 같은 dx도 1/ld^2로
         #   증폭된다. 처음엔 PythonRobotics/Autoware 관례(Ld=k*v+Lfc, 저속일수록 lookahead도
@@ -59,6 +59,13 @@ class PurePursuitController:
         self.lookahead_base_px = lookahead_base_px
         self.lookahead_speed_gain = lookahead_speed_gain
         self.lookahead_max_px = lookahead_max_px
+        # [2026-08-19] speed_lookahead_px = base + gain*(speed - anchor)의 anchor(요청 반영,
+        #   config.py PP_LOOKAHEAD_SPEED_ANCHOR 주석 참고) — 기본값 0.0이면 기존과 완전히
+        #   동일(base가 "speed=0 기준"). anchor를 SPEED_NORMAL로 주면 base 자체가 "주행속도
+        #   기준" lookahead값이 되어 config.py에서 더 직관적으로 읽힌다. 현재는 speed15
+        #   프리셋만 anchor=SPEED_NORMAL(12.0)로 설정 + base_px를 그에 맞게 재계산했고,
+        #   다른 프리셋/기본값은 여전히 anchor=0.0(하위호환).
+        self.lookahead_speed_anchor = lookahead_speed_anchor
 
         # [2026-08-06] curvature 기반 lookahead 감쇠 — Lee, Lee & Moon, "Frequency
         #   Shaping-Based Control Framework for Reducing Motion Sickness in Autonomous
@@ -239,7 +246,8 @@ class PurePursuitController:
             self.held = True
             return self.prev_steer_deg
 
-        speed_lookahead_px = self.lookahead_base_px + self.lookahead_speed_gain * max(speed, 0.0)
+        speed_lookahead_px = self.lookahead_base_px + self.lookahead_speed_gain * (
+            max(speed, 0.0) - self.lookahead_speed_anchor)
 
         # [2026-08-06 버그 수정] damp 판단은 "직전에 실제로 쓴(이미 줄어들었을 수 있는)
         # lookahead에서 나온 self.last_curvature"가 아니라, 매 프레임 댐핑 적용 전
