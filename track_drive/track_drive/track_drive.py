@@ -233,8 +233,8 @@ class TrackDriverNode(Node):
         self._pid_integral   = 0.0
         self._turn_yaw_start = None   # 좌회전 진행 중 플래그 (None=미회전)
         self._turn_frame_cnt = 0      # 좌회전 경과 프레임 수
-        self._s2_commit_t0  = None    # S2 신호 확정 후 물리적 분기 커밋 구간 시작 시각(None=미진입)
-        self._s2_commit_dir = None    # 커밋 구간에서 진행 중인 방향 ('straight'/'left')
+        self._s2_commit_dist = None   # S2 신호 확정 후 물리적 분기 커밋 구간 누적 이동거리(m, None=미진입)
+        self._s2_commit_dir  = None   # 커밋 구간에서 진행 중인 방향 ('straight'/'left')
         self._approach_t0    = None   # [진입] 정지선 감지 후 감속 시작 시각
         self._exit_approach_t0 = None # [진출] S3 탈출 정지선 감지 후 감속 시작 시각
         self._shortcut_t0    = None   # 지름길 진입 시각(끝감지 타이밍용)
@@ -1246,8 +1246,8 @@ class TrackDriverNode(Node):
             self.signal_left_confirmed     = False
             self._sig_straight_cnt = 0
             self._sig_left_cnt     = 0
-            self._s2_commit_t0  = None
-            self._s2_commit_dir = None
+            self._s2_commit_dist = None
+            self._s2_commit_dir  = None
         # S1 진입 시 감속 플래그 초기화
         if new_state == MissionState.S1_LANE_FOLLOW:
             self._approach_t0 = None
@@ -1314,27 +1314,31 @@ class TrackDriverNode(Node):
         """
         4구 신호등 교차로 진입 후 흐름 (순수 신호 인식만으로 경로 선택):
           1. 진입 즉시 정지 (기본값 STOP, 명시적 신호만 출발)
-          2. 직진 초록(signal_straight_confirmed) → 커밋 구간(S2_COMMIT_T) 거쳐 S1 복귀
+          2. 직진 초록(signal_straight_confirmed) → 커밋 구간(S2_COMMIT_DIST_M) 거쳐 S1 복귀
              + Behavior 활성화(라바콘부터 진행)
              좌회전 신호(signal_left_confirmed) → 커밋 구간 거쳐 좌회전 후 S3(지름길)
           3. 좌회전 진행 중이면 신호와 무관하게 완료 우선
-          4. 커밋 구간(_s2_commit_t0)에서는 신호와 무관하게 직진만 유지 — 신호가 보이는
+          4. 커밋 구간(_s2_commit_dist)에서는 신호와 무관하게 직진만 유지 — 신호가 보이는
              지점과 실제 도로가 갈라지는 물리적 분기 지점이 떨어져 있고(config.py
-             S2_COMMIT_T 주석 참고), 그 사이에 _lane_drive()(비전)를 켜면 분기가
+             S2_COMMIT_DIST_M 주석 참고), 그 사이에 _lane_drive()(비전)를 켜면 분기가
              보이기 시작하는 순간 da가 반대쪽 갈래로 끌려간다(실측 재현됨). 신호로
-             이미 확정된 방향이므로 이 구간은 비전을 아예 참조하지 않는다.
+             이미 확정된 방향이므로 이 구간은 비전을 아예 참조하지 않는다. 커밋 구간
+             종료 판정은 시간이 아니라 VESC 실측(v_mps) 적분 거리로 한다 — 대회 주행 때
+             APPROACH_SPEED 근방 실속도가 튜닝 시점과 달라져도 물리적 분기 지점과
+             안 어긋나게(config.py S2_COMMIT_DIST_M 주석 참고).
         """
         if self._turn_yaw_start is not None:
             self._do_left_turn(next_state=MissionState.S3_SHORTCUT)
             return
 
-        if self._s2_commit_t0 is not None:
+        if self._s2_commit_dist is not None:
             self.ctrl_angle = 0.0
             self.ctrl_speed = APPROACH_SPEED
-            if time.time() - self._s2_commit_t0 >= S2_COMMIT_T:
+            self._s2_commit_dist += self._commit_speed_mps() * 0.05  # 20Hz 제어주기(control_loop) 가정
+            if self._s2_commit_dist >= S2_COMMIT_DIST_M:
                 commit_dir = self._s2_commit_dir
-                self._s2_commit_t0  = None
-                self._s2_commit_dir = None
+                self._s2_commit_dist = None
+                self._s2_commit_dir  = None
                 if commit_dir == 'straight':
                     self._behavior_enabled = True
                     self._stopline_cooldown_t = time.time() + STOPLINE_COOLDOWN
@@ -1346,11 +1350,11 @@ class TrackDriverNode(Node):
         self.ctrl_angle, self.ctrl_speed = 0.0, SPEED_STOP
 
         if self.signal_straight_confirmed:
-            self._s2_commit_t0  = time.time()
-            self._s2_commit_dir = 'straight'
+            self._s2_commit_dist = 0.0
+            self._s2_commit_dir  = 'straight'
         elif self.signal_left_confirmed:
-            self._s2_commit_t0  = time.time()
-            self._s2_commit_dir = 'left'
+            self._s2_commit_dist = 0.0
+            self._s2_commit_dir  = 'left'
 
     # ── S3: 지름길 — 직진(+차선소실 대비), 끝에서 좌회전 ──
     def _s3_shortcut(self):
@@ -1427,18 +1431,33 @@ class TrackDriverNode(Node):
 
     # ── 좌회전 공통 (실차 전환: 후진 없이 무난한 좌회전) ──
     def _begin_left_turn(self):
-        self._turn_yaw_start = self.imu_yaw   # 플래그로만 사용 (None 여부 체크)
+        self._turn_yaw_start = self.imu_yaw   # closed-loop 기준점(IMU 죽었을 때만 미사용)
         self._turn_frame_cnt = 0
-        self.get_logger().info(f'좌회전 시작 ({TURN_FRAMES}f)')
+        self.get_logger().info('좌회전 시작')
 
     def _do_left_turn(self, next_state):
-        """무난한(후진 없는) 좌회전 후 next_state로 전환."""
-        if next_state == MissionState.S3_SHORTCUT:
-            trn_ang, trn_spd, trn_f = TURN_ANGLE, TURN_SPEED, TURN_FRAMES
-        else:
-            trn_ang, trn_spd, trn_f = TURN_EXIT_ANGLE, TURN_EXIT_SPEED, TURN_EXIT_FRAMES
+        """무난한(후진 없는) 좌회전 후 next_state로 전환.
 
-        if self._turn_frame_cnt < trn_f:
+        [2026-08-18] 종료 판정을 프레임 카운트(open-loop)에서 IMU yaw 실측
+        기반(closed-loop)으로 변경. IMU가 살아있으면(_imu_live()) 실제 회전각
+        (_yaw_delta(_turn_yaw_start))이 목표(trn_yaw_target, config.py TURN_YAW_TARGET_DEG류)에
+        도달했을 때 끝낸다 — 같은 (조향각, 속도) 명령이어도 배터리 전압 강하·노면·속도
+        변동에 따라 실제 요레이트가 매번 달라질 수 있어, "N프레임 지남"보다 정확하다.
+        trn_f(TURN_FRAMES류)는 이제 트리거가 아니라 IMU가 죽어있을 때만 걸리는 안전
+        타임아웃 상한이다 — 무한 회전 방지 + IMU 장애 시 예전과 동일한 동작으로 열화."""
+        if next_state == MissionState.S3_SHORTCUT:
+            trn_ang, trn_spd, trn_f, trn_yaw_target = (
+                TURN_ANGLE, TURN_SPEED, TURN_FRAMES, TURN_YAW_TARGET_DEG)
+        else:
+            trn_ang, trn_spd, trn_f, trn_yaw_target = (
+                TURN_EXIT_ANGLE, TURN_EXIT_SPEED, TURN_EXIT_FRAMES, TURN_EXIT_YAW_TARGET_DEG)
+
+        turn_done = self._turn_frame_cnt >= trn_f   # IMU 죽었을 때를 위한 안전 타임아웃
+        if self._imu_live():
+            yaw_turned_deg = abs(math.degrees(self._yaw_delta(self._turn_yaw_start)))
+            turn_done = turn_done or yaw_turned_deg >= trn_yaw_target
+
+        if not turn_done:
             self.ctrl_angle = trn_ang
             self.ctrl_speed = trn_spd
         else:
@@ -1648,6 +1667,12 @@ class TrackDriverNode(Node):
                 and (time.time() - self._vesc_t) < VESC_STALE_SEC
                 and abs(self.v_mps) >= VESC_MIN_SPEED_MPS)
 
+    def _imu_live(self):
+        """IMU 실측(self.imu_yaw)을 지금 믿을 수 있는가 — _vesc_live()와 동일 철학의
+        스테일 가드. 기존엔 _imu_curvature_px() 안에 인라인돼 있었는데(imu_live 지역변수),
+        [2026-08-18] _do_left_turn()의 yaw 목표각 판정도 똑같은 가드가 필요해져서 뺐다."""
+        return self._imu_t is not None and (time.time() - self._imu_t) < IMU_STALE_SEC
+
     def _imu_curvature_px(self):
         """IMU 각속도(yaw_rate) + VESC 실측속도(v_mps)로 "차량이 지금 실제로 얼마나
         도는지" curvature(1/px)를 구해 pure_pursuit의 코너 감쇠(lookahead_curvature_gain)를
@@ -1672,8 +1697,7 @@ class TrackDriverNode(Node):
         기존처럼 probe_curvature 단독 판단으로 자동 폴백하게 한다."""
         if not (LANE_DETECTOR_BACKEND == 'dl' and DL_USE_BEV):
             return None
-        imu_live = self._imu_t is not None and (time.time() - self._imu_t) < IMU_STALE_SEC
-        if not (imu_live and self._vesc_live()):
+        if not (self._imu_live() and self._vesc_live()):
             return None
         self._imu_yaw_rate_ema = (IMU_YAW_RATE_EMA_ALPHA * self.imu_yaw_rate
                                    + (1.0 - IMU_YAW_RATE_EMA_ALPHA) * self._imu_yaw_rate_ema)
@@ -1698,6 +1722,17 @@ class TrackDriverNode(Node):
         if self._vesc_live():
             return abs(self.v_mps) / METERS_PER_SPEED_UNIT
         return self._prev_speed
+
+    def _commit_speed_mps(self):
+        """_s2_intersection()의 커밋 구간 이동거리 적분에 쓸 현재 속도(m/s) 추정.
+        VESC 실측이 살아있으면(_vesc_live()) 그 값을 그대로 쓴다 — S2_COMMIT_DIST_M을
+        이 값으로 적분하면 대회 당일 실속도가 얼마든 실제 이동거리 기준으로 맞는다.
+        VESC가 죽어있을 때만 APPROACH_SPEED(명령속도)를 METERS_PER_SPEED_UNIT으로
+        환산해 폴백한다 — 예전 시간 기반(S2_COMMIT_T)이 암묵적으로 가정하던 것과
+        동일한 근사치라 VESC 장애 시에도 이전과 같은 동작으로 안전하게 열화된다."""
+        if self._vesc_live():
+            return abs(self.v_mps)
+        return APPROACH_SPEED * METERS_PER_SPEED_UNIT
 
     def _lane_steer(self, path=None, vehicle_x=None):
         """path(ROI 픽셀좌표 경로, 가까운점→먼점)를 pure_pursuit(controller/pure_pursuit.py)로
