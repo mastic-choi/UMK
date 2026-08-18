@@ -16,6 +16,7 @@ from .frst import frst_multiscale, find_peaks
 from ..config import (
     SIG4_ROI_T, SIG4_ROI_B, SIG4_ROI_L, SIG4_ROI_R,
     SIG4_MIN_RADIUS, SIG4_MAX_RADIUS, SIG4_BRIGHT_MARGIN, SIG4_MAX_CANDIDATES,
+    SIG4_GAP_UNIFORMITY_MAX_RATIO,
     SIG4_AUTOCROP_ENABLE, SIG4_SEARCH_ROI_T, SIG4_SEARCH_ROI_B,
     SIG4_SEARCH_ROI_L, SIG4_SEARCH_ROI_R,
     SIG4_BOARD_SAT_MAX, SIG4_BOARD_V_MIN, SIG4_BOARD_V_MAX,
@@ -75,11 +76,16 @@ class SignalDetector:
             return 0.0
         return float(np.mean(patch))
 
-    def shape_ok(self, circles, vert_max, horiz_max, min_dist):
+    def shape_ok(self, circles, vert_max, horiz_max, min_dist, max_gap_ratio=SIG4_GAP_UNIFORMITY_MAX_RATIO):
         """배치 검사(원 정확히 4개 대상). 반환 (통과여부, 실패사유) — 사유는 디버그 로그용, 통과 시 ''.
         4개보다 많이 잡힌 경우의 완화 처리는 pick_best_4()가 담당. 4개 미만(가림/블러로 실제
         누락)은 이 함수까지 안 오고 detect_s2()에서 바로 실패 처리됨 — 없는 원을 만들어낼 근거가
-        없기 때문. 프레임 단위 디바운스는 track_drive.py의 perc_signal()에서 처리."""
+        없기 때문. 프레임 단위 디바운스는 track_drive.py의 perc_signal()에서 처리.
+
+        [2026-08-18] 등간격 검사 추가 — 실제 4구 신호등은 물리적으로 동일 간격이라, 인접 3개
+        간격 중 최대/최소 비율이 너무 크면(다른 물체가 하나 섞였을 가능성) 개별 간격 조건을
+        다 만족해도 실패 처리한다. config.py SIG4_GAP_UNIFORMITY_MAX_RATIO 주석의 실측
+        근거 참고(정탐 1.13~1.64 vs 오염/오탐 2.22~2.64)."""
         xs = sorted(int(c[0]) for c in circles)
         ys = sorted(int(c[1]) for c in circles)
 
@@ -88,19 +94,26 @@ class SignalDetector:
         if (xs[-1] - xs[0]) > horiz_max:
             return False, f'horiz_spread={xs[-1] - xs[0]}>{horiz_max}'
 
+        gaps = []
         for i in range(len(xs) - 1):
-            if (xs[i + 1] - xs[i]) < min_dist:
-                return False, f'gap[{i}]={xs[i + 1] - xs[i]}<{min_dist}'
+            gap = xs[i + 1] - xs[i]
+            if gap < min_dist:
+                return False, f'gap[{i}]={gap}<{min_dist}'
+            gaps.append(gap)
+
+        gap_ratio = max(gaps) / min(gaps)
+        if gap_ratio > max_gap_ratio:
+            return False, f'gap_ratio={gap_ratio:.2f}>{max_gap_ratio}(gaps={gaps})'
         return True, ''
 
-    def pick_best_4(self, circles, vert_max, horiz_max, min_dist):
+    def pick_best_4(self, circles, vert_max, horiz_max, min_dist, max_gap_ratio=SIG4_GAP_UNIFORMITY_MAX_RATIO):
         """원이 4개보다 많이 잡혔을 때(반사광 등 오검출 섞임), 신호등 배치(shape_ok)를
         통과하는 4개 조합 중 가장 그럴듯한 것을 고른다.
         여러 조합이 통과하면 세로 퍼짐(vert_spread)이 가장 작은 걸 택한다 — 같은 높이에
         나란히 있을수록 진짜 신호등일 확률이 높다는 가정. 반환 (선택된 4개 또는 None, 실패사유)."""
         best, best_score = None, None
         for combo in itertools.combinations(circles, 4):
-            ok, _ = self.shape_ok(combo, vert_max, horiz_max, min_dist)
+            ok, _ = self.shape_ok(combo, vert_max, horiz_max, min_dist, max_gap_ratio)
             if not ok:
                 continue
             ys = [c[1] for c in combo]
