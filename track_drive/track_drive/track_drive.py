@@ -1605,16 +1605,9 @@ class TrackDriverNode(Node):
         # 같은 이유로 건너뛴다(1.0 = 감속 없음).
         corner_radius_scale = 1.0 if is_straight else self._corner_radius_speed_scale()
         target_speed = max(SPEED_CORNER_MIN, target_speed * corner_radius_scale)
-        # [2026-08-10] DL_CENTER_MODE='ll'에서 노란/흰선 중 하나를 저신뢰 추정(간격
-        # 재구성 또는 잔상)으로 메운 프레임은 속도를 SPEED_LL_DEGRADED로 강제 제한한다
-        # (요청 반영). 가/감속 모두 accel_step 램프 없이 즉시 적용 — 기존 코너 감속도
-        # 감속 방향은 램프 없이 즉시 반영되는 관례(가속만 아래 accel_step로 제한)와 동일.
-        # DL 백엔드 + 'll' 모드일 때만 의미 있으므로 getattr로 안전하게 조회한다(다른
-        # 백엔드/모드에선 속성이 없거나 항상 False).
-        slide = getattr(self.lane_detector, '_slide', None)
-        if (LANE_DETECTOR_BACKEND == 'dl' and DL_CENTER_MODE == 'll'
-                and getattr(slide, 'll_degraded', False)):
-            target_speed = min(target_speed, SPEED_LL_DEGRADED)
+        # [2026-08-18] SPEED_LL_DEGRADED 캡 제거 — DL_CENTER_MODE='ll'일 때만 의미있던
+        # 로직인데 현재 DL_CENTER_MODE='da'로 완전히 전환되어 차선(ll) 기반 주행을
+        # 더 이상 쓰지 않는다(요청 반영). config.py SPEED_LL_DEGRADED 상수도 함께 삭제.
         # [2026-08-11] LANE_STALE_SEC 이상 새 차선인식 결과가 안 나온 상태(perc_lane()의
         # lane_stale, config.py LANE_STALE_SEC 주석 참고) — 조향 자체는 이미 self.lane_path가
         # 고정돼 있어 안전하게(발산 없이) 마지막 판단을 유지하지만, 그것만으론 "지금 인지가
@@ -1632,15 +1625,12 @@ class TrackDriverNode(Node):
         # 이탈했다. lane_stale과 같은 SPEED_LANE_STALE 캡을 여기도 건다.
         if self.lane_unstable:
             target_speed = min(target_speed, SPEED_LANE_STALE)
-        # [2026-08-15] avoid-hold 적용4(안전판) — 회피 유예가 걸려있는 동안 choose_side()가
-        # 0(양쪽 다 막혀 어느 쪽으로도 못 피함)을 반환하면 강제로 감속한다. avoid_hold_side는
-        # _update_avoid_hold()가 매 틱 갱신하므로 이 조건은 avoid_hold_active가 아닌 틱에는
-        # 자연히 걸리지 않는다(avoid_hold_side 자체는 항상 계산되지만 여기서 avoid_hold_active
-        # 도 같이 확인). SPEED_CORNER_MIN/SPEED_LL_DEGRADED/SPEED_LANE_STALE과 같은 "즉시 cap"
-        # 관례 — avoid_hold_improvement_proposal.md "적용4" 참고, SPEED_AVOID_HOLD_BLOCKED
-        # 실차 미검증.
-        if self.avoid_hold_active and self.avoid_hold_side == 0:
-            target_speed = min(target_speed, SPEED_AVOID_HOLD_BLOCKED)
+        # [2026-08-18] avoid-hold 적용4(SPEED_AVOID_HOLD_BLOCKED 안전판) 삭제 — 실차 테스트에서
+        # "속도 5 고정" 증상의 실제 원인으로 확인됨(README §2.43). TEST_DISABLE_B2_B3=True라
+        # 실제 회피 기동(옆차선 이동)은 꺼져있는데 이 캡만 무관하게 계속 걸려서, 트리거를
+        # 풀어줄 수단이 없어 무한정 5.0에 고정되는 구조였다. avoid_hold_active/avoid_hold_side
+        # 자체(타이머, _update_avoid_hold())와 DA 클리핑 방향 편향(적용3,
+        # perception/dl_lane.py set_avoid_hold()) 소비부는 그대로 유지 — 요청 반영(속도캡만 제거).
         speed_ratio = min(1.0, self._prev_speed / SPEED_NORMAL)
         corner_decay = CORNER_HOLD_DECAY_LO + (CORNER_HOLD_DECAY_HI - CORNER_HOLD_DECAY_LO) * speed_ratio
         self._corner_hold = max(turn_now, self._corner_hold * corner_decay)
@@ -1858,19 +1848,9 @@ class TrackDriverNode(Node):
             (10, 8 + 32 * len(lines)), (255, 255, 255), 18,
             f'DA seed width:{da_seed_width}px'))
 
-        # [2026-08-10] DL_CENTER_MODE='ll' 전용 — 노란선 기준 현재 차선 판정(lane_side)과
-        # 이번 프레임 저신뢰 추정(간격 재구성/잔상) 사용 여부. 후자가 True면
-        # _lane_drive()가 SPEED_LL_DEGRADED로 속도를 강제 제한 중이라는 뜻이라 빨강으로
-        # 강조 — 요청 반영("디버깅 페이지에도 띄울것").
-        if LANE_DETECTOR_BACKEND == 'dl' and DL_CENTER_MODE == 'll':
-            lane_side = getattr(slide, 'lane_side', None) if slide is not None else None
-            ll_degraded = getattr(slide, 'll_degraded', False) if slide is not None else False
-            degraded_kr = f'저신뢰(속도 {SPEED_LL_DEGRADED:.0f} 제한)' if ll_degraded else '정상'
-            degraded_en = f'DEGRADED (capped {SPEED_LL_DEGRADED:.0f})' if ll_degraded else 'OK'
-            side_color = (0, 0, 220) if ll_degraded else (255, 255, 255)
-            lines.append((
-                f'LL 차선:{lane_side} {degraded_kr}', (10, 8 + 32 * len(lines)), side_color, 18,
-                f'LL side:{lane_side} {degraded_en}'))
+        # [2026-08-18] SPEED_LL_DEGRADED 표시 블록 제거 — DL_CENTER_MODE='ll' 전용이었는데
+        # 현재 항상 'da'라 이 조건 자체가 죽어있었다(요청 반영, 위 target_speed 계산부의
+        # 동일 제거 사유 참고).
 
         canvas = np.full((8 + 32 * len(lines) + 16, 380, 3), 30, dtype=np.uint8)
         put_text_kr_multi(canvas, lines)
@@ -1928,8 +1908,8 @@ class TrackDriverNode(Node):
     # 방향 힌트가 뭔지를 실차에서 한눈에 보기 위한 것과 동시에, 이 기능이 새로 들여온
     # 파라미터 중 실측이 안 된 값들을 매 프레임 같이 띄워서 "이 숫자는 아직 지어낸
     # 값"이라는 걸 계속 상기시키는 용도(실측 절차는 avoid_hold_measurement_todo.md 참고).
-    # 아래 6개(RATE_GAIN/SEC_MAX/RELEASE_DIST_M/DA_AREA_JUMP_RATIO/DIR_BIAS_PX/
-    # SPEED_AVOID_HOLD_BLOCKED)는 그 문서에 적힌 측정 절차를 실차에서 그대로 따라가며
+    # 아래 5개(RATE_GAIN/SEC_MAX/RELEASE_DIST_M/DA_AREA_JUMP_RATIO/DIR_BIAS_PX)는
+    # 그 문서에 적힌 측정 절차를 실차에서 그대로 따라가며
     # 이 창의 실시간 값을 관찰하는 용도로도 쓰인다(예: da_area_jump가 실제 통과 순간에만
     # True로 뜨는지, 노이즈 프레임에서도 뜨는지 여기서 직접 눈으로 확인). control_loop()
     # 에서 매 주기 호출.
@@ -1979,11 +1959,10 @@ class TrackDriverNode(Node):
              (10, 178), UNMEASURED, 12,
              f'RATE_GAIN={AVOID_HOLD_RATE_GAIN} SEC_MAX={AVOID_HOLD_SEC_MAX} '
              f'RELEASE_DIST_M={AVOID_HOLD_RELEASE_DIST_M}'),
-            (f'DA_AREA_JUMP_RATIO={AVOID_HOLD_DA_AREA_JUMP_RATIO}   DIR_BIAS_PX={AVOID_HOLD_DIR_BIAS_PX}px'
-             f'   SPEED_BLOCKED={SPEED_AVOID_HOLD_BLOCKED}',
+            (f'DA_AREA_JUMP_RATIO={AVOID_HOLD_DA_AREA_JUMP_RATIO}   DIR_BIAS_PX={AVOID_HOLD_DIR_BIAS_PX}px',
              (10, 198), UNMEASURED, 12,
              f'DA_AREA_JUMP_RATIO={AVOID_HOLD_DA_AREA_JUMP_RATIO} '
-             f'DIR_BIAS_PX={AVOID_HOLD_DIR_BIAS_PX} SPEED_BLOCKED={SPEED_AVOID_HOLD_BLOCKED}'),
+             f'DIR_BIAS_PX={AVOID_HOLD_DIR_BIAS_PX}'),
         ]
         canvas = np.full((222, 620, 3), 30, dtype=np.uint8)
         put_text_kr_multi(canvas, lines)

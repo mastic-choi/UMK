@@ -107,9 +107,8 @@ SPEED_STOP    = 0.0
 #   진입/탈출 시 속도 급변이 과하게 느껴지면 이 값을 올리는 쪽으로 완화할 것.
 # [2026-08-17j] 15.0 → 7.0(요청 반영). SPEED_CORNER_MIN < SPEED_NORMAL(15.0) 관계가
 #   다시 확보돼 코너 감속이 실제로 걸린다(직전 [2026-08-17i]에서 15.0으로 올려 SPEED_NORMAL과
-#   같아지는 바람에 코너 감속이 no-op이었던 문제 해소). 단, SPEED_LL_DEGRADED/
-#   SPEED_LANE_STALE(5.0, 아래 §2 나머지 참고)은 요청에 따라 그대로 둠 — 인식 저신뢰/정지
-#   상황에서는 여전히 5.0으로 더 깎인다.
+#   같아지는 바람에 코너 감속이 no-op이었던 문제 해소). 단, SPEED_LANE_STALE(5.0, 아래
+#   참고)은 요청에 따라 그대로 둠 — 인지 정지 상황에서는 여전히 5.0으로 더 깎인다.
 # [2026-08-17i] 10.0 → 15.0(요청 반영). ★주의★ SPEED_NORMAL도 15.0이라 이제
 #   SPEED_CORNER_MIN == SPEED_NORMAL — _lane_drive()의 코너 감속(목표속도 하한 clip)이
 #   사실상 no-op이 된다(코너에서도 직진과 같은 속도로 주행, 감속 없음). 과거
@@ -123,19 +122,14 @@ SPEED_STOP    = 0.0
 #   않지만, 코너 감속 폭(15→10, 33%)이 이전(10→5, 50%)보다 완만해졌다는 점은 실차에서
 #   코너 진입 느낌으로 확인할 것 — 부족하면 이 값을 다시 낮출 것.
 SPEED_CORNER_MIN = 7.0
-# [2026-08-10] DL_CENTER_MODE='ll'에서 노란선/흰선 중 하나를 저신뢰 추정(간격 기반
-#   재구성 또는 잔상)으로 메운 프레임의 속도 상한 — perception/dl_lane.py
-#   DLSlideWindow.ll_degraded 플래그가 True면 _lane_drive()가 이 값으로 강제 제한한다
-#   (요청 반영: "안 보이면 속도 5로"). SPEED_CORNER_MIN과 우연히 같은 값이지만 의미가
-#   다른 별도 상수 — 코너 감속과 ll 저신뢰 감속은 서로 다른 이유라 독립적으로 튜닝할
-#   수 있어야 한다. 실차 미검증 초기값.
-SPEED_LL_DEGRADED = 5.0
+# [2026-08-18] SPEED_LL_DEGRADED(DL_CENTER_MODE='ll' 전용 속도 상한) 삭제 — 이제
+#   DL_CENTER_MODE='da'로 완전히 전환되어 차선(ll) 기반 주행 자체를 쓰지 않는다(요청
+#   반영). track_drive.py _lane_drive()/​_debug_viz_steer()의 소비부도 함께 제거.
 # [2026-08-11] DL 추론 워커(별도 스레드, dl_lane.py)가 LANE_STALE_SEC 이상 새 결과를 못
-#   내놓았을 때(카메라/추론 죽음 등, perc_lane()의 lane_stale 판정) 강제하는 속도 상한 —
-#   SPEED_LL_DEGRADED와 동일한 값이지만 사유가 다른 별도 상수(저신뢰 추정 vs 완전 정지된
-#   인지). 일부러 SPEED_CORNER_MIN(5.0)보다 낮추지 않았다 — "코너가 아닌데도 이 속도로
-#   깎였다"는 부자연스러움 자체가 사람이 알아챌 수 있는 신호가 되도록, 급정지가 아니라
-#   코너 감속과 비슷한 수준으로만 눈에 띄게 낮춘다는 설계(요청 반영). 실차 미검증.
+#   내놓았을 때(카메라/추론 죽음 등, perc_lane()의 lane_stale 판정) 강제하는 속도 상한.
+#   일부러 SPEED_CORNER_MIN(5.0)보다 낮추지 않았다 — "코너가 아닌데도 이 속도로 깎였다"는
+#   부자연스러움 자체가 사람이 알아챌 수 있는 신호가 되도록, 급정지가 아니라 코너 감속과
+#   비슷한 수준으로만 눈에 띄게 낮춘다는 설계(요청 반영). 실차 미검증.
 SPEED_LANE_STALE = 5.0
 ANGLE_MAX     = 80.0  # 조향각 클램프(도)
 ANGLE_RATE_MAX = 12.0  # 조향 변화율 제한(도/주기, 20Hz 기준 12도/주기=240도/초) — drive()에서 모든 명령에 일괄 적용
@@ -594,12 +588,11 @@ AVOID_HOLD_DA_AREA_JUMP_RATIO = 1.4    # ★실측 필요★
 AVOID_HOLD_DIR_BIAS_PX = 20.0   # ≈ PASS_OFFSET(80.0, "7. 기타" 절, 실측 기반)의 1/4.
                                  #   ★비율 자체는 실측/재검증 필요★
 
-# [적용4] 안전판(track_drive.py _lane_drive()) — avoid_hold 활성 중 choose_side()가
-#   0(양쪽 다 막혀 어느 쪽으로도 못 피함)을 반환하면 목표속도를 강제로 이 값까지 낮춘다
-#   (F1TENTH류 반응형 스택의 "완벽한 회피보다 안전한 감속" 철학 반영). SPEED_CORNER_MIN/
-#   SPEED_LL_DEGRADED/SPEED_LANE_STALE(위 "2. 차량 속도/조향 기본값" 절)과 같은 "즉시 cap"
-#   관례 — 급정지가 아니라 눈에 띄게만 낮춘다는 설계도 동일.
-SPEED_AVOID_HOLD_BLOCKED = 5.0   # SPEED_CORNER_MIN과 같은 값으로 시작(모터 데드존 위 안전마진). ★실측 필요★
+# [2026-08-18] [적용4] SPEED_AVOID_HOLD_BLOCKED 안전판 삭제 — 실차 테스트에서 "속도 5
+#   고정" 증상의 실제 원인으로 확인됨(README §2.43 참고). TEST_DISABLE_B2_B3=True로 실제
+#   회피 기동(옆차선 이동)은 꺼져있는데 이 캡만 무관하게 계속 걸려서, 트리거를 풀어줄
+#   수단이 없어 무한정 고정되는 구조였다. avoid_hold 타이머/DA 클리핑 방향 편향(적용3,
+#   AVOID_HOLD_DIR_BIAS_PX 위 참고)은 그대로 유지 — 요청 반영(속도캡 소비부만 제거).
 
 # [2026-08-10] DL_CENTER_MODE='ll' 내부에서 실제 밴드 중심 계산 알고리즘을 고르는
 #   2차 스위치 — 같은 날 두 사람이 독립적으로 서로 다른 재설계를 했다(origin/main
