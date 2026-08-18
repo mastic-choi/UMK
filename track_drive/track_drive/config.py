@@ -947,6 +947,18 @@ WHEELBASE_M = 0.335         # 실측값(2026-08-06, 줄자로 앞바퀴-뒷바�
                              #   이식). planner/hybrid_astar.py의 wheelbase 기본값(같은 차량이므로
                              #   반드시 같은 값)과 일치시킬 것 — 재실측 시 둘 다 갱신.
 
+# [2026-08-19] track_drive.py._corner_radius_speed_scale()가 코너 감속용 회전반경을 역산할 때
+#   쓰는 "물리 기반" 축거리 — 여태 PP_WHEELBASE_PX(pure_pursuit.py의 "곡률→조향각" 게인,
+#   실측 축거리가 아니라 자유롭게 재튜닝되는 값)를 그대로 재사용하고 있었는데, 최근 그 값을
+#   조향 반응성 목적으로 49.64→16까지 낮추면서 이 반경 계산식(radius=wheelbase_px/tan(steer))
+#   분자가 같이 줄어들어 살짝만 꺾여도(corner_signal≈10도) 반경이 확 작게 나와 코너 감속이
+#   상시로 걸리는 부작용이 났다(요청 반영으로 분리 — "높은 조향에서 감속이 너무 세게
+#   들어간다"). PP_WHEELBASE_PX 재튜닝과 코너 감속 민감도가 서로 안 엮이도록, 여기서는 그
+#   대신 실측 WHEELBASE_M*DL_PIXELS_PER_METER(물리 기반, PP_WHEELBASE_PX 도입 전 원래
+#   pure_pursuit.py가 쓰던 계산과 동일 — config.py PP_WHEELBASE_PX 주석 참고)를 쓴다.
+#   실차 미검증 — 이 값 자체를 낮추면 코너 감속이 다시 더 민감해진다.
+CORNER_RADIUS_WHEELBASE_PX = WHEELBASE_M * DL_PIXELS_PER_METER  # = 67.0
+
 # ── VESC 실측 속도 연동 (2026-08-06, LQR 브랜치의 ROS1 연동 작업에서 이식) ──
 #   이 로봇엔 별도 엔코더 토픽이 없고, VESC 드라이버(ROS1, vesc_driver)가 /sensors/core
 #   (vesc_msgs/VescStateStamped)로 모터 홀센서 기반 회전속도를 발행한다. vesc_msgs가 이
@@ -1424,7 +1436,14 @@ PP_TUNE_PRESETS = {
         # 버그가 재현되지 않았다 — SPEED_NORMAL*0.7 클램프 불필요, 그리드서치 원값 그대로 적용.
         # 실차 재검증 전.
         PP_LOOKAHEAD_BASE_PX=110.38, PP_LOOKAHEAD_SPEED_GAIN=3.01, PP_LOOKAHEAD_MAX_PX=265.4,
-        PP_WHEELBASE_PX=25, PP_ALPHA=0.70, PP_LD_FLOOR_PX=120.19, PP_DX_DEADZONE_PX=5,
+        # [2026-08-19] 요청 반영 — WHEELBASE_PX를 낮추고(25→16) 대신 boost 폭을 넓혀서
+        # (GAIN_PER_DEG 0.03→0.06, MAX_SCALE 2→2.75) "조향 안 필요할 땐 낮은 게인, 필요할
+        # 땐 확 커지는" 형태로 재분배 — 최종 실효 wheelbase 상한(WB*MAX_SCALE)은 16*2.75=44로
+        # 기존(25*2=50)과 비슷하게 유지하면서 steer1이 작은 구간(노이즈/직진)의 게인만 낮춤.
+        # boost가 steer1(=이미 WB_base로 1차 계산된 값) 크기로 트리거되므로, WB_base만
+        # 낮추고 GAIN/MAX_SCALE을 같이 안 올리면 코너에서도 이중으로 약해지니 주의(위
+        # PP_WHEELBASE_BOOST_* 주석 참고). 실차 미검증, 저속부터 오버/언더스티어 확인할 것.
+        PP_WHEELBASE_PX=16, PP_ALPHA=0.70, PP_LD_FLOOR_PX=120.19, PP_DX_DEADZONE_PX=3,
         PATH_EMA_ALPHA=0.5, DL_STABLE_FRAME_MIN=1, DL_STABLE_JUMP_MAX=37.44,
         SPEED_NORMAL=12.0, #직진 잘한 상태
         # [2026-08-19] 조향각 wheelbase 부스트(요청 반영) — "speed15 프리셋일 때만 적용"이라
@@ -1436,8 +1455,8 @@ PP_TUNE_PRESETS = {
         # 재조정했다 — 0.15를 문턱 없이 그대로 쓰면 (1.5-1)/0.15≈3.3°만 넘어도 MAX_SCALE에
         # 도달해 사실상 상시 최대 부스트가 걸린다(요청("미미할 땐 작게")과 어긋남). 순전히
         # 추정치, 실차에서 체감보고 재조정할 것.
-        PP_WHEELBASE_BOOST_ENABLE=True, PP_WHEELBASE_BOOST_GAIN_PER_DEG=0.03,
-        PP_WHEELBASE_BOOST_MAX_SCALE=2,
+        PP_WHEELBASE_BOOST_ENABLE=True, PP_WHEELBASE_BOOST_GAIN_PER_DEG=0.06,
+        PP_WHEELBASE_BOOST_MAX_SCALE=2.75,
     ),
     'speed17_5': dict(
         PP_LOOKAHEAD_BASE_PX=82.53, PP_LOOKAHEAD_SPEED_GAIN=1.162, PP_LOOKAHEAD_MAX_PX=253.4,

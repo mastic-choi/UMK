@@ -1569,8 +1569,14 @@ class TrackDriverNode(Node):
         EMA)에서 역산한다 — 이유는 _lane_drive() 상단 주석 참고(진동을 매번 급코너로 오인해
         감속하는 문제). [2026-08-10] 이 신호 전환이 커밋 80aefe3("디버그창 적용", 조향과 무관한
         디버그 캔버스 레이아웃 변경)에서 실수로 되돌려져 있던 걸 발견해 복원함 — README §0.5.3
-        참고."""
-        curvature = math.tan(math.radians(self._corner_signal)) / self.pure_pursuit.wheelbase_px
+        참고.
+
+        [2026-08-19] 반경 역산에 쓰는 축거리를 self.pure_pursuit.wheelbase_px(PP_WHEELBASE_PX,
+        조향 게인 튜닝값)에서 config.CORNER_RADIUS_WHEELBASE_PX(물리 기반 고정값, 67.0)로
+        분리했다(요청 반영) — PP_WHEELBASE_PX를 조향 반응성 목적으로 낮출 때마다 이 반경
+        계산도 같이 작아져서, 살짝만 꺾여도 코너 감속이 상시로 걸리는 부작용이 있었다
+        (config.py CORNER_RADIUS_WHEELBASE_PX 주석 참고)."""
+        curvature = math.tan(math.radians(self._corner_signal)) / CORNER_RADIUS_WHEELBASE_PX
         if curvature == 0.0:
             return 1.0
         radius = abs(1.0 / curvature)
