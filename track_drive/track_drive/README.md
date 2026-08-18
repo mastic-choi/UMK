@@ -473,7 +473,9 @@ S0는 초록(직진 위치)만 점등하면 출발, S2는 초록만=직진 / 초
 **수정할 곳:** `config.py` `START_STATE` (`S0_WAIT_GREEN` / `S2_INTERSECTION`).
 
 **디버그:** `DEBUG_VIZ_SIGNAL`(기본 True) → `signal4_roi` 창(ROI 확대 + 판정에 쓰인 4개 원 표시),
-`signal4_board_search` 창(§1.1, 전체 프레임 위에 이번 프레임에 시도한 ROI 후보 전부 표시).
+`signal4_board_search` 창(§1.1, 전체 프레임 위에 이번 프레임에 시도한 ROI 후보 전부 표시),
+`signal_status` 창(§1.11, 전체 카메라 원본 위에 "지금 어디를 보는지"+"확정값"을 한눈에 표시 —
+신호등 로직을 몰라도 인식이 잘 되는지만 빠르게 확인하고 싶을 때).
 `DEBUG_LOG_SIGNAL`(기본 True) → `[SIG-DEBUG]` 단계별 진단 로그(ROI/반지름/검출개수/실패사유 한글 힌트).
 
 **[2026-08-13] ROI 재튜닝(실차 랩 캡처 기반):** 오탐률/미검출 트레이드오프를 실측으로 절충해
@@ -871,6 +873,31 @@ RAW)에서 뽑은 값이라 완전히 다른 조명/거리 조건에서 다시 �
 것으로 기대되지만 검증된 사실은 아니다. RAW에 남은 5건(경계값 근처)도 임계값을 더 좁히면
 잡힐 수 있지만, lap_001 진짜(957/958=12.2%)와의 여유가 이미 빠듯해 추가로 좁히는 건
 신중해야 한다.
+
+### 1.11 "한눈에 보기" 디버그 창(`signal_status`) 추가 (2026-08-18)
+
+**배경:** 사용자 요청 — "신호등 검출 잘 되는지 확인하는(현재 검출되는 부분과 검출 신호)
+디버그 창". 기존 `signal4_roi`/`signal4_board_search`(둘 다 `traffic_signal.py`,
+`SignalDetector` 내부)는 각각 "크롭 확대 + 원 판정 상세"와 "이번 프레임 후보 박스 전부"를
+보여주는 세밀한 창이라, 신호등 로직을 잘 모르는 채로 "지금 잘 잡히고 있나?"만 빠르게 보기엔
+정보가 많다. `track_drive.py`(FSM을 도는 노드 쪽)에 새 창 `signal_status`를 추가해
+`_debug_viz_signal_status()`가 그린다 — 전체 카메라 원본 위에:
+- **박스**: 이번 프레임에 채택/시도된 ROI(초록=성공, 빨강=실패)
+- **순간값**: 이번 프레임 R/S/L 판정
+- **확정값**: `SIG_CONFIRM_FRAMES` 디바운스를 통과한 실제 FSM 반영값(직진확정/좌회전확정) +
+  진행 카운터(`직진 n/3` `좌회전 n/3`)
+- 실패 시 사유(`s2_reject_reason`)까지 같은 창에 표시
+
+기존 두 창은 `SignalDetector` 내부 상태만 보여줘서 디바운스(확정) 여부는 안 나왔는데
+(그건 `track_drive.py` 쪽 상태라 `SignalDetector`가 모른다), 이 창은 그 둘을 합쳐서
+"인식됐다"와 "그래서 FSM이 실제로 확정 처리했다"를 구분해서 보여준다. `control_loop()`에서
+`DEBUG_VIZ_SIGNAL`이 켜져 있고 `mission_state`가 S0/S2일 때만 그린다(그 외 상태는
+`perc_signal()`이 `detect_s2()`를 아예 안 돌려서 표시할 값이 없음).
+
+**검증:** 이 환경엔 ROS2가 없어 노드 자체는 못 띄운다(CLAUDE.md) — `SimpleNamespace`로
+`self`를 흉내 내 `_debug_viz_signal_status()` 로직만 떼어내 lap_001 실제 프레임(성공:
+frame_055, 실패: frame_020 — 손으로 카메라를 가린 프레임)에 돌려 PNG로 저장해 눈으로
+확인했다. 한글 렌더링(`kr_text.put_text_kr_multi`) 포함 정상 동작.
 
 ---
 
