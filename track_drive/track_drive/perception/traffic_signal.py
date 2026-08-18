@@ -16,7 +16,8 @@ from ..config import (
     SIG4_ROI_T, SIG4_ROI_B, SIG4_ROI_L, SIG4_ROI_R,
     SIG4_MIN_RADIUS, SIG4_MAX_RADIUS, SIG4_BRIGHT_MARGIN, SIG4_MAX_CANDIDATES,
     SIG4_AUTOCROP_ENABLE, SIG4_SEARCH_ROI_T, SIG4_SEARCH_ROI_B,
-    SIG4_SEARCH_ROI_L, SIG4_SEARCH_ROI_R, SIG4_BOARD_GRAY_MIN,
+    SIG4_SEARCH_ROI_L, SIG4_SEARCH_ROI_R,
+    SIG4_BOARD_SAT_MAX, SIG4_BOARD_V_MIN, SIG4_BOARD_V_MAX,
     SIG4_BOARD_MIN_AREA_PX, SIG4_BOARD_MAX_AREA_PX, SIG4_BOARD_MIN_ASPECT,
     SIG4_BOARD_MAX_ASPECT, SIG4_BOARD_MAX_CANDIDATES, SIG4_BOARD_CROP_MARGIN,
     DEBUG_VIZ_SIGNAL,
@@ -111,10 +112,17 @@ class SignalDetector:
     def _board_candidates(self, frame):
         """흰 배경판(신호등 rig) 후보 사각형을 탐색범위(SIG4_SEARCH_ROI_*) 안에서 찾아
         (t,b,l,r) 절대 픽셀좌표 리스트로 반환한다(마진 포함, 프레임 경계로 클리핑됨,
-        면적 큰 순 정렬). 재현율 우선 설계 — 천장 조명 등 오탐이 섞여 나와도 상관없다는
-        전제다: 이 함수는 "후보 제안"만 하고, 그중 진짜 신호등인지는 detect_s2()의 기존
-        원 4개 패턴검사(find_circles/shape_ok/pick_best_4)가 최종 판정한다. 실패해도
-        예외 없이 빈 리스트만 반환 — 호출부가 SIG4_ROI_* 고정 폴백으로 이어가면 된다."""
+        면적 작은 순 정렬 — 보드에 더 타이트하게 맞는 후보부터 시도). 이 함수는 "후보
+        제안"만 하고, 그중 진짜 신호등인지는 detect_s2()의 기존 원 4개 패턴검사
+        (find_circles/shape_ok/pick_best_4)가 최종 판정한다. 실패해도 예외 없이 빈
+        리스트만 반환 — 호출부가 SIG4_ROI_* 고정 폴백으로 이어가면 된다.
+
+        [2026-08-18] 그레이스케일 밝기 단일 임계값은 lap_001 실차 캡처에서 거의 항상
+        실패했다(배경판과 블러로 번진 천장 형광등이 하나의 거대한 블롭으로 뭉개짐,
+        config.py 주석 참고) — HSV로 바꿔 채도(S)를 낮게 제한하니(무채색=배경판 특징)
+        분리가 됐다. 채도만으론 완전하지 않아(형광등 주변도 저채도인 경우가 있음)
+        면적 상한을 훨씬 타이트하게 잡고, MORPH_OPEN으로 형광등 반사가 만드는 가늘고
+        긴 줄무늬를 끊어낸다(MORPH_CLOSE는 오히려 그런 줄무늬를 서로 이어붙여 역효과)."""
         h, w = frame.shape[:2]
         st, sb = int(h * SIG4_SEARCH_ROI_T), int(h * SIG4_SEARCH_ROI_B)
         sl, sr = int(w * SIG4_SEARCH_ROI_L), int(w * SIG4_SEARCH_ROI_R)
@@ -122,9 +130,9 @@ class SignalDetector:
         if band.size == 0:
             return []
 
-        gray = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
-        _, mask = cv2.threshold(gray, SIG4_BOARD_GRAY_MIN, 255, cv2.THRESH_BINARY)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+        hsv = cv2.cvtColor(band, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, (0, 0, SIG4_BOARD_V_MIN), (179, SIG4_BOARD_SAT_MAX, SIG4_BOARD_V_MAX))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -148,7 +156,7 @@ class SignalDetector:
             b  = min(h, st + y + ch + my)
             scored.append((area, t, b, l, r_))
 
-        scored.sort(key=lambda v: v[0], reverse=True)
+        scored.sort(key=lambda v: v[0])  # 작은 것부터 — 보드 크기에 더 타이트하게 맞는 후보 우선
         return [(t, b, l, r_) for _, t, b, l, r_ in scored[:SIG4_BOARD_MAX_CANDIDATES]]
 
     def find_circles(self, roi, min_r, max_r):
