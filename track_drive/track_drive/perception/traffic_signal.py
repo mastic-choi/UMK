@@ -12,6 +12,7 @@ import cv2
 #   DEBUG_VIZ_SIGNAL)은 config.py에 있다 — 실차 테스트 중 값을 바꾸려면 이 파일이
 #   아니라 config.py를 고칠 것. 아래 셋(VERT/HORIZ_DIFF_MAX, MIN_DIST)은
 #   MIN/MAX_RADIUS에서 파생되는 값이라 "N배" 관계를 그대로 보여주려고 여기 둔다.
+from .frst import frst_multiscale, find_peaks
 from ..config import (
     SIG4_ROI_T, SIG4_ROI_B, SIG4_ROI_L, SIG4_ROI_R,
     SIG4_MIN_RADIUS, SIG4_MAX_RADIUS, SIG4_BRIGHT_MARGIN, SIG4_MAX_CANDIDATES,
@@ -20,6 +21,8 @@ from ..config import (
     SIG4_BOARD_SAT_MAX, SIG4_BOARD_V_MIN, SIG4_BOARD_V_MAX,
     SIG4_BOARD_MIN_AREA_PX, SIG4_BOARD_MAX_AREA_PX, SIG4_BOARD_MIN_ASPECT,
     SIG4_BOARD_MAX_ASPECT, SIG4_BOARD_MAX_CANDIDATES, SIG4_BOARD_CROP_MARGIN,
+    SIG4_CIRCLE_ENGINE, SIG4_FRST_RADIUS_STEP, SIG4_FRST_ALPHA,
+    SIG4_FRST_STD_FACTOR, SIG4_FRST_REL_THRESHOLD, SIG4_FRST_PEAK_MIN_DIST,
     DEBUG_VIZ_SIGNAL,
 )
 SIG4_VERT_DIFF_MAX  = SIG4_MAX_RADIUS * 2
@@ -171,6 +174,52 @@ class SignalDetector:
 
         return gray, circles
 
+    def _frst_band_peaks(self, frame, min_r, max_r):
+        """FRST(perception/frst.py)를 SIG4_SEARCH_ROI_* 전체 범위에 대해 딱 한 번만 계산해,
+        피크 전부를 프레임 절대좌표 (x,y,r) 리스트로 반환한다.
+
+        [중요, 2026-08-18 버그 수정] 처음엔 후보 크롭마다 매번 FRST를 새로 돌렸는데,
+        find_peaks()의 임계값(SIG4_FRST_REL_THRESHOLD)이 "그 크롭 자체의 최댓값" 대비
+        상대값이라 — 크롭을 작게 자를수록 그 안에 진짜 램프가 없어도 "크롭 안에서
+        상대적으로 제일 강한 지점"이 항상 임계값을 넘어버렸다. lap_001 실측(70프레임 중
+        44개가 "성공"으로 나옴, 대부분 천장조명 오탐)으로 발견됨. 고쳐서, 임계값을
+        "탐색범위 전체의 최댓값" 대비로 한 번만 계산하고, 크롭별로는 그 절대적인 피크
+        목록 중 자기 범위 안에 있는 것만 걸러 쓴다 — 작은 크롭이라고 기준이 느슨해지지
+        않는다. find_circles_frst()가 이 결과를 각 후보 박스 범위로 필터링해 쓴다."""
+        h, w = frame.shape[:2]
+        st, sb = int(h * SIG4_SEARCH_ROI_T), int(h * SIG4_SEARCH_ROI_B)
+        sl, sr = int(w * SIG4_SEARCH_ROI_L), int(w * SIG4_SEARCH_ROI_R)
+        band = frame[st:sb, sl:sr]
+        gray = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
+
+        radii = range(min_r, max_r + 1, SIG4_FRST_RADIUS_STEP)
+        sym_map, radius_map = frst_multiscale(
+            gray, radii, alpha=SIG4_FRST_ALPHA, std_factor=SIG4_FRST_STD_FACTOR)
+        peaks = find_peaks(
+            sym_map, radius_map,
+            max_peaks=SIG4_MAX_CANDIDATES * 3,  # 여러 박스에 나눠 걸릴 수 있으니 넉넉히
+            min_dist=SIG4_FRST_PEAK_MIN_DIST,
+            rel_threshold=SIG4_FRST_REL_THRESHOLD)
+
+        return [(x + sl, y + st, r) for x, y, r in peaks]  # band-로컬 → 프레임 절대좌표
+
+    def find_circles_frst(self, roi, roi_box, band_peaks_abs):
+        """find_circles()의 FRST 버전 — band_peaks_abs(_frst_band_peaks()가 전체 범위에서
+        한 번만 계산한 절대좌표 피크 목록)를 roi_box 범위로 필터링하고, roi_box 기준
+        상대좌표로 변환해 cv2.HoughCircles()와 동일한 (gray, circles) 형식으로 반환한다
+        — detect_s2() 이후 로직(shape_ok/pick_best_4)을 전혀 안 건드리고 재사용하기 위함.
+        lap_001 실측으로 Hough보다 후보 오염(천장조명이 진짜 램프와 섞이는 문제)이 덜한
+        것으로 확인돼 SIG4_CIRCLE_ENGINE 기본값이 됐다(config.py 해당 주석 참고)."""
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+
+        t, b, l, r_ = roi_box
+        local = [(x - l, y - t, r) for x, y, r in band_peaks_abs
+                 if l <= x < r_ and t <= y < b]
+        if not local:
+            return gray, None
+        circles = np.array([local], dtype=np.float64)  # HoughCircles와 동일하게 (1,N,3) 형태
+        return gray, circles
+
     def detect_s2(self, frame):
         """4구 신호등 인식 — S0(출발)/S2(교차로) 공통.
           S0에서 쓸 때: straight_on(초록만 점등) = 출발
@@ -179,10 +228,13 @@ class SignalDetector:
         [2026-08-18] ROI를 SIG4_ROI_*(고정 크롭) 하나가 아니라 "후보 리스트"로 순회한다 —
         SIG4_AUTOCROP_ENABLE=True면 _board_candidates()가 흰 배경판(신호등 rig) 후보를 먼저
         제안하고, 그 뒤에 항상 기존 SIG4_ROI_*(고정 크롭)를 마지막 안전망으로 덧붙인다. 각
-        후보에 대해 아래 원 4개 패턴검사(find_circles→shape_ok/pick_best_4, 기존 로직 그대로)를
-        순서대로 시도해 맨 처음 성공하는 후보를 채택하고 즉시 멈춘다 — 자동탐색이 전부
-        실패해도 도입 전과 똑같이 고정 크롭으로 마지막에 한 번 더 시도되므로 이 변경으로
-        인식률이 이전보다 나빠지진 않는다.
+        후보에 대해 아래 원 4개 패턴검사(find_circles*→shape_ok/pick_best_4, 판정 로직 자체는
+        그대로)를 순서대로 시도해 맨 처음 성공하는 후보를 채택하고 즉시 멈춘다 — 자동탐색이
+        전부 실패해도 도입 전과 똑같이 고정 크롭으로 마지막에 한 번 더 시도되므로 이 변경으로
+        인식률이 이전보다 나빠지진 않는다. 크롭 안에서 원을 찾는 엔진은
+        SIG4_CIRCLE_ENGINE(config.py)로 Hough Circle('hough')과 FRST('frst', 기본값) 중
+        고를 수 있다 — find_circles()/find_circles_frst() 둘 다 같은 (gray, circles) 형식을
+        반환하므로 이 아래 로직은 어느 쪽을 쓰든 동일하다.
 
         원이 정확히 4개가 아니어도 어느 정도는 견딘다(반사광 등으로 여분의 원이 섞이는 경우가
         실차에서 흔해서): 4개 초과면 pick_best_4()로 가장 신호등다운 4개 조합을 고른다.
@@ -206,9 +258,18 @@ class SignalDetector:
         self.red_on = self.straight_on = self.left_on = False
         all_circles = chosen = gray = None
 
+        use_frst = SIG4_CIRCLE_ENGINE == 'frst'
+        # FRST는 후보 박스마다 새로 돌리지 않고 SIG4_SEARCH_ROI_* 전체에 대해 프레임당 한 번만
+        # 계산한다 — find_circles_frst() 주석 참고("크롭마다 새로 돌리면 임계값이 크롭 자체
+        # 기준 상대값이 돼버려 작은 크롭일수록 오탐이 늘어나는" 버그를 막기 위함.
+        band_peaks = self._frst_band_peaks(frame, SIG4_MIN_RADIUS, SIG4_MAX_RADIUS) if use_frst else None
+
         for idx, (t, b, l, r_) in enumerate(roi_boxes):
             roi = frame[t:b, l:r_]
-            gray, raw_circles = self.find_circles(roi, SIG4_MIN_RADIUS, SIG4_MAX_RADIUS)
+            if use_frst:
+                gray, raw_circles = self.find_circles_frst(roi, (t, b, l, r_), band_peaks)
+            else:
+                gray, raw_circles = self.find_circles(roi, SIG4_MIN_RADIUS, SIG4_MAX_RADIUS)
 
             # 진단값(이번 후보 기준으로 매번 덮어씀 — 루프가 끝났을 때 마지막으로 시도한
             # 후보의 값이 남는다. 성공하면 break하므로 그게 곧 채택된 후보의 값)
