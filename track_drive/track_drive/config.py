@@ -1371,6 +1371,26 @@ OBSTACLE_VEHICLE_WIDTH_M = 0.24
 #   DL_STABLE_FRAME_MIN/DL_STABLE_JUMP_MAX 값을 전부 덮어쓴다(아래 globals().update()
 #   — 이 파일 맨 끝에 있어야 나중 정의가 안 덮어씀).
 PP_TUNE_PRESETS = {
+    'speed3': dict(
+        # [2026-08-18] 커밋 0b365ee(2026-08-17, "[Pure Pursuit] 직진모드 curvature 문턱(eps)
+        # 너무 타이트하던 문제 완화")의 값을 그대로 옮김 — 사용자가 이 커밋 시점 파라미터로
+        # 주행이 "엄청 잘 됐다"고 확인. 그 커밋의 실제 SPEED_NORMAL은 3.0이었다(사용자가
+        # "speed5"로 기억했으나 확인 결과 3.0 — 프리셋 이름/SPEED_NORMAL은 실측값 그대로
+        # 'speed3'로 둠, 혼동 방지). 다른 프리셋과 달리 그리드서치 결과가 아니라 그 시점의
+        # 수동 튜닝값을 그대로 옮긴 것 — PP_LD_FLOOR_PX/PP_LOOKAHEAD_MIN_PX는 그 커밋 당시
+        # 이름(PP_MIN_LOOKAHEAD_PX/PP_LOOKAHEAD_MIN_PX)에서 이후 리네이밍(2026-08-18,
+        # 9bfb67f)을 반영해 PP_LD_FLOOR_PX로만 이름을 맞췄고 값 자체는 그대로다.
+        PP_LOOKAHEAD_BASE_PX=90.0, PP_LOOKAHEAD_SPEED_GAIN=4.0, PP_LOOKAHEAD_MAX_PX=190.0,
+        PP_WHEELBASE_PX=25.0, PP_ALPHA=0.8, PP_LD_FLOOR_PX=90.0, PP_DX_DEADZONE_PX=6.0,
+        PP_LOOKAHEAD_CURVATURE_GAIN=100.0, PP_LOOKAHEAD_MIN_PX=40.0,
+        PP_STRAIGHT_CURVATURE_EPS=0.0035, PP_STRAIGHT_CONFIRM_FRAMES=5, PP_STRAIGHT_DEADZONE_PX=20.0,
+        PP_STRAIGHT_ALPHA=0.4, PP_STRAIGHT_BIAS_EMA_ALPHA=0.15,
+        SPEED_CORNER_MIN=5.0, CORNER_SIGN_EMA_ALPHA=0.15, LANE_LOOKAHEAD_REF=220.0,
+        SPEED_ACCEL_STEP=0.4, CORNER_HOLD_DECAY_LO=0.92, CORNER_HOLD_DECAY_HI=0.97,
+        CORNER_MIN_RADIUS_PX=250.0, CORNER_MIN_SPEED_SCALE=0.35,
+        PATH_EMA_ALPHA=0.25, DL_STABLE_FRAME_MIN=2, DL_STABLE_JUMP_MAX=20,
+        SPEED_NORMAL=3.0,
+    ),
     'speed10': dict(
         PP_LOOKAHEAD_BASE_PX=78.61, PP_LOOKAHEAD_SPEED_GAIN=1.476, PP_LOOKAHEAD_MAX_PX=263.7,
         PP_WHEELBASE_PX=49.39, PP_ALPHA=0.7678, PP_LD_FLOOR_PX=63.26, PP_DX_DEADZONE_PX=1.626,
@@ -1481,6 +1501,6 @@ PP_TUNE_PRESETS = {
 # 실차 미검증이었다는 전제로 선택된 것**이라, 위에서 경고한 PP_WHEELBASE_PX/
 # SPEED_ACCEL_STEP/SPEED_CORNER_MIN 재발 위험을 서행 상태에서 최우선 확인할 것.
 # 문제 생기면 None으로 되돌리거나 git 이력의 이전 speed15 프리셋으로 복원할 것.
-PP_TUNE_ACTIVE_PRESET = 'speed15'   # None / 'speed10' / 'speed12_5' / 'speed15' / 'speed17_5' / 'speed20' / 'speed22_5' / 'speed25'
+PP_TUNE_ACTIVE_PRESET = 'speed15'   # None / 'speed3' / 'speed10' / 'speed12_5' / 'speed15' / 'speed17_5' / 'speed20' / 'speed22_5' / 'speed25'
 if PP_TUNE_ACTIVE_PRESET is not None:
     globals().update(PP_TUNE_PRESETS[PP_TUNE_ACTIVE_PRESET])
