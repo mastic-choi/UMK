@@ -15,6 +15,10 @@ import cv2
 from ..config import (
     SIG4_ROI_T, SIG4_ROI_B, SIG4_ROI_L, SIG4_ROI_R,
     SIG4_MIN_RADIUS, SIG4_MAX_RADIUS, SIG4_BRIGHT_MARGIN, SIG4_MAX_CANDIDATES,
+    SIG4_AUTOCROP_ENABLE, SIG4_SEARCH_ROI_T, SIG4_SEARCH_ROI_B,
+    SIG4_SEARCH_ROI_L, SIG4_SEARCH_ROI_R, SIG4_BOARD_GRAY_MIN,
+    SIG4_BOARD_MIN_AREA_PX, SIG4_BOARD_MAX_AREA_PX, SIG4_BOARD_MIN_ASPECT,
+    SIG4_BOARD_MAX_ASPECT, SIG4_BOARD_MAX_CANDIDATES, SIG4_BOARD_CROP_MARGIN,
     DEBUG_VIZ_SIGNAL,
 )
 SIG4_VERT_DIFF_MAX  = SIG4_MAX_RADIUS * 2
@@ -50,6 +54,13 @@ class SignalDetector:
         self.s2_reject_reason = ''            # 실패 사유 ('' = 성공)
         self.s2_brightness    = []            # 좌→우 (빨강,노랑,좌회전,직진) 밝기
         self.s2_lit           = []            # 좌→우 점등 여부(밝기가 평균보다 SIG4_BRIGHT_MARGIN 이상) — 배치검사 통과 시에만 채워짐
+
+        # ── [2026-08-18 신규, 실차 미검증] 흰 배경판 자동크롭 후보 진단 ──
+        #   detect_s2()가 이번 프레임에 시도한 ROI 후보 전부(자동탐색 + 마지막 고정폴백)와
+        #   그중 실제로 성공한 인덱스. _draw_debug_board_search()가 이걸로 signal4_board_search
+        #   창을 그린다 — 어떤 후보가 왜 채택/기각됐는지 실차에서 눈으로 확인하기 위함.
+        self.s2_board_candidates = []   # [(t,b,l,r), ...] — 마지막 항목이 항상 고정폴백(SIG4_ROI_*)
+        self.s2_chosen_idx       = -1   # 성공한 후보의 인덱스, -1이면 전부 실패
 
     def circle_brightness(self, gray, x, y, r):
         y0, y1 = max(0, y - r // 2), y + r // 2
@@ -97,6 +108,49 @@ class SignalDetector:
             return None, 'no_valid_4subset'
         return list(best), ''
 
+    def _board_candidates(self, frame):
+        """흰 배경판(신호등 rig) 후보 사각형을 탐색범위(SIG4_SEARCH_ROI_*) 안에서 찾아
+        (t,b,l,r) 절대 픽셀좌표 리스트로 반환한다(마진 포함, 프레임 경계로 클리핑됨,
+        면적 큰 순 정렬). 재현율 우선 설계 — 천장 조명 등 오탐이 섞여 나와도 상관없다는
+        전제다: 이 함수는 "후보 제안"만 하고, 그중 진짜 신호등인지는 detect_s2()의 기존
+        원 4개 패턴검사(find_circles/shape_ok/pick_best_4)가 최종 판정한다. 실패해도
+        예외 없이 빈 리스트만 반환 — 호출부가 SIG4_ROI_* 고정 폴백으로 이어가면 된다."""
+        h, w = frame.shape[:2]
+        st, sb = int(h * SIG4_SEARCH_ROI_T), int(h * SIG4_SEARCH_ROI_B)
+        sl, sr = int(w * SIG4_SEARCH_ROI_L), int(w * SIG4_SEARCH_ROI_R)
+        band = frame[st:sb, sl:sr]
+        if band.size == 0:
+            return []
+
+        gray = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
+        _, mask = cv2.threshold(gray, SIG4_BOARD_GRAY_MIN, 255, cv2.THRESH_BINARY)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        scored = []
+        for c in contours:
+            area = cv2.contourArea(c)
+            if not (SIG4_BOARD_MIN_AREA_PX <= area <= SIG4_BOARD_MAX_AREA_PX):
+                continue
+            x, y, cw, ch = cv2.boundingRect(c)
+            if ch == 0:
+                continue
+            aspect = cw / ch
+            if not (SIG4_BOARD_MIN_ASPECT <= aspect <= SIG4_BOARD_MAX_ASPECT):
+                continue
+
+            mx, my = int(cw * SIG4_BOARD_CROP_MARGIN), int(ch * SIG4_BOARD_CROP_MARGIN)
+            # band-로컬 좌표 → 원본 frame 절대좌표 변환 + 마진 + 프레임 경계 클리핑
+            l  = max(0, sl + x - mx)
+            r_ = min(w, sl + x + cw + mx)
+            t  = max(0, st + y - my)
+            b  = min(h, st + y + ch + my)
+            scored.append((area, t, b, l, r_))
+
+        scored.sort(key=lambda v: v[0], reverse=True)
+        return [(t, b, l, r_) for _, t, b, l, r_ in scored[:SIG4_BOARD_MAX_CANDIDATES]]
+
     def find_circles(self, roi, min_r, max_r):
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -114,9 +168,18 @@ class SignalDetector:
           S0에서 쓸 때: straight_on(초록만 점등) = 출발
           S2에서 쓸 때: straight_on = 직진, left_on(초록+빨강 동시) = 좌회전
 
+        [2026-08-18] ROI를 SIG4_ROI_*(고정 크롭) 하나가 아니라 "후보 리스트"로 순회한다 —
+        SIG4_AUTOCROP_ENABLE=True면 _board_candidates()가 흰 배경판(신호등 rig) 후보를 먼저
+        제안하고, 그 뒤에 항상 기존 SIG4_ROI_*(고정 크롭)를 마지막 안전망으로 덧붙인다. 각
+        후보에 대해 아래 원 4개 패턴검사(find_circles→shape_ok/pick_best_4, 기존 로직 그대로)를
+        순서대로 시도해 맨 처음 성공하는 후보를 채택하고 즉시 멈춘다 — 자동탐색이 전부
+        실패해도 도입 전과 똑같이 고정 크롭으로 마지막에 한 번 더 시도되므로 이 변경으로
+        인식률이 이전보다 나빠지진 않는다.
+
         원이 정확히 4개가 아니어도 어느 정도는 견딘다(반사광 등으로 여분의 원이 섞이는 경우가
         실차에서 흔해서): 4개 초과면 pick_best_4()로 가장 신호등다운 4개 조합을 고른다.
-        4개 미만이면(가림/블러로 실제로 못 찾은 경우) 만들어낼 근거가 없으므로 그대로 실패.
+        4개 미만이면(가림/블러로 실제로 못 찾은 경우) 만들어낼 근거가 없으므로 그 후보는 실패
+        처리하고 다음 후보로 넘어간다.
         프레임 단위 디바운스(연속 N프레임 확정)는 track_drive.py의 perc_signal()에서 처리한다
         (여기는 항상 '이번 한 프레임' 기준 순간값만 반환)."""
         if frame is None:
@@ -124,57 +187,73 @@ class SignalDetector:
 
         h, w = frame.shape[:2]
 
-        t, b = int(h*SIG4_ROI_T), int(h*SIG4_ROI_B)
-        l, r_ = int(w*SIG4_ROI_L), int(w*SIG4_ROI_R)
-        self.roi = frame[t:b, l:r_]
+        roi_boxes = list(self._board_candidates(frame)) if SIG4_AUTOCROP_ENABLE else []
+        fixed_t, fixed_b = int(h * SIG4_ROI_T), int(h * SIG4_ROI_B)
+        fixed_l, fixed_r = int(w * SIG4_ROI_L), int(w * SIG4_ROI_R)
+        roi_boxes.append((fixed_t, fixed_b, fixed_l, fixed_r))  # 항상 마지막 안전망
 
-        gray, raw_circles = self.find_circles(self.roi, SIG4_MIN_RADIUS, SIG4_MAX_RADIUS)
+        self.s2_board_candidates = roi_boxes
+        self.s2_chosen_idx = -1
+
         self.red_on = self.straight_on = self.left_on = False
+        all_circles = chosen = gray = None
 
-        # 진단값 초기화 (이번 프레임 기준)
-        self.s2_roi_px        = (t, b, l, r_)
-        self.s2_circle_count  = 0 if raw_circles is None else len(raw_circles[0])
-        self.s2_reject_reason = 'no_circles'
-        self.s2_brightness    = []
-        self.s2_lit           = []
+        for idx, (t, b, l, r_) in enumerate(roi_boxes):
+            roi = frame[t:b, l:r_]
+            gray, raw_circles = self.find_circles(roi, SIG4_MIN_RADIUS, SIG4_MAX_RADIUS)
 
-        all_circles = None  # [디버그뷰] Hough가 이번 프레임에 찾은 원 전부(선택 여부 무관)
-        chosen      = None  # [디버그뷰] 배치검사 통과 후 실제 판정에 쓰인 4개(좌→우 정렬)
+            # 진단값(이번 후보 기준으로 매번 덮어씀 — 루프가 끝났을 때 마지막으로 시도한
+            # 후보의 값이 남는다. 성공하면 break하므로 그게 곧 채택된 후보의 값)
+            self.roi = roi
+            self.s2_roi_px        = (t, b, l, r_)
+            self.s2_circle_count  = 0 if raw_circles is None else len(raw_circles[0])
+            self.s2_reject_reason = 'no_circles'
+            self.s2_brightness    = []
+            self.s2_lit           = []
+            all_circles = None
+            chosen      = None
 
-        if raw_circles is not None:
-            all_circles = np.round(raw_circles[0, :]).astype(int)
-            n = len(all_circles)
+            if raw_circles is not None:
+                all_circles = np.round(raw_circles[0, :]).astype(int)
+                n = len(all_circles)
 
-            if n < 4:
-                self.s2_reject_reason = f'circle_count={n}(<4)'
-            elif n > SIG4_MAX_CANDIDATES:
-                self.s2_reject_reason = f'circle_count={n}(>{SIG4_MAX_CANDIDATES}, too noisy)'
-            else:
-                if n == 4:
-                    ok, reason = self.shape_ok(all_circles, SIG4_VERT_DIFF_MAX, SIG4_HORIZ_DIFF_MAX, SIG4_MIN_DIST)
-                    picked = list(all_circles) if ok else None
+                if n < 4:
+                    self.s2_reject_reason = f'circle_count={n}(<4)'
+                elif n > SIG4_MAX_CANDIDATES:
+                    self.s2_reject_reason = f'circle_count={n}(>{SIG4_MAX_CANDIDATES}, too noisy)'
                 else:
-                    picked, reason = self.pick_best_4(all_circles, SIG4_VERT_DIFF_MAX, SIG4_HORIZ_DIFF_MAX, SIG4_MIN_DIST)
+                    if n == 4:
+                        ok, reason = self.shape_ok(all_circles, SIG4_VERT_DIFF_MAX, SIG4_HORIZ_DIFF_MAX, SIG4_MIN_DIST)
+                        picked = list(all_circles) if ok else None
+                    else:
+                        picked, reason = self.pick_best_4(all_circles, SIG4_VERT_DIFF_MAX, SIG4_HORIZ_DIFF_MAX, SIG4_MIN_DIST)
 
-                if picked is None:
-                    self.s2_reject_reason = f'circle_count={n} {reason}'
-                else:
-                    self.s2_reject_reason = ''
-                    chosen = sorted(picked, key=lambda c: c[0])   #좌→우: 빨강,노랑,좌회전,직진
-                    bright = [self.circle_brightness(gray, x, y, r) for x, y, r in chosen]
-                    avg = float(np.mean(bright))
-                    self.s2_brightness = [round(v, 1) for v in bright]
+                    if picked is None:
+                        self.s2_reject_reason = f'circle_count={n} {reason}'
+                    else:
+                        self.s2_reject_reason = ''
+                        chosen = sorted(picked, key=lambda c: c[0])   #좌→우: 빨강,노랑,좌회전,직진
 
-                    lit = [bv - avg > SIG4_BRIGHT_MARGIN for bv in bright]
-                    self.s2_lit = lit
-                    red_lit, _yellow_lit, left_lit, straight_lit = lit
+            if chosen is not None:
+                self.s2_chosen_idx = idx
+                break
 
-                    self.left_on     = left_lit
-                    self.straight_on = straight_lit and not left_lit
-                    self.red_on      = red_lit and not (left_lit or straight_lit)
+        if chosen is not None:
+            bright = [self.circle_brightness(gray, x, y, r) for x, y, r in chosen]
+            avg = float(np.mean(bright))
+            self.s2_brightness = [round(v, 1) for v in bright]
+
+            lit = [bv - avg > SIG4_BRIGHT_MARGIN for bv in bright]
+            self.s2_lit = lit
+            red_lit, _yellow_lit, left_lit, straight_lit = lit
+
+            self.left_on     = left_lit
+            self.straight_on = straight_lit and not left_lit
+            self.red_on      = red_lit and not (left_lit or straight_lit)
 
         if DEBUG_VIZ_SIGNAL:
             self._draw_debug_viz(all_circles, chosen)
+            self._draw_debug_board_search(frame, roi_boxes, self.s2_chosen_idx)
 
         return self.red_on, self.straight_on, self.left_on
 
@@ -213,4 +292,35 @@ class SignalDetector:
 
         self.vis = vis
         cv2.imshow('signal4_roi', self.vis)
+        cv2.waitKey(1)
+
+    def _draw_debug_board_search(self, frame, roi_boxes, chosen_idx):
+        """'signal4_board_search' 창: 전체 프레임 위에 ①탐색범위(SIG4_SEARCH_ROI_*, 회색)
+        ②이번 프레임에 시도한 후보 전부(자동탐색=주황, 마지막 고정폴백=파랑)
+        ③채택된 후보(있으면 초록 굵은 테두리)를 겹쳐 그린다. _board_candidates()가 흰
+        배경판을 실제로 얼마나 잘/잘못 찾는지 한눈에 보려는 순수 디버그 창(판단 로직에는
+        영향 없음) — DEBUG_VIZ_SIGNAL=True일 때 detect_s2()에서만 호출된다."""
+        h, w = frame.shape[:2]
+        vis = frame.copy()
+
+        st, sb = int(h * SIG4_SEARCH_ROI_T), int(h * SIG4_SEARCH_ROI_B)
+        sl, sr = int(w * SIG4_SEARCH_ROI_L), int(w * SIG4_SEARCH_ROI_R)
+        cv2.rectangle(vis, (sl, st), (sr, sb), (120, 120, 120), 1, cv2.LINE_AA)
+
+        n_auto = len(roi_boxes) - 1  # 마지막 하나는 항상 고정폴백
+        for idx, (t, b, l, r_) in enumerate(roi_boxes):
+            is_fallback = (idx == n_auto)
+            is_chosen   = (idx == chosen_idx)
+            # BGR(OpenCV) 순서 — 초록=채택, 주황=고정폴백, 시안=자동후보
+            color = (0, 255, 0) if is_chosen else ((0, 140, 255) if is_fallback else (255, 255, 0))
+            thick = 3 if is_chosen else 1
+            cv2.rectangle(vis, (l, t), (r_, b), color, thick, cv2.LINE_AA)
+
+        status = f'chosen=#{chosen_idx}' if chosen_idx >= 0 else 'chosen=NONE(all failed)'
+        cv2.putText(vis, f'board candidates: {n_auto} auto + 1 fallback | {status}',
+                    (4, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(vis, 'gray=search band  cyan=auto candidate  orange=fixed fallback  green=chosen',
+                    (4, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+
+        cv2.imshow('signal4_board_search', vis)
         cv2.waitKey(1)

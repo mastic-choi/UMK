@@ -1234,6 +1234,29 @@ SIG4_MIN_RADIUS, SIG4_MAX_RADIUS = 9, 26
 SIG4_BRIGHT_MARGIN  = 15
 SIG4_MAX_CANDIDATES = 10  # 원이 이보다 많이 잡히면 조합 탐색 없이 바로 실패 처리(ROI 자체가 노이즈로 판단)
 
+# ── 신호등 자동 크롭(흰 배경판 탐색) — [2026-08-18 신규, 실차 미검증] ──
+#   위 SIG4_ROI_*는 실차 랩 캡처 한 장(frame_000055) 기준 고정 크롭이라 정지 위치/거리가
+#   달라지면 다시 안 맞을 수 있다는 한계가 있었다(위 주석 참고). 실물 신호등 사진(2026-08-18
+#   공유)을 보면 이 rig는 상용 신호등(어두운 박스)과 반대로 "흰 배경판 + 검은 테두리 원통
+#   램프 4개" 구조라, 어두운 영역이 아니라 밝은(흰) 사각형을 먼저 찾는 쪽이 이 rig 생김새에
+#   맞는다 — 같은 lap_001 캡처로 확인해보니 천장 형광등도 같이 밝게 찍혀 오검출 후보가 될
+#   수 있음을 실측했다(frame_000055 부근, board V~160 vs 형광등 V~255로 밝기 자체는 다르지만
+#   구분을 이 임계값 하나에 맡기면 위험). 그래서 이 밝기 기반 후보 탐색은 일부러 관대하게
+#   (재현율 우선, 오탐 허용) 만들고, 진짜 신호등인지는 결국 위 find_circles/shape_ok/
+#   pick_best_4(그대로 재사용)가 "원 4개가 정말 나란히 있는가"로 최종 판정한다 — 색상만으로
+#   확정하지 않는 게 이 설계의 핵심. 후보가 전부 실패하면 위 SIG4_ROI_*(고정 크롭)로
+#   마지막에 한 번 더 시도해 항상 안전망이 있다(perception/traffic_signal.py detect_s2()).
+SIG4_AUTOCROP_ENABLE = True    # False면 기존 SIG4_ROI_* 고정 크롭만 사용(도입 전 동작으로 복귀)
+SIG4_SEARCH_ROI_T, SIG4_SEARCH_ROI_B = 0.0, 0.50  # 후보 탐색 범위(세로 비율) — 바닥 차선/라바콘 배제
+SIG4_SEARCH_ROI_L, SIG4_SEARCH_ROI_R = 0.0, 1.00  # 후보 탐색 범위(가로 비율) — 전체 폭
+SIG4_BOARD_GRAY_MIN    = 120   # 이 밝기 이상을 "흰 배경판 후보"로 포함(관대하게, 실측 1개 프레임 기준)
+SIG4_BOARD_MIN_AREA_PX = 400     # 후보 사각형 최소 면적(px, 탐색범위 해상도 기준) — 노이즈 제거
+SIG4_BOARD_MAX_AREA_PX = 60000   # 후보 사각형 최대 면적(px) — 천장 전체가 통째로 안 잡히게 상한
+SIG4_BOARD_MIN_ASPECT  = 1.5     # 후보 가로/세로 비율 하한(가로로 넓은 사각형만 — 설계값)
+SIG4_BOARD_MAX_ASPECT  = 8.0     # 후보 가로/세로 비율 상한
+SIG4_BOARD_MAX_CANDIDATES = 6    # 이 개수까지만 원 패턴검사를 시도(면적 큰 순, 연산량 상한)
+SIG4_BOARD_CROP_MARGIN = 0.35    # 후보 박스에 이 비율만큼 여유를 더해 크롭(원이 경계에 안 걸리게)
+
 # ── 정지선(perception/perc_floor.py check_stopline(), 백엔드 무관 항상 사용) ──
 STOPLINE_WHITE_LOW = 180        # 그레이스케일 흰색 임계
 STOPLINE_WHITE_RATIO_TH = 0.06  # ROI 내 흰 픽셀 비율 임계 (실측: 1000/16500 ≈ 6%)
