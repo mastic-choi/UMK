@@ -910,6 +910,44 @@ EMA(경로 반응속도)를 아무리 조정해도 게인 자체가 문제면 �
 제어 루프 지연을 아예 모델링하지 않는다는 게 이번에 드러난 설계 공백이다 — 나중에 이 툴을 다시
 쓸 일이 있으면 지연 모델(예: 조향 명령을 N틱 지연시켜 반영)을 추가하는 걸 고려할 것.
 
+### 2.42 `SPEED_LL_DEGRADED` 로직 삭제 — `DL_CENTER_MODE='ll'` 자체를 더 이상 안 씀 (2026-08-18)
+`SPEED_LL_DEGRADED`(2026-08-10 도입, §2절 "차량 속도/조향 기본값")는 `DL_CENTER_MODE=='ll'`
+조건이 걸려 있을 때만 발동하는 속도 상한이었다. `DL_CENTER_MODE`는 2026-08-13에 이미 `'da'`로
+전환됐고(§2.19 병합 이후 계속 `'da'` 유지) 이후로 되돌아간 적이 없어서, 이 조건 자체가 실질적으로
+계속 죽어있던 코드였다 — "속도 5 고정" 디버깅 중 확인. 차선(ll) 기반 주행을 더 이상 쓰지 않기로
+확정(요청 반영)해 아예 삭제:
+- `config.py`: `SPEED_LL_DEGRADED` 상수 삭제.
+- `track_drive.py`: `_lane_drive()`의 `target_speed = min(target_speed, SPEED_LL_DEGRADED)` 캡
+  블록, `_debug_viz_steer()`의 `LL 차선:...` 표시 블록 삭제.
+
+`DL_CENTER_MODE='ll'`/`'ll_da'` 옵션 자체와 `perception/dl_lane.py`의 `ll_degraded` 플래그 계산(밴드
+단위 저신뢰 추정 태깅)은 그대로 남겨뒀다 — 후자는 `_clip_da_by_ll()`류 da 클리핑/디버그 요약 태그
+(`[LL_DEGRADED]`)에서 여전히 쓰이는 별개 코드경로라 이번 삭제 범위 밖.
+
+### 2.43 [중대 버그] `SPEED_AVOID_HOLD_BLOCKED`가 "속도 5 고정"의 실제 원인 — 삭제 (2026-08-18)
+카카오톡 영상(2026-08-18 11:12) 프레임 분석으로 실차에서 속도가 5로 고정된 채 안 올라가는 증상의
+원인을 특정함. `avoid_hold_side==0`(좌우 다 안 비었다고 판정), `obstacle_front=True`(전방 장애물
+~1~1.14m)가 40초 넘게 지속되며 `_lane_drive()`의 §2.32 "적용4" 안전판이 계속 걸려있었다.
+
+**진짜 원인:** `config.py`에 `TEST_DISABLE_B2_B3 = True`로 실제 옆차선 회피 기동(B2/B3 dispatch)이
+꺼져있는데, `_update_avoid_hold()`/`SPEED_AVOID_HOLD_BLOCKED` 캡은 이 플래그와 무관하게 계속
+돈다(주석에 "TEST_DISABLE_B2_B3와 무관하게 매 틱 갱신"이라고 의도적으로 그렇게 적혀있었음). 회피
+기동이 실행됐다면 차량이 움직여 장애물과의 관계(거리/좌우 클리어)가 바뀌면서 유예가 자연히
+풀렸겠지만, 기동 자체가 꺼져있으니 상태를 바꿀 수단이 없어 무한정 5.0에 고정되는 구조였다.
+
+**수정:** `_lane_drive()`의 `if self.avoid_hold_active and self.avoid_hold_side == 0: target_speed
+= min(...)` 캡 블록과 `config.py`의 `SPEED_AVOID_HOLD_BLOCKED` 상수를 삭제(요청 반영: "필요없으면
+제거"). `_update_avoid_hold()` 타이머(`avoid_hold_active`/`avoid_hold_side`) 자체와, 그걸 입력으로
+쓰는 DA 클리핑 방향 편향(적용3, `perception/dl_lane.py` `set_avoid_hold()`/`_clip_da_by_ll()`,
+`AVOID_HOLD_DIR_BIAS_PX`)은 별개 기능이라 그대로 유지 — 속도캡 소비부만 제거.
+
+**알려진 한계:** 실차 재검증 전. 이 캡이 없어졌다는 건 "장애물에 근접 + 양옆 다 막힘" 상황에서
+더 이상 자동으로 감속하지 않는다는 뜻이다 — 지금은 `TEST_DISABLE_B2_B3=True`라 실질적 안전
+행동(회피 기동)이 어차피 없어서 감속만 남겨봐야 의미가 없다는 판단이지만, 나중에 B2/B3를 다시
+켜면 이 안전판 없이 근접 상황에서 속도를 그대로 유지한 채 회피를 시도하게 된다 — 그때 재검토할 것.
+또한 `avoid_hold_side==0`이 왜 그렇게 오래 지속됐는지(라이다 오탐 vs 실제 협소 구간 vs 차량이
+차선 중심을 벗어나 있었을 가능성)는 이번 조치로 해소되지 않은 별개 질문으로 남아있다.
+
 ---
 
 ## 3. 라바콘 (B1_LAVACON)

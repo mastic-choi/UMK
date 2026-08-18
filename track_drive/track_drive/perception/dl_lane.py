@@ -62,8 +62,9 @@
 #             da 폴백은 없다 — 대신 노란/흰 간격 기반 재구성 + 잔상으로 저신뢰
 #             추정한다(config.py DL_CENTER_MODE 'll' 주석 참고).
 #   'da'/'ll' 두 모드는 da 파편화 대응(_largest_da_component())/옆 차선
-#   클리핑(_clip_da_by_ll())을 공유한다('ll_da'=corridor는 둘 다 건너뜀). ll 프레임 단위
-#   sanity check(DL_LL_SANITY_MIN_RATIO 미만이면 이번 프레임 무효)는 세 모드 모두 적용.
+#   클리핑(_clip_da_by_ll())을 공유한다('ll_da'=corridor는 둘 다 건너뜀).
+#   [2026-08-18] ll 프레임 단위 sanity check(DL_LL_SANITY_MIN_RATIO)는 삭제됨 — ll을
+#   더 이상 안 쓰기로 확정, lane_valid/path_ok 모두 da 중심점 유무로만 판정.
 #=============================================
 import argparse
 import os
@@ -204,7 +205,7 @@ from ..config import (
     # [2026-08-12] DL_CENTER_MODE='da' 밴드 중심 탐색창(prior)+속도예측+앵커링 — README §2.27
     DL_DA_SEARCH_HALF_WIDTH_PX, DL_DA_SEARCH_WIDEN_STEP_PX, DL_DA_SEARCH_WIDEN_MAX_PX,
     DL_DA_VELOCITY_EMA_ALPHA, DL_DA_VELOCITY_MAX_PX, DL_DA_BAND_ANCHOR_ALPHA,
-    DL_LL_SANITY_MIN_RATIO, DL_LL_CLIP_MARGIN_PX,
+    DL_LL_CLIP_MARGIN_PX,
     DL_LL_DECAY_ALPHA, DL_LL_DECAY_MIN_VALUE,
     DL_CENTER_MODE, DL_LL_ALGO, DL_LL_SIDE_MIN_PIXELS, DL_DA_SKIP_LL_CLIP,
     DL_LL_SEARCH_HALF_WIDTH_PX,
@@ -1911,10 +1912,10 @@ class DLSlideWindow(SlideWindow):
         near_center = self._group_mean(self.centerline, self.near_slices, True)
         far_center = self._group_mean(self.centerline, self.far_slices, False)
 
-        # ll sanity check: da 중심선이 있어도 ll(차선) 신호가 거의 안 보이면(모션블러 등으로
-        # 세그멘테이션이 통째로 깨진 경우) 이번 프레임을 무효 처리한다 — da 커버리지만으로는
-        # 못 거르는 실패모드를 ll로 보강(모듈 상단 "da를 경로의 주 신호로" 주석 참고).
-        lane_valid = near_center is not None and self.ll_coverage >= DL_LL_SANITY_MIN_RATIO
+        # [2026-08-18] ll sanity check(ll_coverage >= DL_LL_SANITY_MIN_RATIO) 삭제 — ll(차선)을
+        # 더 이상 안 쓰기로 확정(요청 반영, SPEED_LL_DEGRADED 삭제와 같은 사유, README §2.42
+        # 참고). da 근접 중심점 유무만으로 판정한다.
+        lane_valid = near_center is not None
 
         offset = lookahead = 0.0
         if lane_valid:
@@ -1944,8 +1945,10 @@ class DLSlideWindow(SlideWindow):
         # 크래시 원인(내부/외부 조건 불일치)은 재발하지 않게 한다 — DLLaneDetector가
         # 이 값을 그대로 밖으로 노출해 track_drive.py의 self.lane_path도 같은 값으로
         # 가드한다(perc_lane() 참고), 이제 lane_valid는 offset/lane_center 전용이다.
-        path_ok_raw = ((near_center is not None or far_center is not None)
-                       and self.ll_coverage >= DL_LL_SANITY_MIN_RATIO)
+        # [2026-08-18] ll sanity check(ll_coverage >= DL_LL_SANITY_MIN_RATIO) 삭제 — ll을
+        # 더 이상 안 쓰기로 확정(위 lane_valid와 동일 사유, README §2.42 참고). near/far
+        # 중심점 조건만 남아 오히려 완화되는 방향(path가 얼어붙는 빈도가 줄어듦).
+        path_ok_raw = (near_center is not None or far_center is not None)
         self.path_ok = self._debounce_path_ok(path_ok_raw)
 
         fitted_path = self._fit_and_sample_path(

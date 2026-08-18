@@ -116,6 +116,10 @@ class TrackDriverNode(Node):
         # _lane_drive()가 LANE_UNSTABLE_FRAMES 이상이면 SPEED_LANE_STALE과 동일한 캡을
         # 걸도록 보강한다 — "워커가 죽었나"가 아니라 "지금 이 프레임을 믿을 수 있나"
         # 자체를 보는 게 원래 목적에 더 맞다.
+        # [2026-08-18] 기준을 lane_valid(근접 전용)에서 path_ok(근접 OR 원거리)로 통일
+        # (perc_lane() 참고, 요청 반영) — 실제 조향 경로(self.lane_path) 갱신 조건과
+        # 정확히 같은 신호를 보게 되어, "경로는 갱신되는데 속도만 이유 없이 깎이는"
+        # 불일치가 사라진다. 근접+원거리 둘 다 없어야(=path_ok=False) 스트릭이 쌓인다.
         self._lane_invalid_streak = 0
         self.lane_unstable = False
         self._lane_prev_width = 448.0  # 도로폭 직전값(px, EMA)
@@ -524,12 +528,6 @@ class TrackDriverNode(Node):
 
         self.lane_center = lane_center
         self.lane_valid = valid
-        self._lane_invalid_streak = 0 if valid else self._lane_invalid_streak + 1
-        self.lane_unstable = self._lane_invalid_streak >= LANE_UNSTABLE_FRAMES
-        if valid:
-            # 기존 제어 코드와 호환되도록 필터링 적용
-            self.lane_offset = 0.7 * self.lane_offset + 0.3 * offset
-            self.lane_lookahead = 0.5 * self.lane_lookahead + 0.5 * lookahead
         # [2026-08-10] `if path:`만 보던 예전 조건은 디바운스가 전혀 없어서, 밴드 판정이
         # 프레임마다 흔들릴 때 그 흔들림을 거의 그대로 조향에 전달했다 — 그래서 `valid`도
         # 같이 요구하도록 바꿨었다(offset과 동일한 안정성 검증).
@@ -543,6 +541,18 @@ class TrackDriverNode(Node):
         # 여지는 없다. hough/classic_cv처럼 이 속성이 없는 백엔드는 getattr가 `valid`로
         # 폴백해 기존 동작 그대로다.
         path_ok = getattr(self.lane_detector, 'path_ok', valid)
+        # [2026-08-18] lane_unstable(SPEED_LANE_STALE 트리거)의 기준을 `valid`(근접 전용)
+        # 에서 `path_ok`(근접 OR 원거리, 위와 동일)로 통일 — 요청 반영: "경로만 있으면
+        # 충분하다, 경로가 안 찍힐 때 속도를 낮추는 것처럼 둘의 검출조건을 일치시키자".
+        # 실제 조향 경로(self.lane_path, 바로 아래)도 path_ok로 갱신되므로, 이제 "경로가
+        # 갱신 안 되는 시점"과 "속도가 깎이는 시점"이 정확히 같은 조건을 본다 — 근접만
+        # 비고 원거리로 경로가 계속 갱신되는 동안에는 더 이상 속도가 깎이지 않는다.
+        self._lane_invalid_streak = 0 if path_ok else self._lane_invalid_streak + 1
+        self.lane_unstable = self._lane_invalid_streak >= LANE_UNSTABLE_FRAMES
+        if valid:
+            # 기존 제어 코드와 호환되도록 필터링 적용
+            self.lane_offset = 0.7 * self.lane_offset + 0.3 * offset
+            self.lane_lookahead = 0.5 * self.lane_lookahead + 0.5 * lookahead
         if path_ok and path:
             self.lane_path = path
 
@@ -1569,6 +1579,20 @@ class TrackDriverNode(Node):
             return 1.0
         return max(CORNER_MIN_SPEED_SCALE, radius / CORNER_MIN_RADIUS_PX)
 
+    def _imu_corner_confirm_scale(self):
+        """turn_now/turn_preview(비전+조향출력 신호)가 코너라고 판단해도, IMU 실측
+        회전량(self.pure_pursuit.last_imu_curvature_px)이 이를 뒷받침하지 않으면 코너감속을
+        절반 이하로 깎는다(config.py CORNER_IMU_CONFIRM_KAPPA_PX/CORNER_IMU_MIN_SCALE 주석 —
+        2023 KMU AuTURBO rookie 팀의 ModeController가 IMU yaw 변화량으로 "진짜 커브"를
+        확인하던 패턴 참고). last_imu_curvature_px는 _lane_steer()가 이번 틱에 이미
+        갱신해뒀다(_imu_curvature_px() 호출 순서 참고) — 여기서 다시 계산하지 않는다.
+        None이면(IMU/VESC 죽었거나 dl+BEV 조합이 아니면) 기존처럼 비전 신호만 믿도록
+        1.0(무감쇠)을 반환한다. 실차 미검증 첫 추정치."""
+        imu_kappa = getattr(self.pure_pursuit, 'last_imu_curvature_px', None)
+        if imu_kappa is None:
+            return 1.0
+        return max(CORNER_IMU_MIN_SCALE, min(1.0, abs(imu_kappa) / CORNER_IMU_CONFIRM_KAPPA_PX))
+
     def _lane_drive(self):
         """S1/S3 공통 차선 조향+감속 로직. ctrl_angle·ctrl_speed·_prev_speed·_corner_hold 갱신."""
         self.ctrl_angle = self._lane_steer()
@@ -1597,7 +1621,11 @@ class TrackDriverNode(Node):
         # 낸다. is_straight가 아닌 프레임(코너 포함 전부)은 기존 연속값 로직을 그대로 쓴다 —
         # 코너 감속 감도 자체는 전혀 안 바뀜.
         is_straight = getattr(self.pure_pursuit, 'is_straight', False)
-        turn_for_speed = 0.0 if is_straight else max(turn_now, turn_preview * 0.3)
+        # [2026-08-18] IMU 실측 회전량으로 "비전이 본 코너가 진짜인가" 교차검증(위
+        # _imu_corner_confirm_scale() 주석 참고) — is_straight가 아직 확정 전인 애매한
+        # 프레임에서 turn_now/turn_preview가 비전 잡음만으로 감속을 거는 걸 막는다.
+        imu_corner_scale = self._imu_corner_confirm_scale()
+        turn_for_speed = 0.0 if is_straight else max(turn_now, turn_preview * 0.3) * imu_corner_scale
         target_speed = max(SPEED_CORNER_MIN,
                            SPEED_NORMAL * (1.0 - 0.90 * turn_for_speed ** 3))
         # 코너 진입(회전반경 감소) 시 추가 감속 — 기존 turn_for_speed 기반 감속과는 독립적으로
@@ -1605,16 +1633,9 @@ class TrackDriverNode(Node):
         # 같은 이유로 건너뛴다(1.0 = 감속 없음).
         corner_radius_scale = 1.0 if is_straight else self._corner_radius_speed_scale()
         target_speed = max(SPEED_CORNER_MIN, target_speed * corner_radius_scale)
-        # [2026-08-10] DL_CENTER_MODE='ll'에서 노란/흰선 중 하나를 저신뢰 추정(간격
-        # 재구성 또는 잔상)으로 메운 프레임은 속도를 SPEED_LL_DEGRADED로 강제 제한한다
-        # (요청 반영). 가/감속 모두 accel_step 램프 없이 즉시 적용 — 기존 코너 감속도
-        # 감속 방향은 램프 없이 즉시 반영되는 관례(가속만 아래 accel_step로 제한)와 동일.
-        # DL 백엔드 + 'll' 모드일 때만 의미 있으므로 getattr로 안전하게 조회한다(다른
-        # 백엔드/모드에선 속성이 없거나 항상 False).
-        slide = getattr(self.lane_detector, '_slide', None)
-        if (LANE_DETECTOR_BACKEND == 'dl' and DL_CENTER_MODE == 'll'
-                and getattr(slide, 'll_degraded', False)):
-            target_speed = min(target_speed, SPEED_LL_DEGRADED)
+        # [2026-08-18] SPEED_LL_DEGRADED 캡 제거 — DL_CENTER_MODE='ll'일 때만 의미있던
+        # 로직인데 현재 DL_CENTER_MODE='da'로 완전히 전환되어 차선(ll) 기반 주행을
+        # 더 이상 쓰지 않는다(요청 반영). config.py SPEED_LL_DEGRADED 상수도 함께 삭제.
         # [2026-08-11] LANE_STALE_SEC 이상 새 차선인식 결과가 안 나온 상태(perc_lane()의
         # lane_stale, config.py LANE_STALE_SEC 주석 참고) — 조향 자체는 이미 self.lane_path가
         # 고정돼 있어 안전하게(발산 없이) 마지막 판단을 유지하지만, 그것만으론 "지금 인지가
@@ -1632,15 +1653,12 @@ class TrackDriverNode(Node):
         # 이탈했다. lane_stale과 같은 SPEED_LANE_STALE 캡을 여기도 건다.
         if self.lane_unstable:
             target_speed = min(target_speed, SPEED_LANE_STALE)
-        # [2026-08-15] avoid-hold 적용4(안전판) — 회피 유예가 걸려있는 동안 choose_side()가
-        # 0(양쪽 다 막혀 어느 쪽으로도 못 피함)을 반환하면 강제로 감속한다. avoid_hold_side는
-        # _update_avoid_hold()가 매 틱 갱신하므로 이 조건은 avoid_hold_active가 아닌 틱에는
-        # 자연히 걸리지 않는다(avoid_hold_side 자체는 항상 계산되지만 여기서 avoid_hold_active
-        # 도 같이 확인). SPEED_CORNER_MIN/SPEED_LL_DEGRADED/SPEED_LANE_STALE과 같은 "즉시 cap"
-        # 관례 — avoid_hold_improvement_proposal.md "적용4" 참고, SPEED_AVOID_HOLD_BLOCKED
-        # 실차 미검증.
-        if self.avoid_hold_active and self.avoid_hold_side == 0:
-            target_speed = min(target_speed, SPEED_AVOID_HOLD_BLOCKED)
+        # [2026-08-18] avoid-hold 적용4(SPEED_AVOID_HOLD_BLOCKED 안전판) 삭제 — 실차 테스트에서
+        # "속도 5 고정" 증상의 실제 원인으로 확인됨(README §2.43). TEST_DISABLE_B2_B3=True라
+        # 실제 회피 기동(옆차선 이동)은 꺼져있는데 이 캡만 무관하게 계속 걸려서, 트리거를
+        # 풀어줄 수단이 없어 무한정 5.0에 고정되는 구조였다. avoid_hold_active/avoid_hold_side
+        # 자체(타이머, _update_avoid_hold())와 DA 클리핑 방향 편향(적용3,
+        # perception/dl_lane.py set_avoid_hold()) 소비부는 그대로 유지 — 요청 반영(속도캡만 제거).
         speed_ratio = min(1.0, self._prev_speed / SPEED_NORMAL)
         corner_decay = CORNER_HOLD_DECAY_LO + (CORNER_HOLD_DECAY_HI - CORNER_HOLD_DECAY_LO) * speed_ratio
         self._corner_hold = max(turn_now, self._corner_hold * corner_decay)
@@ -1858,19 +1876,9 @@ class TrackDriverNode(Node):
             (10, 8 + 32 * len(lines)), (255, 255, 255), 18,
             f'DA seed width:{da_seed_width}px'))
 
-        # [2026-08-10] DL_CENTER_MODE='ll' 전용 — 노란선 기준 현재 차선 판정(lane_side)과
-        # 이번 프레임 저신뢰 추정(간격 재구성/잔상) 사용 여부. 후자가 True면
-        # _lane_drive()가 SPEED_LL_DEGRADED로 속도를 강제 제한 중이라는 뜻이라 빨강으로
-        # 강조 — 요청 반영("디버깅 페이지에도 띄울것").
-        if LANE_DETECTOR_BACKEND == 'dl' and DL_CENTER_MODE == 'll':
-            lane_side = getattr(slide, 'lane_side', None) if slide is not None else None
-            ll_degraded = getattr(slide, 'll_degraded', False) if slide is not None else False
-            degraded_kr = f'저신뢰(속도 {SPEED_LL_DEGRADED:.0f} 제한)' if ll_degraded else '정상'
-            degraded_en = f'DEGRADED (capped {SPEED_LL_DEGRADED:.0f})' if ll_degraded else 'OK'
-            side_color = (0, 0, 220) if ll_degraded else (255, 255, 255)
-            lines.append((
-                f'LL 차선:{lane_side} {degraded_kr}', (10, 8 + 32 * len(lines)), side_color, 18,
-                f'LL side:{lane_side} {degraded_en}'))
+        # [2026-08-18] SPEED_LL_DEGRADED 표시 블록 제거 — DL_CENTER_MODE='ll' 전용이었는데
+        # 현재 항상 'da'라 이 조건 자체가 죽어있었다(요청 반영, 위 target_speed 계산부의
+        # 동일 제거 사유 참고).
 
         canvas = np.full((8 + 32 * len(lines) + 16, 380, 3), 30, dtype=np.uint8)
         put_text_kr_multi(canvas, lines)
@@ -1985,8 +1993,8 @@ class TrackDriverNode(Node):
     # 방향 힌트가 뭔지를 실차에서 한눈에 보기 위한 것과 동시에, 이 기능이 새로 들여온
     # 파라미터 중 실측이 안 된 값들을 매 프레임 같이 띄워서 "이 숫자는 아직 지어낸
     # 값"이라는 걸 계속 상기시키는 용도(실측 절차는 avoid_hold_measurement_todo.md 참고).
-    # 아래 6개(RATE_GAIN/SEC_MAX/RELEASE_DIST_M/DA_AREA_JUMP_RATIO/DIR_BIAS_PX/
-    # SPEED_AVOID_HOLD_BLOCKED)는 그 문서에 적힌 측정 절차를 실차에서 그대로 따라가며
+    # 아래 5개(RATE_GAIN/SEC_MAX/RELEASE_DIST_M/DA_AREA_JUMP_RATIO/DIR_BIAS_PX)는
+    # 그 문서에 적힌 측정 절차를 실차에서 그대로 따라가며
     # 이 창의 실시간 값을 관찰하는 용도로도 쓰인다(예: da_area_jump가 실제 통과 순간에만
     # True로 뜨는지, 노이즈 프레임에서도 뜨는지 여기서 직접 눈으로 확인). control_loop()
     # 에서 매 주기 호출.
@@ -2036,11 +2044,10 @@ class TrackDriverNode(Node):
              (10, 178), UNMEASURED, 12,
              f'RATE_GAIN={AVOID_HOLD_RATE_GAIN} SEC_MAX={AVOID_HOLD_SEC_MAX} '
              f'RELEASE_DIST_M={AVOID_HOLD_RELEASE_DIST_M}'),
-            (f'DA_AREA_JUMP_RATIO={AVOID_HOLD_DA_AREA_JUMP_RATIO}   DIR_BIAS_PX={AVOID_HOLD_DIR_BIAS_PX}px'
-             f'   SPEED_BLOCKED={SPEED_AVOID_HOLD_BLOCKED}',
+            (f'DA_AREA_JUMP_RATIO={AVOID_HOLD_DA_AREA_JUMP_RATIO}   DIR_BIAS_PX={AVOID_HOLD_DIR_BIAS_PX}px',
              (10, 198), UNMEASURED, 12,
              f'DA_AREA_JUMP_RATIO={AVOID_HOLD_DA_AREA_JUMP_RATIO} '
-             f'DIR_BIAS_PX={AVOID_HOLD_DIR_BIAS_PX} SPEED_BLOCKED={SPEED_AVOID_HOLD_BLOCKED}'),
+             f'DIR_BIAS_PX={AVOID_HOLD_DIR_BIAS_PX}'),
         ]
         canvas = np.full((222, 620, 3), 30, dtype=np.uint8)
         put_text_kr_multi(canvas, lines)

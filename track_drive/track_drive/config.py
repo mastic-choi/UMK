@@ -107,9 +107,8 @@ SPEED_STOP    = 0.0
 #   진입/탈출 시 속도 급변이 과하게 느껴지면 이 값을 올리는 쪽으로 완화할 것.
 # [2026-08-17j] 15.0 → 7.0(요청 반영). SPEED_CORNER_MIN < SPEED_NORMAL(15.0) 관계가
 #   다시 확보돼 코너 감속이 실제로 걸린다(직전 [2026-08-17i]에서 15.0으로 올려 SPEED_NORMAL과
-#   같아지는 바람에 코너 감속이 no-op이었던 문제 해소). 단, SPEED_LL_DEGRADED/
-#   SPEED_LANE_STALE(5.0, 아래 §2 나머지 참고)은 요청에 따라 그대로 둠 — 인식 저신뢰/정지
-#   상황에서는 여전히 5.0으로 더 깎인다.
+#   같아지는 바람에 코너 감속이 no-op이었던 문제 해소). 단, SPEED_LANE_STALE(5.0, 아래
+#   참고)은 요청에 따라 그대로 둠 — 인지 정지 상황에서는 여전히 5.0으로 더 깎인다.
 # [2026-08-17i] 10.0 → 15.0(요청 반영). ★주의★ SPEED_NORMAL도 15.0이라 이제
 #   SPEED_CORNER_MIN == SPEED_NORMAL — _lane_drive()의 코너 감속(목표속도 하한 clip)이
 #   사실상 no-op이 된다(코너에서도 직진과 같은 속도로 주행, 감속 없음). 과거
@@ -123,19 +122,14 @@ SPEED_STOP    = 0.0
 #   않지만, 코너 감속 폭(15→10, 33%)이 이전(10→5, 50%)보다 완만해졌다는 점은 실차에서
 #   코너 진입 느낌으로 확인할 것 — 부족하면 이 값을 다시 낮출 것.
 SPEED_CORNER_MIN = 7.0
-# [2026-08-10] DL_CENTER_MODE='ll'에서 노란선/흰선 중 하나를 저신뢰 추정(간격 기반
-#   재구성 또는 잔상)으로 메운 프레임의 속도 상한 — perception/dl_lane.py
-#   DLSlideWindow.ll_degraded 플래그가 True면 _lane_drive()가 이 값으로 강제 제한한다
-#   (요청 반영: "안 보이면 속도 5로"). SPEED_CORNER_MIN과 우연히 같은 값이지만 의미가
-#   다른 별도 상수 — 코너 감속과 ll 저신뢰 감속은 서로 다른 이유라 독립적으로 튜닝할
-#   수 있어야 한다. 실차 미검증 초기값.
-SPEED_LL_DEGRADED = 5.0
+# [2026-08-18] SPEED_LL_DEGRADED(DL_CENTER_MODE='ll' 전용 속도 상한) 삭제 — 이제
+#   DL_CENTER_MODE='da'로 완전히 전환되어 차선(ll) 기반 주행 자체를 쓰지 않는다(요청
+#   반영). track_drive.py _lane_drive()/​_debug_viz_steer()의 소비부도 함께 제거.
 # [2026-08-11] DL 추론 워커(별도 스레드, dl_lane.py)가 LANE_STALE_SEC 이상 새 결과를 못
-#   내놓았을 때(카메라/추론 죽음 등, perc_lane()의 lane_stale 판정) 강제하는 속도 상한 —
-#   SPEED_LL_DEGRADED와 동일한 값이지만 사유가 다른 별도 상수(저신뢰 추정 vs 완전 정지된
-#   인지). 일부러 SPEED_CORNER_MIN(5.0)보다 낮추지 않았다 — "코너가 아닌데도 이 속도로
-#   깎였다"는 부자연스러움 자체가 사람이 알아챌 수 있는 신호가 되도록, 급정지가 아니라
-#   코너 감속과 비슷한 수준으로만 눈에 띄게 낮춘다는 설계(요청 반영). 실차 미검증.
+#   내놓았을 때(카메라/추론 죽음 등, perc_lane()의 lane_stale 판정) 강제하는 속도 상한.
+#   일부러 SPEED_CORNER_MIN(5.0)보다 낮추지 않았다 — "코너가 아닌데도 이 속도로 깎였다"는
+#   부자연스러움 자체가 사람이 알아챌 수 있는 신호가 되도록, 급정지가 아니라 코너 감속과
+#   비슷한 수준으로만 눈에 띄게 낮춘다는 설계(요청 반영). 실차 미검증.
 SPEED_LANE_STALE = 5.0
 ANGLE_MAX     = 80.0  # 조향각 클램프(도)
 ANGLE_RATE_MAX = 12.0  # 조향 변화율 제한(도/주기, 20Hz 기준 12도/주기=240도/초) — drive()에서 모든 명령에 일괄 적용
@@ -188,6 +182,25 @@ LANE_LOOKAHEAD_REF = 220.0   # 예측감속 최대가 되는 lookahead 편차(px
 #   깎는다. PIXELS_PER_METER 미실측이라 반경은 픽셀 단위 — 실차 미검증 추정치.
 CORNER_MIN_RADIUS_PX = 250.0
 CORNER_MIN_SPEED_SCALE = 0.35  # 반경이 0에 가까워져도 속도가 0으로 죽지 않게 하는 하한 배율
+
+# [2026-08-18] "직선인데 커브로 오검출돼 속도가 안 오른다" 대응 — turn_now(조향각 signed
+#   EMA)/turn_preview(lane_lookahead)는 전부 비전+조향출력에서만 나오는 신호라, 세그멘테이션
+#   잡음이나 조향 잔떨림만으로도 코너로 오인될 수 있다. is_straight(§0.5.9, PP_STRAIGHT_*)가
+#   이미 이 문제를 다루긴 하지만 여러 프레임 연속 확정이 필요한 이진 게이트라, 아직
+#   확정 전인 애매한 프레임에서는 turn_now/turn_preview가 잡음만으로 감속을 걸어도 못 막는다.
+#   2023 KMU 대회 AuTURBO rookie 팀 저장소(ModeController.py, github.com/AuTURBO/
+#   2023_KMU_Autonomous_team_AuTURBO_rookie)의 모드전환 로직을 참고 — 거기서도 비전(픽셀
+#   오차 평균)만으로는 "커브"를 확정하지 않고, diff_degree(IMU yaw 변화량 > 47도)로 실제
+#   회전량을 교차검증한 뒤에야 realcurve로 카운트한다. 그 아이디어를 연속값 버전으로
+#   가져와 track_drive.py._imu_corner_confirm_scale()에서 쓴다 — "비전은 코너라는데 IMU
+#   실측 회전율이 거의 0"이면 코너감속(turn_for_speed)을 절반 이하로 깎는다.
+#   CORNER_IMU_CONFIRM_KAPPA_PX = 1/CORNER_MIN_RADIUS_PX로 잡은 이유: 반경기반 추가감속
+#   (_corner_radius_speed_scale())이 작동을 시작하는 커브(반경<=250px)에서는 IMU 신뢰도가
+#   이미 1.0(무감쇠)에 도달해 있어야, 진짜 코너에서까지 이 게이트가 감속을 방해하지 않는다.
+#   IMU/VESC가 죽어있거나(_imu_curvature_px()가 None) dl+BEV 조합이 아니면 기존처럼 비전
+#   신호만으로 판단(무감쇠, 1.0)한다. 실차 미검증 첫 추정치.
+CORNER_IMU_CONFIRM_KAPPA_PX = 1.0 / CORNER_MIN_RADIUS_PX  # = 0.004 — 이 이상 IMU curvature면 코너감속 100% 신뢰
+CORNER_IMU_MIN_SCALE = 0.5  # IMU가 "회전 거의 없음"을 보고해도 비전신호 기반 감속을 최소 이만큼은 남겨두는 하한
 
 # ── 좌회전 공통 (S2→S3 진입, S3→S1 진출) — 전부 실차 튜닝 필요한 임시값 ──
 #   [2026-08-18] 종료 판정을 프레임 카운트(open-loop)에서 IMU yaw 실측 기반(closed-loop)으로
@@ -385,8 +398,9 @@ DL_DA_VELOCITY_EMA_ALPHA = 0.3      # 밴드 간 이동 속도(px/밴드) EMA �
 DL_DA_VELOCITY_MAX_PX = 40.0        # 예측 이동량 클램프
 DL_DA_BAND_ANCHOR_ALPHA = 0.35      # 밴드별 탐색창 중심 계산 시 "직전 프레임 그 밴드 위치"에 주는 가중치
 
-# ll sanity check — ROI 내 ll(차선) foreground 비율이 이 미만이면 da 결과와 무관하게 무효 처리
-DL_LL_SANITY_MIN_RATIO = 0.005
+# [2026-08-18] DL_LL_SANITY_MIN_RATIO(ll sanity check) 삭제 — lane_valid/path_ok 모두
+#   da 중심점 유무로만 판정하도록 바꿈(perception/dl_lane.py 참고, ll 미사용 확정에 따른
+#   정리, README §2.42 연장선).
 # da가 옆 차선과 이어붙었을 때 ll 라인 바깥(옆 차선 쪽) 픽셀을 잘라내는 여유폭(px)
 #   8 = 실측 라인 두께 2.5cm(=5px @200px/m) + 세그멘테이션 경계 흔들림(1~2px) 여유
 #   (위 [LQR 브랜치 이식] 주석 참고). 옛 값 15px은 필요 이상으로 넓게 잘라내 정상
@@ -594,12 +608,11 @@ AVOID_HOLD_DA_AREA_JUMP_RATIO = 1.4    # ★실측 필요★
 AVOID_HOLD_DIR_BIAS_PX = 20.0   # ≈ PASS_OFFSET(80.0, "7. 기타" 절, 실측 기반)의 1/4.
                                  #   ★비율 자체는 실측/재검증 필요★
 
-# [적용4] 안전판(track_drive.py _lane_drive()) — avoid_hold 활성 중 choose_side()가
-#   0(양쪽 다 막혀 어느 쪽으로도 못 피함)을 반환하면 목표속도를 강제로 이 값까지 낮춘다
-#   (F1TENTH류 반응형 스택의 "완벽한 회피보다 안전한 감속" 철학 반영). SPEED_CORNER_MIN/
-#   SPEED_LL_DEGRADED/SPEED_LANE_STALE(위 "2. 차량 속도/조향 기본값" 절)과 같은 "즉시 cap"
-#   관례 — 급정지가 아니라 눈에 띄게만 낮춘다는 설계도 동일.
-SPEED_AVOID_HOLD_BLOCKED = 5.0   # SPEED_CORNER_MIN과 같은 값으로 시작(모터 데드존 위 안전마진). ★실측 필요★
+# [2026-08-18] [적용4] SPEED_AVOID_HOLD_BLOCKED 안전판 삭제 — 실차 테스트에서 "속도 5
+#   고정" 증상의 실제 원인으로 확인됨(README §2.43 참고). TEST_DISABLE_B2_B3=True로 실제
+#   회피 기동(옆차선 이동)은 꺼져있는데 이 캡만 무관하게 계속 걸려서, 트리거를 풀어줄
+#   수단이 없어 무한정 고정되는 구조였다. avoid_hold 타이머/DA 클리핑 방향 편향(적용3,
+#   AVOID_HOLD_DIR_BIAS_PX 위 참고)은 그대로 유지 — 요청 반영(속도캡 소비부만 제거).
 
 # [2026-08-10] DL_CENTER_MODE='ll' 내부에서 실제 밴드 중심 계산 알고리즘을 고르는
 #   2차 스위치 — 같은 날 두 사람이 독립적으로 서로 다른 재설계를 했다(origin/main
@@ -1390,22 +1403,21 @@ PP_TUNE_PRESETS = {
         SPEED_NORMAL=12.5,
     ),
     'speed15': dict(
-        PP_LOOKAHEAD_BASE_PX=81.12, PP_LOOKAHEAD_SPEED_GAIN=1.225, PP_LOOKAHEAD_MAX_PX=278.0,
-        PP_WHEELBASE_PX=49.97, PP_ALPHA=0.9349, PP_MIN_LOOKAHEAD_PX=62.77, PP_DX_DEADZONE_PX=1.887,
-        PP_LOOKAHEAD_CURVATURE_GAIN=508.0, PP_LOOKAHEAD_MIN_PX=45.14,
-        PP_STRAIGHT_CURVATURE_EPS=0.00574, PP_STRAIGHT_CONFIRM_FRAMES=5, PP_STRAIGHT_DEADZONE_PX=11.35,
-        PP_STRAIGHT_ALPHA=0.411, PP_STRAIGHT_BIAS_EMA_ALPHA=0.7405,
-        # [2026-08-18 배포 직후 수정] 실차 테스트 중 발견 — 그리드서치 원값 15.77이
-        # SPEED_NORMAL(15.0)보다 커서 max(SPEED_CORNER_MIN, SPEED_NORMAL*(1-...)) 공식상
-        # 코너감속 경로가 완전히 죽어있었다(§0.5.10과 동일 실패모드). 실차에서 관찰된
-        # "속도 5 고정" 증상 자체의 원인은 아니었음(그건 LL_DEGRADED/LANE_STALE/
-        # AVOID_HOLD_BLOCKED 캡 — 전부 5.0 — 이 원인으로 추정, 인식 불안정 쪽 별도 확인
-        # 필요) — 다만 이 버그도 별개로 진짜였고 방치하면 실제 코너에서 무감속 위험이
-        # 있어 SPEED_NORMAL*0.7(=10.5)로 완화.
-        SPEED_CORNER_MIN=10.5, CORNER_SIGN_EMA_ALPHA=0.7895, LANE_LOOKAHEAD_REF=477.6,
-        SPEED_ACCEL_STEP=1.476, CORNER_HOLD_DECAY_LO=0.9196, CORNER_HOLD_DECAY_HI=0.9215,
-        CORNER_MIN_RADIUS_PX=678.3, CORNER_MIN_SPEED_SCALE=0.345,
-        PATH_EMA_ALPHA=0.6403, DL_STABLE_FRAME_MIN=5, DL_STABLE_JUMP_MAX=35.35,
+        # [2026-08-18 재그리드서치] 이전 값(BASE=81.12/GAIN=1.225/MAX=278.0/WHEELBASE=49.97/
+        # ALPHA=0.9349 등) 전체를 재실행 결과로 교체(요청 반영). 이번 원값은
+        # SPEED_CORNER_MIN=13.34 < SPEED_NORMAL(15.0)을 그대로 만족해 위 speed10/12.5
+        # 프리셋에서 겪은 "그리드서치 원값이 SPEED_NORMAL보다 커서 코너감속이 no-op"
+        # 버그가 재현되지 않았다 — SPEED_NORMAL*0.7 클램프 불필요, 그리드서치 원값 그대로 적용.
+        # 실차 재검증 전.
+        PP_LOOKAHEAD_BASE_PX=94.38, PP_LOOKAHEAD_SPEED_GAIN=1.01, PP_LOOKAHEAD_MAX_PX=265.4,
+        PP_WHEELBASE_PX=32.52, PP_ALPHA=0.76, PP_MIN_LOOKAHEAD_PX=69.19, PP_DX_DEADZONE_PX=5.204,
+        PP_LOOKAHEAD_CURVATURE_GAIN=602.3, PP_LOOKAHEAD_MIN_PX=50.74,
+        PP_STRAIGHT_CURVATURE_EPS=0.01142, PP_STRAIGHT_CONFIRM_FRAMES=10, PP_STRAIGHT_DEADZONE_PX=3.439,
+        PP_STRAIGHT_ALPHA=0.889, PP_STRAIGHT_BIAS_EMA_ALPHA=0.8182,
+        SPEED_CORNER_MIN=13.34, CORNER_SIGN_EMA_ALPHA=0.8113, LANE_LOOKAHEAD_REF=331.3,
+        SPEED_ACCEL_STEP=3.851, CORNER_HOLD_DECAY_LO=0.9301, CORNER_HOLD_DECAY_HI=0.9753,
+        CORNER_MIN_RADIUS_PX=1227, CORNER_MIN_SPEED_SCALE=0.4969,
+        PATH_EMA_ALPHA=0.9472, DL_STABLE_FRAME_MIN=1, DL_STABLE_JUMP_MAX=37.44,
         SPEED_NORMAL=15.0,
     ),
     'speed17_5': dict(
@@ -1421,18 +1433,20 @@ PP_TUNE_PRESETS = {
         SPEED_NORMAL=17.5,
     ),
     'speed20': dict(
-        PP_LOOKAHEAD_BASE_PX=80.62, PP_LOOKAHEAD_SPEED_GAIN=1.353, PP_LOOKAHEAD_MAX_PX=243.3,
-        PP_WHEELBASE_PX=49.36, PP_ALPHA=0.7727, PP_MIN_LOOKAHEAD_PX=88.88, PP_DX_DEADZONE_PX=1.898,
-        PP_LOOKAHEAD_CURVATURE_GAIN=526.2, PP_LOOKAHEAD_MIN_PX=44.0,
-        PP_STRAIGHT_CURVATURE_EPS=0.001976, PP_STRAIGHT_CONFIRM_FRAMES=10, PP_STRAIGHT_DEADZONE_PX=6.18,
-        PP_STRAIGHT_ALPHA=0.5738, PP_STRAIGHT_BIAS_EMA_ALPHA=0.4795,
-        # [주의] speed_corner_min이 다른 속도보다 훨씬 낮음(5.818) — §8 상단 경고의
-        # "14.05로 트랙 이탈" 사례와는 반대 방향(과감속 쪽)이라 그 실패모드 재현
-        # 가능성은 낮지만, 코너 대응이 다른 속도 프리셋보다 약할 수 있다.
-        SPEED_CORNER_MIN=5.818, CORNER_SIGN_EMA_ALPHA=0.1089, LANE_LOOKAHEAD_REF=458.9,
-        SPEED_ACCEL_STEP=1.576, CORNER_HOLD_DECAY_LO=0.9285, CORNER_HOLD_DECAY_HI=0.9612,
-        CORNER_MIN_RADIUS_PX=185.1, CORNER_MIN_SPEED_SCALE=0.3435,
-        PATH_EMA_ALPHA=0.7997, DL_STABLE_FRAME_MIN=10, DL_STABLE_JUMP_MAX=21.91,
+        # [2026-08-18 재그리드서치] 이전 값(BASE=80.62/GAIN=1.353/MAX=243.3/WHEELBASE=49.36/
+        # ALPHA=0.7727 등, SPEED_CORNER_MIN=5.818) 전체를 재실행 결과로 교체(요청 반영).
+        # 새 SPEED_CORNER_MIN=15.83 < SPEED_NORMAL(20.0) 만족 — 그리드서치 원값 그대로 적용.
+        # DL_STABLE_JUMP_MAX가 21.91→104.2로 크게 뛰었다는 점은 실차에서 da/ll 튐 허용폭이
+        # 훨씬 넓어졌다는 뜻이라 눈여겨볼 것. 실차 재검증 전.
+        PP_LOOKAHEAD_BASE_PX=99.6, PP_LOOKAHEAD_SPEED_GAIN=0.8793, PP_LOOKAHEAD_MAX_PX=331.9,
+        PP_WHEELBASE_PX=38.19, PP_ALPHA=0.9274, PP_MIN_LOOKAHEAD_PX=59.4, PP_DX_DEADZONE_PX=3.577,
+        PP_LOOKAHEAD_CURVATURE_GAIN=840.7, PP_LOOKAHEAD_MIN_PX=61.31,
+        PP_STRAIGHT_CURVATURE_EPS=0.006292, PP_STRAIGHT_CONFIRM_FRAMES=5, PP_STRAIGHT_DEADZONE_PX=3.746,
+        PP_STRAIGHT_ALPHA=0.9339, PP_STRAIGHT_BIAS_EMA_ALPHA=0.349,
+        SPEED_CORNER_MIN=15.83, CORNER_SIGN_EMA_ALPHA=0.7536, LANE_LOOKAHEAD_REF=459.4,
+        SPEED_ACCEL_STEP=4.678, CORNER_HOLD_DECAY_LO=0.9445, CORNER_HOLD_DECAY_HI=0.9143,
+        CORNER_MIN_RADIUS_PX=678.6, CORNER_MIN_SPEED_SCALE=0.261,
+        PATH_EMA_ALPHA=0.9288, DL_STABLE_FRAME_MIN=1, DL_STABLE_JUMP_MAX=104.2,
         SPEED_NORMAL=20.0,
     ),
     'speed22_5': dict(
