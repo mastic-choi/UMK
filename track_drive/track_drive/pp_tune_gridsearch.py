@@ -232,7 +232,13 @@ DT = 0.05                                   # control_loop() 주기와 동일
 # 더 걸리는 조합은 30초를 넘겨 부당하게 미완주 판정될 수 있다. 0.1347 기준으로 캘리브레이션한
 # 30.0을 METERS_PER_SPEED_UNIT 비율로 그대로 스케일링 — 나중에 이 상수가 또 바뀌어도 자동으로
 # 맞춰지도록 하드코딩 대신 수식으로 둔다.
-MAX_SIM_T = 30.0 * (0.1347 / cfg.METERS_PER_SPEED_UNIT)
+# [2026-08-18, 도면 사진 재확인] 위 30.0은 옛 실전트랙(직선 길이 임의 근사, 총 ~23m)
+# 기준이었다. TRACK_LEFT_STRAIGHT_M/TRACK_TOP_BOTTOM_STRAIGHT_M을 도면 실측치로
+# 교체하면서 실전트랙 총길이가 41.8m로 약 1.82배 늘었다(실측: build_paths()['실전트랙']
+# 폴리라인 길이 합) — 그대로 두면 baseline speed=10에서 소요 46.95s vs 한계 47.65s로
+# 여유가 0.7초밖에 안 남아 그리드서치 중 정상 조합도 미완주로 오판될 위험이 있다.
+# 트랙 길이 비율(41.8/23≈1.82)만큼 base를 30.0→55.0으로 올려 다시 여유를 확보했다.
+MAX_SIM_T = 55.0 * (0.1347 / cfg.METERS_PER_SPEED_UNIT)
 DIVERGE_CTE_M = 1.0                         # 이 이상 벗어나면 "발산"으로 보고 그 즉시 종료+페널티
 PATH_DS = 0.02                              # 기준경로 점 간격(m) — build_paths()/build_track_path()
                                              # 둘 다 이 값을 기본값으로 쓴다(아래 NEAREST_WINDOW_M을
@@ -269,6 +275,21 @@ TRACK_ZIGZAG_RADII_M = (1.615, 1.530, 1.595, 1.470)
 ZIGZAG_WIGGLE_DEG = 20.0                    # 위 "알려진 한계" 참고 — 임의 가정값
 TRANSITION_ZONE_M = 0.4                     # 모드 경계 앞뒤 이 거리(m) 안쪽을 "전환구간"으로
                                              # 별도 채점(모드 전환 시 손실 파악용) — 임의 설계값
+
+# [2026-08-18, 도면 사진 재확인] 이전엔 직선 길이를 "각 모드를 관찰하기 충분한" 임의값
+# (좌측 4.0m/상하 6.0m, build_track_path() 기본 인자)으로 뒀는데, 사용자가 도면 사진을
+# 직접 보여줘서 실측 치수를 다시 읽었다 — 이전 근사가 실제 비율과 3~4배 차이나서 시각화가
+# "완전히 다르다"는 지적을 받음(곡률 반경은 이미 정확했으니 문제는 직선 비율이었다).
+#   - 좌측 직선(그림 왼쪽, "8,260" 치수선) ≈ 8.26m → build_track_path()가 시작/끝에서
+#     반씩(lead_in_m) 나눠 쌓아 루프를 닫으므로 lead_in_m = 8.26/2 ≈ 4.13m.
+#   - 상/하단 직선(그림 하단, "10,140" 치수선 — 해당 변에서 가장 크고 뚜렷한 구간) ≈ 10.14m.
+#     상/하단이 같은 길이라는 전제는 도면상 오벌 대칭 형태로 봤을 때 합리적인 근사.
+#   [알려진 한계] 도면 치수선이 벽/기둥/통로 폭까지 잘게 쪼개 표기돼 있어서(예: 하단은
+#   580/450/2,820/1,795/10,140/1,815/940/1,615로 8분할), "어느 구간이 정확히 트랙
+#   직선부인가"는 그림에서 가장 크고 대표적인 값으로 판단한 것이지 좌표 단위 실측은
+#   아니다 — 여전히 근사치. 픽셀 단위로 도면을 다시 재는 것보다는 훨씬 실제에 가깝다.
+TRACK_LEFT_STRAIGHT_M = 8.26                # 좌측 직선 전체 길이(도면 "8,260" 치수)
+TRACK_TOP_BOTTOM_STRAIGHT_M = 10.14         # 상/하단 직선 길이(도면 "10,140" 치수, 대칭 가정)
 
 
 # ─────────────────────────── 기준경로 생성 (월드 좌표, 미터, 표준 수학각) ───────────────────────────
@@ -337,13 +358,17 @@ def build_paths(ds=PATH_DS):
     return paths, path_meta
 
 
-def build_track_path(ds=PATH_DS, lead_in_m=2.0, straight_mid_m=3.0):
+def build_track_path(ds=PATH_DS, lead_in_m=TRACK_LEFT_STRAIGHT_M / 2.0,
+                      straight_mid_m=TRACK_TOP_BOTTOM_STRAIGHT_M):
     """직진→커브(R1.95,90도)→직진→지그재그(4원호, 실측반경)→직진→커브(R1.95,90도)→직진
-    순서로 이어지는 연속 경로 — 트랙 도면(위 TRACK_* 상수 주석 참고)의 곡률을 그대로 쓰되,
-    직선 길이는 도면 실측이 아니라 "각 모드에서 정상상태에 도달하고 전환을 관찰하기에
-    충분한" 근사값이다(실제 길이를 맞추는 게 목적이 아니라 각 모드가 순서대로 이어지는
-    과정 자체를 보는 게 목적). 코너1(90도)+지그재그(net 180도)+코너2(90도)=360도라 방향이
-    제자리로 돌아오는 닫힌 루프가 된다(도면이 실제로 폐루프 트랙인 것과 일치).
+    순서로 이어지는 연속 경로 — 트랙 도면(위 TRACK_* 상수 주석 참고)의 곡률과 직선 길이를
+    그대로 쓴다(2026-08-18 도면 재확인 전에는 직선 길이가 임의 근사값이라 실제 비율과
+    3~4배 차이났었다 — 위 TRACK_LEFT_STRAIGHT_M/TRACK_TOP_BOTTOM_STRAIGHT_M 주석 참고).
+    lead_in_m은 좌측 직선 전체 길이의 절반이다 — 이 함수가 좌측 직선 중간 지점에서
+    시작해 한 바퀴 돌고 다시 좌측 직선 중간으로 돌아오는 구조라, 시작 부분(lead_in_m)과
+    끝 부분(lead_in_m)을 합쳐야 좌측 직선 실제 총길이가 된다. 코너1(90도)+지그재그(net
+    180도)+코너2(90도)=360도라 방향이 제자리로 돌아오는 닫힌 루프가 된다(도면이 실제로
+    폐루프 트랙인 것과 일치).
 
     반환: (pts, segments). segments는 (start_idx, end_idx_exclusive, mode_name) 리스트로,
     simulate()가 모드별/전환구간별 성능을 따로 채점할 수 있게 해준다."""
@@ -477,14 +502,17 @@ def _corner_radius_speed_scale(corner_signal_deg, wheelbase_px, corner_min_radiu
     return max(corner_min_speed_scale, radius / corner_min_radius_px)
 
 
-def simulate(pp, world_pts, speed_norm, sp, rng, meta=None):
+def simulate(pp, world_pts, speed_norm, sp, rng, meta=None, record_trajectory=False):
     """speed_norm: 이 시나리오의 SPEED_NORMAL(모터단위, 순항 목표속도).
     sp: 감속+경로스무딩+디바운스 관련 파라미터 dict(SPEED_KEYS/PATH_KEYS/DEBOUNCE_KEYS 참고)
     — track_drive.py의 _lane_drive() 코너 감속, perception/lane_util.py._update_path()의
     PATH_EMA_ALPHA 경로 스무딩, _debounce()의 N프레임 확정 게이트를 그대로 재현한다.
     meta: build_paths()가 '실전트랙'에 대해서만 채워주는 {'mode_arr','transition_mask'} —
     있으면 모드별/전환구간별 cte도 추가로 집계한다(없으면 기존 3개 시나리오처럼 집계 없이
-    진행)."""
+    진행).
+    record_trajectory: [2026-08-18, 시각화용] True면 매 틱 (vx, vy)를 결과 dict의
+    'trajectory' 키에 리스트로 담아 반환한다 — 그리드서치/스코어링에는 전혀 쓰이지 않는
+    순수 부가기능(기본 False, 기존 호출부 전부 무영향)."""
     vx, vy, vth = float(world_pts[0, 0]), float(world_pts[0, 1]), math.pi / 2
     pp.reset()
 
@@ -514,6 +542,7 @@ def simulate(pp, world_pts, speed_norm, sp, rng, meta=None):
     prev_actuated_steer = 0.0  # drive()의 self._prev_angle_out과 동일 역할 — 아래 [조향 변화율 제한] 참고
 
     ctes, steers, straight_flags, speeds = [], [], [], []
+    trajectory = []
     mode_hits, transition_ctes = [], []
     path_end = world_pts[-1]
     n_ticks = int(MAX_SIM_T / DT)
@@ -670,6 +699,8 @@ def simulate(pp, world_pts, speed_norm, sp, rng, meta=None):
         steers.append(actuated_steer)
         straight_flags.append(is_straight)
         speeds.append(prev_speed)
+        if record_trajectory:
+            trajectory.append((vx, vy))
         if meta is not None:
             mode_hits.append(meta['mode_arr'][idx])
             if meta['transition_mask'][idx]:
@@ -706,6 +737,13 @@ def simulate(pp, world_pts, speed_norm, sp, rng, meta=None):
         'elapsed_s': len(ctes) * DT,
         'completed': completed,
     }
+    if record_trajectory:
+        result['trajectory'] = trajectory
+        # ctes/speeds는 위에서 이미 매 틱 쌓아온 배열을 그대로 노출 — 새로 추적하지 않는다.
+        result['cte_seq'] = ctes.tolist()
+        result['speed_seq'] = speeds.tolist()
+        if meta is not None:
+            result['mode_seq'] = mode_hits
 
     if meta is not None:
         # ctes/mode_hits/transition_ctes는 매 틱 동시에 append되므로(위 루프) 길이가
