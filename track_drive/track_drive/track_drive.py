@@ -1776,6 +1776,10 @@ class TrackDriverNode(Node):
         그대로 유지한다 — pure_pursuit.control()이 내부적으로 이렇게 처리한다.
         [2026-08-14] STEERING_CONTROLLER로 pure_pursuit/lqr 중 고르던 분기를 LQR 컨트롤러
         제거와 함께 없앴다 — 이제 pure_pursuit 고정."""
+        # [2026-08-19] 근접 장애물 급회피 대응 — path 인자를 명시로 넘기는 호출부
+        # (_handle_lavacon() 등)는 아래 if path is None 분기를 안 타므로 near_obstacle이
+        # 항상 False로 남는다 — 라바콘 등 다른 주행모드는 이 변경과 구조적으로 무관하다.
+        near_obstacle = False
         if path is None:
             path = self.lane_path
             # [2026-08-17] roi_w/2.0(캔버스 단순 절반) 대신, 백엔드가 노출하면
@@ -1786,11 +1790,17 @@ class TrackDriverNode(Node):
             vehicle_x = getattr(self.lane_detector, 'vehicle_center_x', None)
             if vehicle_x is None:
                 vehicle_x = roi_w / 2.0
+            # obstacle_front/obstacle_dist는 TEST_DISABLE_B2_B3와 무관하게 perc_obstacle()가
+            # 매 틱 갱신하므로 별도 stale 가드 없이 바로 써도 안전하다(_update_avoid_hold()와
+            # 동일 근거). AVOID_HOLD_TRIGGER_DIST_M(기존 상수, 1.5m) 재사용 — 별도 상수
+            # 안 늘림(요청 반영). pure_pursuit.py _target_point_max_deviation() 참고.
+            near_obstacle = self.obstacle_front and self.obstacle_dist < AVOID_HOLD_TRIGGER_DIST_M
         if not path or vehicle_x is None:
             return self.pure_pursuit.prev_steer_deg
         vehicle_xy = (vehicle_x, path[0][1])
         return self.pure_pursuit.control(path, vehicle_xy, speed=self._speed_for_lookahead(),
-                                          imu_curvature_px=self._imu_curvature_px())
+                                          imu_curvature_px=self._imu_curvature_px(),
+                                          near_obstacle=near_obstacle)
 
     # [DEBUG_VIZ_STEER] 조향 컨트롤러가 이번 주기에 "새로 계산"했는지(초록/현재값 반영)
     # "직전 조향각을 그대로 유지"했는지(주황/직전값 유지)를 별도 창으로 바로 확인.

@@ -226,7 +226,50 @@ class PurePursuitController:
             prev = (x, y)
         return path[-1]
 
-    def control(self, path, vehicle_xy, speed=0.0, imu_curvature_px=None):
+    def _target_point_max_deviation(self, path, vehicle_xy, lookahead_px):
+        """[2026-08-19] 근접 장애물 급회피 대응 — _target_point()가 "호길이 lookahead_px
+        지점 딱 한 점"만 보는 것과 달리, 차량~lookahead_px 구간 전체를 훑으면서
+        가로편차(|x-vehicle_x|)가 가장 큰 점을 목표점으로 삼는다.
+
+        왜 필요한가: da 안전마진(§2.30, DL_DA_SIDE_MARGIN_M)을 넓힌 뒤, 경로가
+        근접부에서는 급하게 옆차선 쪽으로 꺾이고 그 뒤로는 완만해지는(비단조적)
+        모양이 나오는 경우가 생겼다. 기존 _target_point()는 그 급한 꺾임을
+        지나쳐 먼 지점의 "각도"만 보므로(alpha가 커도 ld가 커서 curvature=
+        2*sin(alpha)/ld 가 작게 나옴), 실제로는 지금 당장 크게 틀어야 하는데도
+        조향이 완만하게만 걸려 충돌하는 문제가 실차에서 재현됨.
+
+        단조롭게 휘는 보통 커브(장애물 유무 무관)에서는 편차가 거리에 비례해
+        커지므로 최대편차점이 결국 _target_point()가 고르는 가장 먼 점과 같아져
+        결과가 사실상 동일하다 — 이 메서드가 실제로 다른 결과를 내는 건 경로가
+        진짜로 비단조적일 때뿐이다. 그래서 control()은 이 메서드를 상시 쓰지
+        않고 근접 장애물이 있을 때만 한정적으로 쓴다(호출부 주석 참고) — 평상시
+        주행에 쓰던 검증된 _target_point()의 안정성(§0.5)을 건드리지 않기 위함.
+
+        _target_point()와 동일한 경계 처리(호길이 lookahead_px 지점에서 선형보간,
+        경로가 짧으면 마지막 점)를 그대로 따르되, 그 경계점까지 지나온 모든 점과
+        경계점 자신 중 편차 최댓값을 반환한다. 실차 미검증."""
+        acc = 0.0
+        prev = vehicle_xy
+        best_pt = path[-1] if path else vehicle_xy
+        best_dev = -1.0
+        for x, y in path:
+            seg = math.hypot(x - prev[0], y - prev[1])
+            if seg > 1e-6 and acc + seg >= lookahead_px:
+                t = (lookahead_px - acc) / seg
+                boundary = (prev[0] + t * (x - prev[0]), prev[1] + t * (y - prev[1]))
+                dev = abs(boundary[0] - vehicle_xy[0])
+                if dev > best_dev:
+                    best_pt = boundary
+                return best_pt
+            dev = abs(x - vehicle_xy[0])
+            if dev > best_dev:
+                best_dev = dev
+                best_pt = (x, y)
+            acc += seg
+            prev = (x, y)
+        return best_pt
+
+    def control(self, path, vehicle_xy, speed=0.0, imu_curvature_px=None, near_obstacle=False):
         """path : [(x,y), ...] ROI 픽셀좌표, 가까운점(차량 근처)→먼점 순
            vehicle_xy : (x,y) 차량 기준점(관례상 ROI 하단 중앙 == path[0] 근방)
            speed : 직전 프레임 명령속도(track_drive.py의 _prev_speed, 모터 단위) 근사치 —
@@ -238,6 +281,11 @@ class PurePursuitController:
                    dl+BEV 조합일 때만 값을 주고, 그 외(둘 중 하나라도 죽어있거나 다른
                    백엔드)엔 None을 줘서 아래 로직이 기존처럼 probe_curvature 단독
                    판단으로 자동 폴백하게 만든다.
+           near_obstacle : [2026-08-19] True면 목표점 선택을 _target_point() 대신
+                   _target_point_max_deviation()으로 바꾼다(그 메서드 docstring 참고) —
+                   기본값 False라 이 인자를 안 넘기는 기존 호출부(track_drive.py
+                   _handle_lavacon() 등)는 전과 완전히 동일하게 동작한다. 그 외
+                   lookahead/댐핑/필터/클램프 로직은 이 값과 무관하게 전부 동일하다.
            반환 : 조향각(도), ±angle_max_deg로 클램프.
            호출 후 self.held로 이번 호출이 "새로 계산"(False)했는지 "직전값 유지"(True)
            했는지, self.last_curvature로 이번(혹은 마지막 유효) curvature를 확인할 수
@@ -291,7 +339,10 @@ class PurePursuitController:
         else:
             lookahead_px = (self.lookahead_alpha * lookahead_px_raw
                              + (1.0 - self.lookahead_alpha) * self.last_lookahead_px)
-        tx, ty = self._target_point(path, vehicle_xy, lookahead_px)
+        if near_obstacle:
+            tx, ty = self._target_point_max_deviation(path, vehicle_xy, lookahead_px)
+        else:
+            tx, ty = self._target_point(path, vehicle_xy, lookahead_px)
         self.last_target_xy = (tx, ty)
         self.last_lookahead_px = lookahead_px
         dx = tx - vehicle_xy[0]
