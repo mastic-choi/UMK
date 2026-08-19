@@ -1268,7 +1268,7 @@ class TrackDriverNode(Node):
         # 차량(원점)에서 시작해 정점을 순서대로 잇는다. 원은 정점 하나하나(각 박스의
         # 좌/우 픽 포인트 중점 — "영역"이 아니라 점 하나씩).
         path_m = self._lavacon_path_m
-        if path_m:
+        if DEBUG_VIZ_LAVACON_SHOW_PATH and path_m:
             prev_px = (ORIGIN_EX, ORIGIN_EY)
             for wx, wy in path_m:
                 cur_px = to_px(wx, wy)
@@ -1377,7 +1377,7 @@ class TrackDriverNode(Node):
 
         # 참고용 — 이 boxes로부터 계산된 최종 조향 경로(중점). _draw_lavacon_bev()의 노란
         # 선/점과 같은 재료(self._lavacon_path_m)라 여긴 얇게만 겹쳐 그려 좌/우 차선을 가리지 않게 함.
-        if path_m:
+        if DEBUG_VIZ_LAVACON_SHOW_PATH and path_m:
             prev_px = (ORIGIN_EX, ORIGIN_EY)
             for wx, wy in path_m:
                 cur_px = to_px(wx, wy)
