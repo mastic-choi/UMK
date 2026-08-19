@@ -105,11 +105,14 @@ SPEED_STOP    = 0.0
 #   올렸다가, 이후 5.0으로 재상향(요청 반영) — 데드존 대비 여유를 더 두어 코너에서도 확실히
 #   전진하도록 함. SPEED_NORMAL이 25.0으로 오른 만큼 최고/최저 속도 폭이 넓어졌으니, 코너
 #   진입/탈출 시 속도 급변이 과하게 느껴지면 이 값을 올리는 쪽으로 완화할 것.
+# [2026-08-19] 7.0 → 5.0(요청 반영). 현재 활성 프리셋(speed15)은 SPEED_CORNER_MIN을
+#   따로 덮어쓰지 않아 이 기본값이 그대로 쓰인다 — 실효 SPEED_NORMAL(프리셋이 12.0으로
+#   덮어씀)보다 여전히 낮아(5.0 < 12.0) 아래 no-op 버그 재발 없음. 모터 데드존(~1.4)보다도
+#   충분히 위. 실차 재검증 필요.
 # [2026-08-17j] 15.0 → 7.0(요청 반영). SPEED_CORNER_MIN < SPEED_NORMAL(15.0) 관계가
 #   다시 확보돼 코너 감속이 실제로 걸린다(직전 [2026-08-17i]에서 15.0으로 올려 SPEED_NORMAL과
-#   같아지는 바람에 코너 감속이 no-op이었던 문제 해소). 단, SPEED_LL_DEGRADED/
-#   SPEED_LANE_STALE(5.0, 아래 §2 나머지 참고)은 요청에 따라 그대로 둠 — 인식 저신뢰/정지
-#   상황에서는 여전히 5.0으로 더 깎인다.
+#   같아지는 바람에 코너 감속이 no-op이었던 문제 해소). 단, SPEED_LANE_STALE(5.0, 아래
+#   참고)은 요청에 따라 그대로 둠 — 인지 정지 상황에서는 여전히 5.0으로 더 깎인다.
 # [2026-08-17i] 10.0 → 15.0(요청 반영). ★주의★ SPEED_NORMAL도 15.0이라 이제
 #   SPEED_CORNER_MIN == SPEED_NORMAL — _lane_drive()의 코너 감속(목표속도 하한 clip)이
 #   사실상 no-op이 된다(코너에서도 직진과 같은 속도로 주행, 감속 없음). 과거
@@ -122,20 +125,15 @@ SPEED_STOP    = 0.0
 #   SPEED_NORMAL(15.0) > SPEED_CORNER_MIN(10.0) 관계는 유지되므로 이번엔 그 문제가 재현되진
 #   않지만, 코너 감속 폭(15→10, 33%)이 이전(10→5, 50%)보다 완만해졌다는 점은 실차에서
 #   코너 진입 느낌으로 확인할 것 — 부족하면 이 값을 다시 낮출 것.
-SPEED_CORNER_MIN = 7.0
-# [2026-08-10] DL_CENTER_MODE='ll'에서 노란선/흰선 중 하나를 저신뢰 추정(간격 기반
-#   재구성 또는 잔상)으로 메운 프레임의 속도 상한 — perception/dl_lane.py
-#   DLSlideWindow.ll_degraded 플래그가 True면 _lane_drive()가 이 값으로 강제 제한한다
-#   (요청 반영: "안 보이면 속도 5로"). SPEED_CORNER_MIN과 우연히 같은 값이지만 의미가
-#   다른 별도 상수 — 코너 감속과 ll 저신뢰 감속은 서로 다른 이유라 독립적으로 튜닝할
-#   수 있어야 한다. 실차 미검증 초기값.
-SPEED_LL_DEGRADED = 5.0
+SPEED_CORNER_MIN = 8.0
+# [2026-08-18] SPEED_LL_DEGRADED(DL_CENTER_MODE='ll' 전용 속도 상한) 삭제 — 이제
+#   DL_CENTER_MODE='da'로 완전히 전환되어 차선(ll) 기반 주행 자체를 쓰지 않는다(요청
+#   반영). track_drive.py _lane_drive()/​_debug_viz_steer()의 소비부도 함께 제거.
 # [2026-08-11] DL 추론 워커(별도 스레드, dl_lane.py)가 LANE_STALE_SEC 이상 새 결과를 못
-#   내놓았을 때(카메라/추론 죽음 등, perc_lane()의 lane_stale 판정) 강제하는 속도 상한 —
-#   SPEED_LL_DEGRADED와 동일한 값이지만 사유가 다른 별도 상수(저신뢰 추정 vs 완전 정지된
-#   인지). 일부러 SPEED_CORNER_MIN(5.0)보다 낮추지 않았다 — "코너가 아닌데도 이 속도로
-#   깎였다"는 부자연스러움 자체가 사람이 알아챌 수 있는 신호가 되도록, 급정지가 아니라
-#   코너 감속과 비슷한 수준으로만 눈에 띄게 낮춘다는 설계(요청 반영). 실차 미검증.
+#   내놓았을 때(카메라/추론 죽음 등, perc_lane()의 lane_stale 판정) 강제하는 속도 상한.
+#   일부러 SPEED_CORNER_MIN(5.0)보다 낮추지 않았다 — "코너가 아닌데도 이 속도로 깎였다"는
+#   부자연스러움 자체가 사람이 알아챌 수 있는 신호가 되도록, 급정지가 아니라 코너 감속과
+#   비슷한 수준으로만 눈에 띄게 낮춘다는 설계(요청 반영). 실차 미검증.
 SPEED_LANE_STALE = 5.0
 ANGLE_MAX     = 80.0  # 조향각 클램프(도)
 ANGLE_RATE_MAX = 12.0  # 조향 변화율 제한(도/주기, 20Hz 기준 12도/주기=240도/초) — drive()에서 모든 명령에 일괄 적용
@@ -189,13 +187,41 @@ LANE_LOOKAHEAD_REF = 220.0   # 예측감속 최대가 되는 lookahead 편차(px
 CORNER_MIN_RADIUS_PX = 250.0
 CORNER_MIN_SPEED_SCALE = 0.35  # 반경이 0에 가까워져도 속도가 0으로 죽지 않게 하는 하한 배율
 
+# [2026-08-18] "직선인데 커브로 오검출돼 속도가 안 오른다" 대응 — turn_now(조향각 signed
+#   EMA)/turn_preview(lane_lookahead)는 전부 비전+조향출력에서만 나오는 신호라, 세그멘테이션
+#   잡음이나 조향 잔떨림만으로도 코너로 오인될 수 있다. [2026-08-19] 한때 is_straight
+#   (§0.5.9, PP_STRAIGHT_*, "직진 확정" 이진 게이트)가 이 문제를 같이 다뤘으나 요청 반영으로
+#   그 기능 자체가 제거됐다 — 이제 아래 IMU 교차검증이 이 문제를 다루는 유일한 수단이다.
+#   2023 KMU 대회 AuTURBO rookie 팀 저장소(ModeController.py, github.com/AuTURBO/
+#   2023_KMU_Autonomous_team_AuTURBO_rookie)의 모드전환 로직을 참고 — 거기서도 비전(픽셀
+#   오차 평균)만으로는 "커브"를 확정하지 않고, diff_degree(IMU yaw 변화량 > 47도)로 실제
+#   회전량을 교차검증한 뒤에야 realcurve로 카운트한다. 그 아이디어를 연속값 버전으로
+#   가져와 track_drive.py._imu_corner_confirm_scale()에서 쓴다 — "비전은 코너라는데 IMU
+#   실측 회전율이 거의 0"이면 코너감속(turn_for_speed)을 절반 이하로 깎는다.
+#   CORNER_IMU_CONFIRM_KAPPA_PX = 1/CORNER_MIN_RADIUS_PX로 잡은 이유: 반경기반 추가감속
+#   (_corner_radius_speed_scale())이 작동을 시작하는 커브(반경<=250px)에서는 IMU 신뢰도가
+#   이미 1.0(무감쇠)에 도달해 있어야, 진짜 코너에서까지 이 게이트가 감속을 방해하지 않는다.
+#   IMU/VESC가 죽어있거나(_imu_curvature_px()가 None) dl+BEV 조합이 아니면 기존처럼 비전
+#   신호만으로 판단(무감쇠, 1.0)한다. 실차 미검증 첫 추정치.
+CORNER_IMU_CONFIRM_KAPPA_PX = 1.0 / CORNER_MIN_RADIUS_PX  # = 0.004 — 이 이상 IMU curvature면 코너감속 100% 신뢰
+CORNER_IMU_MIN_SCALE = 0.5  # IMU가 "회전 거의 없음"을 보고해도 비전신호 기반 감속을 최소 이만큼은 남겨두는 하한
+
 # ── 좌회전 공통 (S2→S3 진입, S3→S1 진출) — 전부 실차 튜닝 필요한 임시값 ──
-TURN_ANGLE       = -60.0   # [진입] S2 교차로 → S3 지름길 좌회전 조향각
-TURN_SPEED       = 15.0    # [진입] 좌회전 속도
-TURN_FRAMES      = 40      # [진입] 좌회전 유지 프레임 수 (20Hz 기준)
-TURN_EXIT_ANGLE  = -60.0   # [진출] S3 지름길 → S1 차선주행 좌회전 조향각
-TURN_EXIT_SPEED  = 15.0    # [진출] 좌회전 속도
-TURN_EXIT_FRAMES = 40      # [진출] 좌회전 유지 프레임 수
+#   [2026-08-18] 종료 판정을 프레임 카운트(open-loop)에서 IMU yaw 실측 기반(closed-loop)으로
+#   변경. 같은 (TURN_ANGLE, TURN_SPEED) 명령이어도 배터리 전압 강하·노면·속도 변동에 따라
+#   실제 요레이트(초당 회전각)가 매번 조금씩 달라질 수 있어, "N프레임 지남"보다 "실제로
+#   TURN_YAW_TARGET_DEG만큼 돌았음"이 더 정확하다(track_drive.py _do_left_turn() 참고).
+#   TURN_FRAMES/TURN_EXIT_FRAMES는 이제 트리거가 아니라 IMU가 죽어있을 때만 쓰는 안전
+#   타임아웃 상한(무한 회전 방지)이다 — _imu_live() 가드 패턴, _vesc_live()와 동일 철학.
+TURN_ANGLE           = -60.0   # [진입] S2 교차로 → S3 지름길 좌회전 조향각
+TURN_SPEED           = 15.0    # [진입] 좌회전 속도
+TURN_YAW_TARGET_DEG  = 90.0    # [진입] 목표 회전각(도) — 분기가 직각이 아니라 커브로 열려서
+                                #        정확히 90인지 미검증, 실차 재확인 필요
+TURN_FRAMES          = 40      # [진입] 안전 타임아웃 상한 프레임 수 (20Hz 기준, IMU 죽었을 때만 씀)
+TURN_EXIT_ANGLE      = -60.0   # [진출] S3 지름길 → S1 차선주행 좌회전 조향각
+TURN_EXIT_SPEED      = 15.0    # [진출] 좌회전 속도
+TURN_EXIT_YAW_TARGET_DEG = 90.0  # [진출] 목표 회전각(도) — 위와 동일 사유로 실차 재확인 필요
+TURN_EXIT_FRAMES     = 40      # [진출] 안전 타임아웃 상한 프레임 수 (IMU 죽었을 때만 씀)
 
 # ── 정지선 접근 감속 (S1→S2 진입, S3→S1 진출) ──
 APPROACH_SPEED      = 2.0  # [진입] 정지선 감지 후 S2 진입 전 감속 속도
@@ -211,14 +237,18 @@ APPROACH_EXIT_TIME  = 1.0  # [진출] 감속 유지 시간(s)
 #   그쪽으로 끌려간다(실측 재현됨) — 즉 신호로 이미 확정된 진행방향을 비전이
 #   뒤집어버리는 상황. 신호가 이미 정답을 알고 있으므로(직진 2/3바퀴 확정, 좌회전
 #   1/3바퀴만 등장 — RACE_RULES.md 11절), 이 구간에서는 비전을 아예 참조하지 않고
-#   APPROACH_SPEED로 직진(각도 0)만 유지하다가, 이 시간이 지난 뒤에야 실제 분기
-#   방향(직진 복귀 or 좌회전 스크립트 시작)을 실행한다. 값은 물리적 1m를
-#   APPROACH_SPEED로 주행하는 데 걸리는 시간으로 맞춰야 한다. METERS_PER_SPEED_UNIT은
-#   이제 실측값이 있지만(README.md "6.5 속도 단위 ↔ m/s 환산" 참고) speed=5/10 두
-#   점으로만 회귀한 값이라 APPROACH_SPEED=2.0 같은 저속 구간(추정 데드존 ≈1.4에
-#   가까움)에 그대로 대입하면 못 미덥다 — 그래서 여기 대입해서 자동 계산하지 않고
-#   여전히 우선 추정치로 둔다 — 실차에서 분기 진입 타이밍 보고 조정할 것.
-S2_COMMIT_T = 1.0
+#   APPROACH_SPEED로 직진(각도 0)만 유지하다가, 이 거리를 채운 뒤에야 실제 분기
+#   방향(직진 복귀 or 좌회전 스크립트 시작)을 실행한다.
+#   [2026-08-18] 시간 기반(S2_COMMIT_T=1.0s)에서 거리 기반으로 변경 — 대회 주행 때
+#   APPROACH_SPEED 근방 실제 속도가 튜닝 시점과 달라지면 "몇 초 동안 직진"은 물리적
+#   분기 지점과 안 맞을 수 있다(속도가 빠르면 못 미치고, 느리면 지나침). 대신
+#   track_drive.py _s2_intersection()이 매 제어주기 VESC 실측(self.v_mps, m/s)을
+#   적분해 이 거리(m)를 채웠는지로 판단한다 — METERS_PER_SPEED_UNIT의 저속 회귀
+#   신뢰도 문제(speed=5/10 두 점 회귀라 APPROACH_SPEED=2.0 같은 저속엔 못 미더움,
+#   위 예전 주석 참고)와 무관하게 실제 이동거리 기준으로 맞는다. VESC가
+#   죽어있을 때만(_vesc_live() 가드) METERS_PER_SPEED_UNIT 폴백을 쓴다 — 이전
+#   S2_COMMIT_T가 암묵적으로 가정하던 것과 동일한 근사치다.
+S2_COMMIT_DIST_M = 1.0   # 실측 물리적 분기 거리(≈1m) — 실차에서 재확인 후 조정할 것
 
 
 # #############################################################
@@ -294,6 +324,23 @@ DL_N_SLICES = 8               # da 중심선을 세로로 나눌 밴드 수
 DL_MIN_PIXELS = 40            # 밴드 내 da 픽셀수가 이 미만이면 그 밴드는 "차선 없음" 처리
 DL_NEAR_SLICES = 2            # 근거리(조향용) 편차 계산에 쓸 아래쪽 밴드 수
 DL_FAR_SLICES = 2             # 원거리(코너 예측용) 편차 계산에 쓸 위쪽 밴드 수
+
+# [2026-08-19] 근접 밴드(위 DL_NEAR_SLICES개) 전용 "임시 hold" 상한 — 원거리 밴드가
+#   장애물 회피로 정당하게 휘면 leave-one-out 추세선(_reject_outliers())이 아직
+#   정상인 근접 밴드를 이상치로 오판하던 문제의 2차 안전판(1차는 근접 밴드를 그
+#   검사에서 아예 빼는 것, dl_lane.py detect()/lane_util.py _reject_outliers()
+#   protect_indices 참고). 그 방어를 뚫고도(진짜 순간 미검출 등) 근접 밴드가 비면,
+#   그 밴드가 마지막으로 실제 찾았던 위치(_da_prev_band_x[i])를 이 프레임 수까지만
+#   대신 채운다 — 찰나의 깜빡임은 다리를 놓아 넘기되, 진짜로 오래 안 보이면(장애물이
+#   실제로 근접까지 온 경우일 수 있음, README §2.30 "앞코가 뒷꽁지를 긁는다" 참고)
+#   더는 안 믿고 포기해서 위험 신호를 계속 숨기지 않는다. 같은 목적의 기존
+#   상수(SIDE_CLEAR_CONFIRM_FRAMES=3, AVOID_HOLD_RELEASE_CONFIRM_FRAMES=4,
+#   SIG_CONFIRM_FRAMES=3)가 전부 3~4프레임대라 그 범위의 하한을 택했다 — 이건
+#   "위험할 수 있는 정보를 얼마나 오래 숨길 것인가"라 그 중에서도 짧은 쪽이 안전하다는
+#   판단. 넘기면 near_band_stale=True로 노출돼 track_drive.py _lane_drive()가
+#   SPEED_LANE_STALE급으로 감속시킨다(lane_stale/lane_unstable과 동일 철학). 20Hz
+#   기준 3프레임≈0.15초. 실차 미검증.
+DL_NEAR_HOLD_MAX_FRAMES = 3
 # [LQR 브랜치 dl_lane_BEV_파라미터_변경사유.md에서 이식, 2026-08-05] 아래 4개 값은
 #   원래 BEV 도입 전 원근(perspective) 640×140px ROI 스케일로 잡혔던 값을 그대로
 #   들고 있었다. BEV(585×298px 캔버스, DL_PIXELS_PER_METER=200px/m)로 좌표계가
@@ -372,8 +419,9 @@ DL_DA_VELOCITY_EMA_ALPHA = 0.3      # 밴드 간 이동 속도(px/밴드) EMA �
 DL_DA_VELOCITY_MAX_PX = 40.0        # 예측 이동량 클램프
 DL_DA_BAND_ANCHOR_ALPHA = 0.35      # 밴드별 탐색창 중심 계산 시 "직전 프레임 그 밴드 위치"에 주는 가중치
 
-# ll sanity check — ROI 내 ll(차선) foreground 비율이 이 미만이면 da 결과와 무관하게 무효 처리
-DL_LL_SANITY_MIN_RATIO = 0.005
+# [2026-08-18] DL_LL_SANITY_MIN_RATIO(ll sanity check) 삭제 — lane_valid/path_ok 모두
+#   da 중심점 유무로만 판정하도록 바꿈(perception/dl_lane.py 참고, ll 미사용 확정에 따른
+#   정리, README §2.42 연장선).
 # da가 옆 차선과 이어붙었을 때 ll 라인 바깥(옆 차선 쪽) 픽셀을 잘라내는 여유폭(px)
 #   8 = 실측 라인 두께 2.5cm(=5px @200px/m) + 세그멘테이션 경계 흔들림(1~2px) 여유
 #   (위 [LQR 브랜치 이식] 주석 참고). 옛 값 15px은 필요 이상으로 넓게 잘라내 정상
@@ -492,20 +540,38 @@ DL_DA_SKIP_LL_CLIP = True
 #   구간에서 침식이 과해 da가 DL_DA_MIN_COMPONENT_AREA 밑으로 꺼지면(=그 프레임 무효
 #   처리) 실차에서 확인 후 DL_DA_VEHICLE_MARGIN_M을 낮출 것. 실차 미검증 초기값.
 DL_DA_APPLY_VEHICLE_MARGIN = True
-DL_DA_VEHICLE_MARGIN_M = 0.05   # ASTAR_VEHICLE_MARGIN_M(라이다/Hybrid A* 쪽)과 동일 관례 — 좌우 마진
+DL_DA_VEHICLE_MARGIN_M = 0.05   # ASTAR_VEHICLE_MARGIN_M(라이다/Hybrid A* 쪽)과 동일 관례 — 전/후(세로) 마진 기본값
 
-# [2026-08-17g] 위 DL_DA_VEHICLE_MARGIN_M(+VEHICLE_WIDTH_M/2)은 좌/우/전/후 모두 같은 반경으로
-#   침식하는 등방(isotropic) 원형 커널이라, 방해차량 뒤쪽(=지나간 뒤 재진입하는 da 영역)도
-#   좌우와 똑같은 폭만큼만 벌어져 있었다(질문 확인 결과 — _apply_vehicle_margin()이
-#   cv2.MORPH_ELLIPSE를 정사각형(반경 동일)으로 만들어 씀). 속도가 높을수록 접근 상대속도가
-#   커져 "앞코가 장애물 뒷꽁지를 긁는" 여유가 더 필요하다는 요청 반영 — da 마스크의 세로축
-#   (BEV 캔버스 row, DL_BEV_FAR_CROP_ROW 주석 참고: row가 작을수록 원거리=전방, 클수록
-#   근거리=차량 쪽)이 곧 진행방향이므로, 세로 반경만 v_mps에 비례해 더 키운다(가로=좌우 폭은
-#   DL_DA_VEHICLE_MARGIN_M 그대로). extra_m = min(DL_DA_REAR_MARGIN_REACT_SEC * v_mps,
-#   DL_DA_REAR_MARGIN_MAX_M) — REACT_SEC은 "제동/재계획까지 걸리는 시간"의 근사치로 삼은
-#   설계값(실측 아님), 단위가 s인 게 자연스럽도록 "속도(m/s) × 시간(s) = 거리(m)"로 뒀다.
-#   MAX_M은 da가 통째로 침식돼 사라지는 걸(§2.30, _apply_vehicle_margin() 폴백 참고) 막는 상한.
-#   실차 미검증 초기값 — 코너에서 da가 자주 무효 처리되면 REACT_SEC/MAX_M을 낮출 것.
+# [2026-08-19] DL_DA_SIDE_MARGIN_M — 좌/우(가로) 마진 전용 상수로 분리(요청 반영).
+#   예전엔 위 DL_DA_VEHICLE_MARGIN_M 하나가 좌우/전후 기본 반경을 전부 결정했는데(등방),
+#   "방해차량 옆으로 지나갈 때 여유를 조금만 더 주고 싶다"는 요청을 반영하려면 좌우만
+#   따로 건드릴 수 있어야 한다 — 지금 구조로는 이 값을 올리면 전후(아래
+#   DL_DA_REAR_MARGIN_*이 얹히는 기본값)도 같이 오르는 부작용이 있었다(§2.38 논의 참고).
+#   기본값은 DL_DA_VEHICLE_MARGIN_M과 동일한 0.05였으나(이 분리 자체는 기존 동작을 안
+#   바꿈), [2026-08-19] 실차 테스트로 0.1m이 "딱 적당하게 잘 주행"함을 확인해 그 값으로
+#   교체 — 단, 이 값을 키운 뒤 근접 장애물 앞에서 lookahead가 멀리(옆차선 중앙)
+#   찍히면서 조향이 완만하게만 걸려 충돌하는 2차 증상이 나와서 pure_pursuit.py
+#   _target_point_max_deviation()(근접 장애물 한정) 도입까지 같이 감. 트랙 가장자리/
+#   커브 여백도 이 값을 따라 같이 넓어진다는 점은 여전히 동일하다(dl_lane.py
+#   _apply_vehicle_margin()이 좌우 경계 전체에 등방 적용 — "장애물 옆이라서" 골라
+#   적용되는 게 아니다) — 좁은 커브에서 da가 DL_DA_MIN_COMPONENT_AREA 밑으로 꺼지는지
+#   실차에서 계속 확인할 것.
+DL_DA_SIDE_MARGIN_M = 0.1
+
+# [2026-08-17g] 위 DL_DA_VEHICLE_MARGIN_M(+VEHICLE_WIDTH_M/2)은 원래 좌/우/전/후 모두 같은
+#   반경으로 침식하는 등방(isotropic) 원형 커널이었는데, 방해차량 뒤쪽(=지나간 뒤
+#   재진입하는 da 영역)도 좌우와 똑같은 폭만큼만 벌어져 있었다(질문 확인 결과 —
+#   _apply_vehicle_margin()이 cv2.MORPH_ELLIPSE를 정사각형(반경 동일)으로 만들어 씀).
+#   속도가 높을수록 접근 상대속도가 커져 "앞코가 장애물 뒷꽁지를 긁는" 여유가 더
+#   필요하다는 요청 반영 — da 마스크의 세로축(BEV 캔버스 row, DL_BEV_FAR_CROP_ROW 주석
+#   참고: row가 작을수록 원거리=전방, 클수록 근거리=차량 쪽)이 곧 진행방향이므로, 세로
+#   반경만 v_mps에 비례해 더 키운다([2026-08-19] 가로=좌우 폭은 이제 위
+#   DL_DA_SIDE_MARGIN_M이 독립적으로 결정 — DL_DA_VEHICLE_MARGIN_M과 더는 안 묶임).
+#   extra_m = min(DL_DA_REAR_MARGIN_REACT_SEC * v_mps, DL_DA_REAR_MARGIN_MAX_M) —
+#   REACT_SEC은 "제동/재계획까지 걸리는 시간"의 근사치로 삼은 설계값(실측 아님), 단위가
+#   s인 게 자연스럽도록 "속도(m/s) × 시간(s) = 거리(m)"로 뒀다. MAX_M은 da가 통째로
+#   침식돼 사라지는 걸(§2.30, _apply_vehicle_margin() 폴백 참고) 막는 상한. 실차 미검증
+#   초기값 — 코너에서 da가 자주 무효 처리되면 REACT_SEC/MAX_M을 낮출 것.
 DL_DA_REAR_MARGIN_REACT_SEC = 0.2   # 속도(v_mps)에 비례해 "뒤" 방향 마진을 추가로 늘리는 반응시간(s)
 DL_DA_REAR_MARGIN_MAX_M = 0.5       # 위 추가 마진의 상한(m) — 대략 VEHICLE_LENGTH_M(0.64) 이내로 캡
 
@@ -581,12 +647,11 @@ AVOID_HOLD_DA_AREA_JUMP_RATIO = 1.4    # ★실측 필요★
 AVOID_HOLD_DIR_BIAS_PX = 20.0   # ≈ PASS_OFFSET(80.0, "7. 기타" 절, 실측 기반)의 1/4.
                                  #   ★비율 자체는 실측/재검증 필요★
 
-# [적용4] 안전판(track_drive.py _lane_drive()) — avoid_hold 활성 중 choose_side()가
-#   0(양쪽 다 막혀 어느 쪽으로도 못 피함)을 반환하면 목표속도를 강제로 이 값까지 낮춘다
-#   (F1TENTH류 반응형 스택의 "완벽한 회피보다 안전한 감속" 철학 반영). SPEED_CORNER_MIN/
-#   SPEED_LL_DEGRADED/SPEED_LANE_STALE(위 "2. 차량 속도/조향 기본값" 절)과 같은 "즉시 cap"
-#   관례 — 급정지가 아니라 눈에 띄게만 낮춘다는 설계도 동일.
-SPEED_AVOID_HOLD_BLOCKED = 5.0   # SPEED_CORNER_MIN과 같은 값으로 시작(모터 데드존 위 안전마진). ★실측 필요★
+# [2026-08-18] [적용4] SPEED_AVOID_HOLD_BLOCKED 안전판 삭제 — 실차 테스트에서 "속도 5
+#   고정" 증상의 실제 원인으로 확인됨(README §2.43 참고). TEST_DISABLE_B2_B3=True로 실제
+#   회피 기동(옆차선 이동)은 꺼져있는데 이 캡만 무관하게 계속 걸려서, 트리거를 풀어줄
+#   수단이 없어 무한정 고정되는 구조였다. avoid_hold 타이머/DA 클리핑 방향 편향(적용3,
+#   AVOID_HOLD_DIR_BIAS_PX 위 참고)은 그대로 유지 — 요청 반영(속도캡 소비부만 제거).
 
 # [2026-08-10] DL_CENTER_MODE='ll' 내부에서 실제 밴드 중심 계산 알고리즘을 고르는
 #   2차 스위치 — 같은 날 두 사람이 독립적으로 서로 다른 재설계를 했다(origin/main
@@ -813,6 +878,28 @@ PP_LOOKAHEAD_SPEED_GAIN = 3.305    # 속도가 오를수록 lookahead를 늘리�
 PP_LOOKAHEAD_MAX_PX = 180.7        # lookahead 상한 — 150.0→180.7(그리드서치)
 PP_LOOKAHEAD_CURVATURE_GAIN = 224.8  # 직전 프레임 curvature가 클수록(코너) lookahead를 줄이는 게인 — 100.0→224.8(그리드서치)
 PP_LOOKAHEAD_MIN_PX = 62.61        # 코너에서 lookahead가 줄어들 수 있는 하한 — 40.0→62.61(그리드서치)
+
+# [2026-08-19] speed_lookahead_px = BASE + GAIN*(speed - ANCHOR)의 ANCHOR(요청 반영) —
+#   기존엔 ANCHOR가 암묵적으로 0(=BASE가 "speed=0일 때" 값)이라, 실제로는 절대 안 나오는
+#   speed=0 지점을 기준으로 삼다 보니 config.py만 봐서는 "지금 주행속도에서 lookahead가
+#   대충 얼마인지"가 바로 안 보이는 문제가 있었다(예: speed15 프리셋 BASE=110.38인데 실제
+#   SPEED_NORMAL=12에서 나오는 값은 146.5 — 숫자가 전혀 안 겹쳐서 헷갈림). ANCHOR를
+#   SPEED_NORMAL로 두면 BASE 자체가 "주행속도에서의 lookahead값"이 되어 더 직관적이다.
+#   기본값 0.0 = 기존과 완전히 동일한 동작(하위호환) — 이 전역 기본값과 speed15를 뺀
+#   나머지 프리셋(None 포함)은 전부 이 0.0을 그대로 쓰므로 안 건드림. speed15 프리셋만
+#   아래서 SPEED_NORMAL(12.0)로 덮어쓰고, 그에 맞춰 BASE_PX도 같이 재계산했다(아래
+#   PP_TUNE_PRESETS['speed15'] 주석 참고) — 다른 프리셋으로 바꿔 쓰려면 그 프리셋도
+#   같은 방식으로 ANCHOR+BASE_PX를 맞춰야 한다(아직 안 함).
+PP_LOOKAHEAD_SPEED_ANCHOR = 0.0
+
+# [2026-08-19] lookahead_px 자체에 거는 프레임간 저역통과(요청 반영, pure_pursuit.py
+#   lookahead_alpha 주석 참고) — curvature_damp가 한 프레임 만에 lookahead를 base 근처에서
+#   MIN_PX까지 확 끌어내리면, 좁아진 lookahead가 같은 dx도 더 큰 curvature로 증폭시켜
+#   (curvature=2*sin(alpha)/ld) 급조향 스파이크를 키우거나 복귀 중 재흔들림을 만들 수
+#   있다는 관찰에서 추가. 1.0(기본값)=필터 없음, 기존 동작과 완전히 동일 — 프리셋에서
+#   명시적으로 낮춰야 켜진다. 실차 미검증.
+PP_LOOKAHEAD_ALPHA = 1.0
+
 # [2026-08-06] "곡률→조향각" 게인(pure_pursuit.py의 steer_deg = atan(curvature*wheelbase_px)).
 #   원래 80.0은 "실제 축거리 대신 쓰는" 임의 튜닝값이었다(pure_pursuit.py 상단 주석: "카메라
 #   픽셀→미터 변환이 아직 실측 전이라 wheelbase_px를 대신 쓴다, PIXELS_PER_METER가 실측되면
@@ -834,6 +921,31 @@ PP_WHEELBASE_PX = 49.64            # [2026-08-17h] 25.0→49.64(그리드서치)
                                     #   줄이는 방향). atan(curvature*wheelbase_px) 공식상 값이 작을수록
                                     #   같은 curvature에도 조향각이 더 작게 나옴(반응 약화) — 실차 재검증 필요.
                                     # 원래 = WHEELBASE_M(0.335) * DL_PIXELS_PER_METER(200) 실측 기반 계산값(67.0)
+
+# [2026-08-19] 조향각이 클수록 wheelbase_px를 비례해서 키우는 "부스트"(요청 반영).
+#   atan(curvature*wheelbase_px) 공식상 wheelbase_px를 키우면 같은 curvature에도 조향각이
+#   atan 포화 쪽으로 더 밀린다 — 1차 steer_deg의 절댓값에 그대로 비례해서(GAIN_PER_DEG)
+#   wheelbase_px를 키운다(MAX_SCALE로 상한). [2026-08-19 재수정] 원래는 문턱각
+#   (PP_WHEELBASE_BOOST_ANGLE_TH_DEG)을 넘어야만 부스트가 시작되는 계단형이었는데,
+#   "조향각이 작을 땐 증폭도 작고 커지면 증폭도 커지게"(요청 반영) — 즉 문턱 없이 각도 0부터
+#   연속적으로 커지는 형태로 바꾸면서 문턱각 파라미터 자체를 없앴다. GAIN_PER_DEG도 그에 맞춰
+#   재조정했다 — 문턱이 있을 때는 "문턱을 넘은 초과분"에만 곱해졌지만 이제는 "전체 각도"에
+#   곱해지므로, 예전과 같은 숫자를 쓰면 훨씬 작은 각도에서 MAX_SCALE에 도달해버린다(예:
+#   GAIN=0.15면 MAX_SCALE=1.5 도달 각도가 (1.5-1)/0.15≈3.3°로, 사실상 상시 최대 부스트가
+#   걸리는 것과 다름없어져 "미미할 땐 작게"라는 요청과 어긋난다). 0.03으로 낮춰
+#   (1.5-1)/0.03≈16.7°에서 MAX_SCALE에 닿도록 재설정 — 순전히 추정치, 실차에서 체감보고
+#   재조정할 것.
+#   "speed15 프리셋일 때만 적용" 요청대로(2026-08-19 — 처음엔 런타임 speed==15로, 그 다음엔
+#   별도 계산식으로 잘못/우회적으로 구현했었음) 셋 다 PP_WHEELBASE_PX처럼 "여기 top-level엔
+#   기본값(비활성)만 두고, 아래 PP_TUNE_PRESETS['speed15']가 실제 값으로 덮어쓴다"는 이 파일의
+#   기존 프리셋 관례를 그대로 따른다. PP_TUNE_ACTIVE_PRESET이 'speed15'가 아니거나 None이면
+#   아래 ENABLE 기본값(False)이 그대로 남아 부스트가 꺼진다.
+#   ★ 실차 완전 미검증 ★ — 부스트가 과하면 급코너에서 오버스티어처럼 느껴질 수 있으니
+#   실차에서는 MAX_SCALE부터 낮춰가며 확인할 것.
+PP_WHEELBASE_BOOST_ENABLE = False        # 기본값(비활성) — speed15 프리셋만 아래서 True로 덮어씀
+PP_WHEELBASE_BOOST_GAIN_PER_DEG = 0.03   # 조향각 1도당 wheelbase_px를 이 비율만큼 확대(문턱 없음, 각도 0부터 연속 적용)
+PP_WHEELBASE_BOOST_MAX_SCALE = 1.5       # wheelbase_px 배율 상한(최대 +50%) — 폭주 방지
+
 # [2026-08-12] 직진 구간에서도 계속 진동("와리가리")한다는 보고 대응 — §0.5.3 "알려진
 #   한계"에서 이미 "PP_ALPHA를 낮춰 조향각 저역통과를 더 강하게 거는 쪽을 다음으로 볼 것"
 #   이라고 못박아뒀던 그 다음 단계. 0.5 → 0.35로 낮춰 프레임간 저역통과를 더 세게 건다
@@ -844,17 +956,17 @@ PP_WHEELBASE_PX = 49.64            # [2026-08-17h] 25.0→49.64(그리드서치)
 #   게 뒤늦게 드러났다(원인 분석 대화 참고). 저속(SPEED_NORMAL=3.0 그대로)일수록
 #   speed_lookahead_px가 하한(90px)에 가까워 픽셀노이즈 증폭이 가장 심한 구간이라, 필터를
 #   더 강하게 걸어야 하는 상황에서 반대로 완화했던 것이 원인일 가능성이 높다.
-# [2026-08-17c] 위 문제는 이제 아래 PP_STRAIGHT_ALPHA가 직진 확정 중에만 담당하도록
-#   분리했다(pure_pursuit.py의 "직진(A)/코너+S자(B) 2상태 분기" — is_straight일 때만
-#   PP_STRAIGHT_ALPHA, 그 외엔 이 값을 쓴다). 그래서 이 값은 이제 "코너/S자 등 직진이
-#   아닐 때"의 필터로 그 의미가 좁혀졌고, 그 조건에서는 진동 억제보다 반응성이 우선이라
-#   0.35 → 0.8로 다시 올렸다(대화 중 코너90도/S자커브 합성 시뮬레이션 그리드서치 상위권
-#   — corner_lag/scurve_amp_ratio 기준). 직진 잡음 억제는 더 이상 이 값이 아니라
-#   PP_STRAIGHT_ALPHA + PP_STRAIGHT_DEADZONE_PX + 아래 편향감지(bias EMA) 조합이 담당한다.
-#   실차 미검증 — 화이트박스 합성 시뮬레이션 결과이므로 실차 재검증 필수.
+# [2026-08-17c] 한때 아래 PP_STRAIGHT_ALPHA가 직진 확정 중 필터를 따로 담당하도록
+#   분리했던 적이 있다("직진(A)/코너+S자(B) 2상태 분기") — 그 동안 이 값은 "코너/S자
+#   등 직진이 아닐 때" 전용으로 좁혀져 반응성 우선으로 0.35→0.8까지 올라갔었다.
 # [2026-08-17h] 0.8→0.5244(그리드서치, PP_WHEELBASE_PX 상향과 함께 재탐색된 조합).
-PP_ALPHA = 0.5244                  # 프레임간 조향각 저역통과 필터(1=필터없음, 0=반응없음) — "코너/S자"(비직진) 상태 전용
-PP_MIN_LOOKAHEAD_PX = 86.95        # curvature 분모(ld) 바닥값 — 노이즈 증폭 방지용. PP_LOOKAHEAD_MIN_PX와 다른 값이니 헷갈리지 말 것. 90.0→86.95(그리드서치)
+# [2026-08-19] 요청 반영 — "직진(A)/코너+S자(B) 2상태 분기" 자체(PP_STRAIGHT_*, README
+#   §0.5.9)를 완전히 제거했다. 이제 이 값이 모든 상황(직진 포함)에서 유일하게 쓰이는
+#   저역통과 필터다 — 위 [2026-08-17c] 이전(2026-08-12~17 사이)의 "직진 진동 대응"
+#   문제로 되돌아갈 수 있으니, 직진에서 다시 "와리가리"가 보이면 이 값을 낮추는 쪽으로
+#   대응할 것(위 [2026-08-12]/[2026-08-13] 이력 참고).
+PP_ALPHA = 0.5244                  # 프레임간 조향각 저역통과 필터(1=필터없음, 0=반응없음)
+PP_LD_FLOOR_PX = 86.95        # curvature 분모(ld) 바닥값 — 노이즈 증폭 방지용. lookahead_px 자체의 하한인 PP_LOOKAHEAD_MIN_PX와는 다른 값(개명 전 이름: PP_MIN_LOOKAHEAD_PX)이니 헷갈리지 말 것. 90.0→86.95(그리드서치)
 # [2026-08-12] 6.0 → 15.0. 직진 진동 대응 세 번째 레버 — 원래 값이 중앙 부근 잔떨림을
 #   죽이기엔 너무 작아서(픽셀 몇 개짜리 노이즈도 그대로 통과) 직진에서도 매 프레임 미세한
 #   조향이 나갔던 것으로 추정. LANE_DEADZONE(구 PID 전용, 40px)보다는 여전히 훨씬 작게
@@ -863,55 +975,21 @@ PP_MIN_LOOKAHEAD_PX = 86.95        # curvature 분모(ld) 바닥값 — 노이�
 # [2026-08-13] 15.0 → 5.0(요청 반영, PP_WHEELBASE_PX를 67→40으로 줄여 조향 반응 자체가
 #   약해진 만큼 데드존도 같이 줄임 — 노란선 흔들림 대응) 했었으나, [2026-08-17] PP_ALPHA와
 #   같은 이유로 12.0으로 절충 원복.
-# [2026-08-17c] PP_ALPHA와 같은 이유로 의미가 "코너/S자(비직진) 상태 전용"으로 좁혀졌다 —
-#   직진 잡음 억제는 PP_STRAIGHT_DEADZONE_PX가 담당하므로, 이 값은 이제 코너/S자 추종
-#   반응성 쪽으로 다시 낮췄다(12.0 → 6.0, 그리드서치 상위권 조합). 실차 미검증.
+# [2026-08-17c] 한때 PP_ALPHA와 같은 이유로 "코너/S자(비직진) 상태 전용"으로 좁혀져
+#   12.0→6.0으로 낮아졌던 적이 있다(직진 잡음 억제는 PP_STRAIGHT_DEADZONE_PX가 담당).
 # [2026-08-17h] 6.0→4.445(재증속 후 재실행한 그리드서치, pp_tune_gridsearch.py).
-PP_DX_DEADZONE_PX = 4.445          # 이 이하 픽셀오차는 0으로 죽여 중앙 부근 잔떨림 제거 — "코너/S자"(비직진) 상태 전용
+# [2026-08-19] 요청 반영 — 위 PP_ALPHA와 동일하게 "직진(A)/코너+S자(B) 2상태 분기"를
+#   완전히 제거했다. 이제 이 값이 모든 상황(직진 포함)에서 유일하게 쓰이는 데드존이다.
+PP_DX_DEADZONE_PX = 4.445          # 이 이하 픽셀오차는 0으로 죽여 중앙 부근 잔떨림 제거
 
-# [2026-08-17] 명시적 "직진 모드"(README §0.5.9) — 지금까지의 진동 억제(PP_ALPHA/
-#   PP_DX_DEADZONE_PX)는 전부 "연속값을 더 세게 누르는" 방식이라 코너 반응성과 항상
-#   트레이드오프였다. probe_curvature(코너 판단 신호, pure_pursuit.py control())가 연속
-#   PP_STRAIGHT_CONFIRM_FRAMES 프레임 동안 이 값 미만이면 "직진 확정" 상태로 보고, 그
-#   동안만 데드존을 PP_STRAIGHT_DEADZONE_PX로 넓힌다 — 코너 중엔 이 조건 자체가 안
-#   걸리므로 코너 추종 감도는 그대로다. 셋 다 실차 미검증 첫 추정치.
-
-# [2026-08-17e] 0.001은 너무 타이트했다 — 실차 녹화(카카오톡 영상, 2026-08-17 14:00)에서
-#   육안으론 명백한 직진 구간이 계속 "커브대응"(주황)으로 표시됨을 확인. probe_curvature=
-#   2*sin(alpha)/probe_ld 공식상 0.001은 probe_ld=90~150px(PP_LOOKAHEAD_BASE_PX~MAX_PX,
-#   일반 주행 중 실제 쓰이는 범위) 구간에서 dx 약 5~11px만 넘어도 넘는 값이다 — 이 정도
-#   dx 흔들림은 이 파일 위쪽 min_lookahead_px 주석이 직접 든 실측 예("ld=42px, dx=3px
-#   (육안으론 거의 직진)여도 curvature≈0.0034")보다도 작아, 세그멘테이션의 프레임 간
-#   서브픽셀~픽셀 단위 잡음만으로도 상시 초과했을 가능성이 높다. 그 실측 예(0.0034)가
-#   "거의 직진"으로 불렸다는 걸 기준 삼아 0.0035로 3.5배 완화 — 해제는 여전히 즉시(단일
-#   프레임 디바운스 없음)라 실제 코너 진입 반응성엔 영향 없다(위 PP_STRAIGHT_CONFIRM_FRAMES
-#   주석 참고). 실차 재검증 필요.
-# [2026-08-17h] 셋 다 pp_tune_gridsearch.py 재실행(SPEED_NORMAL=15.0) 결과로 교체.
-PP_STRAIGHT_CURVATURE_EPS = 0.003283  # 이 미만이면 "사실상 직진" — 0.0035→0.003283(그리드서치)
-PP_STRAIGHT_CONFIRM_FRAMES = 10       # 연속 이 프레임 수만큼 유지돼야 직진 확정(20Hz 기준 0.5초, 5→10). 해제는 즉시(디바운스 없음) — 코너 진입 반응이 늦어지면 안 되므로
-PP_STRAIGHT_DEADZONE_PX = 21.64       # 직진 확정 중에만 적용하는 넓은 데드존 — PP_DX_DEADZONE_PX보다 커야 함. 20.0→21.64(그리드서치)
-
-# [2026-08-17c] "직진(A)/코너+S자(B) 2상태 분기" 확장 — 원래 직진모드는 PP_DX_DEADZONE_PX
-#   하나만 넓혔는데(위), PP_ALPHA(저역통과)도 직진과 코너/S자가 원하는 값이 정반대라는 게
-#   대화 중 시뮬레이션으로 확인됐다(직진: 강한 필터가 유리, 코너/S자: 약한 필터가 유리).
-#   그래서 직진 확정 중에는 PP_ALPHA 대신 이 값을 쓴다(pure_pursuit.py control()의
-#   filter_alpha 분기). PP_WHEELBASE_PX는 두 상태 그리드서치에서 공통으로 25.0을
-#   선호해 굳이 분리하지 않았다. 실차 미검증 — 화이트박스 합성 시뮬레이션 추정치.
-# [2026-08-17h] 0.4→0.5096(그리드서치 재실행) — 더 이상 "PP_ALPHA(0.8)보다 낮게"가 아니게
-#   됐다(PP_ALPHA 자체도 0.5244로 낮아짐, 둘이 거의 같은 값) — 직진/코너 필터 차등 자체는
-#   유지되지만 격차가 좁혀졌다는 뜻.
-PP_STRAIGHT_ALPHA = 0.5096          # 직진 확정 중 조향각 저역통과 필터
-
-# [2026-08-17c] "코너 탈출 직후 살짝 틀어진 채 직진 진입" 대응 — 위 PP_STRAIGHT_DEADZONE_PX
-#   (넓은 데드존)는 곡률만 보고 확정되므로, 곡률은 0인데 dx만 한쪽으로 계속 쏠려있는
-#   잔여 오프셋을 영원히 못 지울 위험이 있다(대화 중 시뮬레이션으로 재현). raw dx(데드존
-#   적용 전)의 EMA가 PP_STRAIGHT_DEADZONE_PX 폭을 넘으면 노이즈가 아니라 진짜 편향으로
-#   보고 곡률 조건과 무관하게 직진확정을 해제한다(pure_pursuit.py __init__/control() 상단
-#   주석 참고). 실차 미검증 첫 구현 — 편향 회복이 너무 느리면 이 값을 올릴 것(반응은
-#   빨라지지만 노이즈에도 더 민감해짐).
-# [2026-08-17h] 0.15→0.06785(그리드서치 재실행) — 편향 감지가 더 느려짐(반응은 느려지지만
-#   노이즈에는 덜 민감).
-PP_STRAIGHT_BIAS_EMA_ALPHA = 0.06785
+# [2026-08-19] 명시적 "직진 모드"(README §0.5.9, 2026-08-17 도입) 제거(요청 반영: "직진모드,
+#   커브모드는 빼자 — 파라미터는 모두 커브대응상태만 남기고 날려줘"). pure_pursuit이
+#   probe_curvature/dx 편향으로 "직진 확정" 상태를 판정해 그 동안만 더 넓은 데드존
+#   (PP_STRAIGHT_DEADZONE_PX)과 다른 필터(PP_STRAIGHT_ALPHA)를 쓰던 2상태 분기였는데,
+#   이제 위 PP_ALPHA/PP_DX_DEADZONE_PX 하나로 통일했다(코너/S자 대응 값이 상시 적용) —
+#   PP_STRAIGHT_CURVATURE_EPS/CONFIRM_FRAMES/DEADZONE_PX/ALPHA/BIAS_EMA_ALPHA 5개
+#   상수와 pure_pursuit.py의 판정 로직(is_straight, _straight_frames, _dx_bias_ema)을
+#   전부 삭제했다. 되돌리려면 이 커밋 이전(2026-08-17h) 이력을 참고할 것.
 
 # ── 차량 물리 상수 ──
 # [2026-08-14] 옛 이름 LQR_WHEELBASE_M → WHEELBASE_M. LQR 컨트롤러 제거로 "LQR 전용"이
@@ -920,6 +998,18 @@ PP_STRAIGHT_BIAS_EMA_ALPHA = 0.06785
 WHEELBASE_M = 0.335         # 실측값(2026-08-06, 줄자로 앞바퀴-뒷바퀴 축간거리 실측 — LQR 브랜치에서
                              #   이식). planner/hybrid_astar.py의 wheelbase 기본값(같은 차량이므로
                              #   반드시 같은 값)과 일치시킬 것 — 재실측 시 둘 다 갱신.
+
+# [2026-08-19] track_drive.py._corner_radius_speed_scale()가 코너 감속용 회전반경을 역산할 때
+#   쓰는 "물리 기반" 축거리 — 여태 PP_WHEELBASE_PX(pure_pursuit.py의 "곡률→조향각" 게인,
+#   실측 축거리가 아니라 자유롭게 재튜닝되는 값)를 그대로 재사용하고 있었는데, 최근 그 값을
+#   조향 반응성 목적으로 49.64→16까지 낮추면서 이 반경 계산식(radius=wheelbase_px/tan(steer))
+#   분자가 같이 줄어들어 살짝만 꺾여도(corner_signal≈10도) 반경이 확 작게 나와 코너 감속이
+#   상시로 걸리는 부작용이 났다(요청 반영으로 분리 — "높은 조향에서 감속이 너무 세게
+#   들어간다"). PP_WHEELBASE_PX 재튜닝과 코너 감속 민감도가 서로 안 엮이도록, 여기서는 그
+#   대신 실측 WHEELBASE_M*DL_PIXELS_PER_METER(물리 기반, PP_WHEELBASE_PX 도입 전 원래
+#   pure_pursuit.py가 쓰던 계산과 동일 — config.py PP_WHEELBASE_PX 주석 참고)를 쓴다.
+#   실차 미검증 — 이 값 자체를 낮추면 코너 감속이 다시 더 민감해진다.
+CORNER_RADIUS_WHEELBASE_PX = WHEELBASE_M * DL_PIXELS_PER_METER  # = 67.0
 
 # ── VESC 실측 속도 연동 (2026-08-06, LQR 브랜치의 ROS1 연동 작업에서 이식) ──
 #   이 로봇엔 별도 엔코더 토픽이 없고, VESC 드라이버(ROS1, vesc_driver)가 /sensors/core
@@ -1006,6 +1096,11 @@ DEBUG_PLANNER      = False  # Hybrid A* OccupancyGrid 디버그 창 (track_drive
 DEBUG_VIZ_STEER    = False  # 조향 컨트롤러(직전값유지/현재값반영) 한글 디버그 창 (track_drive.py)
 DEBUG_VIZ_VESC     = False  # VESC 실측속도(/vesc_speed_erpm) 연동 상태(수신중/끊김/미수신) 디버그 창
                              #   (track_drive.py, 2026-08-06 LQR 브랜치에서 이식)
+# [2026-08-18] 좌회전(_do_left_turn())을 IMU yaw closed-loop로 바꾼 뒤(TURN_YAW_TARGET_DEG류
+#   실측 튜닝용) — IMU(/imu) 연동이 실제로 살아있는지 + 지금 imu_yaw 값이 얼마인지 +
+#   좌회전 진행 중이면 목표각까지 얼마나 남았는지를 한 창에서 보여준다. DEBUG_VIZ_VESC와
+#   동일한 3단계 상태(미수신/끊김/정상표시) 패턴(track_drive.py _debug_viz_imu()).
+DEBUG_VIZ_IMU      = True  # IMU(/imu) 연동 상태 + 현재 yaw값 + 좌회전 진행상황 디버그 창
 
 DEBUG_VIZ_DL_LANE    = True  # 차선 — 기본 백엔드('dl') 디버그 창 (perception/dl_lane.py)
 # [2026-08-10] offset 스파크라인이 몇 프레임을 보여줄지 — [2026-08-11] 원래 별도
@@ -1543,15 +1638,21 @@ OBSTACLE_VEHICLE_WIDTH_M = 0.24
 #       진동"(카카오톡 영상 2026-08-17 16:31)으로 25.0으로 되돌려졌던 것과 거의 같은
 #       크기. 이번엔 실전트랙(실측 곡률)+더 넓은 탐색으로 독립적으로 재확인된 값이라
 #       방향성은 신뢰할 만하지만, 진동 재현 여부는 반드시 실차에서 최우선 확인할 것.
-#     - `SPEED_ACCEL_STEP`(전 속도 1.08~1.58)/`SPEED_CORNER_MIN`(대부분 13~16, 일부
-#       5.8) — 각각 과거 1.014(LVC 배터리 트립, 카카오톡 로그 2026-08-17 15:38)와
-#       14.05(트랙 이탈, 카카오톡 영상 2026-08-17 15:44)로 인해 0.4/10.0으로 되돌려진
-#       이력이 있는 구간과 겹친다. 이 두 문제(배터리/트랙이탈)는 시뮬레이터가 아예
-#       모델링하지 않는 영역(배터리 전류, da 밴드 핏 실패)이라 시뮬 점수가 좋다고 해서
+#     - `SPEED_ACCEL_STEP`(전 속도 1.08~1.58) — 과거 1.014(LVC 배터리 트립, 카카오톡
+#       로그 2026-08-17 15:38)로 인해 0.4로 되돌려진 이력이 있는 구간과 겹친다. 이건
+#       시뮬레이터가 아예 모델링하지 않는 영역(배터리 전류)이라 시뮬 점수가 좋다고 해서
 #       재발 안 한다는 보장이 없다 — 첫 실차 테스트에서 최우선으로 지켜볼 것.
 #     - `ANGLE_RATE_MAX`(조향 변화율 제한)는 이 시뮬레이터가 아직 반영하지 않은
 #       상태에서 나온 값이다 — 급커브/지그재그 전환 구간에서 시뮬이 가정한 조향
 #       반응이 실제 서보보다 빠를 수 있다(추가 검증 예정).
+#   [2026-08-18 배포 직후 수정] `SPEED_CORNER_MIN`이 speed10/12.5/15 3개 프리셋에서
+#   그리드서치 원값 그대로 `SPEED_NORMAL`보다 커서(예: speed15는 15.77 vs 15.0)
+#   `max(SPEED_CORNER_MIN, ...)` 공식상 코너감속 경로가 완전히 죽어있던 버그를 실차
+#   테스트로 발견 — §0.5.10과 동일 실패모드. 세 프리셋 다 `SPEED_NORMAL*0.7`로 완화
+#   (아래 dict 안 해당 값 옆 주석 참고). 이 그리드서치(pp_tune_gridsearch.py)의 탐색
+#   공간이 SPEED_CORNER_MIN을 SPEED_NORMAL과 무관하게 독립 샘플링해서 생긴 문제라,
+#   재발 방지하려면 그 스크립트에 "speed_corner_min < speed_norm" 제약을 추가하는 게
+#   근본 해결책 — 아직 미반영.
 #
 #   사용법: 아래 PP_TUNE_ACTIVE_PRESET을 None(기존 개별 값 그대로) 또는 7개 속도
 #   프리셋 중 하나로 바꾸고 colcon build 후 실차에서 테스트. 프리셋이 활성화되면
@@ -1559,13 +1660,34 @@ OBSTACLE_VEHICLE_WIDTH_M = 0.24
 #   DL_STABLE_FRAME_MIN/DL_STABLE_JUMP_MAX 값을 전부 덮어쓴다(아래 globals().update()
 #   — 이 파일 맨 끝에 있어야 나중 정의가 안 덮어씀).
 PP_TUNE_PRESETS = {
+    'speed3': dict(
+        # [2026-08-18] 커밋 0b365ee(2026-08-17, "[Pure Pursuit] 직진모드 curvature 문턱(eps)
+        # 너무 타이트하던 문제 완화")의 값을 그대로 옮김 — 사용자가 이 커밋 시점 파라미터로
+        # 주행이 "엄청 잘 됐다"고 확인. 그 커밋의 실제 SPEED_NORMAL은 3.0이었다(사용자가
+        # "speed5"로 기억했으나 확인 결과 3.0 — 프리셋 이름/SPEED_NORMAL은 실측값 그대로
+        # 'speed3'로 둠, 혼동 방지). 다른 프리셋과 달리 그리드서치 결과가 아니라 그 시점의
+        # 수동 튜닝값을 그대로 옮긴 것 — PP_LD_FLOOR_PX/PP_LOOKAHEAD_MIN_PX는 그 커밋 당시
+        # 이름(PP_MIN_LOOKAHEAD_PX/PP_LOOKAHEAD_MIN_PX)에서 이후 리네이밍(2026-08-18,
+        # 9bfb67f)을 반영해 PP_LD_FLOOR_PX로만 이름을 맞췄고 값 자체는 그대로다.
+        PP_LOOKAHEAD_BASE_PX=90.0, PP_LOOKAHEAD_SPEED_GAIN=4.0, PP_LOOKAHEAD_MAX_PX=190.0,
+        PP_WHEELBASE_PX=25.0, PP_ALPHA=0.8, PP_LD_FLOOR_PX=90.0, PP_DX_DEADZONE_PX=6.0,
+        PP_LOOKAHEAD_CURVATURE_GAIN=100.0, PP_LOOKAHEAD_MIN_PX=40.0,
+        SPEED_CORNER_MIN=5.0, CORNER_SIGN_EMA_ALPHA=0.15, LANE_LOOKAHEAD_REF=220.0,
+        SPEED_ACCEL_STEP=0.4, CORNER_HOLD_DECAY_LO=0.92, CORNER_HOLD_DECAY_HI=0.97,
+        CORNER_MIN_RADIUS_PX=250.0, CORNER_MIN_SPEED_SCALE=0.35,
+        PATH_EMA_ALPHA=0.25, DL_STABLE_FRAME_MIN=2, DL_STABLE_JUMP_MAX=20,
+        SPEED_NORMAL=3.0,
+    ),
     'speed10': dict(
         PP_LOOKAHEAD_BASE_PX=78.61, PP_LOOKAHEAD_SPEED_GAIN=1.476, PP_LOOKAHEAD_MAX_PX=263.7,
-        PP_WHEELBASE_PX=49.39, PP_ALPHA=0.7678, PP_MIN_LOOKAHEAD_PX=63.26, PP_DX_DEADZONE_PX=1.626,
+        PP_WHEELBASE_PX=49.39, PP_ALPHA=0.7678, PP_LD_FLOOR_PX=63.26, PP_DX_DEADZONE_PX=1.626,
         PP_LOOKAHEAD_CURVATURE_GAIN=446.4, PP_LOOKAHEAD_MIN_PX=41.66,
-        PP_STRAIGHT_CURVATURE_EPS=0.008086, PP_STRAIGHT_CONFIRM_FRAMES=5, PP_STRAIGHT_DEADZONE_PX=5.222,
-        PP_STRAIGHT_ALPHA=0.9083, PP_STRAIGHT_BIAS_EMA_ALPHA=0.5997,
-        SPEED_CORNER_MIN=14.16, CORNER_SIGN_EMA_ALPHA=0.6406, LANE_LOOKAHEAD_REF=449.4,
+        # [2026-08-18 배포 직후 수정] 그리드서치 원값 14.16이 SPEED_NORMAL(10.0)보다 커서
+        # max(SPEED_CORNER_MIN, ...) 공식상 코너감속 경로가 완전히 죽어있었다(§0.5.10과
+        # 동일 실패모드, 실차 테스트로 재현됨 — "속도 5 고정" 증상은 이거 때문이 아니라
+        # LL_DEGRADED/LANE_STALE/AVOID_HOLD_BLOCKED 캡이 원인이었지만, 이 버그 자체는
+        # 별개로 진짜였음). SPEED_NORMAL*0.7로 완화.
+        SPEED_CORNER_MIN=7.0, CORNER_SIGN_EMA_ALPHA=0.6406, LANE_LOOKAHEAD_REF=449.4,
         SPEED_ACCEL_STEP=1.562, CORNER_HOLD_DECAY_LO=0.9363, CORNER_HOLD_DECAY_HI=0.9278,
         CORNER_MIN_RADIUS_PX=582.4, CORNER_MIN_SPEED_SCALE=0.2266,
         PATH_EMA_ALPHA=0.4719, DL_STABLE_FRAME_MIN=10, DL_STABLE_JUMP_MAX=43.24,
@@ -1573,34 +1695,54 @@ PP_TUNE_PRESETS = {
     ),
     'speed12_5': dict(
         PP_LOOKAHEAD_BASE_PX=78.44, PP_LOOKAHEAD_SPEED_GAIN=1.808, PP_LOOKAHEAD_MAX_PX=180.1,
-        PP_WHEELBASE_PX=49.17, PP_ALPHA=0.2258, PP_MIN_LOOKAHEAD_PX=52.63, PP_DX_DEADZONE_PX=10.56,
+        PP_WHEELBASE_PX=49.17, PP_ALPHA=0.2258, PP_LD_FLOOR_PX=52.63, PP_DX_DEADZONE_PX=10.56,
         PP_LOOKAHEAD_CURVATURE_GAIN=490.4, PP_LOOKAHEAD_MIN_PX=34.59,
-        PP_STRAIGHT_CURVATURE_EPS=0.01194, PP_STRAIGHT_CONFIRM_FRAMES=7, PP_STRAIGHT_DEADZONE_PX=2.582,
-        PP_STRAIGHT_ALPHA=0.8493, PP_STRAIGHT_BIAS_EMA_ALPHA=0.434,
-        SPEED_CORNER_MIN=14.17, CORNER_SIGN_EMA_ALPHA=1.0, LANE_LOOKAHEAD_REF=405.9,
+        # [2026-08-18 배포 직후 수정] 위 speed10과 동일 버그(14.17 > SPEED_NORMAL 12.5) —
+        # SPEED_NORMAL*0.7로 완화.
+        SPEED_CORNER_MIN=8.75, CORNER_SIGN_EMA_ALPHA=1.0, LANE_LOOKAHEAD_REF=405.9,
         SPEED_ACCEL_STEP=1.084, CORNER_HOLD_DECAY_LO=0.8675, CORNER_HOLD_DECAY_HI=0.9038,
         CORNER_MIN_RADIUS_PX=460.3, CORNER_MIN_SPEED_SCALE=0.126,
         PATH_EMA_ALPHA=0.5028, DL_STABLE_FRAME_MIN=7, DL_STABLE_JUMP_MAX=10.55,
         SPEED_NORMAL=12.5,
     ),
     'speed15': dict(
-        PP_LOOKAHEAD_BASE_PX=81.12, PP_LOOKAHEAD_SPEED_GAIN=1.225, PP_LOOKAHEAD_MAX_PX=278.0,
-        PP_WHEELBASE_PX=49.97, PP_ALPHA=0.9349, PP_MIN_LOOKAHEAD_PX=62.77, PP_DX_DEADZONE_PX=1.887,
-        PP_LOOKAHEAD_CURVATURE_GAIN=508.0, PP_LOOKAHEAD_MIN_PX=45.14,
-        PP_STRAIGHT_CURVATURE_EPS=0.00574, PP_STRAIGHT_CONFIRM_FRAMES=5, PP_STRAIGHT_DEADZONE_PX=11.35,
-        PP_STRAIGHT_ALPHA=0.411, PP_STRAIGHT_BIAS_EMA_ALPHA=0.7405,
-        SPEED_CORNER_MIN=15.77, CORNER_SIGN_EMA_ALPHA=0.7895, LANE_LOOKAHEAD_REF=477.6,
-        SPEED_ACCEL_STEP=1.476, CORNER_HOLD_DECAY_LO=0.9196, CORNER_HOLD_DECAY_HI=0.9215,
-        CORNER_MIN_RADIUS_PX=678.3, CORNER_MIN_SPEED_SCALE=0.345,
-        PATH_EMA_ALPHA=0.6403, DL_STABLE_FRAME_MIN=5, DL_STABLE_JUMP_MAX=35.35,
-        SPEED_NORMAL=15.0,
+        # [2026-08-18 재그리드서치] 이전 값(BASE=81.12/GAIN=1.225/MAX=278.0/WHEELBASE=49.97/
+        # ALPHA=0.9349 등) 전체를 재실행 결과로 교체(요청 반영). 이번 원값은
+        # SPEED_CORNER_MIN=13.34 < SPEED_NORMAL(15.0)을 그대로 만족해 위 speed10/12.5
+        # 프리셋에서 겪은 "그리드서치 원값이 SPEED_NORMAL보다 커서 코너감속이 no-op"
+        # 버그가 재현되지 않았다 — SPEED_NORMAL*0.7 클램프 불필요, 그리드서치 원값 그대로 적용.
+        # 실차 재검증 전.
+        # [2026-08-19] BASE_PX를 "speed=0 기준"에서 "SPEED_NORMAL(=12.0) 기준"으로 재해석
+        #   (요청 반영, 위 전역 PP_LOOKAHEAD_SPEED_ANCHOR 주석 참고) — 실동작은 그대로 유지한 채
+        #   숫자만 다시 계산: 구 BASE_PX(110.38) + GAIN(3.01)*ANCHOR(12.0) = 146.50.
+        #   즉 speed=SPEED_NORMAL(12)일 때 speed_lookahead_px는 여전히 146.5로 그리드서치
+        #   원값과 동일 — PP_LOOKAHEAD_SPEED_ANCHOR를 12.0으로 같이 지정해야 이 등가성이 성립한다.
+        PP_LOOKAHEAD_BASE_PX=180, PP_LOOKAHEAD_SPEED_GAIN=3.01, PP_LOOKAHEAD_MAX_PX=265.4,
+        PP_LOOKAHEAD_SPEED_ANCHOR=12.0,
+        PP_WHEELBASE_PX=20, PP_ALPHA=0.9, PP_LD_FLOOR_PX=120.19, PP_DX_DEADZONE_PX=5,
+
+        PP_LOOKAHEAD_CURVATURE_GAIN=110, PP_LOOKAHEAD_MIN_PX=80,
+        SPEED_CORNER_MIN=10.0, CORNER_SIGN_EMA_ALPHA=0.15, LANE_LOOKAHEAD_REF=220.0,
+        SPEED_ACCEL_STEP=0.4, CORNER_HOLD_DECAY_LO=0.92, CORNER_HOLD_DECAY_HI=0.97,
+        CORNER_MIN_RADIUS_PX=250.0, CORNER_MIN_SPEED_SCALE=0.35,
+        PATH_EMA_ALPHA=0.7, DL_STABLE_FRAME_MIN=1, DL_STABLE_JUMP_MAX=37.44,
+        SPEED_NORMAL=12.0, #직진 잘한 상태
+        # [2026-08-19] 조향각 wheelbase 부스트(요청 반영) — "speed15 프리셋일 때만 적용"이라
+        # 여기(=speed15 프리셋)에만 켜서(ENABLE=True) 넣는다. 다른 프리셋으로 바꾸면 이 키가
+        # 아예 없어서 top-level 기본값(ENABLE=False)이 그대로 남아 자동으로 꺼진다.
+        # [2026-08-19 재수정] 문턱각(구 PP_WHEELBASE_BOOST_ANGLE_TH_DEG=15.0) 없이 각도 0부터
+        # 연속 비례하는 방식으로 바꾸면서(요청 반영, config.py 위 PP_WHEELBASE_BOOST_* 주석
+        # 참고) 이 프리셋에 있던 GAIN_PER_DEG=0.15도 top-level 기본값(0.03)과 같은 값으로
+        # 재조정했다 — 0.15를 문턱 없이 그대로 쓰면 (1.5-1)/0.15≈3.3°만 넘어도 MAX_SCALE에
+        # 도달해 사실상 상시 최대 부스트가 걸린다(요청("미미할 땐 작게")과 어긋남). 순전히
+        # 추정치, 실차에서 체감보고 재조정할 것.
+        PP_WHEELBASE_BOOST_ENABLE=True, PP_WHEELBASE_BOOST_GAIN_PER_DEG=0.15,
+        PP_WHEELBASE_BOOST_MAX_SCALE=2.75,
     ),
     'speed17_5': dict(
         PP_LOOKAHEAD_BASE_PX=82.53, PP_LOOKAHEAD_SPEED_GAIN=1.162, PP_LOOKAHEAD_MAX_PX=253.4,
-        PP_WHEELBASE_PX=50.0, PP_ALPHA=0.6642, PP_MIN_LOOKAHEAD_PX=56.15, PP_DX_DEADZONE_PX=1.694,
+        PP_WHEELBASE_PX=45.0, PP_ALPHA=0.5642, PP_LD_FLOOR_PX=56.15, PP_DX_DEADZONE_PX=1.694,
         PP_LOOKAHEAD_CURVATURE_GAIN=478.8, PP_LOOKAHEAD_MIN_PX=30.73,
-        PP_STRAIGHT_CURVATURE_EPS=0.002449, PP_STRAIGHT_CONFIRM_FRAMES=5, PP_STRAIGHT_DEADZONE_PX=10.34,
-        PP_STRAIGHT_ALPHA=0.75, PP_STRAIGHT_BIAS_EMA_ALPHA=0.4548,
         SPEED_CORNER_MIN=15.61, CORNER_SIGN_EMA_ALPHA=0.4682, LANE_LOOKAHEAD_REF=314.7,
         SPEED_ACCEL_STEP=1.518, CORNER_HOLD_DECAY_LO=0.8894, CORNER_HOLD_DECAY_HI=0.9731,
         CORNER_MIN_RADIUS_PX=551.4, CORNER_MIN_SPEED_SCALE=0.06394,
@@ -1608,26 +1750,24 @@ PP_TUNE_PRESETS = {
         SPEED_NORMAL=17.5,
     ),
     'speed20': dict(
-        PP_LOOKAHEAD_BASE_PX=80.62, PP_LOOKAHEAD_SPEED_GAIN=1.353, PP_LOOKAHEAD_MAX_PX=243.3,
-        PP_WHEELBASE_PX=49.36, PP_ALPHA=0.7727, PP_MIN_LOOKAHEAD_PX=88.88, PP_DX_DEADZONE_PX=1.898,
-        PP_LOOKAHEAD_CURVATURE_GAIN=526.2, PP_LOOKAHEAD_MIN_PX=44.0,
-        PP_STRAIGHT_CURVATURE_EPS=0.001976, PP_STRAIGHT_CONFIRM_FRAMES=10, PP_STRAIGHT_DEADZONE_PX=6.18,
-        PP_STRAIGHT_ALPHA=0.5738, PP_STRAIGHT_BIAS_EMA_ALPHA=0.4795,
-        # [주의] speed_corner_min이 다른 속도보다 훨씬 낮음(5.818) — §8 상단 경고의
-        # "14.05로 트랙 이탈" 사례와는 반대 방향(과감속 쪽)이라 그 실패모드 재현
-        # 가능성은 낮지만, 코너 대응이 다른 속도 프리셋보다 약할 수 있다.
-        SPEED_CORNER_MIN=5.818, CORNER_SIGN_EMA_ALPHA=0.1089, LANE_LOOKAHEAD_REF=458.9,
-        SPEED_ACCEL_STEP=1.576, CORNER_HOLD_DECAY_LO=0.9285, CORNER_HOLD_DECAY_HI=0.9612,
-        CORNER_MIN_RADIUS_PX=185.1, CORNER_MIN_SPEED_SCALE=0.3435,
-        PATH_EMA_ALPHA=0.7997, DL_STABLE_FRAME_MIN=10, DL_STABLE_JUMP_MAX=21.91,
+        # [2026-08-18 재그리드서치] 이전 값(BASE=80.62/GAIN=1.353/MAX=243.3/WHEELBASE=49.36/
+        # ALPHA=0.7727 등, SPEED_CORNER_MIN=5.818) 전체를 재실행 결과로 교체(요청 반영).
+        # 새 SPEED_CORNER_MIN=15.83 < SPEED_NORMAL(20.0) 만족 — 그리드서치 원값 그대로 적용.
+        # DL_STABLE_JUMP_MAX가 21.91→104.2로 크게 뛰었다는 점은 실차에서 da/ll 튐 허용폭이
+        # 훨씬 넓어졌다는 뜻이라 눈여겨볼 것. 실차 재검증 전.
+        PP_LOOKAHEAD_BASE_PX=99.6, PP_LOOKAHEAD_SPEED_GAIN=0.8793, PP_LOOKAHEAD_MAX_PX=331.9,
+        PP_WHEELBASE_PX=38.19, PP_ALPHA=0.9274, PP_LD_FLOOR_PX=59.4, PP_DX_DEADZONE_PX=3.577,
+        PP_LOOKAHEAD_CURVATURE_GAIN=840.7, PP_LOOKAHEAD_MIN_PX=61.31,
+        SPEED_CORNER_MIN=15.83, CORNER_SIGN_EMA_ALPHA=0.7536, LANE_LOOKAHEAD_REF=459.4,
+        SPEED_ACCEL_STEP=4.678, CORNER_HOLD_DECAY_LO=0.9445, CORNER_HOLD_DECAY_HI=0.9143,
+        CORNER_MIN_RADIUS_PX=678.6, CORNER_MIN_SPEED_SCALE=0.261,
+        PATH_EMA_ALPHA=0.9288, DL_STABLE_FRAME_MIN=1, DL_STABLE_JUMP_MAX=104.2,
         SPEED_NORMAL=20.0,
     ),
     'speed22_5': dict(
         PP_LOOKAHEAD_BASE_PX=82.36, PP_LOOKAHEAD_SPEED_GAIN=1.23, PP_LOOKAHEAD_MAX_PX=283.5,
-        PP_WHEELBASE_PX=49.29, PP_ALPHA=0.7039, PP_MIN_LOOKAHEAD_PX=56.8, PP_DX_DEADZONE_PX=1.904,
+        PP_WHEELBASE_PX=49.29, PP_ALPHA=0.7039, PP_LD_FLOOR_PX=56.8, PP_DX_DEADZONE_PX=1.904,
         PP_LOOKAHEAD_CURVATURE_GAIN=442.0, PP_LOOKAHEAD_MIN_PX=46.28,
-        PP_STRAIGHT_CURVATURE_EPS=0.002509, PP_STRAIGHT_CONFIRM_FRAMES=2, PP_STRAIGHT_DEADZONE_PX=4.695,
-        PP_STRAIGHT_ALPHA=0.4509, PP_STRAIGHT_BIAS_EMA_ALPHA=0.6679,
         SPEED_CORNER_MIN=15.71, CORNER_SIGN_EMA_ALPHA=0.1762, LANE_LOOKAHEAD_REF=246.7,
         SPEED_ACCEL_STEP=1.433, CORNER_HOLD_DECAY_LO=0.8567, CORNER_HOLD_DECAY_HI=0.9191,
         CORNER_MIN_RADIUS_PX=208.0, CORNER_MIN_SPEED_SCALE=0.3496,
@@ -1638,10 +1778,8 @@ PP_TUNE_PRESETS = {
         # [주의] speed=25는 METERS_PER_SPEED_UNIT 실측이 하드웨어 문제로 아직 안 끝난
         # 속도(§7 주석 참고) — 이 프리셋의 물리 전제 자체가 5개 프리셋 중 가장 약하다.
         PP_LOOKAHEAD_BASE_PX=80.26, PP_LOOKAHEAD_SPEED_GAIN=1.231, PP_LOOKAHEAD_MAX_PX=250.9,
-        PP_WHEELBASE_PX=49.99, PP_ALPHA=0.7777, PP_MIN_LOOKAHEAD_PX=73.1, PP_DX_DEADZONE_PX=1.989,
+        PP_WHEELBASE_PX=49.99, PP_ALPHA=0.7777, PP_LD_FLOOR_PX=73.1, PP_DX_DEADZONE_PX=1.989,
         PP_LOOKAHEAD_CURVATURE_GAIN=517.9, PP_LOOKAHEAD_MIN_PX=49.07,
-        PP_STRAIGHT_CURVATURE_EPS=0.001982, PP_STRAIGHT_CONFIRM_FRAMES=5, PP_STRAIGHT_DEADZONE_PX=6.251,
-        PP_STRAIGHT_ALPHA=0.6336, PP_STRAIGHT_BIAS_EMA_ALPHA=0.3725,
         SPEED_CORNER_MIN=13.1, CORNER_SIGN_EMA_ALPHA=0.3186, LANE_LOOKAHEAD_REF=568.9,
         SPEED_ACCEL_STEP=1.57, CORNER_HOLD_DECAY_LO=0.9392, CORNER_HOLD_DECAY_HI=0.9318,
         CORNER_MIN_RADIUS_PX=202.0, CORNER_MIN_SPEED_SCALE=0.137,
@@ -1654,6 +1792,6 @@ PP_TUNE_PRESETS = {
 # 실차 미검증이었다는 전제로 선택된 것**이라, 위에서 경고한 PP_WHEELBASE_PX/
 # SPEED_ACCEL_STEP/SPEED_CORNER_MIN 재발 위험을 서행 상태에서 최우선 확인할 것.
 # 문제 생기면 None으로 되돌리거나 git 이력의 이전 speed15 프리셋으로 복원할 것.
-PP_TUNE_ACTIVE_PRESET = 'speed15'   # None / 'speed10' / 'speed12_5' / 'speed15' / 'speed17_5' / 'speed20' / 'speed22_5' / 'speed25'
+PP_TUNE_ACTIVE_PRESET = 'speed15'   # None / 'speed3' / 'speed10' / 'speed12_5' / 'speed15' / 'speed17_5' / 'speed20' / 'speed22_5' / 'speed25'
 if PP_TUNE_ACTIVE_PRESET is not None:
     globals().update(PP_TUNE_PRESETS[PP_TUNE_ACTIVE_PRESET])

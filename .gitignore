@@ -1,3 +1,9 @@
 # 학습용 원본 사진(실험실 인원 얼굴 포함) — git에 올리지 않음.
 # 상세: datasets/yolo_signal_pilot/README.md "개인정보 주의" 참고.
 datasets/
+
+# OS/빌드 캐시 — test/lavacon-nearest-neighbor-pairing 브랜치 병합 중 실수로 커밋된 걸
+# 발견해서 추가(2026-08-19). .DS_Store/__pycache__는 실행 환경마다 달라 저장소에 무의미.
+.DS_Store
+__pycache__/
+*.pyc
