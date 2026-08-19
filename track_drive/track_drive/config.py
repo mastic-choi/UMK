@@ -1255,6 +1255,21 @@ LAVACON_TRIGGER_FRAMES = 5    # (YOLO 콘 검출 AND 좌우 라이다 클러스�
                                #   쌓이면 B1_LAVACON 진입 확정. [2026-08-07] 카메라(YOLO)+라이다
                                #   이중확인으로 강화 — 값 자체는 기존 그대로 유지.
 
+# [2026-08-19] 박스 스택 페어링(perc_lavacon.py `_build_path`)에서, 한쪽만 검출된 박스를
+#   버리지 않고 반폭(half-width) 추정으로 살릴지 여부. 기본 False — 켜기 전엔 기존
+#   `_pick_boxed_centers`와 결과가 100% 동일함이 보장돼야 한다(perc_lavacon.py 상단 주석
+#   5) 참고). 실차에서 콘 간격이 벌어지는 구간 대응이 필요하면 켤 것.
+LAVACON_SPARSE_FALLBACK_ENABLED = False
+LAVACON_HALFWIDTH_EMA_ALPHA     = 0.3   # 좌우 반폭 러닝 추정 EMA 계수(작을수록 더 느리게 반응)
+
+# [2026-08-19] 라이다가 한 프레임 튀어도(반사 노이즈, 순간 미검출) waypoint가 그대로
+#   같이 튀는 문제 대응 — 박스별 좌/우 바운더리 포인트("라바콘 차선")에 프레임간 EMA를
+#   건다(perc_lavacon.py `_blend_boxes_temporal` 참고). PATH_EMA_ALPHA(da 차선 경로용)와
+#   완전히 별개 — 저기는 값이 다르므로 여기 새 상수를 쓴다. 기본 False — 켜기 전엔
+#   기존과 결과가 100% 동일함이 보장돼야 한다(perc_lavacon.py 상단 주석 6) 참고).
+LAVACON_TEMPORAL_EMA_ENABLED = False
+LAVACON_TEMPORAL_EMA_ALPHA   = 0.5      # 새 프레임에 줄 가중치(작을수록 더 부드럽고 느리게 반응)
+
 # ── 라바콘 카메라 이중확인 (perception/yolo_cone.py, YOLOv8n ONNX) ──
 #   perc_lavacon_trigger()가 기존 라이다 좌우 클러스터 판정에 "카메라로도 콘이 보이는가"를
 #   AND로 추가한다 — 라이다 단독 클러스터 판정은 벽 모서리 등에서 오검출 여지가 있어서,

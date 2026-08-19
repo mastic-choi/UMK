@@ -220,6 +220,10 @@ class TrackDriverNode(Node):
         self.lavacon_done   = False
         self.lavacon_path   = []     # _lane_steer()에 그대로 태우는 px 스케일 경로(perc_lavacon() 참고)
         self._lavacon_path_m = []    # 위와 같은 경로의 원본(라이다 미터 좌표) — DEBUG_VIZ_LAVACON 시각화용
+        # [2026-08-19] process_lavacon()의 프레임간 좌/우 EMA(LAVACON_TEMPORAL_EMA_ENABLED)용
+        # 상태 — process_lavacon() 자체는 무상태라 이 노드가 직전 boxes를 들고 있다가
+        # 매 틱 다시 넘겨준다(perc_lavacon.py 상단 주석 6) 참고). 첫 틱엔 None.
+        self._lavacon_boxes_prev = None
         self._lavacon_empty_cnt = 0   # 우측콘 연속 미검출 프레임 수(Phase 전환 디바운스)
         self.lavacon_left_detected  = False  # 좌측 라이다 클러스터 검출 여부(B1 진입 트리거용)
         self.lavacon_right_detected = False  # 우측 라이다 클러스터 검출 여부(B1 진입 트리거용)
@@ -1033,7 +1037,11 @@ class TrackDriverNode(Node):
     # [2-4] 라바콘
     #   출력 lavacon_offset(디버그용)/lavacon_done, lavacon_path(조향용 — _handle_lavacon() 참고)
     def perc_lavacon(self):
-        self.lavacon_offset, self.lavacon_done, path_m = process_lavacon(self.lidar_ranges)
+        self.lavacon_offset, self.lavacon_done, path_m, self._lavacon_boxes_prev = \
+            process_lavacon(self.lidar_ranges, self._lavacon_boxes_prev)
+        # [2026-08-19] process_lavacon()이 프레임간 좌/우 EMA(LAVACON_TEMPORAL_EMA_ENABLED,
+        # perc_lavacon.py 상단 주석 6) 참고)용으로 반환한 boxes를 self._lavacon_boxes_prev에
+        # 그대로 들고 있다가 다음 틱에 다시 넘긴다 — process_lavacon() 자체는 무상태.
         # [2026-08-11] 라바콘 조향 파라미터를 라인주행(_lane_steer())과 완전히 일치시키기로
         # 한 결정 — LAVACON_KP 같은 라바콘 전용 P게인 대신, self.lane_path와 동일하게
         # self.pure_pursuit(같은 PP_* 게인)에 태운다. "1m=DL_PIXELS_PER_METER px,
@@ -1199,11 +1207,11 @@ class TrackDriverNode(Node):
         cv2.putText(bev, f'cone ROI lat=+-{LAVACON_PATH_LAT_LIMIT:.1f}m', to_px(LAVACON_PATH_LON_MAX, LAVACON_PATH_LAT_LIMIT),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
 
-        # [2026-08-19] process_lavacon()의 _pick_boxed_centers()가 실제로 훑는 박스 경계를
+        # [2026-08-19] process_lavacon()의 _pick_boxed_sides()가 실제로 훑는 박스 경계를
         # 파란 가로선으로 표시(요청 반영 — 노란 경로선/점과 헷갈리지 않게 다른 색 사용).
         # 흰색 콘 후보 횡방향 한계선(±LAVACON_PATH_LAT_LIMIT) 사이 폭으로만 그린다 — 그
         # 밖은 애초에 박스 탐색에서도 후보로 안 보는 영역이라 그릴 필요가 없다. 경계 개수는
-        # perc_lavacon.py _pick_boxed_centers()의 n_boxes 계산과 반드시 같은 공식을 쓸 것
+        # perc_lavacon.py _pick_boxed_sides()의 n_boxes 계산과 반드시 같은 공식을 쓸 것
         # (floor + 1e-6 부동소수 오차 가드) — 안 맞추면 이 파란선이 실제 박스 경계와 어긋난다.
         n_lavacon_boxes = max(0, int(math.floor(
             (LAVACON_PATH_LON_MAX - LAVACON_BOX_LON_START) / LAVACON_BOX_LON_WIDTH + 1e-6)))

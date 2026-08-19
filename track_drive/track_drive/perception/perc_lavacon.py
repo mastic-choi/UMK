@@ -3,7 +3,9 @@
 #
 # [사용법] track_drive.py 에서 import 하여 호출:
 #     from perc_lavacon import process_lavacon
-#     offset, done, path_m = process_lavacon(self.lidar_ranges)
+#     offset, done, path_m, boxes = process_lavacon(self.lidar_ranges, prev_boxes)
+#     (prev_boxes는 직전 호출이 반환한 boxes를 self.*에 들고 있다가 그대로 다시 넘긴다 —
+#      LAVACON_TEMPORAL_EMA_ENABLED가 꺼져 있으면 안 넘겨도(None) 무방)
 #
 # [경로생성 방식 변천사, 전부 2026-08-19]
 #   1) 보로노이(scipy.spatial.Voronoi) — 콘 점군 전체로 다이어그램을 계산해 정점(vertex)들을
@@ -20,17 +22,41 @@
 #      트랙을 가로지르는 두 콘(예: 내 차로 안쪽 콘과 그 너머 바깥쪽 콘)이 실제로는 다른
 #      경계에 속하는데도 "물리적으로 가깝다"는 이유만으로 잘못 짝지어질 위험이 있다는
 #      지적(사용자)에 따라 폐기.
-#   4) [현재] 박스 스택 페어링(`_pick_boxed_centers`) — perc_lavacon_trigger()의 진입
-#      트리거 박스(전방 0.3~0.5m 좁은 구간에서 좌우 클러스터 유무만 봄)와 완전히 같은
-#      발상으로 돌아간다: 그 박스와 같은 폭(BOX_LON_WIDTH)의 박스를 전방으로 쭉 쌓아
-#      올리고, 각 박스 "안에서만" 좌(y>0)/우(y<0) 각 1점(차량에서 가장 가까운 점)을 뽑아
-#      그 중점을 그 박스의 경로점으로 삼는다. 짝짓기 후보 자체가 같은 좁은 종방향 구간
-#      안으로 국한되므로 3)의 "먼 트랙 구간 콘과 잘못 짝지어지는" 문제가 구조적으로
+#   4) 박스 스택 페어링(`_pick_boxed_centers`, 2026-08-19 도입) — perc_lavacon_trigger()의
+#      진입 트리거 박스(전방 0.3~0.5m 좁은 구간에서 좌우 클러스터 유무만 봄)와 완전히
+#      같은 발상으로 돌아간다: 그 박스와 같은 폭(BOX_LON_WIDTH)의 박스를 전방으로 쭉
+#      쌓아 올리고, 각 박스 "안에서만" 좌(y>0)/우(y<0) 각 1점(차량에서 가장 가까운 점)을
+#      뽑아 그 중점을 그 박스의 경로점으로 삼는다. 짝짓기 후보 자체가 같은 좁은 종방향
+#      구간 안으로 국한되므로 3)의 "먼 트랙 구간 콘과 잘못 짝지어지는" 문제가 구조적으로
 #      불가능해진다. 박스를 전방 순서대로 훑으므로 결과가 자연히 x 오름차순이라 별도
-#      정렬도 불필요.
-#   출력 형식(offset/done/path_m)과 좌표 약속은 매 단계 동일하게 유지했으므로
-#   track_drive.py의 호출부(perc_lavacon(), _handle_lavacon())는 변경 불필요 —
-#   Pure Pursuit(controller/pure_pursuit.py)가 그대로 이 경로를 추종한다.
+#      정렬도 불필요. 다만 한쪽만 검출된 박스는 통째로 버려져(양쪽 다 있어야만 채택),
+#      콘 간격이 벌어지거나 급커브 안쪽이라 한쪽이 듬성한 구간에서 경로점이 끊기는 약점이
+#      남아있었다.
+#   5) [현재] 좌우 독립 바운더리 + 반폭(half-width) sparse fallback(`_pick_boxed_sides`,
+#      `_build_path`) — 박스 스택의 짝짓기 국한 아이디어(4)는 그대로 두되, 박스마다
+#      "양쪽 다 있어야 채택"이 아니라 좌/우 각각을 독립된 종방향 시퀀스(바운더리 라인)로
+#      전부 들고 있는다. 양쪽 다 검출된 박스는 기존과 동일하게 중점을 쓰고, 한쪽만
+#      검출된 박스는(`LAVACON_SPARSE_FALLBACK_ENABLED`, 기본 False) 직전까지 양쪽 다
+#      검출됐던 박스들의 좌우 반폭 EMA만큼 검출된 쪽 반대로 밀어 중심선을 추정한다.
+#      (da(주행가능영역) 융합도 검토했으나, da는 콘 구간에서 방향성이 검증된 적 없는
+#      신호라 굳이 안 쓰기로 했다 — 라이다 자체 반폭 추정만으로 충분하다는 판단.)
+#      기본값(False)에서는 한쪽만 있는 박스가 그냥 스킵되어 4)와 결과가 100% 동일하다.
+#   6) [현재] 프레임간 "라바콘 차선" EMA(`_blend_boxes_temporal`, 기본 꺼짐) — 라이다가
+#      한 프레임 튀면(반사 노이즈로 잘못된 점이 박스 최근접점으로 뽑히거나, 콘이 순간
+#      한 프레임만 안 보이는 등) 그 튐이 그대로 그 프레임 조향에 들어가는 문제(사용자
+#      지적, waypoint 자체엔 프레임간 스무딩이 전혀 없었음)에 대응. waypoint(중점)를
+#      직접 EMA하지 않고, 그 재료인 박스별 좌/우 포인트("라바콘 차선")를 인덱스별로
+#      EMA한 뒤 중점/반폭 폴백(5)을 매 프레임 그 값으로 다시 계산한다 — 박스 위치가
+#      config 상수로만 정해지는 고정 그리드라 인덱스가 프레임 간에도 항상 같은 종방향
+#      구간을 가리키므로(da 경로가 PATH_N_WAYPOINTS 고정 리샘플링으로 해결한 것과 동일한
+#      문제), `_pick_boxed_sides()`가 빈 박스도 (None,None)으로 채워 반환하도록 같이
+#      바꿨다. `LAVACON_TEMPORAL_EMA_ENABLED`(기본 False)가 꺼져 있으면 5)와 결과가
+#      100% 동일하다. 상태(직전 boxes)는 track_drive.py가 self.*로 들고 있다가 매 틱
+#      다시 넘겨주는 함수형 스레딩(process_lavacon() 자체는 무상태 유지).
+#   출력 형식(offset/done/path_m)과 좌표 약속은 매 단계 동일하게 유지했으므로 Pure
+#   Pursuit(controller/pure_pursuit.py)가 그대로 이 경로를 추종한다. 다만 6) 도입으로
+#   반환 튜플에 boxes가 하나 추가됐으므로 track_drive.py 호출부(perc_lavacon())는
+#   그만큼만 수정했다.
 #
 # [라이다 좌표 약속] (track_drive.py 재실측 기준, 2026-07-22 확정)
 #   · 360칸, 인덱스 = 각도(도), 반시계 방향
@@ -57,6 +83,11 @@ import numpy as np
 #   이 종류의 비동기화로 생겼었음) — config.py를 단일 소스로 삼아 여기서도 그대로
 #   가져다 쓰도록 고쳤다. 값 자체(80.0)는 바뀌지 않았다.
 from ..config import LIDAR_ANGLE_OFFSET_DEG
+# [2026-08-19] sparse 박스(한쪽만 검출) 반폭 추정 폴백 스위치/게인 — config.py가 단일 소스.
+from ..config import LAVACON_SPARSE_FALLBACK_ENABLED, LAVACON_HALFWIDTH_EMA_ALPHA
+# [2026-08-19] 박스별 좌/우 바운더리 포인트("라바콘 차선")에 거는 프레임간 EMA 스위치/게인
+# — waypoint(중점) 자체가 아니라 그 재료인 좌/우 포인트에 건다(_blend_boxes_temporal 참고).
+from ..config import LAVACON_TEMPORAL_EMA_ENABLED, LAVACON_TEMPORAL_EMA_ALPHA
 
 # ─────────────────────────────────────────────
 # 튜닝 상수 (track_drive.py 의 실측 ROI 값과 일치시킴)
@@ -82,22 +113,37 @@ BOX_LON_START    = 0.3          # 첫 박스 시작 지점(전방, m) — 차체
 BOX_LON_WIDTH    = 0.2          # 박스 1개의 종방향 폭(m)
 
 
-def _pick_boxed_centers(x, y, ranges, lon_start, lon_width, lon_max, lat_limit):
+def _pick_boxed_sides(x, y, ranges, lon_start, lon_width, lon_max, lat_limit):
     """차량 전방을 lon_width 폭의 박스로 lon_start부터 lon_max까지 쭉 쌓아올리고, 각 박스
     "안에서만" 좌(y>0)/우(y<0) 각 1점(그 박스 안에서 차량과의 라이다 반사거리가 가장 짧은
-    점)을 뽑아 중점을 그 박스의 경로점으로 삼는다.
+    점)을 뽑는다.
 
-    [2026-08-19] 콘 클러스터링 + 유클리드 최근접 이웃 매칭(구버전, 폐기) 대신 이 방식을
-    쓰는 이유: 유클리드 거리만으로 좌/우를 짝지으면, 급커브에서 트랙을 가로지르는 두 콘이
-    실제로는 서로 다른 경계(내 차로 안쪽 vs 그 너머 바깥쪽)에 속하는데도 "물리적으로
-    가깝다"는 이유만으로 잘못 짝지어질 위험이 있다(사용자 지적) — 각 박스가 좁은 종방향
-    구간으로 짝짓기 후보 자체를 국한시키므로 그런 오매칭이 구조적으로 불가능해진다.
-    박스를 전방 순서대로 훑으므로 결과가 자연히 x(전방) 오름차순이라 별도 정렬도 불필요.
-    한쪽 콘만 있는 박스는 건너뛴다(그 프레임 하나 때문에 전체 경로를 막지 않기 위해) —
-    perc_lavacon_trigger()의 트리거 박스와 동일하게, "박스 안에 뭔가 있는지"만으로
-    판단하고 콘 개수/간격 자체에는 가정을 두지 않는다.
+    [2026-08-19 최초 도입] 콘 클러스터링 + 유클리드 최근접 이웃 매칭(구버전, 폐기) 대신
+    이 방식을 쓰는 이유: 유클리드 거리만으로 좌/우를 짝지으면, 급커브에서 트랙을
+    가로지르는 두 콘이 실제로는 서로 다른 경계(내 차로 안쪽 vs 그 너머 바깥쪽)에
+    속하는데도 "물리적으로 가깝다"는 이유만으로 잘못 짝지어질 위험이 있다(사용자 지적) —
+    각 박스가 좁은 종방향 구간으로 짝짓기 후보 자체를 국한시키므로 그런 오매칭이 구조적으로
+    불가능해진다.
+
+    [2026-08-19 개정] 예전엔 이 함수가 "양쪽 다 있는 박스"만 걸러서 중점까지 계산해
+    반환했는데(`_pick_boxed_centers`), 그러면 한쪽만 검출된 박스가 통째로 버려져 콘 간격이
+    벌어지거나 급커브 안쪽이라 한쪽이 듬성한 구간에서 경로점이 끊기는 문제가 있었다.
+    이제는 박스마다 (left_xy 또는 None, right_xy 또는 None)을 그대로 반환해, 양쪽 유무
+    판단과 중점 계산을 호출부(`_build_path`)로 넘긴다 — 왼쪽만 모으면 왼쪽 바운더리
+    시퀀스, 오른쪽만 모으면 오른쪽 바운더리 시퀀스가 되는 셈이라 "좌우 독립 라인"을
+    별도 자료구조 없이 얻는다. 박스 폭이 이미 좁아서(0.2m) 같은 사이드 안에서도 인접
+    박스끼리 물리적으로 가깝다는 보장이 있으므로 사이드 내부 정렬/매칭 로직은 필요 없다
+    (박스 순번이 곧 종방향 순서).
+
+    [2026-08-19 재개정] 검출이 하나도 없는 박스도 (None, None)으로 그대로 남겨, 반환
+    리스트 길이가 항상 n_boxes로 고정되게 했다 — 박스 위치가 config 상수(lon_start,
+    lon_width, lon_max)로만 정해지는 고정 그리드라 인덱스 i는 프레임이 바뀌어도 항상
+    "차량 기준 같은 종방향 구간"을 가리킨다. 이 안정적인 인덱스가 있어야 호출부에서
+    좌/우 포인트 각각에 프레임간 EMA(`_blend_boxes_temporal`)를 인덱스 정렬해서 걸 수
+    있다 — da 경로가 PATH_N_WAYPOINTS로 고정 리샘플링해서 같은 문제(리스트 길이가
+    프레임마다 달라지면 인덱스별 블렌딩이 무의미해짐)를 피한 것과 동일한 이유.
     """
-    mid_x, mid_y = [], []
+    boxes = []
     n_boxes = max(0, int(math.floor((lon_max - lon_start) / lon_width + 1e-6)))
     for i in range(n_boxes):
         b_lo = lon_start + i * lon_width
@@ -105,38 +151,118 @@ def _pick_boxed_centers(x, y, ranges, lon_start, lon_width, lon_max, lat_limit):
         box_mask = (ranges > 0.0) & (x >= b_lo) & (x < b_hi) & (np.abs(y) < lat_limit)
         left_idx = np.where(box_mask & (y > 0.0))[0]
         right_idx = np.where(box_mask & (y < 0.0))[0]
-        if left_idx.size == 0 or right_idx.size == 0:
+        left_xy = None
+        right_xy = None
+        if left_idx.size > 0:
+            li = left_idx[int(np.argmin(ranges[left_idx]))]
+            left_xy = (float(x[li]), float(y[li]))
+        if right_idx.size > 0:
+            ri = right_idx[int(np.argmin(ranges[right_idx]))]
+            right_xy = (float(x[ri]), float(y[ri]))
+        boxes.append((left_xy, right_xy))
+    return boxes
+
+
+def _blend_boxes_temporal(boxes, prev_boxes, alpha):
+    """"라바콘 차선"(박스별 좌/우 바운더리 포인트)에 프레임간 EMA를 건다 — 최종 waypoint
+    (중점)를 직접 EMA하지 않고, 그 waypoint의 재료인 좌/우 포인트 쪽에 거는 이유는 중점을
+    직접 EMA하면 그 프레임의 검출 유무(양쪽/한쪽/폴백 추정)가 섞여 들어간 값이 다음
+    프레임 기준값이 되어버려 원인 추적이 어려워지기 때문 — 좌/우를 각각 독립적으로
+    EMA하면 "그 사이드가 실제로 어디 있(었)는지"만 부드러워지고, 중점/반폭 폴백은 매
+    프레임 그 스무딩된 좌/우 값으로 그대로 다시 계산한다(_build_path, 변경 없음).
+
+    prev_boxes가 없거나(첫 호출) 길이가 다르면(설정 변경 등 비정상 상황) 블렌딩할 기준이
+    없으므로 이번 프레임 값(boxes)을 그대로 쓴다. 인덱스 i에서 이번 프레임에 검출이
+    없으면(None) 그 사이드는 "안 보인다"를 그대로 인정하고 직전값을 이어붙이지 않는다
+    (사라진 콘을 잔상으로 계속 믿고 가면 더 위험할 수 있다는 판단) — 반대로 직전 프레임에
+    없었는데 이번에 새로 검출됐으면 블렌딩할 과거가 없으므로 이번 프레임 값을 그대로 쓴다.
+    """
+    if prev_boxes is None or len(prev_boxes) != len(boxes):
+        return list(boxes)
+
+    def _blend_point(cur, prev):
+        if cur is None or prev is None:
+            return cur
+        return (alpha * cur[0] + (1.0 - alpha) * prev[0],
+                alpha * cur[1] + (1.0 - alpha) * prev[1])
+
+    return [(_blend_point(l, pl), _blend_point(r, pr))
+            for (l, r), (pl, pr) in zip(boxes, prev_boxes)]
+
+
+def _build_path(boxes, halfwidth_ema_alpha, sparse_fallback_enabled):
+    """`_pick_boxed_sides()`가 반환한 박스별 (left_xy, right_xy)로부터 경로점을 만든다.
+
+    - 양쪽 다 있는 박스: 기존과 동일하게 두 점의 중점.
+    - 한쪽만 있는 박스: `sparse_fallback_enabled`일 때만, 직전까지 양쪽 다 검출됐던
+      박스들의 좌우 반폭 EMA만큼 검출된 쪽 반대로 밀어 중심선을 추정한다(반폭 EMA가
+      아직 없으면, 즉 지금까지 양쪽 다 검출된 박스가 하나도 없었으면 추정 근거가 없으므로
+      스킵). `sparse_fallback_enabled`가 False면(기본값) 한쪽만 있는 박스는 그냥
+      스킵되어 구버전(`_pick_boxed_centers`)과 결과가 완전히 동일해진다.
+    - 양쪽 다 없는 박스: 스킵. [2026-08-19] `_pick_boxed_sides()`가 이제 이런 박스도
+      (None, None)으로 채워서 반환하므로(프레임간 EMA 인덱스 정렬용) 여기서 걸러낸다.
+    """
+    mid_x, mid_y = [], []
+    hw_ema = None
+    for left_xy, right_xy in boxes:
+        if left_xy is None and right_xy is None:
             continue
-        li = left_idx[int(np.argmin(ranges[left_idx]))]
-        ri = right_idx[int(np.argmin(ranges[right_idx]))]
-        mid_x.append((float(x[li]) + float(x[ri])) / 2.0)
-        mid_y.append((float(y[li]) + float(y[ri])) / 2.0)
+        if left_xy is not None and right_xy is not None:
+            cx = (left_xy[0] + right_xy[0]) / 2.0
+            cy = (left_xy[1] + right_xy[1]) / 2.0
+            hw = abs(left_xy[1] - right_xy[1]) / 2.0
+            hw_ema = hw if hw_ema is None else (
+                halfwidth_ema_alpha * hw + (1.0 - halfwidth_ema_alpha) * hw_ema)
+            mid_x.append(cx)
+            mid_y.append(cy)
+            continue
+
+        if not sparse_fallback_enabled or hw_ema is None:
+            continue  # 반폭 추정 근거가 아직 없거나 폴백이 꺼져 있으면 이 박스는 스킵
+
+        known_xy = left_xy if left_xy is not None else right_xy
+        side_sign = 1.0 if left_xy is not None else -1.0   # 검출된 쪽: 왼쪽(+)/오른쪽(-)
+        est_y = known_xy[1] - side_sign * hw_ema
+        mid_x.append(known_xy[0])
+        mid_y.append(est_y)
+
     return mid_x, mid_y
 
 
-def process_lavacon(lidar_ranges):
+def process_lavacon(lidar_ranges, prev_boxes=None):
     """
     2D 라이다 1스캔(360점)으로부터 라바콘 트랙 중심 편차 + 조향용 경로를 계산한다.
 
     입력 : lidar_ranges — 길이 360의 거리 배열 (list 또는 np.ndarray)
                           인덱스 0 = 정면, 인덱스 = 각도(도), 반시계
-    출력 : (lavacon_offset, lavacon_done, path_m) 튜플
+           prev_boxes — 직전 호출이 반환한 boxes(아래 참고). 첫 호출이거나 프레임간
+                          EMA를 안 쓰면 None으로 두면 된다(기본값). 호출부(track_drive.py
+                          perc_lavacon())가 self.* 에 들고 있다가 매 틱 그대로 다시
+                          넘겨주는 함수형 상태 스레딩 — process_lavacon() 자체는 상태를
+                          갖지 않는다(__main__ 자가 테스트에서도 그대로 재사용 가능).
+    출력 : (lavacon_offset, lavacon_done, path_m, boxes) 튜플
            · lavacon_offset (float) : 중심 편차 [-0.8, +0.8], 양수 = 우조향(디버그/로깅용)
            · lavacon_done   (bool)  : 좌/우 모두 콘 미검출 = 라바콘 구간 종료 신호
            · path_m (list[(float,float)]) : 전방으로 쌓아올린 박스(BOX_LON_WIDTH 폭)마다
-             좌/우 최근접 1점씩의 중점, x(전방) 오름차순(박스를 순서대로 훑으므로 자연히
-             정렬됨), (x, y) 라이다 미터 좌표(x=전방+, y=좌측+). 조향 실계산은 이걸 쓴다.
-             유효한 박스가 하나도 없으면 빈 리스트.
+             좌/우 최근접 1점씩의 중점(양쪽 다 검출된 박스) 또는 반폭 추정 중심선(한쪽만
+             검출 + LAVACON_SPARSE_FALLBACK_ENABLED), x(전방) 오름차순(박스를 순서대로
+             훑으므로 자연히 정렬됨), (x, y) 라이다 미터 좌표(x=전방+, y=좌측+). 조향
+             실계산은 이걸 쓴다. 유효한 박스가 하나도 없으면 빈 리스트.
+           · boxes (list[(xy_or_None, xy_or_None)]) : 박스별 좌/우 포인트 —
+             LAVACON_TEMPORAL_EMA_ENABLED면 프레임간 EMA가 이미 반영된 값(_blend_boxes_temporal
+             참고), 아니면 이번 프레임 raw 값. path_m은 항상 이 boxes로부터 계산된다.
+             다음 호출의 prev_boxes로 그대로 넘기면 된다 — 콘 미검출 등으로 유효한 박스가
+             하나도 없어도(위 path_m이 빈 리스트여도) None이 아니라 이 값을 반환한다.
     """
     # ── 0) 입력 유효성 검사 : None 이거나 비어 있으면 즉시 안전 폴백 ──
     if lidar_ranges is None:
-        return (0.0, True, [])
+        return (0.0, True, [], None)
 
     # ── 1) 전처리 : NumPy 배열화 + 무효값(inf/nan/음수/0) 제거 + 차체 마스킹 ──
     ranges = np.asarray(lidar_ranges, dtype=np.float32).copy()  # 원본 훼손 방지 복사
     n = len(ranges)
     if n == 0:
-        return (0.0, True, [])
+        return (0.0, True, [], None)
 
     ranges[~np.isfinite(ranges)] = 0.0     # inf / nan → 0.0 (무효 표시)
     ranges[ranges <= 0.0] = 0.0            # 0 이하 거리 → 무효
@@ -167,15 +293,23 @@ def process_lavacon(lidar_ranges):
     has_right = bool(np.any(py_cone < 0.0))
     lavacon_done = not (has_left or has_right)
 
-    # ── 5) 박스 스택 페어링 : 전방으로 쌓아올린 박스마다 좌/우 최근접 1점의 중점 ──
-    # 상세 근거는 _pick_boxed_centers() 참고. CONE_LON_MAX/CONE_LAT_LIMIT를 그대로
-    # 재사용해 박스 탐색 범위를 위 종료판정 ROI와 동일한 한계 안으로 맞춘다.
-    mid_x, mid_y = _pick_boxed_centers(x, y, ranges, BOX_LON_START, BOX_LON_WIDTH,
-                                        CONE_LON_MAX, CONE_LAT_LIMIT)
+    # ── 5) 박스 스택 페어링 : 전방으로 쌓아올린 박스마다 좌/우 최근접 1점 추출 →
+    #        (기본 꺼짐) 프레임간 EMA로 "라바콘 차선"(좌/우 포인트) 스무딩 → 중점 계산,
+    #        한쪽만 검출된 박스는 반폭 EMA 추정으로 폴백(기본 꺼짐) ──
+    # 상세 근거는 _pick_boxed_sides()/_blend_boxes_temporal()/_build_path() 참고.
+    # CONE_LON_MAX/CONE_LAT_LIMIT를 그대로 재사용해 박스 탐색 범위를 위 종료판정 ROI와
+    # 동일한 한계 안으로 맞춘다.
+    boxes_raw = _pick_boxed_sides(x, y, ranges, BOX_LON_START, BOX_LON_WIDTH,
+                                   CONE_LON_MAX, CONE_LAT_LIMIT)
+    boxes = (_blend_boxes_temporal(boxes_raw, prev_boxes, LAVACON_TEMPORAL_EMA_ALPHA)
+             if LAVACON_TEMPORAL_EMA_ENABLED else boxes_raw)
+    mid_x, mid_y = _build_path(boxes, LAVACON_HALFWIDTH_EMA_ALPHA, LAVACON_SPARSE_FALLBACK_ENABLED)
     if not mid_x:
         # 유효한 박스가 하나도 없음(콘 미검출 등) — 이번 프레임은 경로 생성을 보류한다.
         # pure_pursuit.control()이 빈 경로를 받으면 직전 조향각을 그대로 유지한다.
-        return (0.0, lavacon_done, [])
+        # boxes는 그래도 반환한다 — 다음 프레임 prev_boxes로 이어져야(전부 None이라도)
+        # _blend_boxes_temporal()의 길이 비교가 안전하게 계속 성립한다.
+        return (0.0, lavacon_done, [], boxes)
 
     # ── 6) 편차 계산 : 경로점 y좌표 평균 → 부호 반전 → 클램프 (디버그/로깅용) ──
     # y는 좌측+ 이므로, 중심선이 우측(y평균 < 0)에 있으면
@@ -188,7 +322,7 @@ def process_lavacon(lidar_ranges):
 
     path_m = list(zip(mid_x, mid_y))
 
-    return (lavacon_offset, lavacon_done, path_m)
+    return (lavacon_offset, lavacon_done, path_m, boxes)
 
 
 # ─────────────────────────────────────────────
@@ -213,7 +347,29 @@ if __name__ == '__main__':
     put_xy(1.0, 1.0)   # 게이트2 좌
     put_xy(1.0, -1.0)  # 게이트2 우
 
-    off, done, path_m = process_lavacon(test)
+    off, done, path_m, boxes = process_lavacon(test)
     print(f'offset={off:+.3f} (~-0.125 기대: 두 게이트 중점 y평균의 부호반전), '
           f'done={done} (False 기대), path_m={path_m} '
           f'(~[(0.4,0.25),(1.0,0.0)] 기대)')
+
+    # 시나리오 2 : sparse fallback — 박스0은 양쪽(y=+1.0/-1.0, 반폭=1.0), 박스1은 왼쪽만
+    # (y=+1.2). LAVACON_SPARSE_FALLBACK_ENABLED=False(기본)면 박스1은 스킵되고,
+    # True면 박스0에서 얻은 반폭(1.0)만큼 오른쪽으로 밀어 y=+0.2로 추정한다.
+    boxes2 = [((0.4, 1.0), (0.4, -1.0)), ((0.6, 1.2), None)]
+    mx_off, my_off = _build_path(boxes2, halfwidth_ema_alpha=0.3, sparse_fallback_enabled=False)
+    mx_on,  my_on  = _build_path(boxes2, halfwidth_ema_alpha=0.3, sparse_fallback_enabled=True)
+    print(f'sparse_fallback=False: path=({mx_off},{my_off}) (박스1 스킵, [(0.4,0.0)] 기대)')
+    print(f'sparse_fallback=True : path=({mx_on},{my_on}) (박스1 반폭 추정, '
+          f'[(0.4,0.0),(0.6,0.2)] 기대)')
+
+    # 시나리오 3 : 프레임간 EMA — 직전 프레임엔 박스0 좌=y+1.0이었는데 이번 프레임엔
+    # 라이다가 튀어 y+2.0으로 잡혔다고 가정(우측은 안 튐, y-1.0 그대로). alpha=0.5면
+    # 블렌딩 결과는 0.5*2.0+0.5*1.0=1.5로 튐이 절반만 반영돼야 한다.
+    prev_boxes3 = [((0.4, 1.0), (0.4, -1.0))]
+    cur_boxes3  = [((0.4, 2.0), (0.4, -1.0))]
+    blended3 = _blend_boxes_temporal(cur_boxes3, prev_boxes3, alpha=0.5)
+    print(f'temporal_ema: blended={blended3} (좌 y=1.5로 절반만 반영 기대, 우는 안 튀었으니 -1.0 그대로)')
+
+    # prev_boxes가 None(첫 호출)이거나 길이가 다르면 블렌딩 없이 이번 프레임 값을 그대로 씀.
+    blended3_first = _blend_boxes_temporal(cur_boxes3, None, alpha=0.5)
+    print(f'temporal_ema(첫 호출, prev=None): blended={blended3_first} (raw 그대로, y=2.0 기대)')
