@@ -1092,6 +1092,11 @@ DEBUG_PERIOD = 0.5     # 위 로그 주기(s)
 #   다시 True로 되돌릴 것 — 서로 독립적인 스위치라 다른 항목엔 영향 없음.
 DEBUG_VIZ_LIDAR    = False   # 라이다 BEV 장애물 감지 디버그 창 (track_drive.py)
 DEBUG_VIZ_LAVACON  = True  # 라바콘 트리거 좌우 클러스터 BEV 디버그 창 (track_drive.py)
+# [2026-08-19] LAVACON_TEMPORAL_EMA_ENABLED/LAVACON_SPARSE_FALLBACK_ENABLED를 True로
+#   켜면서, 그 결과(박스별 좌/우 EMA 바운더리 = "라바콘 차선")만 따로 보기 위한 전용 창.
+#   위 DEBUG_VIZ_LAVACON(트리거 판정용)과는 별개 — 이 창은 process_lavacon()이 실제로
+#   조향 경로 재료로 쓰는 boxes 자체(박스별 검출 색칠 + 좌/우 EMA 차선)에 집중한다.
+DEBUG_VIZ_LAVACON_EMA = True  # 라바콘 박스 클러스터링 검출 + 좌우 EMA 차선 디버그 창 (track_drive.py)
 DEBUG_PLANNER      = False  # Hybrid A* OccupancyGrid 디버그 창 (track_drive.py, USE_HYBRID_ASTAR_FOR_B3=True일 때만 의미있음)
 DEBUG_VIZ_STEER    = False  # 조향 컨트롤러(직전값유지/현재값반영) 한글 디버그 창 (track_drive.py)
 DEBUG_VIZ_VESC     = False  # VESC 실측속도(/vesc_speed_erpm) 연동 상태(수신중/끊김/미수신) 디버그 창
@@ -1271,15 +1276,18 @@ LAVACON_TRIGGER_FRAMES = 5    # (YOLO 콘 검출 AND 좌우 라이다 클러스�
 #   버리지 않고 반폭(half-width) 추정으로 살릴지 여부. 기본 False — 켜기 전엔 기존
 #   `_pick_boxed_centers`와 결과가 100% 동일함이 보장돼야 한다(perc_lavacon.py 상단 주석
 #   5) 참고). 실차에서 콘 간격이 벌어지는 구간 대응이 필요하면 켤 것.
-LAVACON_SPARSE_FALLBACK_ENABLED = False
+# [2026-08-19] 자가 테스트로 기존 동작과 동일함이 확인된 상태에서(0d1b55) 실차 검증 단계로
+#   전환 — sparse fallback + 프레임간 EMA(아래) 둘 다 True로 켬. DEBUG_VIZ_LAVACON_EMA
+#   전용 창(track_drive.py `_draw_lavacon_ema_bev()`)으로 좌우 EMA 차선을 직접 보면서 튜닝할 것.
+LAVACON_SPARSE_FALLBACK_ENABLED = True
 LAVACON_HALFWIDTH_EMA_ALPHA     = 0.3   # 좌우 반폭 러닝 추정 EMA 계수(작을수록 더 느리게 반응)
 
 # [2026-08-19] 라이다가 한 프레임 튀어도(반사 노이즈, 순간 미검출) waypoint가 그대로
 #   같이 튀는 문제 대응 — 박스별 좌/우 바운더리 포인트("라바콘 차선")에 프레임간 EMA를
 #   건다(perc_lavacon.py `_blend_boxes_temporal` 참고). PATH_EMA_ALPHA(da 차선 경로용)와
-#   완전히 별개 — 저기는 값이 다르므로 여기 새 상수를 쓴다. 기본 False — 켜기 전엔
-#   기존과 결과가 100% 동일함이 보장돼야 한다(perc_lavacon.py 상단 주석 6) 참고).
-LAVACON_TEMPORAL_EMA_ENABLED = False
+#   완전히 별개 — 저기는 값이 다르므로 여기 새 상수를 쓴다. 기본 False였다가, 실차 검증
+#   단계로 전환하며 True로 켬(위 sparse fallback과 같은 이유, 같은 시점).
+LAVACON_TEMPORAL_EMA_ENABLED = True
 LAVACON_TEMPORAL_EMA_ALPHA   = 0.5      # 새 프레임에 줄 가중치(작을수록 더 부드럽고 느리게 반응)
 
 # ── 라바콘 카메라 이중확인 (perception/yolo_cone.py, YOLOv8n ONNX) ──

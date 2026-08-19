@@ -1057,6 +1057,11 @@ class TrackDriverNode(Node):
         # 위 px 변환 전 원본(라이다 미터 좌표) — _draw_lavacon_bev()가 DEBUG_VIZ_LAVACON일 때
         # 그대로 그려서 "실제로 조향에 쓰이는 경로"를 시각적으로 보여준다.
         self._lavacon_path_m = path_m
+        # [2026-08-19] self._lavacon_boxes_prev는 process_lavacon()이 이번 프레임에 반환한
+        # boxes(LAVACON_TEMPORAL_EMA_ENABLED면 프레임간 EMA 이미 반영됨)로 위에서 막 갱신됨 —
+        # _draw_lavacon_ema_bev()가 이 값을 그대로 "박스별 검출 + 좌우 EMA 차선" 시각화에 쓴다.
+        if DEBUG_VIZ_LAVACON_EMA and self._lavacon_boxes_prev is not None:
+            self._draw_lavacon_ema_bev(self._lavacon_boxes_prev, path_m)
 
     # [2-4b] 라바콘 좌우 클러스터 검출 + YOLO 카메라 이중확인 → B1_LAVACON 진입 트리거
     #   입력 self.lidar_ranges, self.cone_detected_yolo(perc_yolo_cone()이 먼저 채워둠)
@@ -1296,6 +1301,101 @@ class TrackDriverNode(Node):
         cv2.putText(bev, 'white=cone candidate lat limit, blue=box boundaries',
                     (8, 154), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
         cv2.imshow('lavacon_bev', bev)
+        cv2.waitKey(1)
+
+    # [2-4d] [DEBUG_VIZ_LAVACON_EMA] 라바콘 박스 스택 클러스터링 + 프레임간 EMA 전용 디버그 BEV
+    #   perc_lavacon()이 process_lavacon()에서 돌려받은 boxes(박스별 좌/우 최근접점 —
+    #   LAVACON_TEMPORAL_EMA_ENABLED면 프레임간 EMA가 이미 반영된 값)를 그대로 시각화한다.
+    #   위 _draw_lavacon_bev()(진입 트리거 판정용, ROI 0.3~0.5m 좁은 구간만 봄)와는 별개 —
+    #   이 창은 process_lavacon()이 실제 조향 경로 재료로 쓰는 boxes 자체(BOX_LON_START~
+    #   CONE_LON_MAX 전체 박스 스택)에 집중한다. 박스 안에서 좌(초록)/우(주황) 점이
+    #   검출되면 그 절반을 색으로 채우고, 검출된 점들을 박스 순서대로 이어 "좌우 라바콘
+    #   차선"(LAVACON_TEMPORAL_EMA_ENABLED면 프레임간 EMA로 스무딩된 바운더리 라인)을 그린다.
+    def _draw_lavacon_ema_bev(self, boxes, path_m):
+        PPM = 80           # lavacon_bev와 동일 축척 — 두 창을 나란히 놓고 비교하기 쉽게
+        W, H = 500, 600
+        ORIGIN_EX, ORIGIN_EY = 250, 460
+        EGO_MARKER_PULLBACK_PX = int(LAVACON_BOX_LON_WIDTH * PPM)
+        MARKER_EX, MARKER_EY = ORIGIN_EX, ORIGIN_EY + EGO_MARKER_PULLBACK_PX
+        BEAK_LEN = 18
+        bev = np.zeros((H, W, 3), dtype=np.uint8)
+
+        for d in (1, 2, 3):
+            cv2.circle(bev, (ORIGIN_EX, ORIGIN_EY), d * PPM, (50, 50, 50), 1)
+            cv2.putText(bev, f'{d}m', (ORIGIN_EX + 4, ORIGIN_EY - d * PPM + 12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (80, 80, 80), 1)
+
+        def to_px(wx, wy): return (int(ORIGIN_EX - wy * PPM), int(ORIGIN_EY - wx * PPM))
+
+        n_boxes = max(0, int(math.floor(
+            (LAVACON_PATH_LON_MAX - LAVACON_BOX_LON_START) / LAVACON_BOX_LON_WIDTH + 1e-6)))
+
+        # 박스별 검출 색칠(좌=초록/우=주황, 그 박스의 절반만 채움) — 한 번에 반투명 블렌딩.
+        overlay = bev.copy()
+        left_hits = right_hits = 0
+        for i, (left_xy, right_xy) in enumerate(boxes):
+            b_lo = LAVACON_BOX_LON_START + i * LAVACON_BOX_LON_WIDTH
+            b_hi = b_lo + LAVACON_BOX_LON_WIDTH
+            if left_xy is not None:
+                left_hits += 1
+                cv2.rectangle(overlay, to_px(b_lo, LAVACON_PATH_LAT_LIMIT), to_px(b_hi, 0.0),
+                              (0, 180, 0), -1)
+            if right_xy is not None:
+                right_hits += 1
+                cv2.rectangle(overlay, to_px(b_lo, 0.0), to_px(b_hi, -LAVACON_PATH_LAT_LIMIT),
+                              (0, 110, 200), -1)
+        cv2.addWeighted(overlay, 0.35, bev, 0.65, 0, bev)
+
+        # 박스 경계선(파랑) + 콘 후보 횡방향 한계선(흰색) — _draw_lavacon_bev()와 동일 스타일.
+        for bi in range(n_boxes + 1):
+            box_lon = LAVACON_BOX_LON_START + bi * LAVACON_BOX_LON_WIDTH
+            cv2.line(bev, to_px(box_lon, LAVACON_PATH_LAT_LIMIT), to_px(box_lon, -LAVACON_PATH_LAT_LIMIT),
+                     (255, 120, 0), 1)
+        cv2.line(bev, to_px(0.0, LAVACON_PATH_LAT_LIMIT), to_px(LAVACON_PATH_LON_MAX, LAVACON_PATH_LAT_LIMIT),
+                 (255, 255, 255), 1)
+        cv2.line(bev, to_px(0.0, -LAVACON_PATH_LAT_LIMIT), to_px(LAVACON_PATH_LON_MAX, -LAVACON_PATH_LAT_LIMIT),
+                 (255, 255, 255), 1)
+
+        # 좌/우 EMA 차선 — 박스 순서대로 검출점을 이은 선. 미검출(None) 박스에서는 선을
+        # 끊어서(연결하지 않고) "그 구간은 실제로 안 보였다"를 잔상 없이 그대로 보여준다.
+        def _draw_lane(side_getter, color):
+            prev_px = None
+            for left_xy, right_xy in boxes:
+                pt = side_getter(left_xy, right_xy)
+                if pt is None:
+                    prev_px = None
+                    continue
+                cur_px = to_px(pt[0], pt[1])
+                if prev_px is not None:
+                    cv2.line(bev, prev_px, cur_px, color, 2)
+                cv2.circle(bev, cur_px, 4, color, -1)
+                cv2.circle(bev, cur_px, 4, (0, 0, 0), 1)
+                prev_px = cur_px
+
+        _draw_lane(lambda l, r: l, (0, 255, 0))     # 좌측 라바콘 차선(초록)
+        _draw_lane(lambda l, r: r, (0, 140, 255))   # 우측 라바콘 차선(주황)
+
+        # 참고용 — 이 boxes로부터 계산된 최종 조향 경로(중점). _draw_lavacon_bev()의 노란
+        # 선/점과 같은 재료(self._lavacon_path_m)라 여긴 얇게만 겹쳐 그려 좌/우 차선을 가리지 않게 함.
+        if path_m:
+            prev_px = (ORIGIN_EX, ORIGIN_EY)
+            for wx, wy in path_m:
+                cur_px = to_px(wx, wy)
+                cv2.line(bev, prev_px, cur_px, (0, 255, 255), 1)
+                prev_px = cur_px
+
+        cv2.circle(bev, (MARKER_EX, MARKER_EY), 6, (255, 220, 0), -1)
+        cv2.line(bev, (MARKER_EX, MARKER_EY), (MARKER_EX, MARKER_EY - BEAK_LEN), (255, 220, 0), 2)
+
+        cv2.putText(bev, f'boxes={len(boxes)} L_detect={left_hits} R_detect={right_hits}', (8, 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(bev, f'temporal_ema={LAVACON_TEMPORAL_EMA_ENABLED}(a={LAVACON_TEMPORAL_EMA_ALPHA}) '
+                          f'sparse_fallback={LAVACON_SPARSE_FALLBACK_ENABLED}(a={LAVACON_HALFWIDTH_EMA_ALPHA})',
+                    (8, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 200), 1, cv2.LINE_AA)
+        cv2.putText(bev, 'green=left lane(EMA), orange=right lane(EMA), yellow=steer path midpoint',
+                    (8, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+
+        cv2.imshow('lavacon_ema_bev', bev)
         cv2.waitKey(1)
 
     # [2-6] 방해차량 진입 트리거 (라이다)
