@@ -2047,6 +2047,52 @@ class TrackDriverNode(Node):
         cv2.imshow('avoid_hold_debug', canvas)
         cv2.waitKey(1)
 
+    # [DEBUG_VIZ_SIGNAL, 신규 2026-08-18] 신호등 인식 "한눈에 보기" 창 — traffic_signal.py의
+    # signal4_roi(§1, ROI를 확대해 원 하나하나를 보여줌)/signal4_board_search(이번 프레임에
+    # 시도한 후보 박스 전부)와 달리, 이 창은 전체 카메라 원본 위에 "지금 어디를 보고 있는지"
+    # (박스, 초록=이번 프레임 성공/빨강=실패)와 "그래서 결론이 뭔지"(순간값 + SIG_CONFIRM_FRAMES
+    # 디바운스를 통과한 확정값)를 한 창에서 같이 보여준다 — 실차에서 신호등이 잘 잡히는지
+    # 신호등 로직 내부를 몰라도 이 창 하나로 확인하고 싶다는 요청으로 추가. perc_signal()이
+    # S0/S2 상태에서만 detect_s2()를 돌리므로(그 외 상태는 self.signal_detector가 갱신 안 됨)
+    # control_loop()에서도 같은 상태일 때만 호출한다.
+    def _debug_viz_signal_status(self):
+        if self.img_front is None:
+            return
+        sd = self.signal_detector
+        vis = self.img_front.copy()
+
+        t, b, l, r = sd.s2_roi_px
+        ok = not sd.s2_reject_reason
+        box_color = (0, 200, 0) if ok else (0, 0, 220)
+        cv2.rectangle(vis, (l, t), (r, b), box_color, 2, cv2.LINE_AA)
+
+        state_kr = ('좌회전' if self.signal_left_on else
+                    '직진'   if self.signal_straight_on else
+                    '정지(빨강)' if self.signal_red_on else '미검출')
+        confirmed = self.signal_left_confirmed or self.signal_straight_confirmed
+        confirm_kr = ('좌회전 확정' if self.signal_left_confirmed else
+                       '직진 확정'   if self.signal_straight_confirmed else '대기 중')
+        confirm_color = (0, 200, 0) if confirmed else (0, 140, 255)
+
+        lines = [
+            (f'{self.mission_state.name}', (10, 8), (255, 255, 255), 20,
+             f'{self.mission_state.name}'),
+            (f'이번 프레임: {state_kr}', (10, 40), (255, 255, 255) if ok else (0, 0, 220), 20,
+             f'This frame: {state_kr}'),
+            (f'확정: {confirm_kr} (직진 {self._sig_straight_cnt}/{SIG_CONFIRM_FRAMES}  '
+             f'좌회전 {self._sig_left_cnt}/{SIG_CONFIRM_FRAMES})',
+             (10, 72), confirm_color, 18, f'Confirmed: {confirm_kr}'),
+        ]
+        if not ok:
+            lines.append((f'실패 사유: {sd.s2_reject_reason}', (10, 100), (0, 0, 220), 16,
+                           f'Fail: {sd.s2_reject_reason}'))
+
+        put_text_kr_multi(vis, lines)
+        cv2.rectangle(vis, (0, 0), (vis.shape[1] - 1, vis.shape[0] - 1), box_color, 3)
+
+        cv2.imshow('signal_status', vis)
+        cv2.waitKey(1)
+
     def _lane_pid(self, offset, deadzone=LANE_DEADZONE):
         """차선 중앙편차(offset)를 PID 제어로 조향각(angle)으로 변환한다."""
         if abs(offset) < deadzone:
@@ -2408,6 +2454,8 @@ class TrackDriverNode(Node):
             self._debug_viz_imu()
         if DEBUG_VIZ_AVOID_HOLD:
             self._debug_viz_avoid_hold()
+        if DEBUG_VIZ_SIGNAL and self.mission_state in (MissionState.S0_WAIT_GREEN, MissionState.S2_INTERSECTION):
+            self._debug_viz_signal_status()
 
         if ENABLE_BEHAVIOR and self.mission_state == MissionState.S1_LANE_FOLLOW and self._behavior_enabled:
             self.run_behavior_fsm()         #    Behavior 상태 결정
