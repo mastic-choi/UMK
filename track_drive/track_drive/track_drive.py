@@ -2150,26 +2150,37 @@ class TrackDriverNode(Node):
              (10, 62), (255, 255, 255), 13,
              f'trigger — front={self.obstacle_front} dist={self.obstacle_dist:.2f}m '
              f'rate={self.obstacle_rate:+.2f} v={self.v_mps:+.2f}'),
+            # [2026-08-19] near_obstacle(§2.46/§2.48) 카메라 이중확인 상태 — YOLO가 이번
+            # 프레임 'car'를 봤는지(원시)와, (라이다 근접 AND YOLO) 디바운스 확정값을 같이
+            # 보여준다. yolo_vehicle_detector 초기화 실패 시(None) 라이다 단독 폴백 중임을
+            # 별도로 표시(perc_yolo_vehicle() 참고).
+            (f'YOLO 차량 이중확인 — car검출={self.vehicle_detected_yolo}  '
+             f'확정={self.vehicle_confirmed_yolo}({self._yolo_vehicle_confirm_cnt}/{YOLO_VEHICLE_CONFIRM_FRAMES})'
+             + ('' if self.yolo_vehicle_detector is not None else '  [YOLO 미가동, 라이다 단독 폴백]'),
+             (10, 84), (0, 200, 0) if self.vehicle_confirmed_yolo else (150, 150, 150), 13,
+             f'YOLO vehicle — car={self.vehicle_detected_yolo} '
+             f'confirmed={self.vehicle_confirmed_yolo}({self._yolo_vehicle_confirm_cnt}/{YOLO_VEHICLE_CONFIRM_FRAMES})'
+             + ('' if self.yolo_vehicle_detector is not None else ' [YOLO down, lidar-only fallback]')),
             (f'target_speed_est(트리거 스냅샷) = {self._avoid_hold_target_speed_est:+.2f} m/s',
-             (10, 84), (255, 255, 255), 13,
+             (10, 106), (255, 255, 255), 13,
              f'target_speed_est(snapshot) = {self._avoid_hold_target_speed_est:+.2f} m/s'),
             (f'da 연속성 보조트리거(적용2) — chosen_area={da_area}px  jump={"O" if da_jump else "X"}',
-             (10, 106), (0, 200, 255) if da_jump else (150, 150, 150), 13,
+             (10, 128), (0, 200, 255) if da_jump else (150, 150, 150), 13,
              f'da continuity — area={da_area}px jump={"YES" if da_jump else "no"}'),
             (f'조기해제 진행 — front=False {self._avoid_hold_release_cnt}/{AVOID_HOLD_RELEASE_CONFIRM_FRAMES}'
              f'  마지막유효dist={self._avoid_hold_last_valid_dist:.2f}m (>= {AVOID_HOLD_RELEASE_DIST_M}m 필요)',
-             (10, 128), (200, 200, 200), 12,
+             (10, 150), (200, 200, 200), 12,
              f'early-release {self._avoid_hold_release_cnt}/{AVOID_HOLD_RELEASE_CONFIRM_FRAMES}, '
              f'last_valid_dist={self._avoid_hold_last_valid_dist:.2f} (need>={AVOID_HOLD_RELEASE_DIST_M})'),
             ('── ★ 실차 미검증(실측 필요) — avoid_hold_measurement_todo.md 참고 ★',
-             (10, 156), UNMEASURED, 13, '-- UNMEASURED, see avoid_hold_measurement_todo.md --'),
+             (10, 178), UNMEASURED, 13, '-- UNMEASURED, see avoid_hold_measurement_todo.md --'),
             (f'RATE_GAIN={AVOID_HOLD_RATE_GAIN}   SEC_MAX={AVOID_HOLD_SEC_MAX}s   '
              f'RELEASE_DIST_M={AVOID_HOLD_RELEASE_DIST_M}m',
-             (10, 178), UNMEASURED, 12,
+             (10, 200), UNMEASURED, 12,
              f'RATE_GAIN={AVOID_HOLD_RATE_GAIN} SEC_MAX={AVOID_HOLD_SEC_MAX} '
              f'RELEASE_DIST_M={AVOID_HOLD_RELEASE_DIST_M}'),
             (f'DA_AREA_JUMP_RATIO={AVOID_HOLD_DA_AREA_JUMP_RATIO}   DIR_BIAS_PX={AVOID_HOLD_DIR_BIAS_PX}px',
-             (10, 198), UNMEASURED, 12,
+             (10, 220), UNMEASURED, 12,
              f'DA_AREA_JUMP_RATIO={AVOID_HOLD_DA_AREA_JUMP_RATIO} '
              f'DIR_BIAS_PX={AVOID_HOLD_DIR_BIAS_PX}'),
         ]
@@ -2185,7 +2196,7 @@ class TrackDriverNode(Node):
         # 뜻임을 밑에 텍스트로 같이 알려준다. "왜 아직 유예 중인지"는 _avoid_hold_trigger_*
         # (트리거 시점 스냅샷, _update_avoid_hold() 참고)를 오른쪽 텍스트로 별도 표시한다.
         PANEL_W, PANEL_H = 200, 200
-        panel_x0, panel_y0 = 15, 226
+        panel_x0, panel_y0 = 15, 254  # [2026-08-19] YOLO 차량 이중확인 줄 추가로 텍스트 영역이 늘어나 아래로 밀림
         canvas = np.full((panel_y0 + PANEL_H + 12, 620, 3), 30, dtype=np.uint8)
         put_text_kr_multi(canvas, lines)
         cv2.rectangle(canvas, (0, 0), (canvas.shape[1] - 1, canvas.shape[0] - 1), active_color, 3)
