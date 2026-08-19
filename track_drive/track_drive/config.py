@@ -1097,11 +1097,11 @@ DEBUG_VIZ_LAVACON  = True  # 라바콘 트리거 좌우 클러스터 BEV 디버�
 #   위 DEBUG_VIZ_LAVACON(트리거 판정용)과는 별개 — 이 창은 process_lavacon()이 실제로
 #   조향 경로 재료로 쓰는 boxes 자체(박스별 검출 색칠 + 좌/우 EMA 차선)에 집중한다.
 DEBUG_VIZ_LAVACON_EMA = True  # 라바콘 박스 클러스터링 검출 + 좌우 EMA 차선 디버그 창 (track_drive.py)
-# [2026-08-19] 좌/우 EMA 차선(초록/주황)에 집중해서 보고 싶다는 요청으로, lavacon_bev/
-#   lavacon_ema_bev 두 창의 노란 조향경로(self._lavacon_path_m) 그리기만 당분간 끔 —
-#   경로 자체는 그대로 계산/조향에 쓰이고, 이 창들에서 시각화만 생략한다. 다시 보고
-#   싶으면 True로 되돌릴 것(_draw_lavacon_bev()/_draw_lavacon_ema_bev() 참고).
-DEBUG_VIZ_LAVACON_SHOW_PATH = False
+# [2026-08-19] lavacon_bev/lavacon_ema_bev 두 창의 노란 조향경로(self._lavacon_path_m)
+#   그리기 스위치 — 잠깐 꺼뒀다가 다시 요청으로 켬. 경로 자체는 이 값과 무관하게 항상
+#   계산/조향에 쓰이고, 이건 시각화 여부만 결정한다(_draw_lavacon_bev()/
+#   _draw_lavacon_ema_bev() 참고).
+DEBUG_VIZ_LAVACON_SHOW_PATH = True
 DEBUG_PLANNER      = False  # Hybrid A* OccupancyGrid 디버그 창 (track_drive.py, USE_HYBRID_ASTAR_FOR_B3=True일 때만 의미있음)
 DEBUG_VIZ_STEER    = False  # 조향 컨트롤러(직전값유지/현재값반영) 한글 디버그 창 (track_drive.py)
 DEBUG_VIZ_VESC     = False  # VESC 실측속도(/vesc_speed_erpm) 연동 상태(수신중/끊김/미수신) 디버그 창
