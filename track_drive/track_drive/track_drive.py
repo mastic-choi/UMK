@@ -1655,6 +1655,13 @@ class TrackDriverNode(Node):
         # 이탈했다. lane_stale과 같은 SPEED_LANE_STALE 캡을 여기도 건다.
         if self.lane_unstable:
             target_speed = min(target_speed, SPEED_LANE_STALE)
+        # [2026-08-19] 근접 밴드 hold 타임아웃(config.py DL_NEAR_HOLD_MAX_FRAMES,
+        # perception/dl_lane.py detect() 참고) — 근접 밴드가 그 프레임 수 넘게 안 잡혀
+        # hold도 포기한 상태면, "지금 차량 바로 앞 정보를 오래 못 믿고 있다"는 뜻이라
+        # lane_stale/lane_unstable과 동일하게 감속 신호로 드러낸다. hough/classic_cv
+        # 백엔드엔 이 속성이 없으니 getattr로 조회(다른 DL 전용 속성과 동일 관례).
+        if getattr(self.lane_detector, 'near_band_stale', False):
+            target_speed = min(target_speed, SPEED_LANE_STALE)
         # [2026-08-18] avoid-hold 적용4(SPEED_AVOID_HOLD_BLOCKED 안전판) 삭제 — 실차 테스트에서
         # "속도 5 고정" 증상의 실제 원인으로 확인됨(README §2.43). TEST_DISABLE_B2_B3=True라
         # 실제 회피 기동(옆차선 이동)은 꺼져있는데 이 캡만 무관하게 계속 걸려서, 트리거를

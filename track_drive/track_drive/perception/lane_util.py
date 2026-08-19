@@ -451,7 +451,7 @@ class SlideWindow:
 
         return centers
 
-    def _reject_outliers(self, centers):
+    def _reject_outliers(self, centers, protect_indices=None):
         """
         구간별 무게중심들 사이의 위치 일관성을 체크해서 이상치(반사광 등으로
         혼자 튄 값)를 제거한다. 진짜 차선은 슬라이스가 위로 갈수록 완만하게
@@ -465,6 +465,16 @@ class SlideWindow:
                 문제가 있어(실측으로 확인됨) 반드시 leave-one-out으로 한다.
                 슬라이스가 3~5개뿐이라 매 프레임 여러 번 다시 피팅해도 비용은
                 무시할 수준이다.
+          [2026-08-19] protect_indices — 이 인덱스들은 검사 자체를 건너뛰고
+                항상 그대로 통과시킨다(다른 슬라이스를 판정할 때 "나머지"로는
+                여전히 쓰인다). da 모드 회피 중 원거리 슬라이스 여러 개가
+                장애물 때문에 정당하게 한쪽으로 휘면, leave-one-out 추세선이
+                그 휨을 그대로 따라가 아직 정상(중앙)인 근접 슬라이스를
+                오히려 "이상치"로 오판하는 문제가 실차 캡처로 확인됐다 —
+                근접 슬라이스는 원근 왜곡이 작아 원래 가장 신뢰도가 높은
+                구간인데 먼 곳의 추세로 의심하는 게 방향이 거꾸로다. 호출부
+                (dl_lane.py detect())가 near_slices 인덱스를 넘겨 이 오판을
+                막는다. None(기본값)이면 기존과 동일(전부 검사).
           입력/출력 : centers — _slice_centers()와 동일한 형식(길이 불변)
         """
         valid_idx = [i for i, c in enumerate(centers) if c is not None]
@@ -475,8 +485,11 @@ class SlideWindow:
         xs = np.array([centers[i][1] for i in valid_idx])
 
         result = list(centers)
+        protect = set(protect_indices) if protect_indices is not None else ()
 
         for k, i in enumerate(valid_idx):
+            if i in protect:
+                continue
             other_y = np.delete(ys, k)
             other_x = np.delete(xs, k)
 

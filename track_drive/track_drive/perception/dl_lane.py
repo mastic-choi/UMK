@@ -200,6 +200,8 @@ from ..config import (
     DL_N_SLICES, DL_MIN_PIXELS, DL_NEAR_SLICES, DL_FAR_SLICES,
     DL_SLICE_OUTLIER_MAX, DL_SLICE_FIT_MIN,
     DL_STABLE_FRAME_MIN, DL_STABLE_JUMP_MAX,
+    # [2026-08-19] 근접 밴드 이상치 오판 방지(1차) + hold 타임아웃(2차) — README 참고
+    DL_NEAR_HOLD_MAX_FRAMES,
     DL_DA_MIN_COMPONENT_AREA,
     DL_DA_SEED_ROWS_PX, DL_DA_SEED_HALF_WIDTH_PX,
     # [2026-08-12] DL_CENTER_MODE='da' 밴드 중심 탐색창(prior)+속도예측+앵커링 — README §2.27
@@ -212,6 +214,7 @@ from ..config import (
     # [2026-08-14] da 안전마진(차량 폭) 침식 — README §2.30
     # [2026-08-17g] 방해차량 "뒤" 방향 속도비례 추가마진 — config.py DL_DA_REAR_MARGIN_* 주석 참고
     DL_DA_APPLY_VEHICLE_MARGIN, DL_DA_VEHICLE_MARGIN_M, VEHICLE_WIDTH_M,
+    DL_DA_SIDE_MARGIN_M,
     DL_DA_REAR_MARGIN_REACT_SEC, DL_DA_REAR_MARGIN_MAX_M,
     # [2026-08-15] avoid-hold 개선 적용2(da 연속성 보조트리거)/적용3(방향 힌트) — README §2.32,
     # avoid_hold_improvement_proposal.md
@@ -234,23 +237,27 @@ from ..config import (
 )
 
 # ── [2026-08-14] da 안전마진(차량 폭) 침식 커널 — README §2.30 "da 안전마진 설계 논의" ──
-#   VEHICLE_WIDTH_M(실측 차폭)의 절반 + DL_DA_VEHICLE_MARGIN_M(여유)을 DL_PIXELS_PER_METER로
-#   픽셀 환산해 좌우(가로) 반경으로 쓴다. DL_CENTER_MODE='da'에서만 쓰인다(detect() 참고).
+#   VEHICLE_WIDTH_M(실측 차폭)의 절반 + 마진(여유)을 DL_PIXELS_PER_METER로 픽셀 환산해
+#   반경으로 쓴다. DL_CENTER_MODE='da'에서만 쓰인다(detect() 참고).
+#   [2026-08-19] 좌우(가로, rx)와 전후(세로, ry 기본값)를 서로 다른 설정값에서 뽑도록
+#   분리 — 예전엔 이 둘이 같은 DL_DA_VEHICLE_MARGIN_M 하나를 공유해서, "방해차량 옆
+#   여유만 조금 늘리고 싶다"는 요청을 반영하려면 전후 기본값까지 같이 딸려 올라갔다.
+#   이제 DL_DA_SIDE_MARGIN_M(좌우 전용)과 DL_DA_VEHICLE_MARGIN_M(전후 기본값 전용, 아래
+#   REAR_MARGIN_*이 여기에 속도비례로 얹힘)을 독립적으로 조정할 수 있다.
 _DL_DA_MARGIN_PX = int(round((VEHICLE_WIDTH_M / 2.0 + DL_DA_VEHICLE_MARGIN_M) * DL_PIXELS_PER_METER))
-# [2026-08-17g] 예전엔 위 반경을 그대로 정사각 커널(가로=세로, 등방)로 써서 좌우 마진과
-#   전/후("방해차량 뒤" 포함) 마진이 항상 같은 값이었다. 이제 세로(진행방향) 반경만
-#   v_mps에 비례해 늘려서 "뒤" 쪽 여유를 속도에 맞게 더 벌린다 — config.py
-#   DL_DA_REAR_MARGIN_REACT_SEC/MAX_M 주석 참고. 속도에 따라 매 프레임 달라지므로(다른
-#   커널들과 달리) 모듈 임포트 시 한 번만 만들어두지 못하고 _apply_vehicle_margin()이
-#   호출될 때마다 새로 만든다 — cv2.getStructuringElement는 이 크기(수십 px)에서는
-#   무시할 만큼 가볍다.
+_DL_DA_SIDE_MARGIN_PX = int(round((VEHICLE_WIDTH_M / 2.0 + DL_DA_SIDE_MARGIN_M) * DL_PIXELS_PER_METER))
+# [2026-08-17g] 세로(진행방향) 반경만 v_mps에 비례해 늘려서 "뒤" 쪽 여유를 속도에 맞게
+#   더 벌린다 — config.py DL_DA_REAR_MARGIN_REACT_SEC/MAX_M 주석 참고. 속도에 따라 매
+#   프레임 달라지므로(다른 커널들과 달리) 모듈 임포트 시 한 번만 만들어두지 못하고
+#   _apply_vehicle_margin()이 호출될 때마다 새로 만든다 — cv2.getStructuringElement는
+#   이 크기(수십 px)에서는 무시할 만큼 가볍다.
 def _dl_da_margin_kernel(v_mps):
-    if not DL_DA_APPLY_VEHICLE_MARGIN or _DL_DA_MARGIN_PX <= 0:
+    if not DL_DA_APPLY_VEHICLE_MARGIN or (_DL_DA_MARGIN_PX <= 0 and _DL_DA_SIDE_MARGIN_PX <= 0):
         return None
     extra_m = min(DL_DA_REAR_MARGIN_REACT_SEC * max(float(v_mps), 0.0), DL_DA_REAR_MARGIN_MAX_M)
     ry = _DL_DA_MARGIN_PX + int(round(extra_m * DL_PIXELS_PER_METER))
-    rx = _DL_DA_MARGIN_PX
-    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (rx * 2 + 1, ry * 2 + 1))
+    rx = _DL_DA_SIDE_MARGIN_PX
+    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (max(rx, 0) * 2 + 1, max(ry, 0) * 2 + 1))
 
 # [2026-08-10] visualize()가 result 패널 맨 위에 그리는 모드 배너 색을 한곳에서 관리.
 # [2026-08-11] 원래는 여기 색을 _build_params_panel()의 배너와도 맞췄었는데, 그 함수를
@@ -482,6 +489,13 @@ class DLSlideWindow(SlideWindow):
         # README §2.27 참고.
         self._da_velocity = 0.0
         self._da_prev_band_x = [None] * self.n_slices
+        # [2026-08-19] 근접 밴드 이상치 오판(2차 안전판) — _reject_outliers() protect_indices로
+        # 근접 밴드를 검사에서 뺐어도(1차) 진짜 순간 미검출 등으로 비면, 이 카운터가
+        # DL_NEAR_HOLD_MAX_FRAMES에 도달할 때까지만 _da_prev_band_x[i]로 대신 채운다.
+        # detect()/_reject_outliers() 주석, config.py DL_NEAR_HOLD_MAX_FRAMES 참고.
+        self._near_hold_streak = [0] * self.n_slices
+        self.near_band_held = [False] * self.n_slices   # 이 프레임 그 근접 밴드가 hold로 채워졌는지 — visualize() 구분용
+        self.near_band_stale = False   # 근접 밴드가 DL_NEAR_HOLD_MAX_FRAMES 넘게 안 잡혀 hold도 포기했는지 — track_drive.py가 SPEED_LANE_STALE 캡에 씀
         self._white_yellow_gap_px = DL_LL_YELLOW_GAP_INIT_PX  # [2026-08-10] 노란 중앙선-흰색 경계선 간격 러닝 추정치(px, DL_LL_ALGO='yw' 전용) — 둘 다 찾은 밴드에서 EMA 갱신, 한쪽만 찾았을 때 반대쪽 위치 추정에 씀(_ll_yellow_white_centers() 참고).
         # [2026-08-12] _ll_yellow_white_centers()(DL_LL_ALGO='yw') 밴드 간 속도예측 +
         # 프레임 간 앵커링 상태 — 아래 _ll_left/right_velocity(DL_LL_ALGO='lr')와 동일한
@@ -1892,7 +1906,42 @@ class DLSlideWindow(SlideWindow):
                 self.ll_degraded = False
 
         self.da_mask_roi = da_mask
-        self.centerline = self._reject_outliers(merged_centers)
+        # [2026-08-19] da 모드에서만 근접 밴드를 이상치 검사에서 보호한다(①) —
+        # lane_util.py _reject_outliers() protect_indices 주석 참고. 'll'/'ll_da'는
+        # 이 문제의 전제(회피 중 원거리 여러 밴드가 함께 휘는 것)와 무관해 기존과
+        # 동일하게 전부 검사한다.
+        protect_near = range(self.near_slices) if DL_CENTER_MODE == 'da' else None
+        self.centerline = self._reject_outliers(merged_centers, protect_indices=protect_near)
+
+        if DL_CENTER_MODE == 'da':
+            # [2026-08-19] ②(2차 안전판) — ①을 통과하고도(진짜 순간 미검출 등) 근접
+            # 밴드가 비면, 마지막으로 실제 찾았던 위치(_da_prev_band_x[i], 못 찾은
+            # 프레임엔 안 갱신되므로 자연히 "마지막 확인값"을 들고 있다)로
+            # DL_NEAR_HOLD_MAX_FRAMES 프레임까지만 대신 채운다. 그 이상 넘기면 포기하고
+            # (기존 _fit_and_sample_path()의 np.interp 공간적 hold로 자연 폴백)
+            # near_band_stale=True로 노출한다 — config.py DL_NEAR_HOLD_MAX_FRAMES,
+            # track_drive.py _lane_drive() 참고.
+            self.near_band_stale = False
+            slice_h = self.roi_h // self.n_slices
+            for i in range(self.near_slices):
+                if self.centerline[i] is not None:
+                    self._near_hold_streak[i] = 0
+                    self.near_band_held[i] = False
+                    continue
+                if (self._da_prev_band_x[i] is not None
+                        and self._near_hold_streak[i] < DL_NEAR_HOLD_MAX_FRAMES):
+                    y_high = self.roi_h - i * slice_h
+                    y_low = 0 if i == self.n_slices - 1 else self.roi_h - (i + 1) * slice_h
+                    self.centerline[i] = ((y_low + y_high) / 2.0, self._da_prev_band_x[i])
+                    self._near_hold_streak[i] += 1
+                    self.near_band_held[i] = True
+                else:
+                    self.near_band_held[i] = False
+                    if self._near_hold_streak[i] >= DL_NEAR_HOLD_MAX_FRAMES:
+                        self.near_band_stale = True
+        else:
+            self.near_band_held = [False] * self.n_slices
+            self.near_band_stale = False
 
         # 중앙 노란 점선의 밴드별 무게중심 — 탐색창 없는 stateless 방식(_slice_centers(),
         # lane_util.py 참고)으로 뽑는다. 이미 _split_ll_by_yellow()가 컴포넌트 단위로
@@ -2239,6 +2288,10 @@ class DLSlideWindow(SlideWindow):
             tags += f' [AVOID_HOLD dir:{dir_tag}]'
         if self.ll_degraded:
             tags += ' [LL_DEGRADED]'
+        if any(self.near_band_held[:self.near_slices]):
+            tags += ' [NEAR_HELD]'
+        if self.near_band_stale:
+            tags += ' [NEAR_STALE]'
         # 모드마다 밴드 카운트가 뜻하는 바가 달라서 라벨/부가정보를 따로 붙인다 —
         # 'll_da'(corridor)는 corridor로 채택된 밴드 수, 'll'은 DL_LL_ALGO에 따라 서로
         # 다른 부가정보(아래), 'da'는 항상 0(ll 미사용, 기존 방식과 동일 표시).

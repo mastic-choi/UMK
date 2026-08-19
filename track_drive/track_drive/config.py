@@ -324,6 +324,23 @@ DL_N_SLICES = 8               # da 중심선을 세로로 나눌 밴드 수
 DL_MIN_PIXELS = 40            # 밴드 내 da 픽셀수가 이 미만이면 그 밴드는 "차선 없음" 처리
 DL_NEAR_SLICES = 2            # 근거리(조향용) 편차 계산에 쓸 아래쪽 밴드 수
 DL_FAR_SLICES = 2             # 원거리(코너 예측용) 편차 계산에 쓸 위쪽 밴드 수
+
+# [2026-08-19] 근접 밴드(위 DL_NEAR_SLICES개) 전용 "임시 hold" 상한 — 원거리 밴드가
+#   장애물 회피로 정당하게 휘면 leave-one-out 추세선(_reject_outliers())이 아직
+#   정상인 근접 밴드를 이상치로 오판하던 문제의 2차 안전판(1차는 근접 밴드를 그
+#   검사에서 아예 빼는 것, dl_lane.py detect()/lane_util.py _reject_outliers()
+#   protect_indices 참고). 그 방어를 뚫고도(진짜 순간 미검출 등) 근접 밴드가 비면,
+#   그 밴드가 마지막으로 실제 찾았던 위치(_da_prev_band_x[i])를 이 프레임 수까지만
+#   대신 채운다 — 찰나의 깜빡임은 다리를 놓아 넘기되, 진짜로 오래 안 보이면(장애물이
+#   실제로 근접까지 온 경우일 수 있음, README §2.30 "앞코가 뒷꽁지를 긁는다" 참고)
+#   더는 안 믿고 포기해서 위험 신호를 계속 숨기지 않는다. 같은 목적의 기존
+#   상수(SIDE_CLEAR_CONFIRM_FRAMES=3, AVOID_HOLD_RELEASE_CONFIRM_FRAMES=4,
+#   SIG_CONFIRM_FRAMES=3)가 전부 3~4프레임대라 그 범위의 하한을 택했다 — 이건
+#   "위험할 수 있는 정보를 얼마나 오래 숨길 것인가"라 그 중에서도 짧은 쪽이 안전하다는
+#   판단. 넘기면 near_band_stale=True로 노출돼 track_drive.py _lane_drive()가
+#   SPEED_LANE_STALE급으로 감속시킨다(lane_stale/lane_unstable과 동일 철학). 20Hz
+#   기준 3프레임≈0.15초. 실차 미검증.
+DL_NEAR_HOLD_MAX_FRAMES = 3
 # [LQR 브랜치 dl_lane_BEV_파라미터_변경사유.md에서 이식, 2026-08-05] 아래 4개 값은
 #   원래 BEV 도입 전 원근(perspective) 640×140px ROI 스케일로 잡혔던 값을 그대로
 #   들고 있었다. BEV(585×298px 캔버스, DL_PIXELS_PER_METER=200px/m)로 좌표계가
@@ -523,20 +540,35 @@ DL_DA_SKIP_LL_CLIP = True
 #   구간에서 침식이 과해 da가 DL_DA_MIN_COMPONENT_AREA 밑으로 꺼지면(=그 프레임 무효
 #   처리) 실차에서 확인 후 DL_DA_VEHICLE_MARGIN_M을 낮출 것. 실차 미검증 초기값.
 DL_DA_APPLY_VEHICLE_MARGIN = True
-DL_DA_VEHICLE_MARGIN_M = 0.05   # ASTAR_VEHICLE_MARGIN_M(라이다/Hybrid A* 쪽)과 동일 관례 — 좌우 마진
+DL_DA_VEHICLE_MARGIN_M = 0.05   # ASTAR_VEHICLE_MARGIN_M(라이다/Hybrid A* 쪽)과 동일 관례 — 전/후(세로) 마진 기본값
 
-# [2026-08-17g] 위 DL_DA_VEHICLE_MARGIN_M(+VEHICLE_WIDTH_M/2)은 좌/우/전/후 모두 같은 반경으로
-#   침식하는 등방(isotropic) 원형 커널이라, 방해차량 뒤쪽(=지나간 뒤 재진입하는 da 영역)도
-#   좌우와 똑같은 폭만큼만 벌어져 있었다(질문 확인 결과 — _apply_vehicle_margin()이
-#   cv2.MORPH_ELLIPSE를 정사각형(반경 동일)으로 만들어 씀). 속도가 높을수록 접근 상대속도가
-#   커져 "앞코가 장애물 뒷꽁지를 긁는" 여유가 더 필요하다는 요청 반영 — da 마스크의 세로축
-#   (BEV 캔버스 row, DL_BEV_FAR_CROP_ROW 주석 참고: row가 작을수록 원거리=전방, 클수록
-#   근거리=차량 쪽)이 곧 진행방향이므로, 세로 반경만 v_mps에 비례해 더 키운다(가로=좌우 폭은
-#   DL_DA_VEHICLE_MARGIN_M 그대로). extra_m = min(DL_DA_REAR_MARGIN_REACT_SEC * v_mps,
-#   DL_DA_REAR_MARGIN_MAX_M) — REACT_SEC은 "제동/재계획까지 걸리는 시간"의 근사치로 삼은
-#   설계값(실측 아님), 단위가 s인 게 자연스럽도록 "속도(m/s) × 시간(s) = 거리(m)"로 뒀다.
-#   MAX_M은 da가 통째로 침식돼 사라지는 걸(§2.30, _apply_vehicle_margin() 폴백 참고) 막는 상한.
-#   실차 미검증 초기값 — 코너에서 da가 자주 무효 처리되면 REACT_SEC/MAX_M을 낮출 것.
+# [2026-08-19] DL_DA_SIDE_MARGIN_M — 좌/우(가로) 마진 전용 상수로 분리(요청 반영).
+#   예전엔 위 DL_DA_VEHICLE_MARGIN_M 하나가 좌우/전후 기본 반경을 전부 결정했는데(등방),
+#   "방해차량 옆으로 지나갈 때 여유를 조금만 더 주고 싶다"는 요청을 반영하려면 좌우만
+#   따로 건드릴 수 있어야 한다 — 지금 구조로는 이 값을 올리면 전후(아래
+#   DL_DA_REAR_MARGIN_*이 얹히는 기본값)도 같이 오르는 부작용이 있었다(§2.38 논의 참고).
+#   기본값은 DL_DA_VEHICLE_MARGIN_M과 동일한 0.05로 둬서, 이 분리 자체는 기존 동작을
+#   바꾸지 않는다 — 좌우만 늘리고 싶으면 이 값만 올릴 것(예: 0.05 → 0.07~0.08m 정도부터
+#   실차에서 확인). 트랙 가장자리/커브 여백도 이 값을 따라 같이 넓어진다는 점은 여전히
+#   동일하다(da_lane.py _apply_vehicle_margin()이 좌우 경계 전체에 등방 적용 — "장애물
+#   옆이라서" 골라 적용되는 게 아니다) — 너무 키우면 좁은 커브에서 da가
+#   DL_DA_MIN_COMPONENT_AREA 밑으로 꺼질 수 있으니 그 구간부터 확인. 실차 미검증.
+DL_DA_SIDE_MARGIN_M = 0.05
+
+# [2026-08-17g] 위 DL_DA_VEHICLE_MARGIN_M(+VEHICLE_WIDTH_M/2)은 원래 좌/우/전/후 모두 같은
+#   반경으로 침식하는 등방(isotropic) 원형 커널이었는데, 방해차량 뒤쪽(=지나간 뒤
+#   재진입하는 da 영역)도 좌우와 똑같은 폭만큼만 벌어져 있었다(질문 확인 결과 —
+#   _apply_vehicle_margin()이 cv2.MORPH_ELLIPSE를 정사각형(반경 동일)으로 만들어 씀).
+#   속도가 높을수록 접근 상대속도가 커져 "앞코가 장애물 뒷꽁지를 긁는" 여유가 더
+#   필요하다는 요청 반영 — da 마스크의 세로축(BEV 캔버스 row, DL_BEV_FAR_CROP_ROW 주석
+#   참고: row가 작을수록 원거리=전방, 클수록 근거리=차량 쪽)이 곧 진행방향이므로, 세로
+#   반경만 v_mps에 비례해 더 키운다([2026-08-19] 가로=좌우 폭은 이제 위
+#   DL_DA_SIDE_MARGIN_M이 독립적으로 결정 — DL_DA_VEHICLE_MARGIN_M과 더는 안 묶임).
+#   extra_m = min(DL_DA_REAR_MARGIN_REACT_SEC * v_mps, DL_DA_REAR_MARGIN_MAX_M) —
+#   REACT_SEC은 "제동/재계획까지 걸리는 시간"의 근사치로 삼은 설계값(실측 아님), 단위가
+#   s인 게 자연스럽도록 "속도(m/s) × 시간(s) = 거리(m)"로 뒀다. MAX_M은 da가 통째로
+#   침식돼 사라지는 걸(§2.30, _apply_vehicle_margin() 폴백 참고) 막는 상한. 실차 미검증
+#   초기값 — 코너에서 da가 자주 무효 처리되면 REACT_SEC/MAX_M을 낮출 것.
 DL_DA_REAR_MARGIN_REACT_SEC = 0.2   # 속도(v_mps)에 비례해 "뒤" 방향 마진을 추가로 늘리는 반응시간(s)
 DL_DA_REAR_MARGIN_MAX_M = 0.5       # 위 추가 마진의 상한(m) — 대략 VEHICLE_LENGTH_M(0.64) 이내로 캡
 
