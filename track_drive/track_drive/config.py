@@ -1023,7 +1023,7 @@ DEBUG_VIZ_STOPLINE   = False  # 정지선 디버그 창, 백엔드 무관 항상
 #   현재 인식 상태(정지·직진·좌회전·미검출)를 창 하나에 다 보여주도록 확장
 #   (perception/traffic_signal.py detect_s2()). 요청에 따라 기본 True로 켜둠 — 다른 항목과
 #   달리(위 2026-08-11 라바콘 테스트 메모 참고) 이 스위치는 독립적으로 True 유지할 것.
-DEBUG_VIZ_SIGNAL     = False   # 신호등 ROI/HoughCircles 디버그 창 (perception/traffic_signal.py)
+DEBUG_VIZ_SIGNAL     = True    # 신호등 ROI/HoughCircles 디버그 창 (perception/traffic_signal.py)
 # DEBUG_LOG_SIGNAL: 신호등 전용 상세 진단 로그. 전역 DEBUG_LOG(0.5초 주기 요약 [SIG] 한 줄)와는
 #   별개로, 이 플래그가 켜지면 S0/S2 상태에서 매 프레임 "왜 못 잡았는지"(원 개수 부족/배치 불량/
 #   밝기 대비 부족 등) 원인을 자세히 찍는다 — DEBUG_LOG를 꺼도 이것만 켜서 신호등만 디버깅 가능.
@@ -1031,7 +1031,7 @@ DEBUG_VIZ_SIGNAL     = False   # 신호등 ROI/HoughCircles 디버그 창 (perce
 DEBUG_LOG_SIGNAL     = True
 DEBUG_VIZ_YOLO_CONE  = False  # 라바콘 YOLO 검출 박스 디버그 창 (perception/yolo_cone.py)
 DEBUG_VIZ_YOLO_SIGNAL = False  # 신호등 배경판 YOLO 검출 박스 디버그 창 (perception/yolo_signal.py)
-DEBUG_VIZ_YOLO_SIGNAL_STATE = False  # 신호등 색상상태 YOLO 검출 박스 디버그 창 (perception/yolo_signal_state.py) — _debug_viz_signal_status()의 Hough 비교와는 별개로 raw 검출 박스만 보고 싶을 때
+DEBUG_VIZ_YOLO_SIGNAL_STATE = True  # 신호등 색상상태 YOLO 검출 박스 디버그 창 (perception/yolo_signal_state.py) — _debug_viz_signal_status()의 Hough 비교와는 별개로 raw 검출 박스만 보고 싶을 때
 # [2026-08-15] avoid-hold(§2.32) 전용 상태창 — 지금 유예가 걸려있는지/왜 걸렸는지/방향
 #   힌트/조기해제 진행상황을 한곳에 모아 보여주고, 실측 안 된 파라미터 값도 항상 같이
 #   띄워서 "이 숫자 아직 지어낸 값"이라는 걸 상기시킨다(track_drive.py
@@ -1045,7 +1045,11 @@ DEBUG_VIZ_AVOID_HOLD = True
 # #############################################################
 # 6. 미션 State / 실차 테스트 범위 제한
 # #############################################################
-START_STATE     = MissionState.S1_LANE_FOLLOW
+# [2026-08-19, 임시] 신호등 인식만 단독 테스트하려고 S0_WAIT_GREEN으로 잠깐 바꿔둠 —
+#   perc_signal()/_debug_viz_signal_status()가 S0_WAIT_GREEN·S2_INTERSECTION일 때만 도는데
+#   원래 START_STATE=S1_LANE_FOLLOW라 신호등 코드 자체가 아예 안 돌고 있었다. 실제 대회
+#   주행/전체 미션 테스트할 땐 반드시 S1_LANE_FOLLOW로 되돌릴 것.
+START_STATE     = MissionState.S0_WAIT_GREEN
 ENABLE_BEHAVIOR = False   # S1에서 라바콘/장애물/추월 Behavior를 켤지 여부(최상위 스위치)
 #   [2026-08-11] 라바콘(B1) 실차 테스트를 위해 True로 켬. TEST_FORCE_BEHAVIOR=True와 함께
 #   있으면 S2 교차로 없이도 시작부터 라바콘 단독 테스트 가능. B2/B3까지 실차 테스트 범위를
