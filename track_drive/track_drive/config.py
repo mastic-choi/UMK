@@ -1091,17 +1091,13 @@ DEBUG_PERIOD = 0.5     # 위 로그 주기(s)
 #   켜고 나머지는 전부 잠시 끔. 다른 디버그창이 다시 필요하면(예: 차선 인식 디버깅) 개별적으로
 #   다시 True로 되돌릴 것 — 서로 독립적인 스위치라 다른 항목엔 영향 없음.
 DEBUG_VIZ_LIDAR    = False   # 라이다 BEV 장애물 감지 디버그 창 (track_drive.py)
-DEBUG_VIZ_LAVACON  = True  # 라바콘 트리거 좌우 클러스터 BEV 디버그 창 (track_drive.py)
-# [2026-08-19] LAVACON_TEMPORAL_EMA_ENABLED/LAVACON_SPARSE_FALLBACK_ENABLED를 True로
-#   켜면서, 그 결과(박스별 좌/우 EMA 바운더리 = "라바콘 차선")만 따로 보기 위한 전용 창.
-#   위 DEBUG_VIZ_LAVACON(트리거 판정용)과는 별개 — 이 창은 process_lavacon()이 실제로
-#   조향 경로 재료로 쓰는 boxes 자체(박스별 검출 색칠 + 좌/우 EMA 차선)에 집중한다.
-DEBUG_VIZ_LAVACON_EMA = True  # 라바콘 박스 클러스터링 검출 + 좌우 EMA 차선 디버그 창 (track_drive.py)
-# [2026-08-19] lavacon_bev/lavacon_ema_bev 두 창의 노란 조향경로(self._lavacon_path_m)
-#   그리기 스위치 — 잠깐 꺼뒀다가 다시 요청으로 켬. 경로 자체는 이 값과 무관하게 항상
-#   계산/조향에 쓰이고, 이건 시각화 여부만 결정한다(_draw_lavacon_bev()/
-#   _draw_lavacon_ema_bev() 참고).
-DEBUG_VIZ_LAVACON_SHOW_PATH = True
+# [2026-08-19] ENABLE_BEHAVIOR=False(라바콘/장애물/추월 Behavior 전체 비활성, 순수 차선주행만
+#   사용)로 전환하면서, 더 이상 발동되지 않는 라바콘 디버그창 3개도 함께 끔(요청 반영: "디버깅창도
+#   다른거 다 끄고 ll창만"). 나머지 창들도 아래에서 전부 꺼져 있고 DEBUG_VIZ_DL_LANE만 켜져
+#   있다. 라바콘을 다시 켜면(ENABLE_BEHAVIOR=True) 아래 세 개도 다시 True로 되돌릴 것.
+DEBUG_VIZ_LAVACON  = False  # 라바콘 트리거 좌우 클러스터 BEV 디버그 창 (track_drive.py)
+DEBUG_VIZ_LAVACON_EMA = False  # 라바콘 박스 클러스터링 검출 + 좌우 EMA 차선 디버그 창 (track_drive.py)
+DEBUG_VIZ_LAVACON_SHOW_PATH = False
 DEBUG_PLANNER      = False  # Hybrid A* OccupancyGrid 디버그 창 (track_drive.py, USE_HYBRID_ASTAR_FOR_B3=True일 때만 의미있음)
 DEBUG_VIZ_STEER    = False  # 조향 컨트롤러(직전값유지/현재값반영) 한글 디버그 창 (track_drive.py)
 DEBUG_VIZ_VESC     = False  # VESC 실측속도(/vesc_speed_erpm) 연동 상태(수신중/끊김/미수신) 디버그 창
@@ -1154,7 +1150,10 @@ DEBUG_VIZ_AVOID_HOLD = False
 #   대기 없이 차선 추종부터 바로 시작. 신호등 인식만 다시 단독 테스트하려면 위 이력대로
 #   S0_WAIT_GREEN으로 잠깐 바꿔서 쓸 것(그때만 perc_signal()/_debug_viz_signal_status()가 돈다).
 START_STATE     = MissionState.S1_LANE_FOLLOW
-ENABLE_BEHAVIOR = True    # S1에서 라바콘/장애물/추월 Behavior를 켤지 여부(최상위 스위치)
+ENABLE_BEHAVIOR = False   # S1에서 라바콘/장애물/추월 Behavior를 켤지 여부(최상위 스위치)
+# [2026-08-19] 라바콘(B1)·고정장애물(B2)·방해차량 추월(B3) 전부 끄고 순수 차선주행(B0_NORMAL)만
+#   쓰도록 요청 반영 — False면 control_loop()에서 run_behavior_fsm()/apply_behavior_override()
+#   자체를 호출하지 않고 behavior_state를 매 프레임 B0_NORMAL로 고정한다(track_drive.py:2939-2943).
 #   [2026-08-11] 라바콘(B1) 실차 테스트를 위해 True로 켬. TEST_FORCE_BEHAVIOR=True와 함께
 #   있으면 S2 교차로 없이도 시작부터 라바콘 단독 테스트 가능. B2/B3까지 실차 테스트 범위를
 #   넓힐 준비가 되기 전까지는 TEST_DISABLE_B2_B3=True로 B2/B3 발동 자체는 계속 막아둔 상태.
