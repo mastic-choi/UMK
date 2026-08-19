@@ -1155,22 +1155,58 @@ class TrackDriverNode(Node):
     #   perc_obstacle()의 DEBUG_VIZ_LIDAR 창과 같은 스타일, ROI/축척만 라바콘 트리거에 맞게 확대.
     #   초록=좌측(y>0) ROI점, 주황=우측(y<0) ROI점, 회색=ROI 밖. 자홍(magenta)=BODY_LO~BODY_HI
     #   "차체 자기가림"이라고 보고 지워버리는 구간의 마스킹 전 원본(raw) 점 — 이 구간에 실제
-    #   물체(콘)가 있는데도 마스크가 지우고 있는 건 아닌지 진단용. 텍스트로 pts(ROI 내 점수)/
+    #   물체(콘)가 있는데도 마스크가 지우고 있는 건 아닌지 진단용. 반투명 회색 부채꼴 =
+    #   그 구간의 각도 범위 자체(데드존, 135~224도/정후방 중심 90도 폭) — 실제 반사점
+    #   유무와 무관하게 항상 표시. 텍스트로 pts(ROI 내 점수)/
     #   run(최대 연속묶음, CLUSTER_MIN_PTS=2 이상이어야 클러스터로 인정) 표시.
     def _draw_lavacon_bev(self, r, x, y, roi, lon_min, lon_max, lat_max,
                            left_pts, left_run, right_pts, right_run,
                            r_raw, deg, body_lo, body_hi_eff):
         PPM = 80           # 1m = 80px (좁은 트리거 ROI라 perc_obstacle보다 확대)
-        W, H = 500, 500
-        EX, EY = 250, 460  # 자차 위치(하단 중앙)
+        W, H = 500, 600    # [2026-08-19] 상단이 너무 길다는 요청으로 900→600(2/3)로 축소
+        # [2026-08-19] 진짜 원인 발견: EX,EY를 "라이다 원점(모든 센서점의 좌표변환 기준)"과
+        #   "자차 마커(파란 점) 그리는 위치"에 동시에 같은 값으로 써왔다 — to_px()도, 거리원도,
+        #   ROI 점(라인 1208/1216 부근)도 전부 EX,EY를 원점으로 삼는다. 그래서 EX,EY를 옮기면
+        #   마커와 센서점(실제로 찍히는 라바콘 반사점)이 "같이" 움직여서, 화면상 마커와
+        #   반사점의 상대 위치는 절대 안 바뀌었던 것 — 사용자가 실측 물체를 두고 그 반사점과
+        #   마커를 맞춰보려 했는데 계속 그대로였던 진짜 원인. 라이다 원점(ORIGIN_EX/EY, 센서
+        #   좌표변환 전용 — 실측 캘리브레이션 기준이라 고정)과 자차 마커 위치(MARKER_EX/EY)를
+        #   분리해서, 마커만 따로 움직이게 고쳤다.
+        ORIGIN_EX, ORIGIN_EY = 250, 460   # 라이다 원점(센서점 좌표변환 전용, 고정)
+        BEAK_LEN = 18      # 자차 마커 헤딩 표시선("주둥이") 길이(px, 표시용) — 위치 오프셋과는 무관
+        # 자차 마커(파란 원)를 실제 물리거리 기준으로 라이다 원점보다 뒤로 당겨서 그린다 —
+        #   지금은 "적절한 위치가 어디인지" 찾는 튜닝 단계라 이 상수를 눈으로 보면서 조절 중.
+        #   이후 값이 확정되면 이게 곧 "라이다 원점 vs 차량 실제 기준점 차이"라는 뜻이 되므로,
+        #   그때 process_lavacon()/perc_lavacon_trigger()가 쓰는 x=0 원점 자체도 이 값만큼
+        #   실제로 옮길 예정(요청에 따라 순서상 지금은 시각화만, 원점 이동은 다음 단계).
+        # [2026-08-19] 임의 픽셀 대신 파란 박스 스택 경계선 한 칸의 세로(종방향) 길이
+        #   (LAVACON_BOX_LON_WIDTH=0.2m, perc_lavacon.py에서 import된 값)만큼 뒤로 당김 —
+        #   요청 반영. 값을 또 바꾸려면 여기 말고 perc_lavacon.py의 BOX_LON_WIDTH를 바꿀 것
+        #   (그래야 실제 박스 스택 페어링 로직과 이 마커 위치가 계속 같은 값을 공유한다).
+        EGO_MARKER_PULLBACK_PX = int(LAVACON_BOX_LON_WIDTH * PPM)
+        MARKER_EX, MARKER_EY = ORIGIN_EX, ORIGIN_EY + EGO_MARKER_PULLBACK_PX
         bev = np.zeros((H, W, 3), dtype=np.uint8)
 
         for d in (1, 2, 3):
-            cv2.circle(bev, (EX, EY), d * PPM, (50, 50, 50), 1)
-            cv2.putText(bev, f'{d}m', (EX + 4, EY - d * PPM + 12),
+            cv2.circle(bev, (ORIGIN_EX, ORIGIN_EY), d * PPM, (50, 50, 50), 1)
+            cv2.putText(bev, f'{d}m', (ORIGIN_EX + 4, ORIGIN_EY - d * PPM + 12),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.35, (80, 80, 80), 1)
 
-        def to_px(wx, wy): return (int(EX - wy * PPM), int(EY - wx * PPM))
+        def to_px(wx, wy): return (int(ORIGIN_EX - wy * PPM), int(ORIGIN_EY - wx * PPM))
+
+        # [2026-08-19] 라이다 자기가림 데드존(BODY_LO~BODY_HI, LIDAR_ANGLE_OFFSET_DEG 보정 후
+        # 135~224도, 폭 90도, 정후방 중심) 시각화 — 반투명 회색 부채꼴로 "이 각도 구간은
+        # 애초에 아예 안 본다"는 걸 항상 보여준다. 기존 자홍 점(아래)은 그 구간에 실제로
+        # 뭔가 찍혔는지만 보여줄 뿐 각도 범위 자체는 안 보여줬어서 추가. deg 배열(라디안,
+        # 이미 LIDAR_ANGLE_OFFSET_DEG 보정됨)을 그대로 재사용해 각도 계산을 이중화하지 않는다.
+        DEADZONE_R = 3.0  # 부채꼴 표시 반경(m) — 3m 거리원까지 채워서 눈에 띄게
+        dz_pts = ([(ORIGIN_EX, ORIGIN_EY)]
+                  + [to_px(DEADZONE_R * math.cos(a), DEADZONE_R * math.sin(a)) for a in deg[body_lo:body_hi_eff]]
+                  + [(ORIGIN_EX, ORIGIN_EY)])
+        overlay = bev.copy()
+        cv2.fillPoly(overlay, [np.array(dz_pts, dtype=np.int32)], (70, 70, 70))
+        cv2.addWeighted(overlay, 0.4, bev, 0.6, 0, bev)
+
         cv2.rectangle(bev, to_px(lon_min, lat_max), to_px(lon_max, -lat_max), (0, 220, 220), 1)
 
         # 마스킹 전 원본(raw) 점 중 BODY_LO~BODY_HI(자기가림 구간)에 해당하는 것만 자홍색으로 표시.
@@ -1180,7 +1216,7 @@ class TrackDriverNode(Node):
         for xi, yi, ri in zip(masked_x, masked_y, r_raw[body_lo:body_hi_eff]):
             if ri <= 0.0:
                 continue
-            sx, sy = int(EX - yi * PPM), int(EY - xi * PPM)
+            sx, sy = int(ORIGIN_EX - yi * PPM), int(ORIGIN_EY - xi * PPM)
             if 0 <= sx < W and 0 <= sy < H:
                 cv2.circle(bev, (sx, sy), 2, (255, 0, 255), -1)
 
@@ -1188,7 +1224,7 @@ class TrackDriverNode(Node):
         for i in range(len(r)):
             if r[i] <= 0.0:
                 continue
-            sx, sy = int(EX - y[i] * PPM), int(EY - x[i] * PPM)
+            sx, sy = int(ORIGIN_EX - y[i] * PPM), int(ORIGIN_EY - x[i] * PPM)
             if not (0 <= sx < W and 0 <= sy < H):
                 continue
             if left_mask[i]:    col = (0, 255, 0)
@@ -1197,8 +1233,8 @@ class TrackDriverNode(Node):
             cv2.circle(bev, (sx, sy), 3, col, -1)
 
         # [2026-08-19] process_lavacon()의 콘 후보 필터링 횡방향 한계(CONE_LAT_LIMIT,
-        # perc_lavacon.py에서 import — 요청 반영으로 ±2.5m→±1.8m로 축소) 시각화. 이 선
-        # 밖의 점은 종료판정에도, 박스 스택 페어링(_pick_boxed_centers())에도 안 들어간다
+        # perc_lavacon.py에서 import — 요청 반영으로 ±2.5m→±1.8m→±1.0m로 축소) 시각화. 이 선
+        # 밖의 점은 종료판정에도, 박스 스택 페어링(_pick_boxed_sides())에도 안 들어간다
         # — 트리거 ROI(위 청록 박스, LAT_MAX=2.0)와는 별개의 경계선이니 혼동하지 말 것.
         cv2.line(bev, to_px(0.0, LAVACON_PATH_LAT_LIMIT), to_px(LAVACON_PATH_LON_MAX, LAVACON_PATH_LAT_LIMIT),
                  (255, 255, 255), 1)
@@ -1228,7 +1264,7 @@ class TrackDriverNode(Node):
         # 좌/우 픽 포인트 중점 — "영역"이 아니라 점 하나씩).
         path_m = self._lavacon_path_m
         if path_m:
-            prev_px = (EX, EY)
+            prev_px = (ORIGIN_EX, ORIGIN_EY)
             for wx, wy in path_m:
                 cur_px = to_px(wx, wy)
                 cv2.line(bev, prev_px, cur_px, (0, 255, 255), 2)
@@ -1237,8 +1273,8 @@ class TrackDriverNode(Node):
                 cv2.circle(bev, to_px(wx, wy), 5, (0, 255, 255), -1)
                 cv2.circle(bev, to_px(wx, wy), 5, (0, 0, 0), 1)
 
-        cv2.circle(bev, (EX, EY), 6, (255, 220, 0), -1)
-        cv2.line(bev, (EX, EY), (EX, EY - 18), (255, 220, 0), 2)
+        cv2.circle(bev, (MARKER_EX, MARKER_EY), 6, (255, 220, 0), -1)
+        cv2.line(bev, (MARKER_EX, MARKER_EY), (MARKER_EX, MARKER_EY - BEAK_LEN), (255, 220, 0), 2)
 
         l_col = (0, 255, 0)   if self.lavacon_left_detected  else (0, 0, 255)
         r_col = (0, 140, 255) if self.lavacon_right_detected else (0, 0, 255)
@@ -1911,9 +1947,10 @@ class TrackDriverNode(Node):
             return abs(self.v_mps)
         return APPROACH_SPEED * METERS_PER_SPEED_UNIT
 
-    def _lane_steer(self, path=None, vehicle_x=None):
+    def _lane_steer(self, path=None, vehicle_x=None, vehicle_y_px=None):
         """path(ROI 픽셀좌표 경로, 가까운점→먼점)를 pure_pursuit(controller/pure_pursuit.py)로
-        추종해 조향각(도)을 계산한다. 차량 기준점은 (vehicle_x, path[0]의 y좌표)로 둔다.
+        추종해 조향각(도)을 계산한다. 차량 기준점은 (vehicle_x, vehicle_y_px)로 둔다
+        (vehicle_y_px를 안 주면 path[0]의 y좌표를 그대로 쓴다 — 기존 동작).
 
         인자를 생략하면(기본 호출부인 _lane_drive() 등) 기존과 동일하게 self.lane_path와
         ROI 하단 중앙(roi_w/2)을 쓴다 — path[0].y는 lane_util._fit_and_sample_path()가
@@ -1921,6 +1958,18 @@ class TrackDriverNode(Node):
         [2026-08-11] _handle_lavacon()이 self.lavacon_path/vehicle_x=0.0을 명시적으로
         넘겨 호출한다 — 라바콘 조향 파라미터를 라인주행과 완전히 일치시키기 위해, 별도
         게인을 두지 않고 이 함수를 그대로 재사용하기로 한 결정(perc_lavacon() 주석 참고).
+
+        [2026-08-19] vehicle_y_px — path가 "센서 원점 기준" 좌표계일 때(라바콘의 경우
+        라이다 원점, row 0 = 라이다 자체 위치), path[0]의 행(row)을 차량 위치로 대신
+        쓰는 건 "차량이 대략 첫 웨이포인트 부근에 있다"는 근사일 뿐 실제 차량 위치가
+        아니다 — 실측으로 알아낸 진짜 차량 기준점 행이 있으면(예: 라이다가 차량 맨
+        앞부분보다 LIDAR_TO_VEHICLE_FRONT_M만큼 앞에 있다는 게 확인됨, config.py 참고)
+        path[0]와 무관하게 그 절대값을 직접 넘긴다 — path[0]에 "더하는" 식으로 쓰면 안 됨
+        (path[0]의 행 자체가 BOX_LON_START 등 다른 값에 좌우되는 임의 기준이라, 더하면
+        엉뚱한 위치가 나온다). None(기본값)이면 기존과 완전히 동일하게 path[0][1]을 쓴다
+        (라인주행 등 다른 호출부는 전부 이 값을 안 넘겨서 영향 없음). _handle_lavacon()이
+        LIDAR_TO_VEHICLE_FRONT_M*DL_PIXELS_PER_METER(라이다 원점 기준 차량의 절대 행)를
+        직접 계산해 넘긴다.
 
         경로가 비어있으면(첫 프레임, 혹은 roi_w를 아직 모르는 백엔드) 직전 조향각을
         그대로 유지한다 — pure_pursuit.control()이 내부적으로 이렇게 처리한다.
@@ -1947,7 +1996,7 @@ class TrackDriverNode(Node):
             near_obstacle = self.obstacle_front and self.obstacle_dist < AVOID_HOLD_TRIGGER_DIST_M
         if not path or vehicle_x is None:
             return self.pure_pursuit.prev_steer_deg
-        vehicle_xy = (vehicle_x, path[0][1])
+        vehicle_xy = (vehicle_x, path[0][1] if vehicle_y_px is None else vehicle_y_px)
         return self.pure_pursuit.control(path, vehicle_xy, speed=self._speed_for_lookahead(),
                                           imu_curvature_px=self._imu_curvature_px(),
                                           near_obstacle=near_obstacle)
@@ -2416,10 +2465,24 @@ class TrackDriverNode(Node):
         그대로 재사용한다 — 라인주행(_lane_drive())과 조향 파라미터(self.pure_pursuit
         인스턴스, PP_* 게인, ANGLE_MAX/ANGLE_RATE_MAX)를 완전히 일치시키기로 한 결정.
         self.lavacon_path는 perc_lavacon()이 라이다 미터 좌표를
-        self.lane_path와 같은 px 스케일로 변환해둔 것이고, 차량 기준점은 그 변환의
-        원점인 (0.0, path[0].y)다.
+        self.lane_path와 같은 px 스케일로 변환해둔 것이고(row 0 = 라이다 원점), 차량
+        기준점은 그 변환의 원점에서 LIDAR_TO_VEHICLE_FRONT_M만큼 뒤로 민 지점이다.
+
+        [2026-08-19] vehicle_x=0.0은 여전히 라이다의 좌우 중심(라이다가 차량에 좌우로는
+        정렬돼 있다고 가정)과 같지만, 종방향(전후)은 라이다가 차량 맨 앞부분보다 실측
+        LIDAR_TO_VEHICLE_FRONT_M(config.py, lavacon_bev 디버그창에서 자차 마커를 실측
+        물체와 맞춰 확인)만큼 앞에 있다는 게 확인돼서, _lane_steer()의 vehicle_y_px에
+        "라이다 원점(row 0) 기준 차량의 절대 행" = +LIDAR_TO_VEHICLE_FRONT_M*
+        DL_PIXELS_PER_METER(전방=y감소 관례라 양수=뒤쪽)를 직접 넘긴다 — path[0]의 행에
+        더하는 게 아니라 완전히 대체하는 것에 주의(path[0]은 BOX_LON_START 등 다른
+        값에 좌우되는 별개 기준이라 더하면 틀린 값이 나온다, _lane_steer() 주석 참고).
+        안 넘기면(구 동작) 차량이 실제보다 LIDAR_TO_VEHICLE_FRONT_M만큼 앞서 있다고
+        착각해 Pure Pursuit lookahead 거리가 그만큼씩 짧게 계산된다. 실차 재검증
+        필요(2026-08-19, 코드 리뷰 수준 반영).
         """
-        self.ctrl_angle = self._lane_steer(path=self.lavacon_path, vehicle_x=0.0)
+        self.ctrl_angle = self._lane_steer(
+            path=self.lavacon_path, vehicle_x=0.0,
+            vehicle_y_px=LIDAR_TO_VEHICLE_FRONT_M * DL_PIXELS_PER_METER)
         self.ctrl_speed = SPEED_LAVACON
 
         if self.lavacon_done:

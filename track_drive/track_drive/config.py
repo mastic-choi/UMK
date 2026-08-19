@@ -1124,7 +1124,7 @@ DEBUG_VIZ_SIGNAL     = False    # 신호등 ROI/HoughCircles 디버그 창 (perc
 #   밝기 대비 부족 등) 원인을 자세히 찍는다 — DEBUG_LOG를 꺼도 이것만 켜서 신호등만 디버깅 가능.
 #   (track_drive.py perc_signal())
 DEBUG_LOG_SIGNAL     = True
-DEBUG_VIZ_YOLO_CONE  = True  # 라바콘 YOLO 검출 박스 디버그 창 (perception/yolo_cone.py)
+DEBUG_VIZ_YOLO_CONE  = False  # 라바콘 YOLO 검출 박스 디버그 창 (perception/yolo_cone.py)
 DEBUG_VIZ_YOLO_SIGNAL = False  # 신호등 배경판 YOLO 검출 박스 디버그 창 (perception/yolo_signal.py)
 DEBUG_VIZ_YOLO_SIGNAL_STATE = False  # 신호등 색상상태 YOLO 검출 박스 디버그 창 (perception/yolo_signal_state.py) — _debug_viz_signal_status()의 Hough 비교와는 별개로 raw 검출 박스만 보고 싶을 때
 # [2026-08-15] avoid-hold(§2.32) 전용 상태창 — 지금 유예가 걸려있는지/왜 걸렸는지/방향
@@ -1201,6 +1201,18 @@ RESET_PHASE_EACH_LAP = True
 #   보정 후 각도 약속: 0=정면, 90=좌측, 180=후방, 270(-90)=우측(반시계 방향).
 LIDAR_ANGLE_OFFSET_DEG = 80.0
 BODY_MASK_ENABLED = True  # 차체 자기가림 마스킹(BODY_LO~BODY_HI) 전체 스위치. 최종 확정(2026-07-22)
+
+# ── 라이다 장착 위치(종방향) 보정 — 실측 2026-08-19 ──
+#   라이다는 차량 맨 앞부분보다 이만큼(m) 더 앞으로 나가 있다(lavacon_bev 디버그창에서
+#   자차 마커를 물체와 동일선상으로 맞춰가며 실측 — track_drive.py _draw_lavacon_bev()의
+#   EGO_MARKER_PULLBACK_PX/LAVACON_BOX_LON_WIDTH 튜닝 이력 참고). process_lavacon()이
+#   내놓는 라바콘 경로(perc_lavacon.py, path_m)는 전부 "라이다 원점 기준" 좌표라, 그걸
+#   그대로 Pure Pursuit에 "차량이 여기 있다"고 넘기면 차량 위치를 실제보다 0.2m 앞으로
+#   착각하게 된다 — _handle_lavacon()이 _lane_steer()를 호출할 때 이 값만큼 차량 기준점을
+#   뒤로 밀어서 보정한다(track_drive.py _lane_steer() vehicle_y_px 참고). 라바콘
+#   ROI/박스 스택 임계값(perc_lavacon.py LON_MIN/CONE_LON_MAX/BOX_LON_START 등)은 전부
+#   "라이다가 실제로 뭘 보는지" 기준으로 튜닝된 값이라 이 보정과 무관 — 그대로 둔다.
+LIDAR_TO_VEHICLE_FRONT_M = 0.20
 
 # ── 차선 PID (_lane_pid(), B2/B3 behavior가 여전히 사용) ──
 LANE_KP, LANE_KI, LANE_KD = 0.70, 0.0008, 0.15
