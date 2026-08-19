@@ -695,8 +695,20 @@ class TrackDriverNode(Node):
     #   출력 obstacle_front/dist/side, left_clear, right_clear
     def perc_obstacle(self):
         # ── 튜닝 파라미터 ──
-        FRONT_X_MIN, FRONT_X_MAX = 0.0, 5.0   # 전방 ROI 종방향(m)
-        FRONT_Y_HALF             = 1.5         # 전방 ROI 횡방향 반폭(m)
+        # [2026-08-19] 전방 ROI 축소(요청 반영) — 라이다 단독 obstacle_front가 멀리 있는
+        # 벽/코너까지 잡아 오탐하는 문제(§2.48) 대응으로, 종방향은 lidar_bev 디버그창의
+        # 첫 번째 거리 링(1m, DEBUG_VIZ_LIDAR의 `for d in range(1,7): cv2.circle(...)`
+        # 참고)까지만, 횡방향은 기존 절반으로 줄인다. YOLO 이중확인(§2.48)과 별개로,
+        # 감지 범위 자체를 좁혀 오탐 소지를 원천적으로 줄이는 접근.
+        # ★주의★ obstacle_front/obstacle_dist는 SAFETY_DIST(5.0m)/OVERTAKE_TRIGGER(6.5m)/
+        # AVOID_HOLD_TRIGGER_DIST_M(1.5m) 등 이 값보다 먼 거리를 트리거 기준으로 삼는
+        # 다른 곳(B2/B3, avoid-hold)에서도 공유해서 쓴다 — FRONT_X_MAX를 1.0m로 좁히면
+        # 그 지점들은 사실상 "1m 안에 들어와야만" 반응하게 되어(더 먼 거리에서는
+        # obstacle_dist가 아예 999.0으로 남음) 원래 의도한 조기 트리거 거리(5~6.5m)가
+        # 무의미해진다 — 지금은 B2/B3(TEST_DISABLE_B2_B3=True)/ENABLE_BEHAVIOR가 꺼져있어
+        # 당장 영향 없지만, 나중에 그 기능들을 켜면 이 축소를 다시 검토할 것.
+        FRONT_X_MIN, FRONT_X_MAX = 0.0, 1.0   # 전방 ROI 종방향(m)
+        FRONT_Y_HALF             = 0.75        # 전방 ROI 횡방향 반폭(m)
         FRONT_MIN_PTS            = 2           # 전방 장애물 확정 최소 포인트
         FRONT_VEHICLE_PTS        = 12          # 이 이상이면 차량, 미만이면 고정장애물
         SIDE_X_MIN, SIDE_X_MAX   = 0.8, 5.5   # 측면 ROI 종방향(m)

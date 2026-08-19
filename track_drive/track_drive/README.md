@@ -1549,6 +1549,20 @@ external-data 분리를 다시 단일 파일로 합쳐 저장(초기 export가 `
 - `TEST_DISABLE_B2_B3`를 켜서 B2/B3(`TargetPassing`)를 실제로 검증하기로 결정하면, `_update_avoid_hold()`
   등 다른 라이다 단독 트리거들도 같은 오탐 위험을 안고 있다는 점을 같이 고려할 것(§2.32~§2.33).
 
+### 2.49 `perc_obstacle()` 전방 ROI 축소 — 종방향 5.0m→1.0m, 횡방향 1.5m→0.75m (요청 반영, 2026-08-19)
+
+§2.48의 YOLO 이중확인과 별개로, 감지 범위 자체를 좁혀 오탐 소지를 줄이자는 요청 — 종방향은
+`lidar_bev` 디버그창 첫 번째 거리 링(1m)까지, 횡방향은 기존 값(`FRONT_Y_HALF=1.5`)의 절반으로.
+
+**알려진 한계:** `obstacle_front`/`obstacle_dist`는 `perc_obstacle()` 하나가 계산해 B2/B3
+(`SAFETY_DIST=5.0m`/`OVERTAKE_TRIGGER=6.5m`)와 avoid-hold(`AVOID_HOLD_TRIGGER_DIST_M=1.5m`)까지
+전부 공유해서 쓴다 — 종방향 ROI를 1.0m로 좁히면 그 지점들이 원래 의도한 조기(5~6.5m) 트리거를
+사실상 못 하게 된다(1m 밖에서는 `obstacle_dist`가 아예 999.0으로 남으므로). `AVOID_HOLD_TRIGGER_DIST_M`
+(1.5m)도 이제 ROI 자체가 1.0m보다 멀리 못 보므로 사실상 무의미해진 상수다(해가 되진 않지만 더는
+필터링 역할을 안 함). 지금은 `ENABLE_BEHAVIOR=False`/`TEST_DISABLE_B2_B3=True`라 B2/B3 자체가
+꺼져있어 당장 영향은 없지만, 나중에 그 기능들을 켜면 이 ROI 축소부터 다시 검토해야 한다 —
+그때는 트리거별로 서로 다른 ROI가 필요할 수 있음(§4/§5 재작업 시 참고).
+
 ---
 
 ## 3. 라바콘 (B1_LAVACON)
