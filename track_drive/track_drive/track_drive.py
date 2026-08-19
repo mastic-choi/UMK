@@ -34,7 +34,7 @@ from sensor_msgs.msg import Image, LaserScan, Imu
 from std_msgs.msg import Float32MultiArray, Float32
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy, HistoryPolicy
 from cv_bridge import CvBridge
-from .perception.perc_lavacon import process_lavacon, CONE_LON_MAX as LAVACON_PATH_LON_MAX, CONE_LAT_LIMIT as LAVACON_PATH_LAT_LIMIT, BOX_LON_START as LAVACON_BOX_LON_START, BOX_LON_WIDTH as LAVACON_BOX_LON_WIDTH
+from .perception.perc_lavacon import process_lavacon, nearest_cone_lateral, CONE_LON_MAX as LAVACON_PATH_LON_MAX, CONE_LAT_LIMIT as LAVACON_PATH_LAT_LIMIT, BOX_LON_START as LAVACON_BOX_LON_START, BOX_LON_WIDTH as LAVACON_BOX_LON_WIDTH
 from .perception.hough_lane import HoughLaneDetector
 from .perception.perc_floor import check_stopline, LaneDetector as ClassicLaneDetector
 from .perception.lane_util import CameraProcessor, SlideWindow
@@ -2583,10 +2583,18 @@ class TrackDriverNode(Node):
         안 넘기면(구 동작) 차량이 실제보다 LIDAR_TO_VEHICLE_FRONT_M만큼 앞서 있다고
         착각해 Pure Pursuit lookahead 거리가 그만큼씩 짧게 계산된다. 실차 재검증
         필요(2026-08-19, 코드 리뷰 수준 반영).
+
+        [2026-08-19] LAVACON_STEER_MODE_DA_PUSH=True면 위 박스 스택 경로(self.lavacon_path)
+        대신 _lavacon_steer_da_push()(da 경로 + 콘 침범 시 옆으로 밀기)를 쓴다. 기본
+        False라 안 켜면 이 함수의 나머지 동작은 전과 100% 동일 — self.lavacon_done 기반
+        구간 종료 판정도 두 모드에서 공유한다(perc_lavacon()이 매 틱 그대로 계산해두므로).
         """
-        self.ctrl_angle = self._lane_steer(
-            path=self.lavacon_path, vehicle_x=0.0,
-            vehicle_y_px=LIDAR_TO_VEHICLE_FRONT_M * DL_PIXELS_PER_METER)
+        if LAVACON_STEER_MODE_DA_PUSH:
+            self.ctrl_angle = self._lavacon_steer_da_push()
+        else:
+            self.ctrl_angle = self._lane_steer(
+                path=self.lavacon_path, vehicle_x=0.0,
+                vehicle_y_px=LIDAR_TO_VEHICLE_FRONT_M * DL_PIXELS_PER_METER)
         self.ctrl_speed = SPEED_LAVACON
 
         if self.lavacon_done:
@@ -2600,6 +2608,53 @@ class TrackDriverNode(Node):
                 self.get_logger().info('[LAVACON] 구간 통과 완료 → 장애물 구간')
         else:
             self._lavacon_empty_cnt = 0
+
+    # ── B1-라바콘 대안 조향: da 경로 + 콘 침범 시 옆으로 밀기 (LAVACON_STEER_MODE_DA_PUSH) ──
+    #   [2026-08-19] 라이다 박스 스택 페어링이 실차에서 계속 듬성한 검출/노이즈에 시달려서
+    #   (요청 반영) 아예 다른 축으로 전환. da(주행가능영역) 경로(self.lane_path, S1/S3
+    #   차선주행과 완전히 같은 신호)를 그대로 신뢰하고 조향하되, YOLO로 재확인된 콘이
+    #   안전마진(LAVACON_PUSH_SAFETY_MARGIN_M) 안으로 들어왔을 때만 그만큼 반대쪽으로
+    #   self.lane_path 전체를 옆으로 밀어서 _lane_steer()에 넘긴다. "정밀한 경로 재구성"
+    #   대신 "위험할 때만 미는" 훨씬 단순하고 견고한 신호라, 라이다가 콘 1점만 듬성하게
+    #   봐도(박스 스택이 실차에서 계속 시달린 문제) 바로 동작한다. da 단독으로도 라바콘
+    #   구간을 그럭저럭 지나간다는 게 실차로 이미 확인됨(사용자, 2026-08-19).
+    def _lavacon_steer_da_push(self):
+        """push는 self.cone_detected_yolo(그 프레임에 카메라로도 콘이 실제 보일 때)로만
+        켠다 — perc_lavacon_trigger()가 진입 판정에 라이다 단독 대신 YOLO AND 라이다를
+        쓰는 것과 같은 이유(라이다 단독 클러스터는 벽 모서리 등에서 오검출 여지가 있음).
+        YOLO가 콘을 못 볼 때는 push=0으로 da 경로를 그대로 따른다(안전 기본값).
+
+        push_m 부호: nearest_cone_lateral()의 y는 좌측+ — 좌측 콘이 안전마진을 침범하면
+        그만큼 우측(+px)으로, 우측 콘이 침범하면 그만큼 좌측(-px)으로 민다. 두 콘이 동시에
+        침범하면(통로 자체가 마진의 2배보다 좁음) 서로 상쇄돼 순 push가 줄어드는데, 이건
+        "이미 중앙에 있으면 그대로 두는" 게 맞는 동작이라 의도된 결과다.
+
+        vehicle_x는 밀지 않는다 — path만 밀어야 "차량이 경로 대비 반대쪽으로 치우쳤다"고
+        Pure Pursuit이 해석해 실제로 옆으로 붙는 조향이 나온다. vehicle_x도 같이 밀면
+        상대위치가 그대로라 아무 효과가 없다.
+        """
+        push_px = 0.0
+        if self.cone_detected_yolo:
+            left_y, right_y = nearest_cone_lateral(
+                self.lidar_ranges, LAVACON_PUSH_LON_MIN, LAVACON_PUSH_LON_MAX,
+                LAVACON_PUSH_LAT_LIMIT)
+            push_m = 0.0
+            if left_y is not None and left_y < LAVACON_PUSH_SAFETY_MARGIN_M:
+                push_m += LAVACON_PUSH_SAFETY_MARGIN_M - left_y        # 좌측 콘 침범 → 우측(+)으로
+            if right_y is not None and -right_y < LAVACON_PUSH_SAFETY_MARGIN_M:
+                push_m -= LAVACON_PUSH_SAFETY_MARGIN_M - (-right_y)    # 우측 콘 침범 → 좌측(-)으로
+            push_px = push_m * DL_PIXELS_PER_METER
+
+        shifted_path = [(x + push_px, y) for x, y in self.lane_path]
+
+        # [2026-08-17] _lane_steer()의 path=None 기본분기와 동일한 vehicle_x 산출(그대로
+        # 복붙) — 여기선 path를 명시로 넘기므로 그 분기를 안 타 자동 계산이 안 된다.
+        roi_w = getattr(self.lane_detector, 'roi_w', 0) or 0
+        vehicle_x = getattr(self.lane_detector, 'vehicle_center_x', None)
+        if vehicle_x is None:
+            vehicle_x = roi_w / 2.0
+
+        return self._lane_steer(path=shifted_path, vehicle_x=vehicle_x)
 
     # ── B2-고정장애물 회피 ──
     #   차선 2개 + 넘어도 되는 노란 중앙선 구조라, 방향은 '반대편 차선' 하나로 정해진다.

@@ -120,6 +120,54 @@ BOX_LON_START    = 0.3          # 첫 박스 시작 지점(전방, m) — 차체
 BOX_LON_WIDTH    = 0.4          # 박스 1개의 종방향 폭(m)
 
 
+def _lidar_to_xy(lidar_ranges):
+    """라이다 1스캔을 전처리(무효값/자기가림 마스킹)하고 직교좌표(x=전방+, y=좌측+)로
+    변환한다. process_lavacon()과 nearest_cone_lateral()이 똑같이 필요로 하는 전처리라
+    공용 함수로 뺐다 — 두 곳이 각자 복사해서 들고 있으면 마스킹 범위나 각도보정 상수가
+    한쪽만 바뀌는 사고(파일 상단 "2026-06-19 구 규약" 버그와 같은 종류)가 재발할 수 있다.
+    입력이 무효(None/빈 배열)면 (None, None, None)을 반환한다."""
+    if lidar_ranges is None:
+        return None, None, None
+    ranges = np.asarray(lidar_ranges, dtype=np.float32).copy()  # 원본 훼손 방지 복사
+    n = len(ranges)
+    if n == 0:
+        return None, None, None
+
+    ranges[~np.isfinite(ranges)] = 0.0     # inf / nan → 0.0 (무효 표시)
+    ranges[ranges <= 0.0] = 0.0            # 0 이하 거리 → 무효
+    if n > BODY_LO:
+        ranges[BODY_LO:min(BODY_HI, n)] = 0.0   # 차체 자기가림 구간 마스킹
+
+    deg = np.linspace(0.0, 2.0 * math.pi, n, endpoint=False) - math.radians(LIDAR_ANGLE_OFFSET_DEG)
+    x = ranges * np.cos(deg)    # 종방향(전방거리) 성분
+    y = ranges * np.sin(deg)    # 횡방향 성분 — y > 0 좌측, y < 0 우측
+    return x, y, ranges
+
+
+def nearest_cone_lateral(lidar_ranges, lon_min, lon_max, lat_limit):
+    """[2026-08-19] da(주행가능영역) 경로를 그대로 조향에 쓰고, 콘이 안전마진 안으로
+    들어왔을 때만 그만큼 옆으로 미는 방식(track_drive.py `_lavacon_steer_da_push` 참고)
+    전용 — 박스 스택 페어링(`_pick_boxed_sides`/`_build_path`)처럼 좌우 콘을 짝짓거나
+    경로 전체를 재구성하지 않는다. 지정한 좁은 ROI(lon_min~lon_max, ±lat_limit) 안에서
+    좌(y>0)/우(y<0) 각각 라이다 반사거리가 가장 가까운 점 1개의 y좌표만 반환한다 —
+    "정밀한 경로"가 아니라 "얼마나 침범했는지"만 필요하므로 이거면 충분하고, 라이다가
+    듬성하게/노이즈 섞여 검출돼도(박스 스택이 실차에서 계속 시달린 문제) 한 점만 있으면
+    바로 동작한다.
+
+    출력 : (left_y, right_y) — 각각 없으면 None, 있으면 라이다 미터 좌표(좌측+).
+    """
+    x, y, ranges = _lidar_to_xy(lidar_ranges)
+    if x is None:
+        return None, None
+
+    roi = (ranges > 0.0) & (x > lon_min) & (x < lon_max) & (np.abs(y) < lat_limit)
+    left_idx = np.where(roi & (y > 0.0))[0]
+    right_idx = np.where(roi & (y < 0.0))[0]
+    left_y = float(y[left_idx[int(np.argmin(ranges[left_idx]))]]) if left_idx.size > 0 else None
+    right_y = float(y[right_idx[int(np.argmin(ranges[right_idx]))]]) if right_idx.size > 0 else None
+    return left_y, right_y
+
+
 def _pick_boxed_sides(x, y, ranges, lon_start, lon_width, lon_max, lat_limit):
     """차량 전방을 lon_width 폭의 박스로 lon_start부터 lon_max까지 쭉 쌓아올리고, 각 박스
     "안에서만" 좌(y>0)/우(y<0) 각 1점(그 박스 안에서 차량과의 라이다 반사거리가 가장 짧은
@@ -262,28 +310,10 @@ def process_lavacon(lidar_ranges, prev_boxes=None):
              다음 호출의 prev_boxes로 그대로 넘기면 된다 — 콘 미검출 등으로 유효한 박스가
              하나도 없어도(위 path_m이 빈 리스트여도) None이 아니라 이 값을 반환한다.
     """
-    # ── 0) 입력 유효성 검사 : None 이거나 비어 있으면 즉시 안전 폴백 ──
-    if lidar_ranges is None:
+    # ── 0~2) 입력 유효성 검사 + 전처리 + 극좌표→직교좌표 변환 (_lidar_to_xy 공용) ──
+    x, y, ranges = _lidar_to_xy(lidar_ranges)
+    if x is None:
         return (0.0, True, [], None)
-
-    # ── 1) 전처리 : NumPy 배열화 + 무효값(inf/nan/음수/0) 제거 + 차체 마스킹 ──
-    ranges = np.asarray(lidar_ranges, dtype=np.float32).copy()  # 원본 훼손 방지 복사
-    n = len(ranges)
-    if n == 0:
-        return (0.0, True, [], None)
-
-    ranges[~np.isfinite(ranges)] = 0.0     # inf / nan → 0.0 (무효 표시)
-    ranges[ranges <= 0.0] = 0.0            # 0 이하 거리 → 무효
-
-    # 차체 자기가림 구간(인덱스 215~304)을 0.0으로 마스킹 → 전방(0~214, 305~359)만 사용
-    if n > BODY_LO:
-        ranges[BODY_LO:min(BODY_HI, n)] = 0.0
-
-    # ── 2) 극좌표 → 직교좌표 변환 (x: 전방+, y: 좌측+) ──
-    # 인덱스 0이 정면이 아니므로 LIDAR_ANGLE_OFFSET_DEG 만큼 빼서 영점을 보정한다.
-    deg = np.linspace(0.0, 2.0 * math.pi, n, endpoint=False) - math.radians(LIDAR_ANGLE_OFFSET_DEG)
-    x = ranges * np.cos(deg)    # 종방향(전방거리) 성분
-    y = ranges * np.sin(deg)    # 횡방향 성분 — y > 0 좌측, y < 0 우측
 
     # ── 3) 종료 판정용 콘 후보 필터링 : 전방 넓은 ROI 안의 유효 점만 남김 ──
     # 벽·원거리 구조물처럼 트랙과 무관한 점을 배제하기 위해 콘이 존재할 수 있는 영역으로
@@ -385,3 +415,15 @@ if __name__ == '__main__':
     # prev_boxes가 None(첫 호출)이거나 길이가 다르면 블렌딩 없이 이번 프레임 값을 그대로 씀.
     blended3_first = _blend_boxes_temporal(cur_boxes3, None, alpha=0.5)
     print(f'temporal_ema(첫 호출, prev=None): blended={blended3_first} (raw 그대로, y=2.0 기대)')
+
+    # 시나리오 4 : nearest_cone_lateral — da+push 모드용 최소 신호. 박스 그리드/페어링 없이
+    # ROI 안에서 좌/우 각각 최근접 1점의 y만 뽑는다. 좌 y=+0.4, 우 y=-0.3 콘 하나씩만 배치.
+    test4 = np.zeros(360, dtype=np.float32)
+    r = math.hypot(0.5, 0.4)
+    idx = int(round(math.degrees(math.atan2(0.4, 0.5)) + LIDAR_ANGLE_OFFSET_DEG)) % 360
+    test4[idx] = r
+    r = math.hypot(0.5, -0.3)
+    idx = int(round(math.degrees(math.atan2(-0.3, 0.5)) + LIDAR_ANGLE_OFFSET_DEG)) % 360
+    test4[idx] = r
+    ly, ry = nearest_cone_lateral(test4, lon_min=0.2, lon_max=1.5, lat_limit=1.0)
+    print(f'nearest_cone_lateral: left_y={ly} right_y={ry} (~+0.4/-0.3 기대)')

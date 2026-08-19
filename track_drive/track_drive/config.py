@@ -1297,6 +1297,32 @@ LAVACON_HALFWIDTH_EMA_ALPHA     = 0.3   # 좌우 반폭 러닝 추정 EMA 계수
 LAVACON_TEMPORAL_EMA_ENABLED = False
 LAVACON_TEMPORAL_EMA_ALPHA   = 0.5      # 새 프레임에 줄 가중치(작을수록 더 부드럽고 느리게 반응)
 
+# [2026-08-19] 라이다 박스 스택 페어링이 실차에서 계속 듬성한 검출/노이즈에 시달려서
+#   (요청 반영) 아예 다른 축으로 전환 — da(주행가능영역) 단독으로도 라바콘 구간을
+#   그럭저럭 지나간다는 게 실차로 확인됐으므로, da 경로를 기본으로 신뢰하고 콘이 안전
+#   마진 안으로 들어왔을 때만 그만큼 옆으로 미는 방식(track_drive.py
+#   `_lavacon_steer_da_push()`, perc_lavacon.py `nearest_cone_lateral()`)을 추가.
+#   기본 False — 켜기 전엔 기존 박스 스택 조향(_handle_lavacon 구 분기)과 동일하게
+#   동작한다. 실차에서 da_push로 전환해 테스트할 것.
+LAVACON_STEER_MODE_DA_PUSH = False
+
+# [2026-08-19] 안전마진(m) — 이 값보다 콘이 차량 중심에 가깝게 들어오면 그만큼 반대쪽으로
+#   민다. VEHICLE_WIDTH_M(0.31, 실측)/2=0.155(차량 반폭) + DL_DA_SIDE_MARGIN_M(0.1, B2/B3
+#   장애물 회피에서 "실차 테스트로 딱 적당하게 잘 주행함" 확인된 좌우 여유값, 성격이
+#   동일해 재사용) = 0.255 → 0.26로 반올림. 콘 자체의 물리적 반지름은 따로 반영 안 함
+#   (실측값 없음, perc_lavacon_trigger()의 CLUSTER_MAX_GAP=0.35는 "콘 지름 근사"라 참고는
+#   되나 라이다 스프레드가 섞인 값이라 그대로 쓰지 않음) — 실차에서 콘을 스치면 이 값을
+#   올릴 것.
+LAVACON_PUSH_SAFETY_MARGIN_M = 0.26
+
+# [2026-08-19] push 신호 전용 ROI — 박스 스택의 CONE_LON_MAX(4.0m, 구간 전체) 대신 훨씬
+#   가까운 범위만 본다. "지금 당장 스칠 위험이 있는 콘"만 반응해야 하므로, 멀리 있는
+#   콘까지 보면 아직 위협도 아닌데 미리 밀거나(오조향) 다음 콘으로 넘어가면서 push가
+#   들쭉날쭉 튈 위험이 있다. 실측 아님 — 실차에서 튜닝 필요.
+LAVACON_PUSH_LON_MIN     = 0.2   # 차체 바로 앞 반사 배제(perc_lavacon.py LON_MIN과 동일 이유)
+LAVACON_PUSH_LON_MAX     = 1.5   # 이 거리보다 먼 콘은 아직 안 민다
+LAVACON_PUSH_LAT_LIMIT   = 1.0   # 횡방향 탐색 한계 — CONE_LAT_LIMIT(perc_lavacon.py)와 동일값으로 시작
+
 # ── 라바콘 카메라 이중확인 (perception/yolo_cone.py, YOLOv8n ONNX) ──
 #   perc_lavacon_trigger()가 기존 라이다 좌우 클러스터 판정에 "카메라로도 콘이 보이는가"를
 #   AND로 추가한다 — 라이다 단독 클러스터 판정은 벽 모서리 등에서 오검출 여지가 있어서,
