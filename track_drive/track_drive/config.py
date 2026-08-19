@@ -1091,7 +1091,7 @@ DEBUG_PERIOD = 0.5     # 위 로그 주기(s)
 #   켜고 나머지는 전부 잠시 끔. 다른 디버그창이 다시 필요하면(예: 차선 인식 디버깅) 개별적으로
 #   다시 True로 되돌릴 것 — 서로 독립적인 스위치라 다른 항목엔 영향 없음.
 DEBUG_VIZ_LIDAR    = False   # 라이다 BEV 장애물 감지 디버그 창 (track_drive.py)
-DEBUG_VIZ_LAVACON  = False  # 라바콘 트리거 좌우 클러스터 BEV 디버그 창 (track_drive.py)
+DEBUG_VIZ_LAVACON  = True  # 라바콘 트리거 좌우 클러스터 BEV 디버그 창 (track_drive.py)
 DEBUG_PLANNER      = False  # Hybrid A* OccupancyGrid 디버그 창 (track_drive.py, USE_HYBRID_ASTAR_FOR_B3=True일 때만 의미있음)
 DEBUG_VIZ_STEER    = False  # 조향 컨트롤러(직전값유지/현재값반영) 한글 디버그 창 (track_drive.py)
 DEBUG_VIZ_VESC     = False  # VESC 실측속도(/vesc_speed_erpm) 연동 상태(수신중/끊김/미수신) 디버그 창
@@ -1100,9 +1100,9 @@ DEBUG_VIZ_VESC     = False  # VESC 실측속도(/vesc_speed_erpm) 연동 상태(
 #   실측 튜닝용) — IMU(/imu) 연동이 실제로 살아있는지 + 지금 imu_yaw 값이 얼마인지 +
 #   좌회전 진행 중이면 목표각까지 얼마나 남았는지를 한 창에서 보여준다. DEBUG_VIZ_VESC와
 #   동일한 3단계 상태(미수신/끊김/정상표시) 패턴(track_drive.py _debug_viz_imu()).
-DEBUG_VIZ_IMU      = True  # IMU(/imu) 연동 상태 + 현재 yaw값 + 좌회전 진행상황 디버그 창
+DEBUG_VIZ_IMU      = False  # IMU(/imu) 연동 상태 + 현재 yaw값 + 좌회전 진행상황 디버그 창
 
-DEBUG_VIZ_DL_LANE    = True  # 차선 — 기본 백엔드('dl') 디버그 창 (perception/dl_lane.py)
+DEBUG_VIZ_DL_LANE    = False  # 차선 — 기본 백엔드('dl') 디버그 창 (perception/dl_lane.py)
 # [2026-08-10] offset 스파크라인이 몇 프레임을 보여줄지 — [2026-08-11] 원래 별도
 #   'dl_lane_params' 창 하단에 붙었으나, 그 창의 파라미터 텍스트 목록(대부분 config
 #   고정값)을 지우면서 스파크라인만 'dl_lane' 창 맨 아래로 옮겼다(DEBUG_VIZ_DL_LANE
@@ -1118,21 +1118,21 @@ DEBUG_VIZ_STOPLINE   = False  # 정지선 디버그 창, 백엔드 무관 항상
 #   현재 인식 상태(정지·직진·좌회전·미검출)를 창 하나에 다 보여주도록 확장
 #   (perception/traffic_signal.py detect_s2()). 요청에 따라 기본 True로 켜둠 — 다른 항목과
 #   달리(위 2026-08-11 라바콘 테스트 메모 참고) 이 스위치는 독립적으로 True 유지할 것.
-DEBUG_VIZ_SIGNAL     = True    # 신호등 ROI/HoughCircles 디버그 창 (perception/traffic_signal.py)
+DEBUG_VIZ_SIGNAL     = False    # 신호등 ROI/HoughCircles 디버그 창 (perception/traffic_signal.py)
 # DEBUG_LOG_SIGNAL: 신호등 전용 상세 진단 로그. 전역 DEBUG_LOG(0.5초 주기 요약 [SIG] 한 줄)와는
 #   별개로, 이 플래그가 켜지면 S0/S2 상태에서 매 프레임 "왜 못 잡았는지"(원 개수 부족/배치 불량/
 #   밝기 대비 부족 등) 원인을 자세히 찍는다 — DEBUG_LOG를 꺼도 이것만 켜서 신호등만 디버깅 가능.
 #   (track_drive.py perc_signal())
 DEBUG_LOG_SIGNAL     = True
-DEBUG_VIZ_YOLO_CONE  = False  # 라바콘 YOLO 검출 박스 디버그 창 (perception/yolo_cone.py)
+DEBUG_VIZ_YOLO_CONE  = True  # 라바콘 YOLO 검출 박스 디버그 창 (perception/yolo_cone.py)
 DEBUG_VIZ_YOLO_SIGNAL = False  # 신호등 배경판 YOLO 검출 박스 디버그 창 (perception/yolo_signal.py)
-DEBUG_VIZ_YOLO_SIGNAL_STATE = True  # 신호등 색상상태 YOLO 검출 박스 디버그 창 (perception/yolo_signal_state.py) — _debug_viz_signal_status()의 Hough 비교와는 별개로 raw 검출 박스만 보고 싶을 때
+DEBUG_VIZ_YOLO_SIGNAL_STATE = False  # 신호등 색상상태 YOLO 검출 박스 디버그 창 (perception/yolo_signal_state.py) — _debug_viz_signal_status()의 Hough 비교와는 별개로 raw 검출 박스만 보고 싶을 때
 # [2026-08-15] avoid-hold(§2.32) 전용 상태창 — 지금 유예가 걸려있는지/왜 걸렸는지/방향
 #   힌트/조기해제 진행상황을 한곳에 모아 보여주고, 실측 안 된 파라미터 값도 항상 같이
 #   띄워서 "이 숫자 아직 지어낸 값"이라는 걸 상기시킨다(track_drive.py
 #   _debug_viz_avoid_hold(), avoid_hold_measurement_todo.md 참고). 다른 회피 관련 창
 #   (lidar_bev 등)과 별개로 언제든 독립적으로 켜고 끌 수 있다.
-DEBUG_VIZ_AVOID_HOLD = True
+DEBUG_VIZ_AVOID_HOLD = False
 #   [2026-08-11] smooth-imu-yaw-rate 브랜치(0c0d88b)에서 수동 포팅 — 라바콘 실차 테스트 중
 #   라이다 창과 함께 켜 두고 나머지는 꺼둔 상태(요청 반영).
 
@@ -1140,15 +1140,17 @@ DEBUG_VIZ_AVOID_HOLD = True
 # #############################################################
 # 6. 미션 State / 실차 테스트 범위 제한
 # #############################################################
-# [2026-08-19, 임시] 신호등 인식만 단독 테스트하려고 S0_WAIT_GREEN으로 잠깐 바꿔둠 —
-#   perc_signal()/_debug_viz_signal_status()가 S0_WAIT_GREEN·S2_INTERSECTION일 때만 도는데
-#   원래 START_STATE=S1_LANE_FOLLOW라 신호등 코드 자체가 아예 안 돌고 있었다. 실제 대회
-#   주행/전체 미션 테스트할 땐 반드시 S1_LANE_FOLLOW로 되돌릴 것.
-START_STATE     = MissionState.S0_WAIT_GREEN
-ENABLE_BEHAVIOR = False   # S1에서 라바콘/장애물/추월 Behavior를 켤지 여부(최상위 스위치)
+# [2026-08-19] 신호등 단독 테스트(S0_WAIT_GREEN) 끝나고 S1_LANE_FOLLOW로 복귀 — 신호등
+#   대기 없이 차선 추종부터 바로 시작. 신호등 인식만 다시 단독 테스트하려면 위 이력대로
+#   S0_WAIT_GREEN으로 잠깐 바꿔서 쓸 것(그때만 perc_signal()/_debug_viz_signal_status()가 돈다).
+START_STATE     = MissionState.S1_LANE_FOLLOW
+ENABLE_BEHAVIOR = True    # S1에서 라바콘/장애물/추월 Behavior를 켤지 여부(최상위 스위치)
 #   [2026-08-11] 라바콘(B1) 실차 테스트를 위해 True로 켬. TEST_FORCE_BEHAVIOR=True와 함께
 #   있으면 S2 교차로 없이도 시작부터 라바콘 단독 테스트 가능. B2/B3까지 실차 테스트 범위를
 #   넓힐 준비가 되기 전까지는 TEST_DISABLE_B2_B3=True로 B2/B3 발동 자체는 계속 막아둔 상태.
+# [2026-08-19] 신호등 단독 테스트하느라 잠깐 False로 꺼뒀던 걸 다시 True로 복귀 — YOLO
+#   라바콘 인식·좌우 라이다 값은 잡히는데 이 스위치가 꺼져 있어서 run_behavior_fsm() 자체가
+#   안 불려 B1 전환이 안 되던 문제(2706행 게이트) 확인 후 되돌림.
 
 # ── 실차 테스트 범위 제한 ──
 #   지금 단계에서 실차로 검증 가능한 건 딱 세 가지: ①신호등 인식 후 출발(S0)

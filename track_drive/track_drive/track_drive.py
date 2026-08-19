@@ -34,7 +34,7 @@ from sensor_msgs.msg import Image, LaserScan, Imu
 from std_msgs.msg import Float32MultiArray, Float32
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy, HistoryPolicy
 from cv_bridge import CvBridge
-from .perception.perc_lavacon import process_lavacon, CONE_LON_MAX as LAVACON_PATH_LON_MAX
+from .perception.perc_lavacon import process_lavacon, CONE_LON_MAX as LAVACON_PATH_LON_MAX, CONE_LAT_LIMIT as LAVACON_PATH_LAT_LIMIT, BOX_LON_START as LAVACON_BOX_LON_START, BOX_LON_WIDTH as LAVACON_BOX_LON_WIDTH
 from .perception.hough_lane import HoughLaneDetector
 from .perception.perc_floor import check_stopline, LaneDetector as ClassicLaneDetector
 from .perception.lane_util import CameraProcessor, SlideWindow
@@ -1042,9 +1042,9 @@ class TrackDriverNode(Node):
         # 좌표(x=전방+, y=좌측+)를 그 스케일로 그대로 변환하면 물리적으로 일관된 입력이
         # 된다 — 차량 기준점은 원점(0,0)으로 두고(_handle_lavacon()이 vehicle_x=0.0으로
         # 호출), 좌측(+y_m)은 이미지 왼쪽(-col_px)에 대응한다.
-        # [2026-08-19] path_m 생성 로직 자체는 보로노이 → 좌우 콘 클러스터 중앙 페어링으로
-        # 교체됐지만(perc_lavacon.py 상단 주석 참고), 여기 변환/호출부는 출력 형식이 그대로라
-        # 변경 없음.
+        # [2026-08-19] path_m 생성 로직 자체는 보로노이 → 콘 클러스터 페어링 → 박스 스택
+        # 페어링 순으로 여러 차례 교체됐지만(perc_lavacon.py 상단 주석 참고), 여기 변환/
+        # 호출부는 출력 형식이 그대로라 변경 없음.
         self.lavacon_path = [(-y * DL_PIXELS_PER_METER, -x * DL_PIXELS_PER_METER) for x, y in path_m]
         # 위 px 변환 전 원본(라이다 미터 좌표) — _draw_lavacon_bev()가 DEBUG_VIZ_LAVACON일 때
         # 그대로 그려서 "실제로 조향에 쓰이는 경로"를 시각적으로 보여준다.
@@ -1188,20 +1188,36 @@ class TrackDriverNode(Node):
             else:                col = (60, 60, 60)
             cv2.circle(bev, (sx, sy), 3, col, -1)
 
-        # [2026-08-19] dl_lane.py의 vehicle_center_x 빨간 세로선(차량이 자기 위치/정면이라
-        # 믿는 기준선)과 동일한 개념 — 라이다 기준 차량 정면 방향(y=0, 전방 x축)을 빨간
-        # 직선으로 그린다. process_lavacon()의 최근접 이웃 페어링(_pair_nearest())이 바로
-        # 이 선 위에서 "가까운 좌측 콘부터, 그때 가장 가까운 우측 콘"을 찾아 짝짓는다 —
-        # 이 선이 곧 그 페어링의 기준이라는 걸 시각적으로 보여준다.
-        cv2.line(bev, to_px(0.0, 0.0), to_px(LAVACON_PATH_LON_MAX, 0.0), (0, 0, 255), 1)
-        cv2.putText(bev, 'vehicle_x (y=0)', (EX + 4, EY - 14),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1, cv2.LINE_AA)
+        # [2026-08-19] process_lavacon()의 콘 후보 필터링 횡방향 한계(CONE_LAT_LIMIT,
+        # perc_lavacon.py에서 import — 요청 반영으로 ±2.5m→±1.8m로 축소) 시각화. 이 선
+        # 밖의 점은 종료판정에도, 박스 스택 페어링(_pick_boxed_centers())에도 안 들어간다
+        # — 트리거 ROI(위 청록 박스, LAT_MAX=2.0)와는 별개의 경계선이니 혼동하지 말 것.
+        cv2.line(bev, to_px(0.0, LAVACON_PATH_LAT_LIMIT), to_px(LAVACON_PATH_LON_MAX, LAVACON_PATH_LAT_LIMIT),
+                 (255, 255, 255), 1)
+        cv2.line(bev, to_px(0.0, -LAVACON_PATH_LAT_LIMIT), to_px(LAVACON_PATH_LON_MAX, -LAVACON_PATH_LAT_LIMIT),
+                 (255, 255, 255), 1)
+        cv2.putText(bev, f'cone ROI lat=+-{LAVACON_PATH_LAT_LIMIT:.1f}m', to_px(LAVACON_PATH_LON_MAX, LAVACON_PATH_LAT_LIMIT),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+
+        # [2026-08-19] process_lavacon()의 _pick_boxed_centers()가 실제로 훑는 박스 경계를
+        # 파란 가로선으로 표시(요청 반영 — 노란 경로선/점과 헷갈리지 않게 다른 색 사용).
+        # 흰색 콘 후보 횡방향 한계선(±LAVACON_PATH_LAT_LIMIT) 사이 폭으로만 그린다 — 그
+        # 밖은 애초에 박스 탐색에서도 후보로 안 보는 영역이라 그릴 필요가 없다. 경계 개수는
+        # perc_lavacon.py _pick_boxed_centers()의 n_boxes 계산과 반드시 같은 공식을 쓸 것
+        # (floor + 1e-6 부동소수 오차 가드) — 안 맞추면 이 파란선이 실제 박스 경계와 어긋난다.
+        n_lavacon_boxes = max(0, int(math.floor(
+            (LAVACON_PATH_LON_MAX - LAVACON_BOX_LON_START) / LAVACON_BOX_LON_WIDTH + 1e-6)))
+        for bi in range(n_lavacon_boxes + 1):
+            box_lon = LAVACON_BOX_LON_START + bi * LAVACON_BOX_LON_WIDTH
+            cv2.line(bev, to_px(box_lon, LAVACON_PATH_LAT_LIMIT), to_px(box_lon, -LAVACON_PATH_LAT_LIMIT),
+                     (255, 120, 0), 1)
 
         # [2026-08-11] 실제 조향에 쓰이는 경로(self._lavacon_path_m, perc_lavacon()이 채운
-        # 좌우 콘 클러스터 중점 → x오름차순 정렬 결과, [2026-08-19] 보로노이 → 클러스터
-        # 중앙 추종 → 최근접 이웃 페어링 순으로 교체됨) 시각화. 노란 선분이 Pure Pursuit/LQR이
-        # _target_point()에서 그대로 걷는 꺾은선이다 — 차량(원점)에서 시작해 정점을 순서대로
-        # 잇는다. 원은 정점 하나하나(§질문 답변: "영역"이 아니라 점 하나씩).
+        # 박스 스택 페어링 결과 — [2026-08-19] 보로노이 → 클러스터 순번 매칭 → 클러스터
+        # 최근접 이웃 매칭 → 박스 스택 페어링 순으로 교체됨, perc_lavacon.py 상단 주석 참고) 시각화.
+        # 노란 선분이 Pure Pursuit/LQR이 _target_point()에서 그대로 걷는 꺾은선이다 —
+        # 차량(원점)에서 시작해 정점을 순서대로 잇는다. 원은 정점 하나하나(각 박스의
+        # 좌/우 픽 포인트 중점 — "영역"이 아니라 점 하나씩).
         path_m = self._lavacon_path_m
         if path_m:
             prev_px = (EX, EY)
@@ -1231,10 +1247,10 @@ class TrackDriverNode(Node):
         masked_min_s = f'{masked_min:.2f}m' if masked_min >= 0 else 'N/A'
         cv2.putText(bev, f'masked(magenta) pts={masked_pts} min={masked_min_s}',
                     (8, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1, cv2.LINE_AA)
-        cv2.putText(bev, f'yellow=lavacon_path(L/R cone-cluster midpoint, n={len(path_m)})',
+        cv2.putText(bev, f'yellow=lavacon_path(boxed L/R nearest-pair midpoint, n={len(path_m)})',
                     (8, 132), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
-        cv2.putText(bev, 'red=vehicle heading ref line (nearest-neighbor pairing axis)',
-                    (8, 154), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1, cv2.LINE_AA)
+        cv2.putText(bev, 'white=cone candidate lat limit, blue=box boundaries',
+                    (8, 154), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
         cv2.imshow('lavacon_bev', bev)
         cv2.waitKey(1)
 
@@ -2382,7 +2398,7 @@ class TrackDriverNode(Node):
                 f'보임(추정 속도={target_speed_est:+.2f}m/s) — 오검출/오판 의심',
                 throttle_duration_sec=1.0)
 
-    # ── B1-라바콘: 좌우 콘 클러스터 중앙 경로 추종([2026-08-19] 보로노이에서 교체) ──
+    # ── B1-라바콘: 박스 스택 페어링 경로 추종([2026-08-19] 보로노이 → 클러스터 매칭 → 박스 스택으로 교체) ──
     def _handle_lavacon(self):
         """
         Phase.LAVACON 동안 항상 활성(트리거 조건 없음).
@@ -2717,7 +2733,7 @@ class TrackDriverNode(Node):
           [LANE] 차선편차px(검출여부) stale=LANE_STALE_SEC 이상 새 추론결과 없음(1) 여부
                  (SPEED_LANE_STALE로 강제감속 중이라는 뜻 — 코너 아닌데 감속되면 이거 확인)
                  / obs = 라이다 전방장애물(거리m,좌우,타입)
-          lava   = 라바콘 좌우 클러스터 중앙 편차(구간종료 판정)
+          lava   = 라바콘 박스 스택 페어링 중앙 편차(디버그/로깅용, 조향엔 미사용)
           trigL  = 라바콘 진입: 본선카운트/기준 (좌클러스터,우클러스터 검출여부)
           trigV  = 차량 진입:   본선카운트/기준
           [LAVA-ROI] 라바콘 트리거 ROI(전방0.3~3.0m,좌우2.0m) 안에 잡힌 점 개수(pts)와
