@@ -30,6 +30,7 @@ from ..config import (
     SIG4_CIRCLE_SAT_MAX,
     SIG4_FALLBACK_MAX_BOARD_FRAC,
     DEBUG_VIZ_SIGNAL,
+    YOLO_SIGNAL_ENABLE, YOLO_SIGNAL_MAX_CANDIDATES, YOLO_SIGNAL_CROP_MARGIN,
 )
 SIG4_VERT_DIFF_MAX  = SIG4_MAX_RADIUS * 2
 SIG4_HORIZ_DIFF_MAX = SIG4_MAX_RADIUS * 11
@@ -46,7 +47,14 @@ SIG4_LABELS = ('R', 'Y', 'L', 'S')  # 빨강, 노랑, 좌회전, 직진
 
 
 class SignalDetector:
-    def __init__(self):
+    def __init__(self, yolo_detector=None):
+        """yolo_detector: perception/yolo_signal.py의 YoloSignalDetector 인스턴스(선택).
+        None이면(기본값, signal_offline_check.py 등 기존 호출부와 100% 호환) YOLO_SIGNAL_ENABLE
+        여부와 무관하게 기존 HSV 자동크롭(_board_candidates())만 쓴다. track_drive.py가
+        YOLO_SIGNAL_ENABLE=True일 때만 실제 인스턴스를 만들어 넘겨준다(yolo_signal_detection_plan.md
+        참고) — 모델 파일이 아직 없어도(파일럿만 있는 상태) 이 클래스 자체는 항상 정상 동작한다."""
+        self._yolo_detector = yolo_detector
+
         self.red_on = False
         self.straight_on = False
         self.left_on = False
@@ -241,6 +249,29 @@ class SignalDetector:
         scored.sort(key=lambda v: v[0])  # 작은 것부터 — 보드 크기에 더 타이트하게 맞는 후보 우선
         return [(t, b, l, r_) for _, t, b, l, r_ in scored[:SIG4_BOARD_MAX_CANDIDATES]]
 
+    def _board_candidates_yolo(self, frame):
+        """YOLO(self._yolo_detector)로 배경판 후보를 찾아 (t,b,l,r) 절대 픽셀좌표 리스트로
+        반환 — _board_candidates()(HSV 자동크롭)의 대체 소스. 신뢰도 내림차순 정렬 후 상위
+        YOLO_SIGNAL_MAX_CANDIDATES개만 쓰고, 각 bbox에 YOLO_SIGNAL_CROP_MARGIN만큼 여유를
+        더해 프레임 경계로 클리핑한다(_board_candidates()의 SIG4_BOARD_CROP_MARGIN과 동일한
+        이유 — 원이 bbox 경계에 안 걸리게). 그 뒤 원 4개 패턴검사(find_circles*/shape_ok/
+        pick_best_4)는 무수정으로 그대로 재사용한다 — detect_s2()가 이 함수와
+        _board_candidates()를 완전히 동일한 반환 형식으로 취급하기 때문."""
+        h, w = frame.shape[:2]
+        detections = self._yolo_detector.detect(frame)
+        detections.sort(key=lambda d: d[4], reverse=True)
+
+        boxes = []
+        for x1, y1, x2, y2, _conf in detections[:YOLO_SIGNAL_MAX_CANDIDATES]:
+            bw, bh = x2 - x1, y2 - y1
+            mx, my = bw * YOLO_SIGNAL_CROP_MARGIN, bh * YOLO_SIGNAL_CROP_MARGIN
+            t = max(0, int(y1 - my))
+            b = min(h, int(y2 + my))
+            l = max(0, int(x1 - mx))
+            r_ = min(w, int(x2 + mx))
+            boxes.append((t, b, l, r_))
+        return boxes
+
     def find_circles(self, roi, min_r, max_r):
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -330,7 +361,16 @@ class SignalDetector:
 
         h, w = frame.shape[:2]
 
-        roi_boxes = list(self._board_candidates(frame)) if SIG4_AUTOCROP_ENABLE else []
+        # [2026-08-19] 배경판 후보 소스 선택 — YOLO_SIGNAL_ENABLE=True고 yolo_detector가
+        # 주어졌으면 YOLO(_board_candidates_yolo())로 대체, 아니면 기존 HSV 자동크롭
+        # (_board_candidates())을 그대로 쓴다. 어느 쪽이든 그 뒤 원 4개 패턴검사 로직은
+        # 완전히 동일 — 아래 fixed 고정폴백도 소스와 무관하게 항상 마지막에 붙는다.
+        if YOLO_SIGNAL_ENABLE and self._yolo_detector is not None:
+            roi_boxes = list(self._board_candidates_yolo(frame))
+        elif SIG4_AUTOCROP_ENABLE:
+            roi_boxes = list(self._board_candidates(frame))
+        else:
+            roi_boxes = []
         fixed_t, fixed_b = int(h * SIG4_ROI_T), int(h * SIG4_ROI_B)
         fixed_l, fixed_r = int(w * SIG4_ROI_L), int(w * SIG4_ROI_R)
         # [2026-08-18, §1.10] 고정폴백도 _dominant_blob_frac()로 "지금 이 위치에 진짜 배경판

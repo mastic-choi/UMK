@@ -41,6 +41,7 @@ from .perception.lane_util import CameraProcessor, SlideWindow
 from .perception.dl_lane import DLLaneDetector
 from .perception.traffic_signal import SignalDetector
 from .perception.yolo_cone import YoloConeDetector
+from .perception.yolo_signal import YoloSignalDetector
 from .controller.obstacle_avoidance import ObstacleAvoidance, AvoidPhase
 # vehicle_overtake.py 의 구 VehicleOvertake 는 더 이상 쓰지 않는다.
 #   추월/회피가 규정상 같은 기동("타겟이 없는 차선으로 지나간다")이라
@@ -198,7 +199,6 @@ class TrackDriverNode(Node):
 
         # ── 외부 차선 인식 모듈 초기화 (LANE_DETECTOR_BACKEND로 선택, 인터페이스는 셋 다 동일) ──
         self.lane_detector = self._build_lane_detector(LANE_DETECTOR_BACKEND)
-        self.signal_detector = SignalDetector()          # 신호등(3구/4구) Hough Circle 인식기
 
         # 라바콘 카메라 이중확인용 YOLO 콘 검출기. onnxruntime 미설치/모델 파일 부재 등으로
         # 초기화가 실패하면 _build_lane_detector()의 dl→hough 폴백과 달리 대체 백엔드가
@@ -211,6 +211,22 @@ class TrackDriverNode(Node):
                 f'YOLO 콘 검출기 초기화 실패, 라바콘 트리거는 라이다 단독 판정으로 폴백합니다: {e}'
             )
             self.yolo_cone_detector = None
+
+        # [2026-08-19, 파일럿] 신호등 배경판 위치 탐지용 YOLO — YOLO_SIGNAL_ENABLE=False가
+        # 기본값이라(datasets/yolo_signal_pilot 스모크테스트 데이터뿐, 실데이터 재학습 전)
+        # 평소엔 이 블록이 아예 안 돈다. 켜져 있는데 모델 파일이 없으면 위 콘 검출기와 동일한
+        # 패턴으로 None 폴백 — SignalDetector가 yolo_detector=None이면 기존 HSV 자동크롭으로
+        # 자동 복귀하므로(traffic_signal.py 참고) 안전하다.
+        self.yolo_signal_detector = None
+        if YOLO_SIGNAL_ENABLE:
+            try:
+                self.yolo_signal_detector = YoloSignalDetector(logger=self.get_logger())
+            except Exception as e:
+                self.get_logger().error(
+                    f'YOLO 신호등 검출기 초기화 실패, 배경판 탐색은 기존 HSV 자동크롭으로 폴백합니다: {e}'
+                )
+                self.yolo_signal_detector = None
+        self.signal_detector = SignalDetector(yolo_detector=self.yolo_signal_detector)  # 신호등(3구/4구) 인식기
 
         # ── 판단/제어 상태 ──
         self.mission_state  = START_STATE
@@ -593,6 +609,8 @@ class TrackDriverNode(Node):
         if self.mission_state in (MissionState.S0_WAIT_GREEN, MissionState.S2_INTERSECTION):
             self.signal_red_on, self.signal_straight_on, self.signal_left_on = \
                 self.signal_detector.detect_s2(self.img_front)
+            if self.yolo_signal_detector is not None:
+                self.yolo_signal_detector.show_debug_windows()  # 메인 스레드 전용(yolo_signal.py 주석 참고)
 
             self._sig_straight_cnt = self._sig_straight_cnt + 1 if self.signal_straight_on else 0
             self._sig_left_cnt     = self._sig_left_cnt + 1 if self.signal_left_on else 0
