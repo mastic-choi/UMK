@@ -1396,8 +1396,11 @@ class TrackDriverNode(Node):
         cv2.putText(bev, f'temporal_ema={LAVACON_TEMPORAL_EMA_ENABLED}(a={LAVACON_TEMPORAL_EMA_ALPHA}) '
                           f'sparse_fallback={LAVACON_SPARSE_FALLBACK_ENABLED}(a={LAVACON_HALFWIDTH_EMA_ALPHA})',
                     (8, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 200), 1, cv2.LINE_AA)
+        cv2.putText(bev, f'line_continuity={LAVACON_LINE_CONTINUITY_ENABLED}'
+                          f'(max_jump={LAVACON_LINE_TRACK_MAX_JUMP_M}m)',
+                    (8, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 200), 1, cv2.LINE_AA)
         cv2.putText(bev, 'green=left lane(EMA), orange=right lane(EMA), yellow=steer path midpoint',
-                    (8, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+                    (8, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
 
         cv2.imshow('lavacon_ema_bev', bev)
         cv2.waitKey(1)

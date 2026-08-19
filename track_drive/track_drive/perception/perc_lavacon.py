@@ -53,6 +53,22 @@
 #      바꿨다. `LAVACON_TEMPORAL_EMA_ENABLED`(기본 False)가 꺼져 있으면 5)와 결과가
 #      100% 동일하다. 상태(직전 boxes)는 track_drive.py가 self.*로 들고 있다가 매 틱
 #      다시 넘겨주는 함수형 스레딩(process_lavacon() 자체는 무상태 유지).
+#   7) [현재] 좌/우 배정을 y부호 대신 라인 연속성으로(`_assign_by_continuity`,
+#      `LAVACON_LINE_CONTINUITY_ENABLED`, 기본 True) — 지금까지 5)/6) 전부 박스 안에서
+#      좌/우를 "y부호"(차량 헤딩 기준 고정 중앙선, y>0=좌/y<0=우)로 먼저 가른 뒤 그 절반
+#      안에서 최근접 1점을 뽑았다. 급커브에서는 물리적으로 계속 "오른쪽 라인"이던 콘이
+#      차량 헤딩 기준 y>0(수학적으로는 왼쪽)으로 넘어갈 수 있는데, 고정 y=0 경계로는 그
+#      점이 왼쪽 라인으로 잘못 편입된다 — 사용자가 lavacon_ema_bev 창에서 실제로 확인
+#      (오른쪽 콘 두 개가 초록/주황으로 색이 갈려서 찍힘). 켜면 박스 안 후보를 y부호로
+#      먼저 안 가르고, 직전 박스에서 확정된 좌/우 점과 유클리드 거리가 가장 가까운
+#      후보를 그 라인의 연속으로 우선 배정한다(`LAVACON_LINE_TRACK_MAX_JUMP_M` 이내일
+#      때만) — 처음 검출되는 라인이거나 연속 배정에 실패하면(다른 콘/라인일 가능성) 그
+#      때만 기존 y부호 방식으로 폴백한다. 끄면 5)/6)과 100% 동일(자가 테스트로 확인).
+#      [참고] 같은 날 별도로 박스 스택 자체를 우회하는 da_push 조향 모드
+#      (`LAVACON_STEER_MODE_DA_PUSH`, track_drive.py `_lavacon_steer_da_push()`)도
+#      추가됐다 — da_push가 켜지면 이 파일의 박스 스택 경로(process_lavacon의 path_m)는
+#      lavacon_done 판정에만 쓰이고 조향엔 `nearest_cone_lateral()`이 쓰인다.
+#
 #   출력 형식(offset/done/path_m)과 좌표 약속은 매 단계 동일하게 유지했으므로 Pure
 #   Pursuit(controller/pure_pursuit.py)가 그대로 이 경로를 추종한다. 다만 6) 도입으로
 #   반환 튜플에 boxes가 하나 추가됐으므로 track_drive.py 호출부(perc_lavacon())는
@@ -88,6 +104,10 @@ from ..config import LAVACON_SPARSE_FALLBACK_ENABLED, LAVACON_HALFWIDTH_EMA_ALPH
 # [2026-08-19] 박스별 좌/우 바운더리 포인트("라바콘 차선")에 거는 프레임간 EMA 스위치/게인
 # — waypoint(중점) 자체가 아니라 그 재료인 좌/우 포인트에 건다(_blend_boxes_temporal 참고).
 from ..config import LAVACON_TEMPORAL_EMA_ENABLED, LAVACON_TEMPORAL_EMA_ALPHA
+# [2026-08-19] 박스 안 후보점을 y부호(고정 중앙선)로 가르는 대신 직전 박스의 같은 라인과의
+# 최근접 연속성으로 배정할지 여부 — _pick_boxed_sides() 참고. 급커브에서 실제로는 오른쪽
+# 라인인 콘이 차량 헤딩 기준 y>0으로 넘어가는 걸 사용자가 디버그 창에서 확인(2026-08-19).
+from ..config import LAVACON_LINE_CONTINUITY_ENABLED, LAVACON_LINE_TRACK_MAX_JUMP_M
 
 # ─────────────────────────────────────────────
 # 튜닝 상수 (track_drive.py 의 실측 ROI 값과 일치시킴)
@@ -168,10 +188,69 @@ def nearest_cone_lateral(lidar_ranges, lon_min, lon_max, lat_limit):
     return left_y, right_y
 
 
-def _pick_boxed_sides(x, y, ranges, lon_start, lon_width, lon_max, lat_limit):
+def _assign_by_continuity(box_idx, x, y, ranges, prev_left_xy, prev_right_xy, max_jump_m):
+    """한 박스 안 후보점 인덱스(box_idx)를, 직전 박스에서 확정됐던 좌/우 점(prev_left_xy/
+    prev_right_xy)과의 유클리드 최근접 연속성으로 좌/우에 배정한다.
+
+    [2026-08-19 도입 배경] 기존 `_pick_boxed_sides()`는 박스 안 후보를 y부호(y>0=좌/
+    y<0=우, 차량 헤딩 기준 고정 중앙선)로 먼저 갈랐는데, 급커브에서는 물리적으로 계속
+    "오른쪽 라인"이던 콘이 차량 헤딩 기준 y>0(수학적으로는 왼쪽) 쪽으로 넘어갈 수 있다 —
+    이 경우 고정 y=0 경계로는 그 점이 왼쪽 라인으로 잘못 편입된다(사용자가 lavacon_ema_bev
+    창에서 실제로 확인). 이 함수는 그 대신 "직전까지 오른쪽이던 점과 물리적으로 가장
+    가까운 후보가 이번에도 오른쪽일 가능성이 높다"는 연속성 가정으로 배정한다.
+
+    한 박스에 후보가 여러 개면 좌 배정을 먼저 확정하고 그 점을 후보군에서 제거한 뒤 우를
+    고른다(같은 점이 좌/우 양쪽에 동시 배정되는 것을 구조적으로 막음) — 순서 자체(좌 우선)
+    가 결과를 크게 좌우하진 않는다, 어차피 서로 다른 이전 앵커에 대한 최근접이라 겹칠
+    일이 드물기 때문. `max_jump_m`보다 먼 점만 남으면(그 라인 콘이 그 박스에 없거나 너무
+    많이 꺾인 경우) 연속 배정을 포기한다.
+
+    직전 앵커가 아예 없는 경우(그 라인이 아직 한 번도 검출 안 됐거나, 방금 연속 배정에
+    실패한 경우)엔 기존 y부호 방식으로 폴백한다 — 처음 게이트에 진입하는 순간처럼 아직
+    "그 라인이 어디인지" 알 근거가 없을 때는 차량 헤딩 기준 좌/우 구분이 최선의 추정이기
+    때문. 이때도 그 절반 안에서는 기존과 동일하게 라이다 최근접점(ranges 최소)을 고른다.
+    """
+    if box_idx.size == 0:
+        return None, None
+    remaining = list(box_idx)
+
+    def _pop_nearest_to(ref_xy):
+        if ref_xy is None or not remaining:
+            return None
+        d = [math.hypot(x[j] - ref_xy[0], y[j] - ref_xy[1]) for j in remaining]
+        k = int(np.argmin(d))
+        if d[k] > max_jump_m:
+            return None
+        j = remaining.pop(k)
+        return (float(x[j]), float(y[j]))
+
+    left_xy = _pop_nearest_to(prev_left_xy)
+    right_xy = _pop_nearest_to(prev_right_xy)
+
+    if left_xy is None and remaining:
+        cand = [j for j in remaining if y[j] > 0.0]
+        if cand:
+            j = cand[int(np.argmin(ranges[cand]))]
+            left_xy = (float(x[j]), float(y[j]))
+            remaining.remove(j)
+    if right_xy is None and remaining:
+        cand = [j for j in remaining if y[j] < 0.0]
+        if cand:
+            j = cand[int(np.argmin(ranges[cand]))]
+            right_xy = (float(x[j]), float(y[j]))
+            remaining.remove(j)
+
+    return left_xy, right_xy
+
+
+def _pick_boxed_sides(x, y, ranges, lon_start, lon_width, lon_max, lat_limit,
+                       line_continuity_enabled=LAVACON_LINE_CONTINUITY_ENABLED,
+                       max_jump_m=LAVACON_LINE_TRACK_MAX_JUMP_M):
     """차량 전방을 lon_width 폭의 박스로 lon_start부터 lon_max까지 쭉 쌓아올리고, 각 박스
-    "안에서만" 좌(y>0)/우(y<0) 각 1점(그 박스 안에서 차량과의 라이다 반사거리가 가장 짧은
-    점)을 뽑는다.
+    "안에서만" 좌/우 각 1점을 뽑는다. `line_continuity_enabled`가 꺼져 있으면(기본) 좌
+    (y>0)/우(y<0) 고정 경계로 나눈 뒤 그 박스 안에서 차량과의 라이다 반사거리가 가장 짧은
+    점을 고른다. 켜져 있으면 `_assign_by_continuity()`로 직전 박스의 같은 라인과의 최근접
+    연속성으로 배정한다(급커브에서 y부호가 뒤집히는 문제 대응 — 그 함수 docstring 참고).
 
     [2026-08-19 최초 도입] 콘 클러스터링 + 유클리드 최근접 이웃 매칭(구버전, 폐기) 대신
     이 방식을 쓰는 이유: 유클리드 거리만으로 좌/우를 짝지으면, 급커브에서 트랙을
@@ -201,20 +280,32 @@ def _pick_boxed_sides(x, y, ranges, lon_start, lon_width, lon_max, lat_limit):
     """
     boxes = []
     n_boxes = max(0, int(math.floor((lon_max - lon_start) / lon_width + 1e-6)))
+    prev_left_xy, prev_right_xy = None, None   # line_continuity_enabled일 때만 갱신/사용
     for i in range(n_boxes):
         b_lo = lon_start + i * lon_width
         b_hi = b_lo + lon_width
         box_mask = (ranges > 0.0) & (x >= b_lo) & (x < b_hi) & (np.abs(y) < lat_limit)
-        left_idx = np.where(box_mask & (y > 0.0))[0]
-        right_idx = np.where(box_mask & (y < 0.0))[0]
-        left_xy = None
-        right_xy = None
-        if left_idx.size > 0:
-            li = left_idx[int(np.argmin(ranges[left_idx]))]
-            left_xy = (float(x[li]), float(y[li]))
-        if right_idx.size > 0:
-            ri = right_idx[int(np.argmin(ranges[right_idx]))]
-            right_xy = (float(x[ri]), float(y[ri]))
+
+        if line_continuity_enabled:
+            box_idx = np.where(box_mask)[0]
+            left_xy, right_xy = _assign_by_continuity(
+                box_idx, x, y, ranges, prev_left_xy, prev_right_xy, max_jump_m)
+            if left_xy is not None:
+                prev_left_xy = left_xy
+            if right_xy is not None:
+                prev_right_xy = right_xy
+        else:
+            left_idx = np.where(box_mask & (y > 0.0))[0]
+            right_idx = np.where(box_mask & (y < 0.0))[0]
+            left_xy = None
+            right_xy = None
+            if left_idx.size > 0:
+                li = left_idx[int(np.argmin(ranges[left_idx]))]
+                left_xy = (float(x[li]), float(y[li]))
+            if right_idx.size > 0:
+                ri = right_idx[int(np.argmin(ranges[right_idx]))]
+                right_xy = (float(x[ri]), float(y[ri]))
+
         boxes.append((left_xy, right_xy))
     return boxes
 
@@ -338,7 +429,8 @@ def process_lavacon(lidar_ranges, prev_boxes=None):
     # CONE_LON_MAX/CONE_LAT_LIMIT를 그대로 재사용해 박스 탐색 범위를 위 종료판정 ROI와
     # 동일한 한계 안으로 맞춘다.
     boxes_raw = _pick_boxed_sides(x, y, ranges, BOX_LON_START, BOX_LON_WIDTH,
-                                   CONE_LON_MAX, CONE_LAT_LIMIT)
+                                   CONE_LON_MAX, CONE_LAT_LIMIT,
+                                   LAVACON_LINE_CONTINUITY_ENABLED, LAVACON_LINE_TRACK_MAX_JUMP_M)
     boxes = (_blend_boxes_temporal(boxes_raw, prev_boxes, LAVACON_TEMPORAL_EMA_ALPHA)
              if LAVACON_TEMPORAL_EMA_ENABLED else boxes_raw)
     mid_x, mid_y = _build_path(boxes, LAVACON_HALFWIDTH_EMA_ALPHA, LAVACON_SPARSE_FALLBACK_ENABLED)
@@ -427,3 +519,23 @@ if __name__ == '__main__':
     test4[idx] = r
     ly, ry = nearest_cone_lateral(test4, lon_min=0.2, lon_max=1.5, lat_limit=1.0)
     print(f'nearest_cone_lateral: left_y={ly} right_y={ry} (~+0.4/-0.3 기대)')
+
+    # 시나리오 5 : 좌/우 배정 — y부호 vs 라인 연속성 (2026-08-19, 사용자가 lavacon_ema_bev
+    # 창에서 직접 확인한 문제 재현). 급커브에서 오른쪽 라인 콘이 차량 헤딩 기준
+    # y>0(수학적으로는 왼쪽)으로 넘어가는 상황 — 직전 박스에서 오른쪽=(0.4,-0.2),
+    # 왼쪽=(0.4,0.9)이 확정된 상태에서, 다음 박스엔 오른쪽 라인이 이어진 (0.8,0.2)
+    # (y가 양수로 넘어감)와 왼쪽 라인이 이어진 (0.8,0.95) 두 후보만 있다고 하자.
+    x5 = np.array([0.8, 0.8])
+    y5 = np.array([0.2, 0.95])   # idx0=오른쪽 라인이 이어진 점(y가 양수로 넘어감), idx1=왼쪽 라인이 이어진 점
+    ranges5 = np.hypot(x5, y5)
+    box_idx5 = np.array([0, 1])
+    prev_left5, prev_right5 = (0.4, 0.9), (0.4, -0.2)
+
+    left_by_sign = list(box_idx5[y5[box_idx5] > 0.0])
+    right_by_sign = list(box_idx5[y5[box_idx5] < 0.0])
+    print(f'y부호만 쓰면: left 후보={left_by_sign} right 후보={right_by_sign} '
+          f'(오른쪽 후보 0개 기대 — 둘 다 y>0이라 오른쪽 라인이 이 박스에서 통째로 안 잡힘)')
+
+    l_cont, r_cont = _assign_by_continuity(box_idx5, x5, y5, ranges5, prev_left5, prev_right5, max_jump_m=0.6)
+    print(f'line_continuity: left={l_cont} right={r_cont} '
+          f'(기대: left=(0.8,0.95) right=(0.8,0.2) — 둘 다 y>0인데도 각자 직전 라인과 이어져서 올바르게 배정)')

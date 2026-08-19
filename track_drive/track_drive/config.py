@@ -1302,9 +1302,10 @@ LAVACON_TEMPORAL_EMA_ALPHA   = 0.5      # 새 프레임에 줄 가중치(작을�
 #   그럭저럭 지나간다는 게 실차로 확인됐으므로, da 경로를 기본으로 신뢰하고 콘이 안전
 #   마진 안으로 들어왔을 때만 그만큼 옆으로 미는 방식(track_drive.py
 #   `_lavacon_steer_da_push()`, perc_lavacon.py `nearest_cone_lateral()`)을 추가.
-#   기본 False — 켜기 전엔 기존 박스 스택 조향(_handle_lavacon 구 분기)과 동일하게
-#   동작한다. 실차에서 da_push로 전환해 테스트할 것.
-LAVACON_STEER_MODE_DA_PUSH = False
+#   자가 테스트로 꺼진 상태에서 기존 박스 스택 조향과 동일함이 확인된 상태에서(ff6e80a),
+#   기본 주행 방식으로 채택하며 True로 전환(요청 반영) — 박스 스택 조향은 이제
+#   `_handle_lavacon()`의 폴백 분기로만 남는다.
+LAVACON_STEER_MODE_DA_PUSH = True
 
 # [2026-08-19] 안전마진(m) — 이 값보다 콘이 차량 중심에 가깝게 들어오면 그만큼 반대쪽으로
 #   민다. VEHICLE_WIDTH_M(0.31, 실측)/2=0.155(차량 반폭) + DL_DA_SIDE_MARGIN_M(0.1, B2/B3
@@ -1322,6 +1323,17 @@ LAVACON_PUSH_SAFETY_MARGIN_M = 0.26
 LAVACON_PUSH_LON_MIN     = 0.2   # 차체 바로 앞 반사 배제(perc_lavacon.py LON_MIN과 동일 이유)
 LAVACON_PUSH_LON_MAX     = 1.5   # 이 거리보다 먼 콘은 아직 안 민다
 LAVACON_PUSH_LAT_LIMIT   = 1.0   # 횡방향 탐색 한계 — CONE_LAT_LIMIT(perc_lavacon.py)와 동일값으로 시작
+
+# [2026-08-19] 박스 안 후보점의 좌/우 배정을 y부호(차량 헤딩 기준 고정 중앙선, y>0=좌/
+#   y<0=우) 대신 직전 박스의 같은 라인과의 최근접 연속성으로 할지 여부
+#   (perc_lavacon.py `_assign_by_continuity()` 참고). 급커브에서는 물리적으로 계속
+#   "오른쪽 라인"이던 콘이 차량 헤딩 기준 y>0(수학적으로는 왼쪽)으로 넘어갈 수 있는데,
+#   고정 y=0 경계로 가르면 그 점이 왼쪽 라인으로 잘못 편입된다 — 사용자가 lavacon_ema_bev
+#   창에서 실제로 확인(오른쪽 콘 두 개가 색이 갈려서 찍힘). 자가 테스트로 기존 동작과
+#   동일함이 확인된 상태에서 바로 True로 켬(요청 반영) — 끄면 기존 y부호 방식과 100%
+#   동일하다.
+LAVACON_LINE_CONTINUITY_ENABLED = True
+LAVACON_LINE_TRACK_MAX_JUMP_M   = 0.6   # 직전 박스 같은 라인 점과의 최대 허용 거리(m) — 이보다 멀면 다른 콘/라인으로 보고 y부호 폴백
 
 # ── 라바콘 카메라 이중확인 (perception/yolo_cone.py, YOLOv8n ONNX) ──
 #   perc_lavacon_trigger()가 기존 라이다 좌우 클러스터 판정에 "카메라로도 콘이 보이는가"를
