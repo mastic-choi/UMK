@@ -106,11 +106,18 @@ OFFSET_GAIN      = 1.0          # y평균 → offset 스케일 계수 (제어팀
 
 # [2026-08-19] 박스 스택 페어링 파라미터 — track_drive.py perc_lavacon_trigger()의 진입
 #   트리거 박스와 반드시 같은 폭을 유지할 것(BOX_LON_START=LON_MIN, BOX_LON_WIDTH=
-#   LON_MAX-LON_MIN, 트리거 쪽은 0.3~0.5). perc_lavacon.py와 perc_lavacon_trigger()가
+#   LON_MAX-LON_MIN, 트리거 쪽은 0.3~0.7). perc_lavacon.py와 perc_lavacon_trigger()가
 #   서로 import하지 않는 기존 관례상 값을 복사해서 들고 있다(위 BODY_LO/HI 주석 참고) —
 #   한쪽만 바꾸면 반드시 다른 쪽도 같이 바꿀 것.
 BOX_LON_START    = 0.3          # 첫 박스 시작 지점(전방, m) — 차체 바로 앞 반사 배제
-BOX_LON_WIDTH    = 0.2          # 박스 1개의 종방향 폭(m)
+# [2026-08-19] 0.2→0.4로 확대(실차 확인 반영) — 실제 라바콘 간격이 옛 박스 폭 기준
+#   2칸(≈0.4m)이라, 0.2m 박스로는 콘 하나 걸러 빈 박스가 계속 나와 좌/우 바운더리가
+#   듬성듬성해지고(같은 이유로 프레임간 EMA도 인덱스가 잘 안 맞음) sparse fallback의
+#   반폭 EMA 부트스트랩(양쪽 다 검출된 박스 필요)도 잘 안 걸렸다. 박스 폭을 실제 콘
+#   간격에 맞추면 박스 하나에 콘 하나가 안정적으로 들어와 이 문제들이 구조적으로
+#   완화된다. lavacon_bev/lavacon_ema_bev의 파란 격자도 이 값을 그대로 따라간다
+#   (track_drive.py가 이 상수를 LAVACON_BOX_LON_WIDTH로 import).
+BOX_LON_WIDTH    = 0.4          # 박스 1개의 종방향 폭(m)
 
 
 def _pick_boxed_sides(x, y, ranges, lon_start, lon_width, lon_max, lat_limit):
@@ -131,8 +138,9 @@ def _pick_boxed_sides(x, y, ranges, lon_start, lon_width, lon_max, lat_limit):
     이제는 박스마다 (left_xy 또는 None, right_xy 또는 None)을 그대로 반환해, 양쪽 유무
     판단과 중점 계산을 호출부(`_build_path`)로 넘긴다 — 왼쪽만 모으면 왼쪽 바운더리
     시퀀스, 오른쪽만 모으면 오른쪽 바운더리 시퀀스가 되는 셈이라 "좌우 독립 라인"을
-    별도 자료구조 없이 얻는다. 박스 폭이 이미 좁아서(0.2m) 같은 사이드 안에서도 인접
-    박스끼리 물리적으로 가깝다는 보장이 있으므로 사이드 내부 정렬/매칭 로직은 필요 없다
+    별도 자료구조 없이 얻는다. 박스 폭이 이미 좁아서(BOX_LON_WIDTH, 실측 콘 간격 기준)
+    같은 사이드 안에서도 인접 박스끼리 물리적으로 가깝다는 보장이 있으므로 사이드 내부
+    정렬/매칭 로직은 필요 없다
     (박스 순번이 곧 종방향 순서).
 
     [2026-08-19 재개정] 검출이 하나도 없는 박스도 (None, None)으로 그대로 남겨, 반환
@@ -330,9 +338,13 @@ def process_lavacon(lidar_ranges, prev_boxes=None):
 # ─────────────────────────────────────────────
 if __name__ == '__main__':
     # 가상 시나리오 : 두 "게이트"(좌우 콘 쌍)를 서로 다른 박스에 하나씩 배치.
-    #   게이트1(전방 0.4m): 좌 y=+1.5, 우 y=-1.0 → 중점 y=+0.25 → offset≈-0.25(좌조향)
-    #   게이트2(전방 1.0m): 좌 y=+1.0, 우 y=-1.0 → 중점 y=0.0  → offset≈0(직진)
-    # 박스 폭(BOX_LON_WIDTH=0.2m)보다 좁게 좌우를 같은 x에 둬야 같은 박스에 페어링된다.
+    #   [2026-08-19] y값을 CONE_LAT_LIMIT(현재 1.0m, 실차 튜닝으로 1.8→1.0 축소됨)보다
+    #   확실히 안쪽으로 잡아야 한다 — 예전엔 y=1.5/1.0을 썼는데 1.0은 "< lat_limit" 경계에
+    #   딱 걸쳐 있어서(부동소수 반올림에 우연히 걸러지지 않고 통과) 테스트가 취약했다.
+    #   게이트1(전방 0.4m): 좌 y=+0.8, 우 y=-0.5 → 중점 y=+0.15 → offset 기여 -0.15
+    #   게이트2(전방 1.0m): 좌 y=+0.6, 우 y=-0.6 → 중점 y=0.0   → offset 기여 0.0
+    #   → offset ≈ -(0.15+0.0)/2 = -0.075(좌조향)
+    # 박스 폭(BOX_LON_WIDTH, 현재 0.4m)보다 좁게 좌우를 같은 x에 둬야 같은 박스에 페어링된다.
     test = np.zeros(360, dtype=np.float32)
 
     def put_xy(fx, fy):
@@ -342,15 +354,15 @@ if __name__ == '__main__':
         idx = int(round(true_deg + LIDAR_ANGLE_OFFSET_DEG)) % 360
         test[idx] = r
 
-    put_xy(0.4, 1.5)   # 게이트1 좌
-    put_xy(0.4, -1.0)  # 게이트1 우
-    put_xy(1.0, 1.0)   # 게이트2 좌
-    put_xy(1.0, -1.0)  # 게이트2 우
+    put_xy(0.4, 0.8)   # 게이트1 좌
+    put_xy(0.4, -0.5)  # 게이트1 우
+    put_xy(1.0, 0.6)   # 게이트2 좌
+    put_xy(1.0, -0.6)  # 게이트2 우
 
     off, done, path_m, boxes = process_lavacon(test)
-    print(f'offset={off:+.3f} (~-0.125 기대: 두 게이트 중점 y평균의 부호반전), '
+    print(f'offset={off:+.3f} (~-0.075 기대: 두 게이트 중점 y평균의 부호반전), '
           f'done={done} (False 기대), path_m={path_m} '
-          f'(~[(0.4,0.25),(1.0,0.0)] 기대)')
+          f'(~[(0.4,0.15),(1.0,0.0)] 기대)')
 
     # 시나리오 2 : sparse fallback — 박스0은 양쪽(y=+1.0/-1.0, 반폭=1.0), 박스1은 왼쪽만
     # (y=+1.2). LAVACON_SPARSE_FALLBACK_ENABLED=False(기본)면 박스1은 스킵되고,
