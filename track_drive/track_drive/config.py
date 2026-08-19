@@ -1256,6 +1256,34 @@ YOLO_CONE_INPUT_SIZE = 640     # cone_best_n.onnx export 시 imgsz와 반드시 
 YOLO_CONE_CONF_THRESHOLD = 0.5 # 이 신뢰도 이상인 검출만 인정(모델이 nms=True로 export돼 좌표 디코딩은 불필요)
 YOLO_CONE_MODEL_PATH = None    # None이면 yolo_ros/cone_best_n.onnx(형제 디렉터리)를 자동으로 찾음(perception/yolo_cone.py 참고)
 
+# ── [2026-08-19] 방해차량 카메라 이중확인 (perception/yolo_vehicle.py, YOLOv8n ONNX) ──
+#   배경: 실차 테스트에서 라이다 단독 obstacle_front가 벽/코너 등에서 오탐돼 평상시
+#   주행 중에도 pure_pursuit near_obstacle 트리거(README §2.46)가 잘못 걸리는 문제가
+#   나왔다 — 라바콘(perc_lavacon_trigger())이 이미 쓰는 "라이다 AND YOLO 카메라
+#   이중확인" 패턴을 그대로 재사용해서, 라이다가 가깝다고 봐도 카메라가 실제로
+#   'car'를 못 보면 트리거를 안 걸리게 한다.
+#   [2026-08-19] 파인튜닝된 전용 모델(cone_best_n.onnx 같은) 없이, 실측(yolo_ros/
+#   yolov8n.pt, COCO 사전학습)의 'car'(클래스 id 2) 검출만으로 실제 방해차량(20×41×16cm
+#   RC카 모형)이 잡히는지 raw 캡처(lap_005_raw_2734, pseudo_dataset_v2)로 육안 확인함 —
+#   신뢰도 0.15~0.78 범위로 실제 위치에 정확히 박싱됨을 확인. 반면 'truck' 클래스는
+#   같은 확인 과정에서 카트/의자 더미를 최고 신뢰도(0.81)로 오탐하는 게 확인돼 제외 —
+#   YOLO_VEHICLE_CLASS_ID=2('car') 하나만 쓴다.
+#   yolo_ros/yolov8n_car.onnx는 yolov8n.pt를 `model.export(format='onnx', imgsz=640,
+#   opset=12, simplify=True, nms=True)`로 변환한 것(cone_best_n.onnx와 동일 관례) —
+#   단, opset=12로 변환이 안 되고(Resize 연산자 미지원) 실제로는 opset=18로
+#   내보내졌다. Jetson의 onnxruntime 버전이 opset 18을 지원 못 하면 로드 자체가
+#   실패할 수 있음 — 실차 미검증, 실패하면 opset을 낮춰(또는 다른 변환 경로로)
+#   재변환할 것.
+YOLO_VEHICLE_INPUT_SIZE = 640      # yolov8n_car.onnx export 시 imgsz와 반드시 일치시킬 것
+YOLO_VEHICLE_CONF_THRESHOLD = 0.3  # 확인된 실측 신뢰도 범위(0.15~0.78, 평균 0.3대) 하한 근처로 설정 — 실차 미검증
+YOLO_VEHICLE_CLASS_ID = 2          # COCO 클래스 id — 'car'만 씀('truck'은 오탐 확인돼 제외)
+YOLO_VEHICLE_MODEL_PATH = None     # None이면 yolo_ros/yolov8n_car.onnx(형제 디렉터리)를 자동으로 찾음(perception/yolo_vehicle.py 참고)
+DEBUG_VIZ_YOLO_VEHICLE = False     # 방해차량 YOLO 검출 박스 디버그 창 (perception/yolo_vehicle.py)
+# 라이다 근접(AVOID_HOLD_TRIGGER_DIST_M) AND YOLO car가 이 프레임 수만큼 연속 확인돼야
+#   near_obstacle 트리거 확정 — VEHICLE_TRIGGER_FRAMES(아래, B3 진입용)와 동일 관례.
+#   배경 소품의 순간적 오탐(카트→truck 사례처럼 한두 프레임만 스치는 것)을 걸러낸다.
+YOLO_VEHICLE_CONFIRM_FRAMES = 3
+
 SAFETY_DIST      = 5.0        # B2(고정장애물) 발동 거리(m)
 OVERTAKE_TRIGGER = 6.5        # B3(방해차량) 발동 거리(m)
 VEHICLE_TRIGGER_FRAMES = 5    # 라이다 단독검출 연속 N프레임이면 B3_VEHICLE 진입 확정

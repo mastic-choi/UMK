@@ -41,6 +41,7 @@ from .perception.lane_util import CameraProcessor, SlideWindow
 from .perception.dl_lane import DLLaneDetector
 from .perception.traffic_signal import SignalDetector
 from .perception.yolo_cone import YoloConeDetector
+from .perception.yolo_vehicle import YoloVehicleDetector
 from .controller.obstacle_avoidance import ObstacleAvoidance, AvoidPhase
 # vehicle_overtake.py 의 구 VehicleOvertake 는 더 이상 쓰지 않는다.
 #   추월/회피가 규정상 같은 기동("타겟이 없는 차선으로 지나간다")이라
@@ -216,6 +217,10 @@ class TrackDriverNode(Node):
         self.lavacon_left_detected  = False  # 좌측 라이다 클러스터 검출 여부(B1 진입 트리거용)
         self.lavacon_right_detected = False  # 우측 라이다 클러스터 검출 여부(B1 진입 트리거용)
         self.cone_detected_yolo     = False  # YOLO 카메라 콘 검출 여부(B1 진입 트리거 이중확인용)
+        # [2026-08-19] 근접 장애물 카메라 이중확인(README §2.46 near_obstacle 트리거 보강)
+        self.vehicle_detected_yolo    = False  # 이번 프레임 YOLO 'car' 검출 여부(원시값)
+        self._yolo_vehicle_confirm_cnt = 0     # (라이다 근접 AND YOLO car) 연속 프레임 수(디바운스 카운터)
+        self.vehicle_confirmed_yolo   = False  # 위 카운터가 YOLO_VEHICLE_CONFIRM_FRAMES 넘겨 확정됐는지
         self.lavacon_trigger        = False  # (YOLO 검출 AND 좌우 라이다 동시검출)이 디바운스 프레임수만큼 유지되면 True
         self._lavacon_trigger_cnt   = 0      # 동시검출 연속 프레임 수(디바운스 카운터)
         self._lavacon_dbg = (0, 0, 0, 0)     # 디버그용 (좌ROI점수, 좌최대연속묶음, 우ROI점수, 우최대연속묶음)
@@ -241,6 +246,17 @@ class TrackDriverNode(Node):
                 f'YOLO 콘 검출기 초기화 실패, 라바콘 트리거는 라이다 단독 판정으로 폴백합니다: {e}'
             )
             self.yolo_cone_detector = None
+
+        # [2026-08-19] 근접 장애물(pure_pursuit near_obstacle, README §2.46) 카메라
+        # 이중확인용 YOLO 차량 검출기 — yolo_cone_detector와 동일한 이유로 초기화
+        # 실패해도 None으로 두고 _lane_steer()가 라이다 단독 판정으로 폴백하게 한다.
+        try:
+            self.yolo_vehicle_detector = YoloVehicleDetector(logger=self.get_logger())
+        except Exception as e:
+            self.get_logger().error(
+                f'YOLO 차량 검출기 초기화 실패, near_obstacle 트리거는 라이다 단독 판정으로 폴백합니다: {e}'
+            )
+            self.yolo_vehicle_detector = None
 
         # ── 판단/제어 상태 ──
         self.mission_state  = START_STATE
@@ -471,6 +487,7 @@ class TrackDriverNode(Node):
         self._update_avoid_hold()  # 라이다(위 obstacle_front/dist 기반) — perc_obstacle() 직후여야 함
         self.perc_lavacon()     # 라이다
         self.perc_yolo_cone()   # 비전 (YOLO, perc_lavacon_trigger()가 라이다와 AND 결합해서 씀)
+        self.perc_yolo_vehicle()  # 비전 (YOLO, _lane_steer()의 near_obstacle 트리거가 라이다와 AND 결합해서 씀)
         self.perc_lavacon_trigger()  # 라이다+비전 (YOLO 콘 검출 AND 좌우 클러스터 동시검출 → B1_LAVACON 진입 트리거)
         self.perc_vehicle_trigger()  # 라이다 (전방 장애물 근접 → B3_VEHICLE 진입 트리거)
         self.perc_stopline()    # 비전
@@ -489,6 +506,31 @@ class TrackDriverNode(Node):
             return
         self.cone_detected_yolo = self.yolo_cone_detector.detect(self.img_front)
         self.yolo_cone_detector.show_debug_windows()  # 메인 스레드에서만 호출(yolo_cone.py 주석 참고)
+
+    # [2-4c] 근접 장애물 카메라 이중확인 (YOLO) — README §2.46
+    #   입력 self.img_front, self.obstacle_front/obstacle_dist(perc_obstacle()가 먼저
+    #        채워둠 — perceive_all() 호출 순서 참고)
+    #   출력 self.vehicle_detected_yolo(이번 프레임 원시 'car' 검출), self.vehicle_confirmed_yolo
+    #        (라이다 AND YOLO가 YOLO_VEHICLE_CONFIRM_FRAMES 연속 유지돼야 확정)
+    #   perc_lavacon_trigger()와 동일한 "라이다 AND 카메라" 이중확인 패턴 — 라이다
+    #   단독 근접판정이 벽/코너에서 오탐되어 평상시 주행에도 pure_pursuit
+    #   near_obstacle이 잘못 걸리는 문제(실차 확인)를 카메라로 거른다.
+    def perc_yolo_vehicle(self):
+        if self.yolo_vehicle_detector is None:
+            # 초기화 실패 상태 — 카메라 확인 자체를 못 하므로 게이트를 없애고 라이다
+            # 판정만으로 확정한다(cone_confirmed_cam = ... else True와 동일 원칙 —
+            # "카메라 확인 불가 시 라이다 단독 판정으로 폴백").
+            self.vehicle_confirmed_yolo = (
+                self.obstacle_front and self.obstacle_dist < AVOID_HOLD_TRIGGER_DIST_M)
+            return
+        if self.img_front is not None:
+            self.vehicle_detected_yolo = self.yolo_vehicle_detector.detect(self.img_front)
+            self.yolo_vehicle_detector.show_debug_windows()  # 메인 스레드에서만 호출
+
+        near_and_seen = (self.obstacle_front and self.obstacle_dist < AVOID_HOLD_TRIGGER_DIST_M
+                          and self.vehicle_detected_yolo)
+        self._yolo_vehicle_confirm_cnt = self._yolo_vehicle_confirm_cnt + 1 if near_and_seen else 0
+        self.vehicle_confirmed_yolo = self._yolo_vehicle_confirm_cnt >= YOLO_VEHICLE_CONFIRM_FRAMES
 
     # [2-1] 차선
     #   입력 self.img_front → 출력 self.lane_offset(우측+), self.lane_valid
@@ -1849,11 +1891,14 @@ class TrackDriverNode(Node):
             vehicle_x = getattr(self.lane_detector, 'vehicle_center_x', None)
             if vehicle_x is None:
                 vehicle_x = roi_w / 2.0
-            # obstacle_front/obstacle_dist는 TEST_DISABLE_B2_B3와 무관하게 perc_obstacle()가
-            # 매 틱 갱신하므로 별도 stale 가드 없이 바로 써도 안전하다(_update_avoid_hold()와
-            # 동일 근거). AVOID_HOLD_TRIGGER_DIST_M(기존 상수, 1.5m) 재사용 — 별도 상수
-            # 안 늘림(요청 반영). pure_pursuit.py _target_point_max_deviation() 참고.
-            near_obstacle = self.obstacle_front and self.obstacle_dist < AVOID_HOLD_TRIGGER_DIST_M
+            # [2026-08-19] 라이다 단독(obstacle_front/obstacle_dist)이 벽/코너에서
+            # 오탐돼 평상시 주행에도 이 트리거가 잘못 걸리는 문제가 실차에서 확인됨 —
+            # perc_yolo_vehicle()이 이미 "라이다 근접 AND YOLO car 검출"을
+            # YOLO_VEHICLE_CONFIRM_FRAMES 연속으로 디바운스해둔 self.vehicle_confirmed_yolo를
+            # 그대로 쓴다(라바콘의 라이다+카메라 이중확인과 동일 패턴, README §2.46/
+            # config.py YOLO_VEHICLE_* 주석 참고). YOLO 검출기 초기화 실패 시엔
+            # perc_yolo_vehicle()이 자동으로 라이다 단독 판정으로 폴백한다.
+            near_obstacle = self.vehicle_confirmed_yolo
         if not path or vehicle_x is None:
             return self.pure_pursuit.prev_steer_deg
         vehicle_xy = (vehicle_x, path[0][1])
@@ -2702,7 +2747,9 @@ class TrackDriverNode(Node):
             f'  [TRIG] trigL={self._lavacon_trigger_cnt}/{LAVACON_TRIGGER_FRAMES}'
             f'(L{int(self.lavacon_left_detected)}R{int(self.lavacon_right_detected)}'
             f'Y{int(self.cone_detected_yolo)}) '
-            f'trigV={self._vehicle_trigger_cnt}/{VEHICLE_TRIGGER_FRAMES}\n'
+            f'trigV={self._vehicle_trigger_cnt}/{VEHICLE_TRIGGER_FRAMES} '
+            f'trigNearYolo={self._yolo_vehicle_confirm_cnt}/{YOLO_VEHICLE_CONFIRM_FRAMES}'
+            f'(cam{int(self.vehicle_detected_yolo)} confirmed{int(self.vehicle_confirmed_yolo)})\n'
             f'  [LAVA-ROI] L pts={lava_lp} run={lava_lrun}(need>=2) '
             f'R pts={lava_rp} run={lava_rrun}(need>=2) '
             f'masked_raw_pts={masked_pts} masked_min={masked_min_s}'

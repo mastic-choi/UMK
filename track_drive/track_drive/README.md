@@ -1506,6 +1506,49 @@ ROI에 벽/다른 물체 점이 같이 잡혀도 실제로 트리거 판단에 �
 테스트까지만 확인) — 실제 라이다 프레임에서 BEV 패널 축척(`PPM`)이 겹치는 클러스터를 구분해 보여주기
 충분한지는 실차에서 확인 필요.
 
+### 2.48 §2.46 `near_obstacle` 트리거를 라이다 단독 → 라이다+YOLO 카메라 이중확인으로
+(`perception/yolo_vehicle.py` 신설, 2026-08-19)
+
+§2.46에서 넣은 `near_obstacle`(pure_pursuit `_target_point_max_deviation()` 전환 트리거)이 실차
+테스트에서 벽/코너 등에 반응해 **평상시 주행 중에도 잘못 걸리는** 문제가 확인됨 — 라이다
+`obstacle_front` 단독 판정의 오탐률이 생각보다 커서, 근본 원인(라이다가 벽과 차량을 구분 못 함)을
+건드리지 않으면 §2.46 자체가 무의미해지는 상황이었다.
+
+**해결 접근:** 파인튜닝된 전용 모델을 새로 학습하는 대신(시간 소요 큼), **파인튜닝 없는
+`yolo_ros/yolov8n.pt`(COCO 사전학습)로 실제 방해차량이 검출되는지**를 먼저 raw 캡처
+(`lap_005_raw_2734`, `pseudo_dataset_v2`)에 돌려 육안 확인했다 — `car`(COCO 클래스 id 2)가 실제
+차량 위치에 신뢰도 0.15~0.78(평균 0.3대)로 정확히 박싱됨을 확인. 단, `truck` 클래스는 같은 확인
+과정에서 최고 신뢰도(0.81) 사례가 실제로는 카트/의자 더미를 오탐한 것으로 확인돼 **`car` 클래스만
+사용**하기로 결정.
+
+**구현:** `yolo_cone.py`(라바콘 검출기)와 완전히 동일한 구조(별도 데몬 스레드 논블로킹 추론, ONNX
+Runtime)로 `perception/yolo_vehicle.py`를 신설. 차이는 파인튜닝된 단일클래스 모델이 아니라 COCO
+80클래스 모델이라 `YOLO_VEHICLE_CLASS_ID=2`('car')로 걸러야 한다는 점뿐. `yolo_ros/yolov8n.pt`를
+`model.export(format='onnx', imgsz=640, opset=12, simplify=True, nms=True)`(`cone_best_n.onnx`와
+동일 관례)로 변환해 `yolo_ros/yolov8n_car.onnx`로 저장 — **단 opset=12 변환은 실패**(Resize
+연산자가 target version 12를 지원 안 함)해서 **실제로는 opset=18**로 내보내졌다. onnx 라이브러리로
+external-data 분리를 다시 단일 파일로 합쳐 저장(초기 export가 `.onnx`+`.onnx.data` 두 파일로
+쪼개져 나와서, `cone_best_n.onnx`처럼 파일 하나로 배포하기 위함).
+
+`perc_yolo_vehicle()`(`track_drive.py`)가 라바콘의 `perc_lavacon_trigger()`와 동일한 "라이다 AND
+카메라" 패턴으로 `(obstacle_front and obstacle_dist<AVOID_HOLD_TRIGGER_DIST_M) AND YOLO car 검출`을
+`YOLO_VEHICLE_CONFIRM_FRAMES`(3프레임) 연속 확인해야 확정한다(`self.vehicle_confirmed_yolo`) —
+`_lane_steer()`의 `near_obstacle`은 이제 이 확정값을 그대로 쓴다. YOLO 검출기 초기화 실패 시엔
+(onnxruntime 미설치 등) 카메라 이중확인 자체를 생략하고 라이다 단독 판정으로 자동 폴백한다
+(`yolo_cone_detector`가 없을 때 `perc_lavacon_trigger()`가 하는 것과 동일 원칙).
+
+**알려진 한계:**
+- `YOLO_VEHICLE_CONF_THRESHOLD=0.3`은 확인된 신뢰도 범위 하한 근처로 잡은 추정치, 실차 미검증.
+- opset 18로 내보내졌다는 게 핵심 리스크 — Jetson의 onnxruntime 버전이 opset 18을 지원 못 하면
+  세션 로드 자체가 실패할 수 있다. 실패하면 `_default_model_path()`/폴백 로직상 카메라 이중확인
+  없이 라이다 단독으로 동작하게 되므로(안전하게 열화되긴 함) 기능 자체가 무력화된다 — 실차에서
+  가장 먼저 확인할 것.
+- 파인튜닝 안 된 COCO 모델이라 `car` 자체도 다른 실내 배경(다른 차량 모형, 카트 등)을 오탐할 여지가
+  여전히 있다 — 라이다 AND 조건이 대부분 걸러주지만 완전하진 않다. 시간이 되면 `cone_best_n.pt`와
+  같은 방식으로 이 방해차량 전용 파인튜닝을 하는 게 근본 해결책(별도 과제로 남김).
+- `TEST_DISABLE_B2_B3`를 켜서 B2/B3(`TargetPassing`)를 실제로 검증하기로 결정하면, `_update_avoid_hold()`
+  등 다른 라이다 단독 트리거들도 같은 오탐 위험을 안고 있다는 점을 같이 고려할 것(§2.32~§2.33).
+
 ---
 
 ## 3. 라바콘 (B1_LAVACON)
