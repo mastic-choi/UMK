@@ -1290,9 +1290,11 @@ LAVACON_HALFWIDTH_EMA_ALPHA     = 0.3   # 좌우 반폭 러닝 추정 EMA 계수
 # [2026-08-19] 라이다가 한 프레임 튀어도(반사 노이즈, 순간 미검출) waypoint가 그대로
 #   같이 튀는 문제 대응 — 박스별 좌/우 바운더리 포인트("라바콘 차선")에 프레임간 EMA를
 #   건다(perc_lavacon.py `_blend_boxes_temporal` 참고). PATH_EMA_ALPHA(da 차선 경로용)와
-#   완전히 별개 — 저기는 값이 다르므로 여기 새 상수를 쓴다. 기본 False였다가, 실차 검증
-#   단계로 전환하며 True로 켬(위 sparse fallback과 같은 이유, 같은 시점).
-LAVACON_TEMPORAL_EMA_ENABLED = True
+#   완전히 별개 — 저기는 값이 다르므로 여기 새 상수를 쓴다. 기본 False였다가 실차 검증
+#   단계로 전환하며 잠깐 True였음 — 라바콘 간격이 넓어(박스 폭 0.2→0.4로 이미 대응) 콘이
+#   가려져서 검출이 성긴 구간에서는 EMA로 스무딩할 재료(연속 프레임 검출) 자체가 부족해
+#   급커브 대응에 도움이 안 된다고 판단, 다시 False로 뺌(요청 반영).
+LAVACON_TEMPORAL_EMA_ENABLED = False
 LAVACON_TEMPORAL_EMA_ALPHA   = 0.5      # 새 프레임에 줄 가중치(작을수록 더 부드럽고 느리게 반응)
 
 # ── 라바콘 카메라 이중확인 (perception/yolo_cone.py, YOLOv8n ONNX) ──
