@@ -1030,6 +1030,7 @@ DEBUG_VIZ_SIGNAL     = False   # 신호등 ROI/HoughCircles 디버그 창 (perce
 #   (track_drive.py perc_signal())
 DEBUG_LOG_SIGNAL     = True
 DEBUG_VIZ_YOLO_CONE  = False  # 라바콘 YOLO 검출 박스 디버그 창 (perception/yolo_cone.py)
+DEBUG_VIZ_YOLO_SIGNAL = False  # 신호등 YOLO 검출 박스 디버그 창 (perception/yolo_signal.py) — _debug_viz_signal_status()의 Hough 비교와는 별개로 raw 검출 박스만 보고 싶을 때
 # [2026-08-15] avoid-hold(§2.32) 전용 상태창 — 지금 유예가 걸려있는지/왜 걸렸는지/방향
 #   힌트/조기해제 진행상황을 한곳에 모아 보여주고, 실측 안 된 파라미터 값도 항상 같이
 #   띄워서 "이 숫자 아직 지어낸 값"이라는 걸 상기시킨다(track_drive.py
@@ -1160,6 +1161,18 @@ LAVACON_TRIGGER_FRAMES = 5    # (YOLO 콘 검출 AND 좌우 라이다 클러스�
 YOLO_CONE_INPUT_SIZE = 640     # cone_best_n.onnx export 시 imgsz와 반드시 일치시킬 것
 YOLO_CONE_CONF_THRESHOLD = 0.5 # 이 신뢰도 이상인 검출만 인정(모델이 nms=True로 export돼 좌표 디코딩은 불필요)
 YOLO_CONE_MODEL_PATH = None    # None이면 yolo_ros/cone_best_n.onnx(형제 디렉터리)를 자동으로 찾음(perception/yolo_cone.py 참고)
+
+# ── 신호등 색상상태 YOLO (perception/yolo_signal.py, YOLOv8n ONNX) ──
+#   [2026-08-19] datasets/signal_state/(라벨링 워크플로는 그쪽 README 참고)로 파인튜닝한
+#   신호등 색상상태(빨강/직진초록/좌회전초록) 검출기. 아직 perc_signal()의 실제 주행 판단
+#   (FSM 전환)에는 연결하지 않았다 — _debug_viz_signal_status() 창에서 기존 Hough Circle
+#   결과(traffic_signal.py)와 나란히 비교만 하는 단계. 실차 검증 후 판단 소스를 이걸로
+#   바꿀지는 별도로 결정할 것(§"da 블롭 선택" 항목과 같은 이유 — 새 인식기를 실측 검증 없이
+#   바로 주행 판단에 연결하지 않는다).
+YOLO_SIGNAL_INPUT_SIZE = 640     # signal_state_best_n.onnx export 시 imgsz와 반드시 일치시킬 것
+YOLO_SIGNAL_CONF_THRESHOLD = 0.5 # 이 신뢰도 이상인 검출만 인정(모델이 nms=True로 export돼 좌표 디코딩은 불필요) — 실차 미검증 기본값, cone과 동일하게 잡아둠
+YOLO_SIGNAL_MODEL_PATH = None    # None이면 yolo_ros/signal_state_best_n.onnx(형제 디렉터리)를 자동으로 찾음(perception/yolo_signal.py 참고)
+YOLO_SIGNAL_CLASS_NAMES = ('red', 'green_straight', 'green_left')  # class id(0/1/2) 순서 — datasets/signal_state/classes.txt와 반드시 일치시킬 것
 
 SAFETY_DIST      = 5.0        # B2(고정장애물) 발동 거리(m)
 OVERTAKE_TRIGGER = 6.5        # B3(방해차량) 발동 거리(m)

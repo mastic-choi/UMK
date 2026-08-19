@@ -41,6 +41,7 @@ from .perception.lane_util import CameraProcessor, SlideWindow
 from .perception.dl_lane import DLLaneDetector
 from .perception.traffic_signal import SignalDetector
 from .perception.yolo_cone import YoloConeDetector
+from .perception.yolo_signal import YoloSignalDetector
 from .controller.obstacle_avoidance import ObstacleAvoidance, AvoidPhase
 # vehicle_overtake.py 의 구 VehicleOvertake 는 더 이상 쓰지 않는다.
 #   추월/회피가 규정상 같은 기동("타겟이 없는 차선으로 지나간다")이라
@@ -131,6 +132,12 @@ class TrackDriverNode(Node):
         self.signal_left_confirmed     = False
         self._sig_straight_cnt = 0   # signal_straight_on 연속 유지 프레임 수
         self._sig_left_cnt     = 0   # signal_left_on 연속 유지 프레임 수
+        # [2026-08-19] YOLO 신호등 색상상태 검출(perception/yolo_signal.py) 비교용 — 위
+        # signal_*_on(Hough Circle)과 나란히 보기만 하고 아직 FSM 판단에는 안 씀(YOLO_SIGNAL_*
+        # config.py 주석 참고).
+        self.signal_red_on_yolo      = False
+        self.signal_straight_on_yolo = False
+        self.signal_left_on_yolo     = False
         self.stopline = False            # 굵은 가로 흰선(정지선/지름길 끝 단서)
         self._stopline_cooldown_t = 0.0  # 이 시각까지 정지선 재감지 무시
         self._last_stopline_t = 0.0      # [10] 정지선을 마지막으로 본 시각(교차로 근처 기동 금지용)
@@ -211,6 +218,15 @@ class TrackDriverNode(Node):
                 f'YOLO 콘 검출기 초기화 실패, 라바콘 트리거는 라이다 단독 판정으로 폴백합니다: {e}'
             )
             self.yolo_cone_detector = None
+
+        # 신호등 색상상태 YOLO 검출기 — 아직 주행 판단에는 안 쓰고 Hough Circle과 비교만
+        # 하는 단계라(YOLO_SIGNAL_* config.py 주석 참고), 초기화 실패해도 폴백 없이 그냥
+        # None으로 두고 비교 창만 안 뜨게 한다(주행 자체엔 영향 없음).
+        try:
+            self.yolo_signal_detector = YoloSignalDetector(logger=self.get_logger())
+        except Exception as e:
+            self.get_logger().error(f'YOLO 신호등 검출기 초기화 실패, 비교 창 없이 진행합니다: {e}')
+            self.yolo_signal_detector = None
 
         # ── 판단/제어 상태 ──
         self.mission_state  = START_STATE
@@ -441,6 +457,7 @@ class TrackDriverNode(Node):
         self._update_avoid_hold()  # 라이다(위 obstacle_front/dist 기반) — perc_obstacle() 직후여야 함
         self.perc_lavacon()     # 라이다
         self.perc_yolo_cone()   # 비전 (YOLO, perc_lavacon_trigger()가 라이다와 AND 결합해서 씀)
+        self.perc_yolo_signal() # 비전 (YOLO, 아직 비교용 — _debug_viz_signal_status()에서만 씀)
         self.perc_lavacon_trigger()  # 라이다+비전 (YOLO 콘 검출 AND 좌우 클러스터 동시검출 → B1_LAVACON 진입 트리거)
         self.perc_vehicle_trigger()  # 라이다 (전방 장애물 근접 → B3_VEHICLE 진입 트리거)
         self.perc_stopline()    # 비전
@@ -459,6 +476,22 @@ class TrackDriverNode(Node):
             return
         self.cone_detected_yolo = self.yolo_cone_detector.detect(self.img_front)
         self.yolo_cone_detector.show_debug_windows()  # 메인 스레드에서만 호출(yolo_cone.py 주석 참고)
+
+    # [2-4b] 신호등 색상상태 YOLO (비교용, 아직 주행 판단에는 미연결)
+    #   입력 self.img_front → 출력 self.signal_*_on_yolo
+    #   yolo_signal.py가 별도 스레드에서 자기 페이스로 추론하므로 여기선 논블로킹으로
+    #   최신 결과만 받아온다(perc_yolo_cone()과 동일한 패턴). perc_signal()과 달리 S0/S2가
+    #   아닐 때도 항상 돌린다 — 실차 영상 전체 구간에서 이 모델이 얼마나 오탐하는지도
+    #   같이 보고 싶어서(정상 주행 중 신호등 아닌 걸 신호로 잘못 잡는지 확인 목적).
+    def perc_yolo_signal(self):
+        if self.yolo_signal_detector is None:
+            self.signal_red_on_yolo = self.signal_straight_on_yolo = self.signal_left_on_yolo = False
+            return
+        if self.img_front is None:
+            return
+        self.signal_red_on_yolo, self.signal_straight_on_yolo, self.signal_left_on_yolo = \
+            self.yolo_signal_detector.detect(self.img_front)
+        self.yolo_signal_detector.show_debug_windows()  # 메인 스레드에서만 호출(yolo_signal.py 주석 참고)
 
     # [2-1] 차선
     #   입력 self.img_front → 출력 self.lane_offset(우측+), self.lane_valid
@@ -1996,6 +2029,17 @@ class TrackDriverNode(Node):
         if not ok:
             lines.append((f'실패 사유: {sd.s2_reject_reason}', (10, 100), (0, 0, 220), 16,
                            f'Fail: {sd.s2_reject_reason}'))
+
+        # [2026-08-19] YOLO 신호등 색상상태(yolo_signal.py) 비교 줄 — Hough 결과 옆에 나란히
+        # 보여줘서 실차에서 둘이 얼마나 일치하는지 눈으로 바로 확인할 수 있게 한다. 아직
+        # FSM 판단에는 안 쓰므로 여기선 순수 비교 표시 목적(YOLO_SIGNAL_* config.py 주석 참고).
+        yolo_state_kr = ('좌회전' if self.signal_left_on_yolo else
+                          '직진'   if self.signal_straight_on_yolo else
+                          '정지(빨강)' if self.signal_red_on_yolo else '미검출')
+        agree = yolo_state_kr == state_kr
+        lines.append((f'YOLO: {yolo_state_kr}' + ('' if agree else ' (Hough와 불일치)'),
+                       (10, 128 if ok else 128 + 28), (255, 255, 255) if agree else (0, 140, 255), 18,
+                       f'YOLO: {yolo_state_kr}'))
 
         put_text_kr_multi(vis, lines)
         cv2.rectangle(vis, (0, 0), (vis.shape[1] - 1, vis.shape[0] - 1), box_color, 3)
