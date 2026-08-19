@@ -167,6 +167,15 @@ class TrackDriverNode(Node):
         self.obstacle_rate  = 0.0     # 접근율(m/s, 음수=접근). 추돌 방지·교차확인용
         self._obstacle_prev_dist = None
         self._obstacle_prev_t    = 0.0
+        # [2026-08-19] avoid_hold 디버그창(_debug_viz_avoid_hold)이 "어떤 라이다 클러스터를
+        # 보고 판단했는지"를 그릴 수 있도록, perc_obstacle()이 매 틱 갱신하는 타겟 클러스터
+        # 원본 좌표(전방(+x)/횡(+y), m 단위) — self._obstacle_cluster_x/y가 실제 선택된
+        # 클러스터(tgt), self._obstacle_front_all_x/y가 같은 전방 ROI의 나머지 점(비교용 배경).
+        self._obstacle_cluster_x = np.empty(0, dtype=np.float32)
+        self._obstacle_cluster_y = np.empty(0, dtype=np.float32)
+        self._obstacle_front_all_x = np.empty(0, dtype=np.float32)
+        self._obstacle_front_all_y = np.empty(0, dtype=np.float32)
+        self._obstacle_cluster_group_count = 0  # 이번 틱 전방 ROI 안에서 발견된 별개 클러스터 개수
         # [2026-08-14] 회피 "복귀 유예"(avoid-hold) — _update_avoid_hold()가 perc_obstacle()
         # 직후 갱신하고, perc_lane()이 DL 차선인식 백엔드로 그대로 넘긴다(config.py
         # AVOID_HOLD_TRIGGER_DIST_M/AVOID_HOLD_SEC_* 주석, README §2.32/§2.33 참고).
@@ -181,6 +190,23 @@ class TrackDriverNode(Node):
         self._avoid_hold_release_cnt = 0            # obstacle_front=False 연속 프레임(조기해제 디바운스)
         self._avoid_hold_last_valid_dist = 999.0    # 마지막으로 obstacle_front=True였던 순간의 obstacle_dist
         self._avoid_hold_target_speed_est = 0.0     # 트리거 시점 target_speed_est 스냅샷(디버그 표시용)
+        # [2026-08-19] avoid_hold "왜 트리거됐는지" 라이다 클러스터 스냅샷 — 위
+        # self._obstacle_cluster_x/y(perc_obstacle()이 매 틱 덮어씀)를 트리거되는 그
+        # 순간(_update_avoid_hold() "새 트리거" 분기)에 한 번 복사해 avoid_hold_hold_sec
+        # 동안 그대로 유지한다. 매틱 최신값을 그대로 보여주면 장애물이 이미 멀어진 뒤
+        # (avoid_hold_active만 유예로 남아있는 동안)엔 화면이 비어 "왜 아직 유예 중인지"를
+        # 설명 못 한다 — _debug_viz_avoid_hold()가 이 스냅샷을 그린다.
+        self._avoid_hold_trigger_cluster_x = np.empty(0, dtype=np.float32)
+        self._avoid_hold_trigger_cluster_y = np.empty(0, dtype=np.float32)
+        self._avoid_hold_trigger_front_all_x = np.empty(0, dtype=np.float32)
+        self._avoid_hold_trigger_front_all_y = np.empty(0, dtype=np.float32)
+        self._avoid_hold_trigger_obstacle_dist  = 999.0
+        self._avoid_hold_trigger_obstacle_width = 0.0
+        self._avoid_hold_trigger_obstacle_type  = 'none'
+        self._avoid_hold_trigger_obstacle_side  = 'none'
+        self._avoid_hold_trigger_cluster_pts    = 0
+        self._avoid_hold_trigger_group_count    = 0
+        self._avoid_hold_trigger_cause          = ''  # 'lidar' / 'da_jump'
         # [2-4 라바콘]
         self.lavacon_offset = 0.0    # 디버그/로깅용(중심선 y평균) — 조향엔 더 이상 안 씀
         self.lavacon_done   = False
@@ -696,6 +722,15 @@ class TrackDriverNode(Node):
             groups = np.split(fidx, np.where(np.diff(fidx) > 1)[0] + 1)
             tgt = min(groups, key=lambda g: float(np.min(r[g])))
 
+            # [avoid_hold 디버그용] 선택된 타겟 클러스터(tgt)와 전방 ROI 전체 점(fidx, 배경
+            # 비교용) 원본 좌표를 저장 — _update_avoid_hold()가 트리거 순간에 이 값을
+            # 스냅샷해 _debug_viz_avoid_hold()가 그려준다(위 클래스 초기화부 주석 참고).
+            self._obstacle_cluster_x = x[tgt]
+            self._obstacle_cluster_y = y[tgt]
+            self._obstacle_front_all_x = x[fidx]
+            self._obstacle_front_all_y = y[fidx]
+            self._obstacle_cluster_group_count = len(groups)
+
             ty = y[tgt]
             self.obstacle_dist  = float(np.min(r[tgt]))
             # [6] 분류 기준을 '점 개수' → '실제 횡폭(m)' 으로.
@@ -740,6 +775,14 @@ class TrackDriverNode(Node):
             self._obstacle_prev_dist = None
             self._ema_y *= (1.0 - SIDE_EMA_ALPHA)
             self.obstacle_y = self._ema_y
+            # [2026-08-19] 위 obstacle_dist/type처럼 완전히 리셋 — 안 하면 장애물이 실제로
+            # 시야에서 사라진 뒤에도 _debug_viz_avoid_hold()의 BEV 패널에 몇 틱 전 클러스터
+            # 점이 계속 남아있어 "창이 멈췄다"로 오해하기 쉽다.
+            self._obstacle_cluster_x = np.empty(0, dtype=np.float32)
+            self._obstacle_cluster_y = np.empty(0, dtype=np.float32)
+            self._obstacle_front_all_x = np.empty(0, dtype=np.float32)
+            self._obstacle_front_all_y = np.empty(0, dtype=np.float32)
+            self._obstacle_cluster_group_count = 0
 
         # ── 좌/우 차선 공간 (추월 이동·복귀 판단) ──
         left_mask  = valid & (x > SIDE_X_MIN) & (x < SIDE_X_MAX) & (y >  LEFT_Y_MIN)  & (y <  LEFT_Y_MAX)
@@ -890,6 +933,22 @@ class TrackDriverNode(Node):
                     AVOID_HOLD_SEC_MAX, max(AVOID_HOLD_SEC_MIN, AVOID_HOLD_SEC_BASE + gain_term))
                 self._avoid_hold_release_cnt = 0
                 self.avoid_hold_release_reason = ''
+                # [2026-08-19] "어떤 라이다 클러스터를 보고 트리거됐는지" 디버그용 스냅샷 —
+                # target_speed_est와 같은 이유로 트리거 순간에만 찍는다(매 틱 최신값으로
+                # 덮어쓰면 장애물이 멀어진 뒤엔 화면이 비어버림, 위 클래스 초기화부 주석 참고).
+                self._avoid_hold_trigger_cluster_x = self._obstacle_cluster_x.copy()
+                self._avoid_hold_trigger_cluster_y = self._obstacle_cluster_y.copy()
+                self._avoid_hold_trigger_front_all_x = self._obstacle_front_all_x.copy()
+                self._avoid_hold_trigger_front_all_y = self._obstacle_front_all_y.copy()
+                self._avoid_hold_trigger_obstacle_dist  = self.obstacle_dist
+                self._avoid_hold_trigger_obstacle_width = self.obstacle_width
+                self._avoid_hold_trigger_obstacle_type  = self.obstacle_type
+                self._avoid_hold_trigger_obstacle_side  = self.obstacle_side
+                self._avoid_hold_trigger_cluster_pts    = int(self._obstacle_cluster_x.size)
+                self._avoid_hold_trigger_group_count    = self._obstacle_cluster_group_count
+                self._avoid_hold_trigger_cause = (
+                    'lidar' if (self.obstacle_front and self.obstacle_dist < AVOID_HOLD_TRIGGER_DIST_M)
+                    else 'da_jump')
             self._avoid_hold_until_t = now + self.avoid_hold_hold_sec
 
         # ③ 조기 해제 판정용 상태 갱신 — obstacle_front가 True인 동안(=아직 가까움)은
@@ -2057,9 +2116,85 @@ class TrackDriverNode(Node):
              f'DA_AREA_JUMP_RATIO={AVOID_HOLD_DA_AREA_JUMP_RATIO} '
              f'DIR_BIAS_PX={AVOID_HOLD_DIR_BIAS_PX}'),
         ]
-        canvas = np.full((222, 620, 3), 30, dtype=np.uint8)
+        # [2026-08-19] "어떤 라이다 클러스터를 보고 판단했는지" 미니 BEV 패널 — 위 텍스트
+        # 줄의 'front=.. dist=..'는 숫자로만 알려주는데, 벽/다른 차량 등 여러 클러스터가 같은
+        # 전방 ROI에 동시에 잡혀도 실제로 '이 결정에 쓰인' 게 어느 점 묶음인지는 안 보였다.
+        # [2026-08-19 수정] 처음엔 트리거 "순간"에만 스냅샷해 유예 내내 고정 표시했는데,
+        # 그러면 avoid_hold가 다시 트리거되기 전까진 패널이 그대로 멈춰있어("이 창 멈췄나?"
+        # 오해 재현됨) — perc_obstacle()이 매 틱 갱신하는 self._obstacle_cluster_x/y(현재
+        # 타겟 클러스터)/self._obstacle_front_all_x/y(같은 ROI 배경점)를 매 프레임 그대로
+        # 그리는 라이브 표시로 바꿨다. 장애물이 실제로 안 보이면(전방 ROI에 아무 점도 없으면)
+        # 패널도 정직하게 빈 채로 나온다 — 그게 "멈춤"이 아니라 "지금 아무것도 안 잡힘"이라는
+        # 뜻임을 밑에 텍스트로 같이 알려준다. "왜 아직 유예 중인지"는 _avoid_hold_trigger_*
+        # (트리거 시점 스냅샷, _update_avoid_hold() 참고)를 오른쪽 텍스트로 별도 표시한다.
+        PANEL_W, PANEL_H = 200, 200
+        panel_x0, panel_y0 = 15, 226
+        canvas = np.full((panel_y0 + PANEL_H + 12, 620, 3), 30, dtype=np.uint8)
         put_text_kr_multi(canvas, lines)
         cv2.rectangle(canvas, (0, 0), (canvas.shape[1] - 1, canvas.shape[0] - 1), active_color, 3)
+
+        cv2.putText(canvas, 'LIVE FRONT LIDAR CLUSTER (매틱 갱신)',
+                    (panel_x0, panel_y0 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1, cv2.LINE_AA)
+
+        bev = canvas[panel_y0:panel_y0 + PANEL_H, panel_x0:panel_x0 + PANEL_W]
+        FRONT_X_MAX_V, FRONT_Y_HALF_V = 5.0, 1.5   # perc_obstacle() FRONT ROI와 동일(표시축척용 재선언)
+        PPM = min(PANEL_H / (FRONT_X_MAX_V + 0.3), PANEL_W / (2 * FRONT_Y_HALF_V + 0.6))
+        EX, EY = PANEL_W // 2, PANEL_H - 8
+
+        def to_px(wx, wy):
+            return (int(EX - wy * PPM), int(EY - wx * PPM))
+
+        for d in (1, 2, 3, 4, 5):
+            if d > FRONT_X_MAX_V + 0.3:
+                break
+            cv2.circle(bev, (EX, EY), int(d * PPM), (55, 55, 55), 1)
+        cv2.rectangle(bev, to_px(0.0, FRONT_Y_HALF_V), to_px(FRONT_X_MAX_V, -FRONT_Y_HALF_V), (0, 150, 150), 1)
+
+        all_x = self._obstacle_front_all_x   # 매틱 갱신되는 라이브 값(perc_obstacle())
+        all_y = self._obstacle_front_all_y
+        for i in range(all_x.size):
+            px, py = to_px(float(all_x[i]), float(all_y[i]))
+            if 0 <= px < PANEL_W and 0 <= py < PANEL_H:
+                cv2.circle(bev, (px, py), 2, (90, 90, 90), -1)   # 같은 ROI의 다른 점(미사용, 회색)
+
+        cl_x = self._obstacle_cluster_x       # 매틱 갱신되는 라이브 값 — 지금 avoid_hold 트리거
+        cl_y = self._obstacle_cluster_y       # 판정(obstacle_front/obstacle_dist)에 쓰이는 바로 그 클러스터
+        for i in range(cl_x.size):
+            px, py = to_px(float(cl_x[i]), float(cl_y[i]))
+            if 0 <= px < PANEL_W and 0 <= py < PANEL_H:
+                cv2.circle(bev, (px, py), 4, (0, 0, 255), -1)    # 실제 판정에 쓰인 타겟 클러스터(빨강)
+
+        if all_x.size == 0:
+            cv2.putText(bev, '(전방 ROI에 점 없음)', (8, PANEL_H - 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1, cv2.LINE_AA)
+
+        cv2.circle(bev, (EX, EY), 5, (255, 220, 0), -1)          # 자차 위치
+        cv2.rectangle(bev, (0, 0), (PANEL_W - 1, PANEL_H - 1), (80, 80, 80), 1)
+
+        info_x = panel_x0 + PANEL_W + 24
+        info_lines = [
+            ('빨강=현재 avoid_hold 판정에 쓰이는 클러스터', (info_x, panel_y0 - 4), (255, 255, 255), 13,
+             'red = cluster currently used'),
+            ('회색=같은 ROI의 다른 점(미사용)', (info_x, panel_y0 + 18), (150, 150, 150), 12,
+             'gray = other ROI points (unused)'),
+            (f'── 마지막 트리거 시점(hold_sec 재시작 순간) 스냅샷 ──',
+             (info_x, panel_y0 + 44), (110, 160, 255), 12,
+             '-- last trigger-moment snapshot --'),
+            (f'원인={self._avoid_hold_trigger_cause or "(아직 없음)"}  '
+             f'클러스터 {self._avoid_hold_trigger_cluster_pts}점'
+             f'/전체클러스터 {self._avoid_hold_trigger_group_count}개',
+             (info_x, panel_y0 + 66), (255, 255, 255), 12,
+             f'cause={self._avoid_hold_trigger_cause or "(none)"} '
+             f'pts={self._avoid_hold_trigger_cluster_pts}/{self._avoid_hold_trigger_group_count}'),
+            (f'거리={self._avoid_hold_trigger_obstacle_dist:.2f}m  '
+             f'폭={self._avoid_hold_trigger_obstacle_width:.2f}m  '
+             f'{self._avoid_hold_trigger_obstacle_type}/{self._avoid_hold_trigger_obstacle_side}',
+             (info_x, panel_y0 + 88), (255, 255, 255), 12,
+             f'dist={self._avoid_hold_trigger_obstacle_dist:.2f}m '
+             f'width={self._avoid_hold_trigger_obstacle_width:.2f}m '
+             f'{self._avoid_hold_trigger_obstacle_type}/{self._avoid_hold_trigger_obstacle_side}'),
+        ]
+        put_text_kr_multi(canvas, info_lines)
 
         cv2.imshow('avoid_hold_debug', canvas)
         cv2.waitKey(1)
