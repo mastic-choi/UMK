@@ -1030,7 +1030,8 @@ DEBUG_VIZ_SIGNAL     = False   # 신호등 ROI/HoughCircles 디버그 창 (perce
 #   (track_drive.py perc_signal())
 DEBUG_LOG_SIGNAL     = True
 DEBUG_VIZ_YOLO_CONE  = False  # 라바콘 YOLO 검출 박스 디버그 창 (perception/yolo_cone.py)
-DEBUG_VIZ_YOLO_SIGNAL = False  # 신호등 YOLO 검출 박스 디버그 창 (perception/yolo_signal.py) — _debug_viz_signal_status()의 Hough 비교와는 별개로 raw 검출 박스만 보고 싶을 때
+DEBUG_VIZ_YOLO_SIGNAL = False  # 신호등 배경판 YOLO 검출 박스 디버그 창 (perception/yolo_signal.py)
+DEBUG_VIZ_YOLO_SIGNAL_STATE = False  # 신호등 색상상태 YOLO 검출 박스 디버그 창 (perception/yolo_signal_state.py) — _debug_viz_signal_status()의 Hough 비교와는 별개로 raw 검출 박스만 보고 싶을 때
 # [2026-08-15] avoid-hold(§2.32) 전용 상태창 — 지금 유예가 걸려있는지/왜 걸렸는지/방향
 #   힌트/조기해제 진행상황을 한곳에 모아 보여주고, 실측 안 된 파라미터 값도 항상 같이
 #   띄워서 "이 숫자 아직 지어낸 값"이라는 걸 상기시킨다(track_drive.py
@@ -1162,17 +1163,22 @@ YOLO_CONE_INPUT_SIZE = 640     # cone_best_n.onnx export 시 imgsz와 반드시 
 YOLO_CONE_CONF_THRESHOLD = 0.5 # 이 신뢰도 이상인 검출만 인정(모델이 nms=True로 export돼 좌표 디코딩은 불필요)
 YOLO_CONE_MODEL_PATH = None    # None이면 yolo_ros/cone_best_n.onnx(형제 디렉터리)를 자동으로 찾음(perception/yolo_cone.py 참고)
 
-# ── 신호등 색상상태 YOLO (perception/yolo_signal.py, YOLOv8n ONNX) ──
+# ── 신호등 색상상태 YOLO (perception/yolo_signal_state.py, YOLOv8n ONNX) ──
 #   [2026-08-19] datasets/signal_state/(라벨링 워크플로는 그쪽 README 참고)로 파인튜닝한
-#   신호등 색상상태(빨강/직진초록/좌회전초록) 검출기. 아직 perc_signal()의 실제 주행 판단
-#   (FSM 전환)에는 연결하지 않았다 — _debug_viz_signal_status() 창에서 기존 Hough Circle
-#   결과(traffic_signal.py)와 나란히 비교만 하는 단계. 실차 검증 후 판단 소스를 이걸로
-#   바꿀지는 별도로 결정할 것(§"da 블롭 선택" 항목과 같은 이유 — 새 인식기를 실측 검증 없이
-#   바로 주행 판단에 연결하지 않는다).
-YOLO_SIGNAL_INPUT_SIZE = 640     # signal_state_best_n.onnx export 시 imgsz와 반드시 일치시킬 것
-YOLO_SIGNAL_CONF_THRESHOLD = 0.5 # 이 신뢰도 이상인 검출만 인정(모델이 nms=True로 export돼 좌표 디코딩은 불필요) — 실차 미검증 기본값, cone과 동일하게 잡아둠
-YOLO_SIGNAL_MODEL_PATH = None    # None이면 yolo_ros/signal_state_best_n.onnx(형제 디렉터리)를 자동으로 찾음(perception/yolo_signal.py 참고)
-YOLO_SIGNAL_CLASS_NAMES = ('red', 'green_straight', 'green_left')  # class id(0/1/2) 순서 — datasets/signal_state/classes.txt와 반드시 일치시킬 것
+#   신호등 색상상태(빨강/직진초록/좌회전초록) 검출기 — 바로 아래 "신호등 배경판 위치 탐지"
+#   (YOLO_SIGNAL_*, perception/yolo_signal.py)와는 별개 모델/별개 목적이다: 그쪽은 배경판
+#   "위치"만 찾아 기존 HSV 자동크롭을 대체하는 하이브리드고, 이쪽은 배경판 위치와 무관하게
+#   "지금 어떤 색이 켜져 있는지" 자체를 단일 스테이지로 직접 예측한다. 이름이 겹치지 않게
+#   전부 YOLO_SIGNAL_STATE_* 접두어를 쓴다.
+#   아직 perc_signal()의 실제 주행 판단(FSM 전환)에는 연결하지 않았다 —
+#   _debug_viz_signal_status() 창에서 기존 Hough Circle 결과(traffic_signal.py)와 나란히
+#   비교만 하는 단계. 실차 검증 후 판단 소스를 이걸로 바꿀지는 별도로 결정할 것
+#   (§"da 블롭 선택" 항목과 같은 이유 — 새 인식기를 실측 검증 없이 바로 주행 판단에
+#   연결하지 않는다).
+YOLO_SIGNAL_STATE_INPUT_SIZE = 640     # signal_state_best_n.onnx export 시 imgsz와 반드시 일치시킬 것
+YOLO_SIGNAL_STATE_CONF_THRESHOLD = 0.5 # 이 신뢰도 이상인 검출만 인정(모델이 nms=True로 export돼 좌표 디코딩은 불필요) — 실차 미검증 기본값, cone과 동일하게 잡아둠
+YOLO_SIGNAL_STATE_MODEL_PATH = None    # None이면 yolo_ros/signal_state_best_n.onnx(형제 디렉터리)를 자동으로 찾음(perception/yolo_signal_state.py 참고)
+YOLO_SIGNAL_STATE_CLASS_NAMES = ('red', 'green_straight', 'green_left')  # class id(0/1/2) 순서 — datasets/signal_state/classes.txt와 반드시 일치시킬 것
 
 SAFETY_DIST      = 5.0        # B2(고정장애물) 발동 거리(m)
 OVERTAKE_TRIGGER = 6.5        # B3(방해차량) 발동 거리(m)
@@ -1401,6 +1407,23 @@ SIG4_BOARD_MAX_ASPECT  = 6.0     # 후보 가로/세로 비율 상한
 SIG4_BOARD_MAX_CANDIDATES = 6    # 이 개수까지만 원 패턴검사를 시도(면적 작은 순 — 보드에 더
     #   타이트하게 맞는 후보부터, 연산량 상한)
 SIG4_BOARD_CROP_MARGIN = 0.35    # 후보 박스에 이 비율만큼 여유를 더해 크롭(원이 경계에 안 걸리게)
+
+# ── 신호등 배경판 위치 탐지 — YOLO 하이브리드 (perception/yolo_signal.py) ──
+# [2026-08-19] 위 SIG4_BOARD_*(HSV 임계값 기반 자동크롭)가 반복적으로 오탐/미탐을 겪는 자리
+# (천장 형광등/벽 TV가 배경판처럼 잡힘, §1.4~§1.10대 시행착오)를 YOLO 객체탐지로 대체하려는
+# 하이브리드 시도. 점등 색상 판정(find_circles/shape_ok/pick_best_4)은 그대로 두고, "배경판이
+# 어디 있는지"만 이걸로 찾는다 — yolo_signal_detection_plan.md 참고.
+# ★주의★ yolo_ros/signal_board_best_n.onnx는 datasets/yolo_signal_pilot(긍정 8+부정 7=15장,
+# 스모크테스트 전용, 조명/배경 다양성 없음) 기준 학습본이면 기본값은 False로 둘 것. 실데이터
+# (다른 세션 여러 번)로 재학습한 모델로 교체 전까지 켜면 이 파일럿 환경에만 과적합된 채로
+# 실차에 올라간다 — 지금 yolo_ros/에 있는 파일이 파일럿용인지 본학습용인지 확인 후 켤 것.
+YOLO_SIGNAL_ENABLE = False
+YOLO_SIGNAL_INPUT_SIZE = 640     # export 시 imgsz와 반드시 일치시킬 것 (train_pilot.md 참고)
+YOLO_SIGNAL_CONF_THRESHOLD = 0.5 # 이 신뢰도 이상인 검출만 board 후보로 인정
+YOLO_SIGNAL_MODEL_PATH = None    # None이면 yolo_ros/signal_board_best_n.onnx(형제 디렉터리) 자동탐색
+YOLO_SIGNAL_MAX_CANDIDATES = 3   # 신뢰도 상위 몇 개까지 detect_s2()의 board 후보로 넘길지
+YOLO_SIGNAL_CROP_MARGIN = 0.35   # bbox에 이 비율만큼 여유를 더해 크롭(SIG4_BOARD_CROP_MARGIN과
+                                  #   동일한 이유 — 원이 bbox 경계에 안 걸리게)
 
 # ── 신호등 원 탐색 엔진 — Hough Circle vs FRST(Fast Radial Symmetry Transform) ──
 #   [2026-08-18] 위 SIG4_BOARD_*(흰 배경판 후보 크롭) 자체는 그대로 두고, 그 크롭 "안에서"

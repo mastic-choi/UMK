@@ -42,6 +42,7 @@ from .perception.dl_lane import DLLaneDetector
 from .perception.traffic_signal import SignalDetector
 from .perception.yolo_cone import YoloConeDetector
 from .perception.yolo_signal import YoloSignalDetector
+from .perception.yolo_signal_state import YoloSignalStateDetector
 from .controller.obstacle_avoidance import ObstacleAvoidance, AvoidPhase
 # vehicle_overtake.py 의 구 VehicleOvertake 는 더 이상 쓰지 않는다.
 #   추월/회피가 규정상 같은 기동("타겟이 없는 차선으로 지나간다")이라
@@ -205,7 +206,6 @@ class TrackDriverNode(Node):
 
         # ── 외부 차선 인식 모듈 초기화 (LANE_DETECTOR_BACKEND로 선택, 인터페이스는 셋 다 동일) ──
         self.lane_detector = self._build_lane_detector(LANE_DETECTOR_BACKEND)
-        self.signal_detector = SignalDetector()          # 신호등(3구/4구) Hough Circle 인식기
 
         # 라바콘 카메라 이중확인용 YOLO 콘 검출기. onnxruntime 미설치/모델 파일 부재 등으로
         # 초기화가 실패하면 _build_lane_detector()의 dl→hough 폴백과 달리 대체 백엔드가
@@ -219,14 +219,31 @@ class TrackDriverNode(Node):
             )
             self.yolo_cone_detector = None
 
-        # 신호등 색상상태 YOLO 검출기 — 아직 주행 판단에는 안 쓰고 Hough Circle과 비교만
-        # 하는 단계라(YOLO_SIGNAL_* config.py 주석 참고), 초기화 실패해도 폴백 없이 그냥
-        # None으로 두고 비교 창만 안 뜨게 한다(주행 자체엔 영향 없음).
+        # [2026-08-19, 파일럿] 신호등 배경판 위치 탐지용 YOLO — YOLO_SIGNAL_ENABLE=False가
+        # 기본값이라(datasets/yolo_signal_pilot 스모크테스트 데이터뿐, 실데이터 재학습 전)
+        # 평소엔 이 블록이 아예 안 돈다. 켜져 있는데 모델 파일이 없으면 위 콘 검출기와 동일한
+        # 패턴으로 None 폴백 — SignalDetector가 yolo_detector=None이면 기존 HSV 자동크롭으로
+        # 자동 복귀하므로(traffic_signal.py 참고) 안전하다.
+        self.yolo_signal_detector = None
+        if YOLO_SIGNAL_ENABLE:
+            try:
+                self.yolo_signal_detector = YoloSignalDetector(logger=self.get_logger())
+            except Exception as e:
+                self.get_logger().error(
+                    f'YOLO 신호등 검출기 초기화 실패, 배경판 탐색은 기존 HSV 자동크롭으로 폴백합니다: {e}'
+                )
+                self.yolo_signal_detector = None
+        self.signal_detector = SignalDetector(yolo_detector=self.yolo_signal_detector)  # 신호등(3구/4구) 인식기
+
+        # 신호등 색상상태 YOLO 검출기(위 배경판 위치 탐지용과는 별개 모델/역할 —
+        # perception/yolo_signal_state.py 헤더 주석 참고) — 아직 주행 판단에는 안 쓰고 Hough
+        # Circle과 비교만 하는 단계라(YOLO_SIGNAL_STATE_* config.py 주석 참고), 초기화 실패해도
+        # 폴백 없이 그냥 None으로 두고 비교 창만 안 뜨게 한다(주행 자체엔 영향 없음).
         try:
-            self.yolo_signal_detector = YoloSignalDetector(logger=self.get_logger())
+            self.yolo_signal_state_detector = YoloSignalStateDetector(logger=self.get_logger())
         except Exception as e:
-            self.get_logger().error(f'YOLO 신호등 검출기 초기화 실패, 비교 창 없이 진행합니다: {e}')
-            self.yolo_signal_detector = None
+            self.get_logger().error(f'YOLO 신호등 색상상태 검출기 초기화 실패, 비교 창 없이 진행합니다: {e}')
+            self.yolo_signal_state_detector = None
 
         # ── 판단/제어 상태 ──
         self.mission_state  = START_STATE
@@ -457,7 +474,7 @@ class TrackDriverNode(Node):
         self._update_avoid_hold()  # 라이다(위 obstacle_front/dist 기반) — perc_obstacle() 직후여야 함
         self.perc_lavacon()     # 라이다
         self.perc_yolo_cone()   # 비전 (YOLO, perc_lavacon_trigger()가 라이다와 AND 결합해서 씀)
-        self.perc_yolo_signal() # 비전 (YOLO, 아직 비교용 — _debug_viz_signal_status()에서만 씀)
+        self.perc_yolo_signal_state() # 비전 (YOLO, 아직 비교용 — _debug_viz_signal_status()에서만 씀)
         self.perc_lavacon_trigger()  # 라이다+비전 (YOLO 콘 검출 AND 좌우 클러스터 동시검출 → B1_LAVACON 진입 트리거)
         self.perc_vehicle_trigger()  # 라이다 (전방 장애물 근접 → B3_VEHICLE 진입 트리거)
         self.perc_stopline()    # 비전
@@ -479,19 +496,19 @@ class TrackDriverNode(Node):
 
     # [2-4b] 신호등 색상상태 YOLO (비교용, 아직 주행 판단에는 미연결)
     #   입력 self.img_front → 출력 self.signal_*_on_yolo
-    #   yolo_signal.py가 별도 스레드에서 자기 페이스로 추론하므로 여기선 논블로킹으로
+    #   yolo_signal_state.py가 별도 스레드에서 자기 페이스로 추론하므로 여기선 논블로킹으로
     #   최신 결과만 받아온다(perc_yolo_cone()과 동일한 패턴). perc_signal()과 달리 S0/S2가
     #   아닐 때도 항상 돌린다 — 실차 영상 전체 구간에서 이 모델이 얼마나 오탐하는지도
     #   같이 보고 싶어서(정상 주행 중 신호등 아닌 걸 신호로 잘못 잡는지 확인 목적).
-    def perc_yolo_signal(self):
-        if self.yolo_signal_detector is None:
+    def perc_yolo_signal_state(self):
+        if self.yolo_signal_state_detector is None:
             self.signal_red_on_yolo = self.signal_straight_on_yolo = self.signal_left_on_yolo = False
             return
         if self.img_front is None:
             return
         self.signal_red_on_yolo, self.signal_straight_on_yolo, self.signal_left_on_yolo = \
-            self.yolo_signal_detector.detect(self.img_front)
-        self.yolo_signal_detector.show_debug_windows()  # 메인 스레드에서만 호출(yolo_signal.py 주석 참고)
+            self.yolo_signal_state_detector.detect(self.img_front)
+        self.yolo_signal_state_detector.show_debug_windows()  # 메인 스레드에서만 호출(yolo_signal_state.py 주석 참고)
 
     # [2-1] 차선
     #   입력 self.img_front → 출력 self.lane_offset(우측+), self.lane_valid
@@ -626,6 +643,8 @@ class TrackDriverNode(Node):
         if self.mission_state in (MissionState.S0_WAIT_GREEN, MissionState.S2_INTERSECTION):
             self.signal_red_on, self.signal_straight_on, self.signal_left_on = \
                 self.signal_detector.detect_s2(self.img_front)
+            if self.yolo_signal_detector is not None:
+                self.yolo_signal_detector.show_debug_windows()  # 메인 스레드 전용(yolo_signal.py 주석 참고)
 
             self._sig_straight_cnt = self._sig_straight_cnt + 1 if self.signal_straight_on else 0
             self._sig_left_cnt     = self._sig_left_cnt + 1 if self.signal_left_on else 0
@@ -2030,7 +2049,7 @@ class TrackDriverNode(Node):
             lines.append((f'실패 사유: {sd.s2_reject_reason}', (10, 100), (0, 0, 220), 16,
                            f'Fail: {sd.s2_reject_reason}'))
 
-        # [2026-08-19] YOLO 신호등 색상상태(yolo_signal.py) 비교 줄 — Hough 결과 옆에 나란히
+        # [2026-08-19] YOLO 신호등 색상상태(yolo_signal_state.py) 비교 줄 — Hough 결과 옆에 나란히
         # 보여줘서 실차에서 둘이 얼마나 일치하는지 눈으로 바로 확인할 수 있게 한다. 아직
         # FSM 판단에는 안 쓰므로 여기선 순수 비교 표시 목적(YOLO_SIGNAL_* config.py 주석 참고).
         yolo_state_kr = ('좌회전' if self.signal_left_on_yolo else
