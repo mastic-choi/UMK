@@ -96,13 +96,7 @@ class YoloVehicleEngine:
 
         available = set(ort.get_available_providers())
         if providers is None:
-            # [2026-08-20 §2.57] target_vehicle_best.onnx는 nms=False로 export돼 그래프
-            # 안에 NonMaxSuppression이 없다 — cone_best_n.onnx/구 yolov8n_car.onnx가 겪은
-            # TRT-16198(NMS 레이어의 빈 텐서 처리 실패)이 애초에 발생할 여지가 없으므로
-            # TensorRT를 먼저 시도한다. 다만 실차(Jetson Orin NX, JetPack 6)에서의 첫 로드는
-            # trt_cache가 비어있어 엔진 빌드로 수 분 걸릴 수 있고, 이 조합 자체는 실차
-            # 미검증 — 문제가 재현되면 cone 모델과 동일하게 CUDA로 건너뛰는 것으로 되돌릴 것.
-            priority = ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
+            priority = ['CUDAExecutionProvider', 'CPUExecutionProvider']
             providers = [p for p in priority if p in available] or ['CPUExecutionProvider']
 
         provider_options = []
