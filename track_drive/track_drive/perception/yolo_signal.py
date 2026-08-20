@@ -191,6 +191,8 @@ class YoloSignalDetector:
         self._latest_debug = None           # 시각화용 vis 프레임
         self._stopped = False
         self._last_fps_log_t = time.time()
+        self._logged_infer_error = False  # [2026-08-20] 추론 예외를 매 프레임 로그하면 로그창이
+                                           #   그걸로 도배돼(요청 반영) 최초 1회만 찍고 이후는 조용히 스킵
 
         self._thread = threading.Thread(target=self._worker, name='yolo_signal_infer', daemon=True)
         self._thread.start()
@@ -223,7 +225,9 @@ class YoloSignalDetector:
                     cv2.putText(vis, f'n={len(detections)}',
                                 (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
             except Exception as e:
-                self._log(f'추론 실패, 이번 프레임 스킵: {e}')
+                if not self._logged_infer_error:
+                    self._log(f'추론 실패(이후 반복 로그는 생략, 이번 프레임부터 계속 스킵): {e}')
+                    self._logged_infer_error = True
                 continue
 
             with self._lock:
@@ -231,8 +235,11 @@ class YoloSignalDetector:
                 self._latest_debug = vis
 
             now = time.time()
-            if now - self._last_fps_log_t >= FPS_LOG_PERIOD_SEC:
-                self._log(f'YOLO 신호등 추론 FPS≈{self.engine.fps:.1f} (provider={self.engine.active_provider})')
+            # [2026-08-20] 검출 안 될 때도 몇 초마다 FPS 로그가 계속 찍혀 로그창을 채우던 것을
+            # "실제로 뭔가 검출됐을 때만" 찍히도록 변경(요청 반영).
+            if detections and now - self._last_fps_log_t >= FPS_LOG_PERIOD_SEC:
+                self._log(f'YOLO 신호등 검출됨 n={len(detections)} FPS≈{self.engine.fps:.1f} '
+                          f'(provider={self.engine.active_provider})')
                 self._last_fps_log_t = now
 
     def detect(self, frame):
