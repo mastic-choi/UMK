@@ -674,9 +674,11 @@ AVOID_HOLD_DIR_BIAS_PX = 20.0   # ≈ PASS_OFFSET(80.0, "7. 기타" 절, 실측 
 #   ENABLE_OBSTACLE_CUT=False가 기본값이다 — 부호규약(장애물 쪽을 정확히 잘라야
 #   하는지 반대로 잘라 오히려 장애물 쪽으로 조향하게 되는지)이 실차 미검증이라,
 #   반드시 정지/저속에서 먼저 확인 후 켤 것.
-ENABLE_OBSTACLE_CUT = False   # [2026-08-20, 임시] 신호등 YOLO(signal-whiteboard-autocrop 병합분)
-                               # 단독 테스트를 위해 잠시 끔 — 방해차량 YOLO 검출기 자체를 안 띄운다.
-                               # 라인주행+초반출발+신호등 인식만 볼 것. 검증 끝나면 True로 되돌릴 것.
+ENABLE_OBSTACLE_CUT = True    # [2026-08-21, 임시] B3(방해차량) 회피 실차 검증을 위해 다시 켬 —
+                               # 이게 현재 B2/B3의 실제 회피 메커니즘(위 배경 설명 참고)이라 꺼진
+                               # 채로는 트리거만 잡히고 실제 회피 조향/속도캡이 전혀 안 걸린다.
+                               # ⚠ 위 "부호규약 실차 미검증" 경고 그대로 유효 — 반드시 정지/저속
+                               # 구간에서 먼저 방향 확인 후 트랙 주행에 쓸 것.
                                # ENABLE_BEHAVIOR/TEST_DISABLE_B2_B3와 무관하게 독립적으로 켜고 끔
 
 # ── da 근접 컷 진입 트리거 (perc_obstacle_cut_trigger(), track_drive.py) ──
@@ -1209,7 +1211,11 @@ DEBUG_VIZ_SIGNAL_DETAIL = False  # 신호등 후보탐색 과정 디버그 창 2
 #   (perc_signal() 참고) 이 로그도 안 찍힌다 — Hough 경로로 되돌렸을 때만 의미 있음.
 #   (track_drive.py perc_signal())
 DEBUG_LOG_SIGNAL     = True
-DEBUG_VIZ_YOLO_CONE  = False  # 라바콘 YOLO 검출 박스 디버그 창 (perception/yolo_cone.py)
+DEBUG_VIZ_YOLO_CONE  = True   # [2026-08-21] B2(고정장애물=콘) 회피 검증 중 켬 — obstacle_cut_debug
+                               # 창의 카메라 패널이 이 vis 프레임을 그대로 가져다 쓴다(꺼져 있으면
+                               # yolo_cone.py _worker()가 vis 자체를 안 만들어 "카메라 프레임 없음"만
+                               # 뜬다). yolo_vehicle.py DEBUG_VIZ_YOLO_VEHICLE과 동일 관례 — 검증
+                               # 끝나면 False로 되돌릴 것.
 # [2026-08-20] 배경판+색상상태 YOLO 동시 테스트 끝나서 다시 False로 되돌림(요청 반영,
 #   디버그창 전체 끄기).
 DEBUG_VIZ_YOLO_SIGNAL = False  # 신호등 배경판 YOLO 검출 박스 디버그 창 (perception/yolo_signal.py)
@@ -1234,36 +1240,40 @@ DEBUG_VIZ_OBSTACLE_CUT = True   # [2026-08-20] 실차 검증 시작과 함께 �
 # #############################################################
 # 6. 미션 State / 실차 테스트 범위 제한
 # #############################################################
-# [2026-08-20] 전체 미션(S0→S4) 상태전환 복구 시작 — S0_SIGNAL부터 정상 출발.
-#   (직전엔 YOLO 신호등 단독 테스트 중 S1_LANE_FOLLOW로 바꿔둔 채 주석만 S0로 되돌린다고
-#   적어놓고 실제 코드는 안 고쳐서 어긋나 있었음 — 이번에 코드를 주석 의도에 맞게 정정.)
+# [2026-08-21, 임시] 방해차량 회피(B3, obstacle_cut_type='vehicle') 단독 실차 검증 —
+#   S0_SIGNAL 신호대기를 건너뛰고 S1_LANE_FOLLOW로 바로 출발, ENABLE_OBSTACLE_CUT(현재
+#   B2/B3의 실제 회피 메커니즘 — 위 run_behavior_fsm() Phase.OBSTACLE_ZONE 분기, da 근접
+#   컷)/ENABLE_BEHAVIOR/TEST_DISABLE_B2_B3=False를 모두 켜서 트랙의 라바콘(B2)→방해차량
+#   (B3) 구간을 정상 순서로 통과시키며 B3 회피만 집중 관찰한다. YOLO_CONE_ENABLE도 같이
+#   켠다 — perc_obstacle_cut_trigger()가 콘/차량 카메라 이중확인으로 obstacle_cut_type을
+#   'fixed'/'vehicle'로 가르는데, 콘 YOLO가 꺼져 있으면 B2가 카메라 폴백(라이다 단독)으로
+#   흐려 "트랙 순서상 B2 먼저"라는 전제(_b2_passed 가드, 위 Phase.OBSTACLE_ZONE 분기 참고)가
+#   약해진다. 검증 끝나면 아래 원래 값(START_STATE=S0_SIGNAL, ENABLE_OBSTACLE_CUT 이전
+#   기본값은 사용자 확인 필요, ENABLE_BEHAVIOR=True 유지, TEST_DISABLE_B2_B3=False 유지,
+#   TEST_FORCE_BEHAVIOR=False)으로 되돌릴 것.
 # [2026-08-20, signal-whiteboard-autocrop 브랜치 병합] START_STATE는 원래 S0_WAIT_GREEN
 #   이었으나, 그 상태와 S2_INTERSECTION이 S0_SIGNAL 하나로 통합됐다(위 MissionState enum
 #   주석 참고, 출발선/교차로 재진입 모두 같은 SignalDetector.detect_s2() 재사용) — 값은
 #   그대로 "맨 처음 신호등 판독" 지점이라 의미상 동일하다.
-START_STATE     = MissionState.S0_SIGNAL
-# [2026-08-20, 임시] 신호등 YOLO(signal-whiteboard-autocrop 병합분) 단독 검증 — 차량검출
-#   (ENABLE_OBSTACLE_CUT)/라바콘검출(YOLO_CONE_ENABLE) YOLO를 위에서 이미 끔. 이번 테스트
-#   범위는 딱 두 가지: ①초반 출발(S0_SIGNAL 신호 판독 후 출발) ②라인주행(S1) 중 신호등
-#   재인식+정지. B1/B2/B3 Behavior가 카메라 확인 없이 라이다 단독으로 오발동해 테스트를
-#   흐리지 않도록 ENABLE_BEHAVIOR도 같이 끈다 — 검증 끝나면 전체 파이프라인 복구 상태
-#   (ENABLE_BEHAVIOR=True, TEST_DISABLE_B2_B3=False)로 되돌릴 것.
-ENABLE_BEHAVIOR = False  # S1에서 라바콘/장애물/추월 Behavior를 켤지 여부(최상위 스위치)
+START_STATE     = MissionState.S1_LANE_FOLLOW
+ENABLE_BEHAVIOR = True  # S1에서 라바콘/장애물/추월 Behavior를 켤지 여부(최상위 스위치)
 
 # ── 실차 테스트 범위 제한 ──
 TEST_DISABLE_INTERSECTION = False
 #   True: 신호등 보드 인식(signal_board_confirmed, README §1.15 이전엔 정지선 self.stopline
 #         기준이었음)이 확정돼도 감속→S0_SIGNAL 재진입을 아예 안 함(차선주행만 계속).
-#   False: 원래대로 신호등 보드 인식 확정 시 감속 후 S0_SIGNAL로 정상 전환. — 이번 테스트가
-#         보고 싶은 게 바로 이 재진입(라인주행 중 신호등 인식)이라 False 유지.
-TEST_DISABLE_B2_B3 = True
+#   False: 원래대로 신호등 보드 인식 확정 시 감속 후 S0_SIGNAL로 정상 전환.
+TEST_DISABLE_B2_B3 = False
 #   True: Phase가 FIXED_OBSTACLE/VEHICLE로 넘어가도 트리거 검사를 건너뛰고
 #         B0_NORMAL로 고정(B1 끝난 뒤 계속 일반 차선주행만 함). ENABLE_BEHAVIOR=False와
 #         이중으로 걸어 B2/B3가 어떤 경로로도 안 켜지게 한다(안전판).
-#   False: 원래대로 SAFETY_DIST/OVERTAKE_TRIGGER 트리거 검사해서 B2/B3 정상 발동.
-TEST_FORCE_BEHAVIOR = False
-#   True: _behavior_enabled를 시작부터 강제 True로 켜서, 교차로를 끈 채로도
-#         라바콘(B1)만 독립적으로 실차 검증할 수 있게 한다.
+#   False: 원래대로 SAFETY_DIST/OVERTAKE_TRIGGER 트리거 검사해서 B2/B3 정상 발동 —
+#         이번 B3 검증이 보고 싶은 게 바로 이 발동이라 False.
+TEST_FORCE_BEHAVIOR = True
+#   True: _behavior_enabled를 시작부터 강제 True로 켜서, START_STATE=S1_LANE_FOLLOW로
+#         S0/S2를 건너뛴 채로도 B1→B2→B3가 정상 발동한다(그렇지 않으면 _behavior_enabled가
+#         S2 교차로 직진 확정 시에만 True가 되는데 그 경로 자체를 안 타므로 계속 False로
+#         남아 Behavior가 영원히 안 켜짐).
 #   False: 원래대로 S2 교차로 직진 신호를 받아야만 Behavior가 켜짐.
 
 # [2026-08-11] B2(정지 장애물) Hybrid A* 대안(USE_HYBRID_ASTAR_FOR_B2) 삭제.
@@ -1428,7 +1438,11 @@ LAVACON_LINE_TRACK_MAX_JUMP_M   = 0.6   # 직전 박스 같은 라인 점과의 
 #   동일 패턴으로, False면 track_drive.py가 YoloConeDetector 자체를 생성하지 않는다
 #   (self.yolo_cone_detector=None, perc_yolo_cone()이 None 체크로 조용히 스킵).
 #   라바콘(B1) 실차 테스트를 다시 시작하면 True로 되돌릴 것.
-YOLO_CONE_ENABLE = False
+# [2026-08-21, 임시] B3(방해차량) 회피 검증을 위해 다시 켬 — perc_obstacle_cut_trigger()가
+#   콘/차량 카메라 이중확인으로 obstacle_cut_type을 가르는데, 이게 꺼져 있으면 B2(콘)가
+#   카메라 폴백(라이다 단독)으로 흐려 "트랙 순서상 B2가 먼저 지나가야 B3 인정"이라는
+#   _b2_passed 가드가 안정적으로 안 걸린다(위 START_STATE 근처 임시 테스트 블록 참고).
+YOLO_CONE_ENABLE = True
 YOLO_CONE_INPUT_SIZE = 640     # cone_best_n.onnx export 시 imgsz와 반드시 일치시킬 것
 YOLO_CONE_CONF_THRESHOLD = 0.5 # 이 신뢰도 이상인 검출만 인정(모델이 nms=True로 export돼 좌표 디코딩은 불필요)
 YOLO_CONE_MODEL_PATH = None    # None이면 yolo_ros/cone_best_n.onnx(형제 디렉터리)를 자동으로 찾음(perception/yolo_cone.py 참고)

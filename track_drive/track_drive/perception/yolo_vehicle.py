@@ -202,6 +202,7 @@ class YoloVehicleDetector:
         self._lock = threading.Lock()
         self._latest_frame = None
         self._latest_result = (False, [])          # (vehicle_detected, detections)
+        self._latest_side = None                      # [2026-08-21] 'L'/'R'/None — get_latest_side() 참고
         self._latest_debug = None                    # 시각화용 vis 프레임
         self._stopped = False
         self._last_fps_log_t = time.time()
@@ -226,6 +227,17 @@ class YoloVehicleDetector:
 
             try:
                 vehicle_detected, detections = self.engine.infer(frame)
+                # [2026-08-21] 라이다-YOLO 좌우 교차검증(perc_obstacle_cut_trigger() 오검출
+                # 방지 로직)용 — 가장 신뢰도 높은 박스의 중심 x가 프레임 가로 중앙(=
+                # YOLO_VEHICLE_INPUT_SIZE/2, letterbox 없는 단순 리사이즈라 원본 중앙과
+                # 동일 비율 지점) 왼쪽이면 'L', 오른쪽이면 'R'. 전방(비반전) 카메라라
+                # 이미지 왼쪽=차량 좌측 그대로 대응 — 라이다 y>0=좌측 규약과 부호만
+                # 다를 뿐 같은 실세계 방향.
+                side = None
+                if detections:
+                    best = max(detections, key=lambda d: d[4])  # 최고 신뢰도 박스 하나만 사용
+                    cx = (best[0] + best[2]) / 2.0
+                    side = 'L' if cx < YOLO_VEHICLE_INPUT_SIZE / 2.0 else 'R'
                 vis = None
                 if DEBUG_VIZ_YOLO_VEHICLE:
                     # 그리기만 여기서(스레드 세이프하지 않은 imshow/waitKey는 절대 호출 안 함
@@ -249,6 +261,7 @@ class YoloVehicleDetector:
 
             with self._lock:
                 self._latest_result = (vehicle_detected, detections)
+                self._latest_side = side
                 self._latest_debug = vis
 
             now = time.time()
@@ -269,6 +282,14 @@ class YoloVehicleDetector:
         with self._lock:
             vehicle_detected, _detections = self._latest_result
         return vehicle_detected
+
+    def get_latest_side(self):
+        """[2026-08-21] 최신 프레임에서 검출된(최고 신뢰도) target_vehicle 박스의 좌우
+        위치 — 'L'/'R'(검출 없었으면 None). perc_obstacle_cut_trigger()가 라이다 판정
+        (self._obstacle_cut_y 부호)과 이 값을 대조해 방향이 일치할 때만 방해차량으로
+        확정하는 오검출 방지 게이트에 쓴다."""
+        with self._lock:
+            return self._latest_side
 
     def get_latest_debug_frame(self):
         """최신 시각화 프레임(카메라 원본 + 검출 박스)을 스레드 세이프하게 반환만 한다

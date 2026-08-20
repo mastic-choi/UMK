@@ -258,6 +258,17 @@ class YoloConeDetector:
             cone_detected, _detections = self._latest_result
         return cone_detected
 
+    def get_latest_debug_frame(self):
+        """[2026-08-21] 최신 시각화 프레임(카메라 원본 + 검출 박스)을 스레드 세이프하게
+        반환만 한다(cv2.imshow는 호출하지 않음) — yolo_vehicle.py get_latest_debug_frame()과
+        동일 패턴. track_drive.py _debug_viz_obstacle_cut()이 B2(고정장애물=콘) 검증 중엔
+        이 프레임을, B3(방해차량) 검증 중엔 yolo_vehicle의 프레임을 같은 라이다 BEV 패널
+        옆에 합쳐서 그린다(_active_yolo_stage()로 어느 쪽이 활성인지 판단). show_debug_windows()
+        가 띄우는 'yolo_cone_result' 창과는 별개로, DEBUG_VIZ_YOLO_CONE=True일 때만 vis가
+        만들어지므로(위 _worker() 참고) 꺼져 있으면 항상 None."""
+        with self._lock:
+            return self._latest_debug
+
     def show_debug_windows(self):
         """★ 반드시 메인 스레드에서만 호출할 것 ★ (dl_lane.py와 동일한 이유)."""
         if not DEBUG_VIZ_YOLO_CONE:

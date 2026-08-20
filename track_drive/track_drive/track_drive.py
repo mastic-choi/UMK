@@ -263,6 +263,11 @@ class TrackDriverNode(Node):
         self._obstacle_cut_release_cnt  = 0      # 해제 판단용 라이다 클리어 연속 프레임 수(디바운스 카운터)
         self.obstacle_cut_release_reason = ''    # 디버그용 — 'floor_and_lidar_clear' 등
         self._obstacle_cut_lidar_near = False    # 디버그용 — 이번 프레임 트리거 ROI에 라이다 점이 잡혔는지(원시값)
+        # [2026-08-21] 방해차량 좌우 교차검증 디버그용(perc_obstacle_cut_trigger() 참고) —
+        # 매틱 갱신, _debug_viz_obstacle_cut()에서 그대로 표시.
+        self._obstacle_cut_lidar_side = None   # 'L'/'R'/None(lidar_near 아니었으면)
+        self._obstacle_cut_yolo_side  = None   # 'L'/'R'/None(YOLO 미검출)
+        self._obstacle_cut_side_veto  = False  # True면 이번 틱 좌우 불일치로 vehicle_seen 취소됨
         # [2026-08-20] _debug_viz_obstacle_cut() BEV 패널용 — avoid_hold_debug의
         # _obstacle_front_all_x/y·_obstacle_cluster_x/y와 동일 패턴(매틱 갱신되는 라이브 값).
         # bg_*는 표시범위 안의 배경점 전부(회색), roi_*는 실제 트리거 ROI 안에 잡힌 점만(빨강).
@@ -339,14 +344,22 @@ class TrackDriverNode(Node):
         # ── 판단/제어 상태 ──
         self.mission_state  = START_STATE
         self.behavior_state = BehaviorState.B0_NORMAL
-        self.phase          = Phase.LAVACON     # S1 내부 진행 순서(라바콘부터 시작)
+        # [2026-08-21, 임시] B2(고정장애물=콘) 회피 단독 검증 — Phase.LAVACON(B1 진입 대기,
+        # 실제 회피는 없는 placeholder라 건너뛰어도 손해 없음)을 건너뛰고 시작부터 바로
+        # Phase.OBSTACLE_ZONE으로 진입한다. _b2_passed는 기본값 False 그대로 둔다 —
+        # _active_yolo_stage()가 Phase.OBSTACLE_ZONE에서 "_b2_passed가 아니면 콘, 이면 차량"
+        # 스테이지를 고르므로(위 참고) False라야 카메라가 콘 모델에 물려 obstacle_cut_type이
+        # 'fixed'(B2)로 잡힌다. [이전엔 B3(방해차량) 단독 검증용으로 여길 True로 켜뒀었음 —
+        # B3 검증을 다시 하려면 True로, 그리고 아래처럼 이 값 자체를 되돌릴 것.]
+        self.phase          = Phase.OBSTACLE_ZONE
         # [2026-08-15] Phase.OBSTACLE_ZONE 통합(da_based_b2b3_proposal.md B안) —
         # B2/B3 각각 최소 한 번 완료됐는지 추적. 둘 다 True가 돼야 Phase.DONE으로
         # 넘어간다(_mark_behavior_passed() 참고).
         # [2026-08-20] 대회 트랙은 고정장애물(B2)이 항상 이동장애물(B3)보다 먼저
         # 나오는 게 확정된 순서라(요청 반영) — run_behavior_fsm()에서 B3 트리거를
         # self._b2_passed가 True일 때만 받아들이도록 순서를 강제한다(아래 참고).
-        self._b2_passed = False
+        self._b2_passed = False   # [2026-08-21] B2 단독 검증 중 — RESET_PHASE_EACH_LAP=True면
+                                   # 매 바퀴 1843~1844행에서 어차피 Phase.LAVACON/False로 리셋됨
         self._b3_passed = False
         # [2026-08-20] 요청 반영 — B2/B3 실제 처리를 da 근접 컷(obstacle_cut_active) 기반으로
         # 바꾸면서 추가. obstacle_cut_active 진입 순간 'B2'/'B3' 중 하나를 latch해뒀다가,
@@ -1308,6 +1321,24 @@ class TrackDriverNode(Node):
         # perc_yolo_cone() 자체는 계속 돈다, perceive_all() 참고).
         cone_seen    = self.cone_detected_yolo        if self.yolo_cone_detector        is not None else False
         vehicle_seen = self.vehicle_detected_yolo_cut  if self.yolo_vehicle_cut_detector is not None else False
+        # [2026-08-21] 방해차량(vehicle) 오검출 방지 — 라이다/YOLO가 각각 판단한 좌우가
+        # 일치할 때만 vehicle_seen을 신뢰한다. 라이다·카메라가 "이번 틱에 뭔가 있다"까지는
+        # 둘 다 맞아도 서로 다른 위치(예: 라이다는 우측 근접 장애물, YOLO는 좌측 배경
+        # 오검출)를 보고 있으면 우연히 같은 프레임에 겹친 것뿐이라 방해차량 확정 근거로
+        # 부족하다 — 좌우 부호가 어긋나면 이번 틱은 vehicle_seen을 취소해 cone_seen/라이다
+        # 단독 판정 경로로 폴백시킨다(아래 cam_confirmed 계산 참고). self._obstacle_cut_y는
+        # 위에서 lidar_near일 때만 갱신되므로 그 경우에만 비교한다. y>0=좌측 규약(위 x,y
+        # 계산부 주석)과 yolo_vehicle.py get_latest_side()의 'L'/'R'은 둘 다 전방 카메라/
+        # 라이다 기준 같은 실세계 좌우라 부호만 맞춰주면 바로 비교 가능하다.
+        self._obstacle_cut_lidar_side = self._obstacle_cut_yolo_side = None
+        self._obstacle_cut_side_veto = False
+        if vehicle_seen and lidar_near and self.yolo_vehicle_cut_detector is not None:
+            yolo_side = self.yolo_vehicle_cut_detector.get_latest_side()
+            lidar_side = 'L' if self._obstacle_cut_y > 0.0 else 'R'
+            self._obstacle_cut_lidar_side, self._obstacle_cut_yolo_side = lidar_side, yolo_side
+            if yolo_side is not None and yolo_side != lidar_side:
+                vehicle_seen = False
+                self._obstacle_cut_side_veto = True
         # 두 검출기 다 초기화 실패면(드묾) perc_lavacon_trigger()와 동일 원칙으로 라이다
         # 단독 판정으로 폴백(카메라 확인 자체를 생략, cam_confirmed=True).
         both_cams_unavailable = self.yolo_cone_detector is None and self.yolo_vehicle_cut_detector is None
@@ -2811,6 +2842,21 @@ class TrackDriverNode(Node):
         col_range = getattr(slide, 'obstacle_cut_col_range', None)
         UNMEASURED = (60, 160, 255)
 
+        # [2026-08-21] B2(고정장애물=콘)/B3(방해차량) 공용 창 — obstacle_cut 메커니즘 자체가
+        # 라이다 ROI/트리거/유지타이머까지 완전히 공유라(perc_obstacle_cut_trigger() 참고)
+        # 창 대부분은 손 안 대고, 카메라 패널/검출값 텍스트만 지금 활성 스테이지
+        # (_active_yolo_stage(), Phase.OBSTACLE_ZONE에서 _b2_passed 기준 'cone'/'vehicle')에
+        # 맞춰 콘 검출기 ↔ 차량 검출기를 동적으로 바꿔 보여준다.
+        cam_stage = self._active_yolo_stage()
+        if cam_stage == 'vehicle':
+            cam_detector, cam_label = self.yolo_vehicle_cut_detector, 'YOLO VEHICLE CAM'
+            yolo_detected, yolo_flag_label = self.vehicle_detected_yolo_cut, 'car'
+            viz_flag_name = 'DEBUG_VIZ_YOLO_VEHICLE'
+        else:
+            cam_detector, cam_label = self.yolo_cone_detector, 'YOLO CONE CAM'
+            yolo_detected, yolo_flag_label = self.cone_detected_yolo, 'cone'
+            viz_flag_name = 'DEBUG_VIZ_YOLO_CONE'
+
         # --- 상단 카메라(YOLO)/라이다 BEV 패널 레이아웃 -------------------------------
         CAM_W, CAM_H = 300, 220
         cam_x0, cam_y0 = 10, 34
@@ -2818,7 +2864,7 @@ class TrackDriverNode(Node):
         panel_x0, panel_y0 = cam_x0 + CAM_W + 20, cam_y0
         text_y0 = cam_y0 + CAM_H + 16
 
-        canvas = np.full((text_y0 + 164, panel_x0 + PANEL_W + 10, 3), 30, dtype=np.uint8)
+        canvas = np.full((text_y0 + 186, panel_x0 + PANEL_W + 10, 3), 30, dtype=np.uint8)
 
         headline = [
             (f'OBSTACLE-CUT: {"활성" if self.obstacle_cut_active else "대기"}  '
@@ -2832,45 +2878,49 @@ class TrackDriverNode(Node):
              f'장애물 y={self._obstacle_cut_y if self._obstacle_cut_y is not None else "N/A"}',
              (10, text_y0), (255, 255, 255), 14,
              f'last release: {self.obstacle_cut_release_reason or "(none)"}'),
-            (f'트리거 — 라이다 근접={self._obstacle_cut_lidar_near}  '
-             f'YOLO car={self.vehicle_detected_yolo_cut}  '
+            (f'[{cam_stage or "?"}단계] 트리거 — 라이다 근접={self._obstacle_cut_lidar_near}  '
+             f'YOLO {yolo_flag_label}={yolo_detected}  '
              f'AND확정={self._obstacle_cut_trigger_cnt}/{OBSTACLE_CUT_TRIGGER_FRAMES}',
              (10, text_y0 + 28), (255, 255, 255), 13,
-             f'trigger — lidar={self._obstacle_cut_lidar_near} yolo={self.vehicle_detected_yolo_cut} '
+             f'[{cam_stage}] trigger — lidar={self._obstacle_cut_lidar_near} yolo={yolo_detected} '
              f'confirm={self._obstacle_cut_trigger_cnt}/{OBSTACLE_CUT_TRIGGER_FRAMES}'),
             (f'해제 진행 — 라이다클리어 {self._obstacle_cut_release_cnt}/{OBSTACLE_CUT_RELEASE_CONFIRM_FRAMES}',
              (10, text_y0 + 50), (200, 200, 200), 13,
              f'release progress {self._obstacle_cut_release_cnt}/{OBSTACLE_CUT_RELEASE_CONFIRM_FRAMES}'),
+            (f'좌우 교차검증 — 라이다={self._obstacle_cut_lidar_side} YOLO={self._obstacle_cut_yolo_side} '
+             + ('★불일치→vehicle_seen 취소★' if self._obstacle_cut_side_veto else '(일치 또는 미해당)'),
+             (10, text_y0 + 72), (0, 0, 255) if self._obstacle_cut_side_veto else (180, 180, 180), 13,
+             f'side-check lidar={self._obstacle_cut_lidar_side} yolo={self._obstacle_cut_yolo_side} '
+             f'veto={self._obstacle_cut_side_veto}'),
             (f'컷 열(px) 범위 = {col_range}  (da BEV 좌표계)',
-             (10, text_y0 + 72), (255, 0, 255), 13, f'cut col range = {col_range}'),
-            (f'YOLO 검출기: {"정상" if self.yolo_vehicle_cut_detector is not None else "초기화실패→라이다단독폴백"}',
-             (10, text_y0 + 94), (255, 255, 255), 12,
-             f'yolo detector: {"OK" if self.yolo_vehicle_cut_detector is not None else "FAILED->lidar-only"}'),
-            ('── ★ 전 파라미터 실차 미검증 ★', (10, text_y0 + 118), UNMEASURED, 13,
+             (10, text_y0 + 94), (255, 0, 255), 13, f'cut col range = {col_range}'),
+            (f'YOLO 검출기({cam_stage or "?"}): {"정상" if cam_detector is not None else "초기화실패→라이다단독폴백"}',
+             (10, text_y0 + 116), (255, 255, 255), 12,
+             f'yolo detector({cam_stage}): {"OK" if cam_detector is not None else "FAILED->lidar-only"}'),
+            ('── ★ 전 파라미터 실차 미검증 ★', (10, text_y0 + 140), UNMEASURED, 13,
              '-- ALL PARAMS UNMEASURED --'),
             (f'TRIGGER X_MAX={OBSTACLE_CUT_TRIGGER_X_MAX_M}m Y_HALF={OBSTACLE_CUT_TRIGGER_Y_HALF_M}m  '
              f'NEAR_M={OBSTACLE_CUT_NEAR_M}m  SPEED_CAP={SPEED_OBSTACLE_CUT}',
-             (10, text_y0 + 140), UNMEASURED, 12,
+             (10, text_y0 + 162), UNMEASURED, 12,
              f'trigger_x={OBSTACLE_CUT_TRIGGER_X_MAX_M} y_half={OBSTACLE_CUT_TRIGGER_Y_HALF_M} '
              f'near={OBSTACLE_CUT_NEAR_M} speed_cap={SPEED_OBSTACLE_CUT}'),
         ]
         put_text_kr_multi(canvas, headline + lines)
 
-        # --- 카메라(YOLO 원시 박스) 패널 -------------------------------------------
-        cam_vis = (self.yolo_vehicle_cut_detector.get_latest_debug_frame()
-                   if self.yolo_vehicle_cut_detector is not None else None)
+        # --- 카메라(YOLO 원시 박스) 패널 — cam_stage에 따라 콘/차량 검출기 중 하나 --------
+        cam_vis = cam_detector.get_latest_debug_frame() if cam_detector is not None else None
         cam_region = canvas[cam_y0:cam_y0 + CAM_H, cam_x0:cam_x0 + CAM_W]
         if cam_vis is not None:
-            # 종횡비 유지 없이 단순 리사이즈(표시 전용 — yolo_vehicle.py preprocess()와
-            # 동일 관례, "검출 여부"만 보면 되고 좌표 왜곡은 이 창의 목적에 영향 없음).
+            # 종횡비 유지 없이 단순 리사이즈(표시 전용 — yolo_vehicle.py/yolo_cone.py
+            # preprocess()와 동일 관례, "검출 여부"만 보면 되고 좌표 왜곡은 이 창의 목적에
+            # 영향 없음).
             cam_region[:] = cv2.resize(cam_vis, (CAM_W, CAM_H), interpolation=cv2.INTER_LINEAR)
         else:
-            reason = ('DEBUG_VIZ_YOLO_VEHICLE 확인' if self.yolo_vehicle_cut_detector is not None
-                      else '검출기 초기화 실패')
+            reason = (f'{viz_flag_name} 확인' if cam_detector is not None else '검출기 초기화 실패')
             cv2.putText(cam_region, f'카메라 프레임 없음 ({reason})', (8, CAM_H // 2),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.42, (140, 140, 140), 1, cv2.LINE_AA)
         cv2.rectangle(canvas, (cam_x0, cam_y0), (cam_x0 + CAM_W - 1, cam_y0 + CAM_H - 1), (80, 80, 80), 1)
-        cv2.putText(canvas, 'YOLO VEHICLE CAM', (cam_x0, cam_y0 - 6),
+        cv2.putText(canvas, cam_label, (cam_x0, cam_y0 - 6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1, cv2.LINE_AA)
 
         # --- 라이다 ROI(트리거에 실제 쓰인 박스) BEV 패널 ---------------------------
@@ -3503,9 +3553,17 @@ class TrackDriverNode(Node):
         sig_flags = (f'R{int(self.signal_red_on)}L{int(self.signal_left_on)}S{int(self.signal_straight_on)} '
                      f'confirmS{int(self.signal_straight_confirmed)}({self._sig_straight_cnt}/{SIG_CONFIRM_FRAMES})'
                      f'L{int(self.signal_left_confirmed)}({self._sig_left_cnt}/{SIG_CONFIRM_FRAMES})')
+        # [2026-08-21] B2/B3 실제 회피는 behavior_state(override 여부)가 아니라 da 근접 컷
+        # (obstacle_cut_active)으로 이뤄져서 이 상태에선 behavior_state가 항상 B0_NORMAL로
+        # 고정돼(run_behavior_fsm() Phase.OBSTACLE_ZONE 분기 참고) 로그만 보면 회피 중인지
+        # 구분이 안 됐다 — obstacle_cut_debug(cv2 창)를 못 볼 때도 터미널에서 바로 보이게
+        # 요약 줄에 추가.
+        cut_desc = (f'{"ON" if self.obstacle_cut_active else "off"}'
+                    f'({self.obstacle_cut_type})' if self.obstacle_cut_type != 'none'
+                    else ("ON" if self.obstacle_cut_active else "off"))
         self.get_logger().info(
             f'[{self.mission_state.name}|{self.behavior_state.name}|{self.phase.name}] '
-            f'ang={self.ctrl_angle:+.1f} spd={self.ctrl_speed:.1f}\n'
+            f'ang={self.ctrl_angle:+.1f} spd={self.ctrl_speed:.1f} cut={cut_desc}\n'
             f'  [LAP] {self.lap}/{TOTAL_LAPS} 바퀴 '
             f'누적={math.degrees(self._yaw_accum):+.0f}도/{math.degrees(LAP_YAW_FULL):.0f} '
             f'경과={time.time() - self._lap_t0:.0f}s\n'
