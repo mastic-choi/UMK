@@ -35,7 +35,7 @@ from sensor_msgs.msg import Image, LaserScan, Imu
 from std_msgs.msg import Float32MultiArray, Float32
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy, HistoryPolicy
 from cv_bridge import CvBridge
-from .perception.perc_lavacon import process_lavacon
+from .perception.perc_lavacon import process_lavacon, CONE_LON_MAX as LAVACON_PATH_LON_MAX
 from .perception.hough_lane import HoughLaneDetector
 from .perception.perc_floor import check_stopline, LaneDetector as ClassicLaneDetector
 from .perception.lane_util import CameraProcessor, SlideWindow
@@ -119,6 +119,10 @@ class TrackDriverNode(Node):
         # _lane_drive()가 LANE_UNSTABLE_FRAMES 이상이면 SPEED_LANE_STALE과 동일한 캡을
         # 걸도록 보강한다 — "워커가 죽었나"가 아니라 "지금 이 프레임을 믿을 수 있나"
         # 자체를 보는 게 원래 목적에 더 맞다.
+        # [2026-08-18] 기준을 lane_valid(근접 전용)에서 path_ok(근접 OR 원거리)로 통일
+        # (perc_lane() 참고, 요청 반영) — 실제 조향 경로(self.lane_path) 갱신 조건과
+        # 정확히 같은 신호를 보게 되어, "경로는 갱신되는데 속도만 이유 없이 깎이는"
+        # 불일치가 사라진다. 근접+원거리 둘 다 없어야(=path_ok=False) 스트릭이 쌓인다.
         self._lane_invalid_streak = 0
         self.lane_unstable = False
         self._lane_prev_width = 448.0  # 도로폭 직전값(px, EMA)
@@ -173,6 +177,15 @@ class TrackDriverNode(Node):
         self.obstacle_rate  = 0.0     # 접근율(m/s, 음수=접근). 추돌 방지·교차확인용
         self._obstacle_prev_dist = None
         self._obstacle_prev_t    = 0.0
+        # [2026-08-19] avoid_hold 디버그창(_debug_viz_avoid_hold)이 "어떤 라이다 클러스터를
+        # 보고 판단했는지"를 그릴 수 있도록, perc_obstacle()이 매 틱 갱신하는 타겟 클러스터
+        # 원본 좌표(전방(+x)/횡(+y), m 단위) — self._obstacle_cluster_x/y가 실제 선택된
+        # 클러스터(tgt), self._obstacle_front_all_x/y가 같은 전방 ROI의 나머지 점(비교용 배경).
+        self._obstacle_cluster_x = np.empty(0, dtype=np.float32)
+        self._obstacle_cluster_y = np.empty(0, dtype=np.float32)
+        self._obstacle_front_all_x = np.empty(0, dtype=np.float32)
+        self._obstacle_front_all_y = np.empty(0, dtype=np.float32)
+        self._obstacle_cluster_group_count = 0  # 이번 틱 전방 ROI 안에서 발견된 별개 클러스터 개수
         # [2026-08-14] 회피 "복귀 유예"(avoid-hold) — _update_avoid_hold()가 perc_obstacle()
         # 직후 갱신하고, perc_lane()이 DL 차선인식 백엔드로 그대로 넘긴다(config.py
         # AVOID_HOLD_TRIGGER_DIST_M/AVOID_HOLD_SEC_* 주석, README §2.32/§2.33 참고).
@@ -187,6 +200,23 @@ class TrackDriverNode(Node):
         self._avoid_hold_release_cnt = 0            # obstacle_front=False 연속 프레임(조기해제 디바운스)
         self._avoid_hold_last_valid_dist = 999.0    # 마지막으로 obstacle_front=True였던 순간의 obstacle_dist
         self._avoid_hold_target_speed_est = 0.0     # 트리거 시점 target_speed_est 스냅샷(디버그 표시용)
+        # [2026-08-19] avoid_hold "왜 트리거됐는지" 라이다 클러스터 스냅샷 — 위
+        # self._obstacle_cluster_x/y(perc_obstacle()이 매 틱 덮어씀)를 트리거되는 그
+        # 순간(_update_avoid_hold() "새 트리거" 분기)에 한 번 복사해 avoid_hold_hold_sec
+        # 동안 그대로 유지한다. 매틱 최신값을 그대로 보여주면 장애물이 이미 멀어진 뒤
+        # (avoid_hold_active만 유예로 남아있는 동안)엔 화면이 비어 "왜 아직 유예 중인지"를
+        # 설명 못 한다 — _debug_viz_avoid_hold()가 이 스냅샷을 그린다.
+        self._avoid_hold_trigger_cluster_x = np.empty(0, dtype=np.float32)
+        self._avoid_hold_trigger_cluster_y = np.empty(0, dtype=np.float32)
+        self._avoid_hold_trigger_front_all_x = np.empty(0, dtype=np.float32)
+        self._avoid_hold_trigger_front_all_y = np.empty(0, dtype=np.float32)
+        self._avoid_hold_trigger_obstacle_dist  = 999.0
+        self._avoid_hold_trigger_obstacle_width = 0.0
+        self._avoid_hold_trigger_obstacle_type  = 'none'
+        self._avoid_hold_trigger_obstacle_side  = 'none'
+        self._avoid_hold_trigger_cluster_pts    = 0
+        self._avoid_hold_trigger_group_count    = 0
+        self._avoid_hold_trigger_cause          = ''  # 'lidar' / 'da_jump'
         # [2-4 라바콘]
         self.lavacon_offset = 0.0    # 디버그/로깅용(중심선 y평균) — 조향엔 더 이상 안 씀
         self.lavacon_done   = False
@@ -274,8 +304,8 @@ class TrackDriverNode(Node):
         self._pid_integral   = 0.0
         self._turn_yaw_start = None   # 좌회전 진행 중 플래그 (None=미회전)
         self._turn_frame_cnt = 0      # 좌회전 경과 프레임 수
-        self._s2_commit_t0  = None    # S2 신호 확정 후 물리적 분기 커밋 구간 시작 시각(None=미진입)
-        self._s2_commit_dir = None    # 커밋 구간에서 진행 중인 방향 ('straight'/'left')
+        self._s2_commit_dist = None   # S2 신호 확정 후 물리적 분기 커밋 구간 누적 이동거리(m, None=미진입)
+        self._s2_commit_dir  = None   # 커밋 구간에서 진행 중인 방향 ('straight'/'left')
         self._approach_t0    = None   # [진입] 정지선 감지 후 감속 시작 시각
         self._exit_approach_t0 = None # [진출] S3 탈출 정지선 감지 후 감속 시작 시각
         self._shortcut_t0    = None   # 지름길 진입 시각(끝감지 타이밍용)
@@ -328,15 +358,15 @@ class TrackDriverNode(Node):
             wheelbase_px=PP_WHEELBASE_PX,
             angle_max_deg=ANGLE_MAX,
             alpha=PP_ALPHA,
-            min_lookahead_px=PP_MIN_LOOKAHEAD_PX,
+            ld_floor_px=PP_LD_FLOOR_PX,
             dx_deadzone_px=PP_DX_DEADZONE_PX,
             lookahead_curvature_gain=PP_LOOKAHEAD_CURVATURE_GAIN,
             lookahead_min_px=PP_LOOKAHEAD_MIN_PX,
-            straight_curvature_eps=PP_STRAIGHT_CURVATURE_EPS,
-            straight_confirm_frames=PP_STRAIGHT_CONFIRM_FRAMES,
-            straight_deadzone_px=PP_STRAIGHT_DEADZONE_PX,
-            straight_alpha=PP_STRAIGHT_ALPHA,
-            straight_bias_ema_alpha=PP_STRAIGHT_BIAS_EMA_ALPHA,
+            wheelbase_boost_enable=PP_WHEELBASE_BOOST_ENABLE,
+            wheelbase_boost_gain_per_deg=PP_WHEELBASE_BOOST_GAIN_PER_DEG,
+            wheelbase_boost_max_scale=PP_WHEELBASE_BOOST_MAX_SCALE,
+            lookahead_alpha=PP_LOOKAHEAD_ALPHA,
+            lookahead_speed_anchor=PP_LOOKAHEAD_SPEED_ANCHOR,
         )
 
         self.path = None
@@ -556,14 +586,14 @@ class TrackDriverNode(Node):
         #   엄밀히는 직전 틱 값(0.05s 이내 오차, 디버깅 목적엔 무시 가능).
         lookahead_xy = self.pure_pursuit.last_target_xy
         lookahead_px = self.pure_pursuit.last_lookahead_px
-        # [2026-08-17d] 직전 틱의 직진/커브대응 상태도 같이 넘겨서 result 패널에 표시한다
-        # (dl_lane.DLLaneDetector.show_debug_windows() 주석 참고) — lookahead_xy/px와 동일하게
-        # 한 틱(0.05s) 지연 가능.
-        is_straight = self.pure_pursuit.is_straight
-        # [2026-08-17g] dl_lane 창 맨 아래 yellow 패널이 속도+커브대응 상태 패널로
-        # 바뀌면서(perception/dl_lane.py show_debug_windows() 참고) v_mps도 같이 넘긴다.
+        # [2026-08-19] wheelbase 부스트 전/후 조향각도 같이 넘겨서 ll 패널 상단에 표시한다
+        # (perception/dl_lane.py show_debug_windows() steer_deg_raw/steer_deg_final 주석,
+        # 요청 반영) — lookahead_xy와 동일하게 이번 틱 _lane_steer() 실행 전 시점이라
+        # 직전 틱 값(0.05s 이내 오차, 무시 가능).
         getattr(self.lane_detector, 'show_debug_windows', lambda *a, **k: None)(
-            lookahead_xy, lookahead_px, is_straight, self.v_mps)
+            lookahead_xy, lookahead_px, self.v_mps,
+            steer_deg_raw=self.pure_pursuit.last_pre_boost_steer_deg,
+            steer_deg_final=self.pure_pursuit.prev_steer_deg)
 
         # [2026-08-11] "재사용된 최신값"과 "완전히 안 갱신됨"을 구분 — DLLaneDetector가
         # 추론 1회 끝날 때마다 올리는 result_seq(dl_lane.py 참고)가 직전 틱에서 본 값과
@@ -582,12 +612,6 @@ class TrackDriverNode(Node):
 
         self.lane_center = lane_center
         self.lane_valid = valid
-        self._lane_invalid_streak = 0 if valid else self._lane_invalid_streak + 1
-        self.lane_unstable = self._lane_invalid_streak >= LANE_UNSTABLE_FRAMES
-        if valid:
-            # 기존 제어 코드와 호환되도록 필터링 적용
-            self.lane_offset = 0.7 * self.lane_offset + 0.3 * offset
-            self.lane_lookahead = 0.5 * self.lane_lookahead + 0.5 * lookahead
         # [2026-08-10] `if path:`만 보던 예전 조건은 디바운스가 전혀 없어서, 밴드 판정이
         # 프레임마다 흔들릴 때 그 흔들림을 거의 그대로 조향에 전달했다 — 그래서 `valid`도
         # 같이 요구하도록 바꿨었다(offset과 동일한 안정성 검증).
@@ -601,6 +625,18 @@ class TrackDriverNode(Node):
         # 여지는 없다. hough/classic_cv처럼 이 속성이 없는 백엔드는 getattr가 `valid`로
         # 폴백해 기존 동작 그대로다.
         path_ok = getattr(self.lane_detector, 'path_ok', valid)
+        # [2026-08-18] lane_unstable(SPEED_LANE_STALE 트리거)의 기준을 `valid`(근접 전용)
+        # 에서 `path_ok`(근접 OR 원거리, 위와 동일)로 통일 — 요청 반영: "경로만 있으면
+        # 충분하다, 경로가 안 찍힐 때 속도를 낮추는 것처럼 둘의 검출조건을 일치시키자".
+        # 실제 조향 경로(self.lane_path, 바로 아래)도 path_ok로 갱신되므로, 이제 "경로가
+        # 갱신 안 되는 시점"과 "속도가 깎이는 시점"이 정확히 같은 조건을 본다 — 근접만
+        # 비고 원거리로 경로가 계속 갱신되는 동안에는 더 이상 속도가 깎이지 않는다.
+        self._lane_invalid_streak = 0 if path_ok else self._lane_invalid_streak + 1
+        self.lane_unstable = self._lane_invalid_streak >= LANE_UNSTABLE_FRAMES
+        if valid:
+            # 기존 제어 코드와 호환되도록 필터링 적용
+            self.lane_offset = 0.7 * self.lane_offset + 0.3 * offset
+            self.lane_lookahead = 0.5 * self.lane_lookahead + 0.5 * lookahead
         if path_ok and path:
             self.lane_path = path
 
@@ -747,6 +783,15 @@ class TrackDriverNode(Node):
             groups = np.split(fidx, np.where(np.diff(fidx) > 1)[0] + 1)
             tgt = min(groups, key=lambda g: float(np.min(r[g])))
 
+            # [avoid_hold 디버그용] 선택된 타겟 클러스터(tgt)와 전방 ROI 전체 점(fidx, 배경
+            # 비교용) 원본 좌표를 저장 — _update_avoid_hold()가 트리거 순간에 이 값을
+            # 스냅샷해 _debug_viz_avoid_hold()가 그려준다(위 클래스 초기화부 주석 참고).
+            self._obstacle_cluster_x = x[tgt]
+            self._obstacle_cluster_y = y[tgt]
+            self._obstacle_front_all_x = x[fidx]
+            self._obstacle_front_all_y = y[fidx]
+            self._obstacle_cluster_group_count = len(groups)
+
             ty = y[tgt]
             self.obstacle_dist  = float(np.min(r[tgt]))
             # [6] 분류 기준을 '점 개수' → '실제 횡폭(m)' 으로.
@@ -791,6 +836,14 @@ class TrackDriverNode(Node):
             self._obstacle_prev_dist = None
             self._ema_y *= (1.0 - SIDE_EMA_ALPHA)
             self.obstacle_y = self._ema_y
+            # [2026-08-19] 위 obstacle_dist/type처럼 완전히 리셋 — 안 하면 장애물이 실제로
+            # 시야에서 사라진 뒤에도 _debug_viz_avoid_hold()의 BEV 패널에 몇 틱 전 클러스터
+            # 점이 계속 남아있어 "창이 멈췄다"로 오해하기 쉽다.
+            self._obstacle_cluster_x = np.empty(0, dtype=np.float32)
+            self._obstacle_cluster_y = np.empty(0, dtype=np.float32)
+            self._obstacle_front_all_x = np.empty(0, dtype=np.float32)
+            self._obstacle_front_all_y = np.empty(0, dtype=np.float32)
+            self._obstacle_cluster_group_count = 0
 
         # ── 좌/우 차선 공간 (추월 이동·복귀 판단) ──
         left_mask  = valid & (x > SIDE_X_MIN) & (x < SIDE_X_MAX) & (y >  LEFT_Y_MIN)  & (y <  LEFT_Y_MAX)
@@ -941,6 +994,22 @@ class TrackDriverNode(Node):
                     AVOID_HOLD_SEC_MAX, max(AVOID_HOLD_SEC_MIN, AVOID_HOLD_SEC_BASE + gain_term))
                 self._avoid_hold_release_cnt = 0
                 self.avoid_hold_release_reason = ''
+                # [2026-08-19] "어떤 라이다 클러스터를 보고 트리거됐는지" 디버그용 스냅샷 —
+                # target_speed_est와 같은 이유로 트리거 순간에만 찍는다(매 틱 최신값으로
+                # 덮어쓰면 장애물이 멀어진 뒤엔 화면이 비어버림, 위 클래스 초기화부 주석 참고).
+                self._avoid_hold_trigger_cluster_x = self._obstacle_cluster_x.copy()
+                self._avoid_hold_trigger_cluster_y = self._obstacle_cluster_y.copy()
+                self._avoid_hold_trigger_front_all_x = self._obstacle_front_all_x.copy()
+                self._avoid_hold_trigger_front_all_y = self._obstacle_front_all_y.copy()
+                self._avoid_hold_trigger_obstacle_dist  = self.obstacle_dist
+                self._avoid_hold_trigger_obstacle_width = self.obstacle_width
+                self._avoid_hold_trigger_obstacle_type  = self.obstacle_type
+                self._avoid_hold_trigger_obstacle_side  = self.obstacle_side
+                self._avoid_hold_trigger_cluster_pts    = int(self._obstacle_cluster_x.size)
+                self._avoid_hold_trigger_group_count    = self._obstacle_cluster_group_count
+                self._avoid_hold_trigger_cause = (
+                    'lidar' if (self.obstacle_front and self.obstacle_dist < AVOID_HOLD_TRIGGER_DIST_M)
+                    else 'da_jump')
             self._avoid_hold_until_t = now + self.avoid_hold_hold_sec
 
         # ③ 조기 해제 판정용 상태 갱신 — obstacle_front가 True인 동안(=아직 가까움)은
@@ -982,6 +1051,9 @@ class TrackDriverNode(Node):
         # 좌표(x=전방+, y=좌측+)를 그 스케일로 그대로 변환하면 물리적으로 일관된 입력이
         # 된다 — 차량 기준점은 원점(0,0)으로 두고(_handle_lavacon()이 vehicle_x=0.0으로
         # 호출), 좌측(+y_m)은 이미지 왼쪽(-col_px)에 대응한다.
+        # [2026-08-19] path_m 생성 로직 자체는 보로노이 → 좌우 콘 클러스터 중앙 페어링으로
+        # 교체됐지만(perc_lavacon.py 상단 주석 참고), 여기 변환/호출부는 출력 형식이 그대로라
+        # 변경 없음.
         self.lavacon_path = [(-y * DL_PIXELS_PER_METER, -x * DL_PIXELS_PER_METER) for x, y in path_m]
         # 위 px 변환 전 원본(라이다 미터 좌표) — _draw_lavacon_bev()가 DEBUG_VIZ_LAVACON일 때
         # 그대로 그려서 "실제로 조향에 쓰이는 경로"를 시각적으로 보여준다.
@@ -1125,8 +1197,18 @@ class TrackDriverNode(Node):
             else:                col = (60, 60, 60)
             cv2.circle(bev, (sx, sy), 3, col, -1)
 
+        # [2026-08-19] dl_lane.py의 vehicle_center_x 빨간 세로선(차량이 자기 위치/정면이라
+        # 믿는 기준선)과 동일한 개념 — 라이다 기준 차량 정면 방향(y=0, 전방 x축)을 빨간
+        # 직선으로 그린다. process_lavacon()의 최근접 이웃 페어링(_pair_nearest())이 바로
+        # 이 선 위에서 "가까운 좌측 콘부터, 그때 가장 가까운 우측 콘"을 찾아 짝짓는다 —
+        # 이 선이 곧 그 페어링의 기준이라는 걸 시각적으로 보여준다.
+        cv2.line(bev, to_px(0.0, 0.0), to_px(LAVACON_PATH_LON_MAX, 0.0), (0, 0, 255), 1)
+        cv2.putText(bev, 'vehicle_x (y=0)', (EX + 4, EY - 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1, cv2.LINE_AA)
+
         # [2026-08-11] 실제 조향에 쓰이는 경로(self._lavacon_path_m, perc_lavacon()이 채운
-        # 보로노이 정점 → x오름차순 정렬 결과) 시각화. 노란 선분이 Pure Pursuit/LQR이
+        # 좌우 콘 클러스터 중점 → x오름차순 정렬 결과, [2026-08-19] 보로노이 → 클러스터
+        # 중앙 추종 → 최근접 이웃 페어링 순으로 교체됨) 시각화. 노란 선분이 Pure Pursuit/LQR이
         # _target_point()에서 그대로 걷는 꺾은선이다 — 차량(원점)에서 시작해 정점을 순서대로
         # 잇는다. 원은 정점 하나하나(§질문 답변: "영역"이 아니라 점 하나씩).
         path_m = self._lavacon_path_m
@@ -1158,8 +1240,10 @@ class TrackDriverNode(Node):
         masked_min_s = f'{masked_min:.2f}m' if masked_min >= 0 else 'N/A'
         cv2.putText(bev, f'masked(magenta) pts={masked_pts} min={masked_min_s}',
                     (8, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1, cv2.LINE_AA)
-        cv2.putText(bev, f'yellow=lavacon_path(voronoi vertex, n={len(path_m)})',
+        cv2.putText(bev, f'yellow=lavacon_path(L/R cone-cluster midpoint, n={len(path_m)})',
                     (8, 132), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(bev, 'red=vehicle heading ref line (nearest-neighbor pairing axis)',
+                    (8, 154), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1, cv2.LINE_AA)
         cv2.imshow('lavacon_bev', bev)
         cv2.waitKey(1)
 
@@ -1306,8 +1390,8 @@ class TrackDriverNode(Node):
             self.signal_left_confirmed     = False
             self._sig_straight_cnt = 0
             self._sig_left_cnt     = 0
-            self._s2_commit_t0  = None
-            self._s2_commit_dir = None
+            self._s2_commit_dist = None
+            self._s2_commit_dir  = None
         # S1 진입 시 감속 플래그 초기화
         if new_state == MissionState.S1_LANE_FOLLOW:
             self._approach_t0 = None
@@ -1370,30 +1454,34 @@ class TrackDriverNode(Node):
         (정지 → 4구 신호 판독 → 직진/좌회전 확정). 이 state는 출발 직후 1번, 이후 매 바퀴
         트랙 중앙 분기점에서 재진입한다.
           1. 진입 즉시 정지 (기본값 STOP, 명시적 신호만 출발/재출발)
-          2. 직진 초록(signal_straight_confirmed) → 커밋 구간(S2_COMMIT_T) 거쳐 S1 복귀
+          2. 직진 초록(signal_straight_confirmed) → 커밋 구간(S2_COMMIT_DIST_M) 거쳐 S1 복귀
              + Behavior 활성화(라바콘부터 진행 — README §대회 규정 요약대로 출발 직후에도 매번 켠다)
              좌회전 신호(signal_left_confirmed) → 커밋 구간 거쳐 좌회전 후 S3(지름길, 3바퀴 중
              2·3바퀴째에 한 번만 등장)
           3. 좌회전 진행 중이면 신호와 무관하게 완료 우선
-          4. 커밋 구간(_s2_commit_t0)에서는 신호와 무관하게 직진만 유지 — 신호가 보이는
+          4. 커밋 구간(_s2_commit_dist)에서는 신호와 무관하게 직진만 유지 — 신호가 보이는
              지점과 실제 도로가 갈라지는 물리적 분기 지점이 떨어져 있고(config.py
-             S2_COMMIT_T 주석 참고), 그 사이에 _lane_drive()(비전)를 켜면 분기가
+             S2_COMMIT_DIST_M 주석 참고), 그 사이에 _lane_drive()(비전)를 켜면 분기가
              보이기 시작하는 순간 da가 반대쪽 갈래로 끌려간다(실측 재현됨, 교차로 기준). 신호로
-             이미 확정된 방향이므로 이 구간은 비전을 아예 참조하지 않는다. 출발 시점에는 이
-             분기 자체가 없지만 같은 코드경로를 타므로 출발 직후에도 짧게(S2_COMMIT_T=1초)
-             이 구간을 거친다 — 출발선은 직선이라 문제는 없을 것으로 보이나 실차 미검증.
+             이미 확정된 방향이므로 이 구간은 비전을 아예 참조하지 않는다. 커밋 구간 종료
+             판정은 시간이 아니라 VESC 실측(v_mps) 적분 거리로 한다 — 대회 주행 때 APPROACH_SPEED
+             근방 실속도가 튜닝 시점과 달라져도 물리적 분기 지점과 안 어긋나게(config.py
+             S2_COMMIT_DIST_M 주석 참고). 출발 시점에는 이 분기 자체가 없지만 같은 코드경로를
+             타므로 출발 직후에도 짧게(≈S2_COMMIT_DIST_M=1m) 이 구간을 거친다 — 출발선은 직선이라
+             문제는 없을 것으로 보이나 실차 미검증.
         """
         if self._turn_yaw_start is not None:
             self._do_left_turn(next_state=MissionState.S3_SHORTCUT)
             return
 
-        if self._s2_commit_t0 is not None:
+        if self._s2_commit_dist is not None:
             self.ctrl_angle = 0.0
             self.ctrl_speed = APPROACH_SPEED
-            if time.time() - self._s2_commit_t0 >= S2_COMMIT_T:
+            self._s2_commit_dist += self._commit_speed_mps() * 0.05  # 20Hz 제어주기(control_loop) 가정
+            if self._s2_commit_dist >= S2_COMMIT_DIST_M:
                 commit_dir = self._s2_commit_dir
-                self._s2_commit_t0  = None
-                self._s2_commit_dir = None
+                self._s2_commit_dist = None
+                self._s2_commit_dir  = None
                 if commit_dir == 'straight':
                     self._behavior_enabled = True
                     self._stopline_cooldown_t = time.time() + STOPLINE_COOLDOWN
@@ -1405,11 +1493,11 @@ class TrackDriverNode(Node):
         self.ctrl_angle, self.ctrl_speed = 0.0, SPEED_STOP
 
         if self.signal_straight_confirmed:
-            self._s2_commit_t0  = time.time()
-            self._s2_commit_dir = 'straight'
+            self._s2_commit_dist = 0.0
+            self._s2_commit_dir  = 'straight'
         elif self.signal_left_confirmed:
-            self._s2_commit_t0  = time.time()
-            self._s2_commit_dir = 'left'
+            self._s2_commit_dist = 0.0
+            self._s2_commit_dir  = 'left'
 
     # ── S3: 지름길 — 직진(+차선소실 대비), 끝에서 좌회전 ──
     def _s3_shortcut(self):
@@ -1486,18 +1574,33 @@ class TrackDriverNode(Node):
 
     # ── 좌회전 공통 (실차 전환: 후진 없이 무난한 좌회전) ──
     def _begin_left_turn(self):
-        self._turn_yaw_start = self.imu_yaw   # 플래그로만 사용 (None 여부 체크)
+        self._turn_yaw_start = self.imu_yaw   # closed-loop 기준점(IMU 죽었을 때만 미사용)
         self._turn_frame_cnt = 0
-        self.get_logger().info(f'좌회전 시작 ({TURN_FRAMES}f)')
+        self.get_logger().info('좌회전 시작')
 
     def _do_left_turn(self, next_state):
-        """무난한(후진 없는) 좌회전 후 next_state로 전환."""
-        if next_state == MissionState.S3_SHORTCUT:
-            trn_ang, trn_spd, trn_f = TURN_ANGLE, TURN_SPEED, TURN_FRAMES
-        else:
-            trn_ang, trn_spd, trn_f = TURN_EXIT_ANGLE, TURN_EXIT_SPEED, TURN_EXIT_FRAMES
+        """무난한(후진 없는) 좌회전 후 next_state로 전환.
 
-        if self._turn_frame_cnt < trn_f:
+        [2026-08-18] 종료 판정을 프레임 카운트(open-loop)에서 IMU yaw 실측
+        기반(closed-loop)으로 변경. IMU가 살아있으면(_imu_live()) 실제 회전각
+        (_yaw_delta(_turn_yaw_start))이 목표(trn_yaw_target, config.py TURN_YAW_TARGET_DEG류)에
+        도달했을 때 끝낸다 — 같은 (조향각, 속도) 명령이어도 배터리 전압 강하·노면·속도
+        변동에 따라 실제 요레이트가 매번 달라질 수 있어, "N프레임 지남"보다 정확하다.
+        trn_f(TURN_FRAMES류)는 이제 트리거가 아니라 IMU가 죽어있을 때만 걸리는 안전
+        타임아웃 상한이다 — 무한 회전 방지 + IMU 장애 시 예전과 동일한 동작으로 열화."""
+        if next_state == MissionState.S3_SHORTCUT:
+            trn_ang, trn_spd, trn_f, trn_yaw_target = (
+                TURN_ANGLE, TURN_SPEED, TURN_FRAMES, TURN_YAW_TARGET_DEG)
+        else:
+            trn_ang, trn_spd, trn_f, trn_yaw_target = (
+                TURN_EXIT_ANGLE, TURN_EXIT_SPEED, TURN_EXIT_FRAMES, TURN_EXIT_YAW_TARGET_DEG)
+
+        turn_done = self._turn_frame_cnt >= trn_f   # IMU 죽었을 때를 위한 안전 타임아웃
+        if self._imu_live():
+            yaw_turned_deg = abs(math.degrees(self._yaw_delta(self._turn_yaw_start)))
+            turn_done = turn_done or yaw_turned_deg >= trn_yaw_target
+
+        if not turn_done:
             self.ctrl_angle = trn_ang
             self.ctrl_speed = trn_spd
         else:
@@ -1600,14 +1703,34 @@ class TrackDriverNode(Node):
         EMA)에서 역산한다 — 이유는 _lane_drive() 상단 주석 참고(진동을 매번 급코너로 오인해
         감속하는 문제). [2026-08-10] 이 신호 전환이 커밋 80aefe3("디버그창 적용", 조향과 무관한
         디버그 캔버스 레이아웃 변경)에서 실수로 되돌려져 있던 걸 발견해 복원함 — README §0.5.3
-        참고."""
-        curvature = math.tan(math.radians(self._corner_signal)) / self.pure_pursuit.wheelbase_px
+        참고.
+
+        [2026-08-19] 반경 역산에 쓰는 축거리를 self.pure_pursuit.wheelbase_px(PP_WHEELBASE_PX,
+        조향 게인 튜닝값)에서 config.CORNER_RADIUS_WHEELBASE_PX(물리 기반 고정값, 67.0)로
+        분리했다(요청 반영) — PP_WHEELBASE_PX를 조향 반응성 목적으로 낮출 때마다 이 반경
+        계산도 같이 작아져서, 살짝만 꺾여도 코너 감속이 상시로 걸리는 부작용이 있었다
+        (config.py CORNER_RADIUS_WHEELBASE_PX 주석 참고)."""
+        curvature = math.tan(math.radians(self._corner_signal)) / CORNER_RADIUS_WHEELBASE_PX
         if curvature == 0.0:
             return 1.0
         radius = abs(1.0 / curvature)
         if radius >= CORNER_MIN_RADIUS_PX:
             return 1.0
         return max(CORNER_MIN_SPEED_SCALE, radius / CORNER_MIN_RADIUS_PX)
+
+    def _imu_corner_confirm_scale(self):
+        """turn_now/turn_preview(비전+조향출력 신호)가 코너라고 판단해도, IMU 실측
+        회전량(self.pure_pursuit.last_imu_curvature_px)이 이를 뒷받침하지 않으면 코너감속을
+        절반 이하로 깎는다(config.py CORNER_IMU_CONFIRM_KAPPA_PX/CORNER_IMU_MIN_SCALE 주석 —
+        2023 KMU AuTURBO rookie 팀의 ModeController가 IMU yaw 변화량으로 "진짜 커브"를
+        확인하던 패턴 참고). last_imu_curvature_px는 _lane_steer()가 이번 틱에 이미
+        갱신해뒀다(_imu_curvature_px() 호출 순서 참고) — 여기서 다시 계산하지 않는다.
+        None이면(IMU/VESC 죽었거나 dl+BEV 조합이 아니면) 기존처럼 비전 신호만 믿도록
+        1.0(무감쇠)을 반환한다. 실차 미검증 첫 추정치."""
+        imu_kappa = getattr(self.pure_pursuit, 'last_imu_curvature_px', None)
+        if imu_kappa is None:
+            return 1.0
+        return max(CORNER_IMU_MIN_SCALE, min(1.0, abs(imu_kappa) / CORNER_IMU_CONFIRM_KAPPA_PX))
 
     def _lane_drive(self):
         """S1/S3 공통 차선 조향+감속 로직. ctrl_angle·ctrl_speed·_prev_speed·_corner_hold 갱신."""
@@ -1631,30 +1754,23 @@ class TrackDriverNode(Node):
                                 + (1.0 - CORNER_SIGN_EMA_ALPHA) * self._corner_signal)
         turn_now     = min(1.0, abs(self._corner_signal) / ANGLE_MAX)
         turn_preview = min(1.0, abs(self.lane_lookahead) / LANE_LOOKAHEAD_REF)
-        # [2026-08-17] 명시적 직진 모드(README §0.5.9)를 코너 감속에도 병합 — pure_pursuit이
-        # (조향 출력과는 독립된 경로 curvature+IMU 신호로) "직진 확정"을 판단해준 프레임에는
-        # turn_now/turn_preview에 낀 잔여 노이즈로 인한 유령 감속을 무시하고 그대로 전속력을
-        # 낸다. is_straight가 아닌 프레임(코너 포함 전부)은 기존 연속값 로직을 그대로 쓴다 —
-        # 코너 감속 감도 자체는 전혀 안 바뀜.
-        is_straight = getattr(self.pure_pursuit, 'is_straight', False)
-        turn_for_speed = 0.0 if is_straight else max(turn_now, turn_preview * 0.3)
+        # [2026-08-18] IMU 실측 회전량으로 "비전이 본 코너가 진짜인가" 교차검증
+        # (_imu_corner_confirm_scale() 주석 참고) — turn_now/turn_preview가 비전 잡음만으로
+        # 감속을 거는 걸 막는다.
+        imu_corner_scale = self._imu_corner_confirm_scale()
+        turn_for_speed = max(turn_now, turn_preview * 0.3) * imu_corner_scale
+        # [2026-08-19] 0.90 → 0.80(요청 반영) — 조향(turn_for_speed)에 따른 감속이 너무 강하게
+        #   느껴진다는 피드백으로 소폭 완화. turn_for_speed=1(최대 코너 신호)일 때 SPEED_NORMAL
+        #   대비 90%가 아니라 80%까지만 깎이도록 함. 실차 재검증 필요 — 여전히 과하면 더 낮출 것.
         target_speed = max(SPEED_CORNER_MIN,
-                           SPEED_NORMAL * (1.0 - 0.90 * turn_for_speed ** 3))
+                           SPEED_NORMAL * (1.0 - 0.80 * turn_for_speed ** 3))
         # 코너 진입(회전반경 감소) 시 추가 감속 — 기존 turn_for_speed 기반 감속과는 독립적으로
-        # 계산해서 더 낮은 쪽을 쓴다(대체가 아니라 추가 안전판). 직진 확정 중엔 이 반경 계산도
-        # 같은 이유로 건너뛴다(1.0 = 감속 없음).
-        corner_radius_scale = 1.0 if is_straight else self._corner_radius_speed_scale()
+        # 계산해서 더 낮은 쪽을 쓴다(대체가 아니라 추가 안전판).
+        corner_radius_scale = self._corner_radius_speed_scale()
         target_speed = max(SPEED_CORNER_MIN, target_speed * corner_radius_scale)
-        # [2026-08-10] DL_CENTER_MODE='ll'에서 노란/흰선 중 하나를 저신뢰 추정(간격
-        # 재구성 또는 잔상)으로 메운 프레임은 속도를 SPEED_LL_DEGRADED로 강제 제한한다
-        # (요청 반영). 가/감속 모두 accel_step 램프 없이 즉시 적용 — 기존 코너 감속도
-        # 감속 방향은 램프 없이 즉시 반영되는 관례(가속만 아래 accel_step로 제한)와 동일.
-        # DL 백엔드 + 'll' 모드일 때만 의미 있으므로 getattr로 안전하게 조회한다(다른
-        # 백엔드/모드에선 속성이 없거나 항상 False).
-        slide = getattr(self.lane_detector, '_slide', None)
-        if (LANE_DETECTOR_BACKEND == 'dl' and DL_CENTER_MODE == 'll'
-                and getattr(slide, 'll_degraded', False)):
-            target_speed = min(target_speed, SPEED_LL_DEGRADED)
+        # [2026-08-18] SPEED_LL_DEGRADED 캡 제거 — DL_CENTER_MODE='ll'일 때만 의미있던
+        # 로직인데 현재 DL_CENTER_MODE='da'로 완전히 전환되어 차선(ll) 기반 주행을
+        # 더 이상 쓰지 않는다(요청 반영). config.py SPEED_LL_DEGRADED 상수도 함께 삭제.
         # [2026-08-11] LANE_STALE_SEC 이상 새 차선인식 결과가 안 나온 상태(perc_lane()의
         # lane_stale, config.py LANE_STALE_SEC 주석 참고) — 조향 자체는 이미 self.lane_path가
         # 고정돼 있어 안전하게(발산 없이) 마지막 판단을 유지하지만, 그것만으론 "지금 인지가
@@ -1672,15 +1788,19 @@ class TrackDriverNode(Node):
         # 이탈했다. lane_stale과 같은 SPEED_LANE_STALE 캡을 여기도 건다.
         if self.lane_unstable:
             target_speed = min(target_speed, SPEED_LANE_STALE)
-        # [2026-08-15] avoid-hold 적용4(안전판) — 회피 유예가 걸려있는 동안 choose_side()가
-        # 0(양쪽 다 막혀 어느 쪽으로도 못 피함)을 반환하면 강제로 감속한다. avoid_hold_side는
-        # _update_avoid_hold()가 매 틱 갱신하므로 이 조건은 avoid_hold_active가 아닌 틱에는
-        # 자연히 걸리지 않는다(avoid_hold_side 자체는 항상 계산되지만 여기서 avoid_hold_active
-        # 도 같이 확인). SPEED_CORNER_MIN/SPEED_LL_DEGRADED/SPEED_LANE_STALE과 같은 "즉시 cap"
-        # 관례 — avoid_hold_improvement_proposal.md "적용4" 참고, SPEED_AVOID_HOLD_BLOCKED
-        # 실차 미검증.
-        if self.avoid_hold_active and self.avoid_hold_side == 0:
-            target_speed = min(target_speed, SPEED_AVOID_HOLD_BLOCKED)
+        # [2026-08-19] 근접 밴드 hold 타임아웃(config.py DL_NEAR_HOLD_MAX_FRAMES,
+        # perception/dl_lane.py detect() 참고) — 근접 밴드가 그 프레임 수 넘게 안 잡혀
+        # hold도 포기한 상태면, "지금 차량 바로 앞 정보를 오래 못 믿고 있다"는 뜻이라
+        # lane_stale/lane_unstable과 동일하게 감속 신호로 드러낸다. hough/classic_cv
+        # 백엔드엔 이 속성이 없으니 getattr로 조회(다른 DL 전용 속성과 동일 관례).
+        if getattr(self.lane_detector, 'near_band_stale', False):
+            target_speed = min(target_speed, SPEED_LANE_STALE)
+        # [2026-08-18] avoid-hold 적용4(SPEED_AVOID_HOLD_BLOCKED 안전판) 삭제 — 실차 테스트에서
+        # "속도 5 고정" 증상의 실제 원인으로 확인됨(README §2.43). TEST_DISABLE_B2_B3=True라
+        # 실제 회피 기동(옆차선 이동)은 꺼져있는데 이 캡만 무관하게 계속 걸려서, 트리거를
+        # 풀어줄 수단이 없어 무한정 5.0에 고정되는 구조였다. avoid_hold_active/avoid_hold_side
+        # 자체(타이머, _update_avoid_hold())와 DA 클리핑 방향 편향(적용3,
+        # perception/dl_lane.py set_avoid_hold()) 소비부는 그대로 유지 — 요청 반영(속도캡만 제거).
         speed_ratio = min(1.0, self._prev_speed / SPEED_NORMAL)
         corner_decay = CORNER_HOLD_DECAY_LO + (CORNER_HOLD_DECAY_HI - CORNER_HOLD_DECAY_LO) * speed_ratio
         self._corner_hold = max(turn_now, self._corner_hold * corner_decay)
@@ -1707,6 +1827,12 @@ class TrackDriverNode(Node):
                 and (time.time() - self._vesc_t) < VESC_STALE_SEC
                 and abs(self.v_mps) >= VESC_MIN_SPEED_MPS)
 
+    def _imu_live(self):
+        """IMU 실측(self.imu_yaw)을 지금 믿을 수 있는가 — _vesc_live()와 동일 철학의
+        스테일 가드. 기존엔 _imu_curvature_px() 안에 인라인돼 있었는데(imu_live 지역변수),
+        [2026-08-18] _do_left_turn()의 yaw 목표각 판정도 똑같은 가드가 필요해져서 뺐다."""
+        return self._imu_t is not None and (time.time() - self._imu_t) < IMU_STALE_SEC
+
     def _imu_curvature_px(self):
         """IMU 각속도(yaw_rate) + VESC 실측속도(v_mps)로 "차량이 지금 실제로 얼마나
         도는지" curvature(1/px)를 구해 pure_pursuit의 코너 감쇠(lookahead_curvature_gain)를
@@ -1731,8 +1857,7 @@ class TrackDriverNode(Node):
         기존처럼 probe_curvature 단독 판단으로 자동 폴백하게 한다."""
         if not (LANE_DETECTOR_BACKEND == 'dl' and DL_USE_BEV):
             return None
-        imu_live = self._imu_t is not None and (time.time() - self._imu_t) < IMU_STALE_SEC
-        if not (imu_live and self._vesc_live()):
+        if not (self._imu_live() and self._vesc_live()):
             return None
         self._imu_yaw_rate_ema = (IMU_YAW_RATE_EMA_ALPHA * self.imu_yaw_rate
                                    + (1.0 - IMU_YAW_RATE_EMA_ALPHA) * self._imu_yaw_rate_ema)
@@ -1758,6 +1883,17 @@ class TrackDriverNode(Node):
             return abs(self.v_mps) / METERS_PER_SPEED_UNIT
         return self._prev_speed
 
+    def _commit_speed_mps(self):
+        """_s0_signal()의 커밋 구간 이동거리 적분에 쓸 현재 속도(m/s) 추정.
+        VESC 실측이 살아있으면(_vesc_live()) 그 값을 그대로 쓴다 — S2_COMMIT_DIST_M을
+        이 값으로 적분하면 대회 당일 실속도가 얼마든 실제 이동거리 기준으로 맞는다.
+        VESC가 죽어있을 때만 APPROACH_SPEED(명령속도)를 METERS_PER_SPEED_UNIT으로
+        환산해 폴백한다 — 예전 시간 기반(S2_COMMIT_T)이 암묵적으로 가정하던 것과
+        동일한 근사치라 VESC 장애 시에도 이전과 같은 동작으로 안전하게 열화된다."""
+        if self._vesc_live():
+            return abs(self.v_mps)
+        return APPROACH_SPEED * METERS_PER_SPEED_UNIT
+
     def _lane_steer(self, path=None, vehicle_x=None):
         """path(ROI 픽셀좌표 경로, 가까운점→먼점)를 pure_pursuit(controller/pure_pursuit.py)로
         추종해 조향각(도)을 계산한다. 차량 기준점은 (vehicle_x, path[0]의 y좌표)로 둔다.
@@ -1773,6 +1909,10 @@ class TrackDriverNode(Node):
         그대로 유지한다 — pure_pursuit.control()이 내부적으로 이렇게 처리한다.
         [2026-08-14] STEERING_CONTROLLER로 pure_pursuit/lqr 중 고르던 분기를 LQR 컨트롤러
         제거와 함께 없앴다 — 이제 pure_pursuit 고정."""
+        # [2026-08-19] 근접 장애물 급회피 대응 — path 인자를 명시로 넘기는 호출부
+        # (_handle_lavacon() 등)는 아래 if path is None 분기를 안 타므로 near_obstacle이
+        # 항상 False로 남는다 — 라바콘 등 다른 주행모드는 이 변경과 구조적으로 무관하다.
+        near_obstacle = False
         if path is None:
             path = self.lane_path
             # [2026-08-17] roi_w/2.0(캔버스 단순 절반) 대신, 백엔드가 노출하면
@@ -1783,11 +1923,17 @@ class TrackDriverNode(Node):
             vehicle_x = getattr(self.lane_detector, 'vehicle_center_x', None)
             if vehicle_x is None:
                 vehicle_x = roi_w / 2.0
+            # obstacle_front/obstacle_dist는 TEST_DISABLE_B2_B3와 무관하게 perc_obstacle()가
+            # 매 틱 갱신하므로 별도 stale 가드 없이 바로 써도 안전하다(_update_avoid_hold()와
+            # 동일 근거). AVOID_HOLD_TRIGGER_DIST_M(기존 상수, 1.5m) 재사용 — 별도 상수
+            # 안 늘림(요청 반영). pure_pursuit.py _target_point_max_deviation() 참고.
+            near_obstacle = self.obstacle_front and self.obstacle_dist < AVOID_HOLD_TRIGGER_DIST_M
         if not path or vehicle_x is None:
             return self.pure_pursuit.prev_steer_deg
         vehicle_xy = (vehicle_x, path[0][1])
         return self.pure_pursuit.control(path, vehicle_xy, speed=self._speed_for_lookahead(),
-                                          imu_curvature_px=self._imu_curvature_px())
+                                          imu_curvature_px=self._imu_curvature_px(),
+                                          near_obstacle=near_obstacle)
 
     # [DEBUG_VIZ_STEER] 조향 컨트롤러가 이번 주기에 "새로 계산"했는지(초록/현재값 반영)
     # "직전 조향각을 그대로 유지"했는지(주황/직전값 유지)를 별도 창으로 바로 확인.
@@ -1828,17 +1974,6 @@ class TrackDriverNode(Node):
         imu_text = f'{imu_kappa:+.4f}' if imu_kappa is not None else '미반영(IMU/VESC 확인)'
         lines.append((f'IMU curvature: {imu_text}', (10, 8 + 32 * len(lines)), imu_color, 18,
                        f'IMU curvature: {imu_text if imu_kappa is not None else "N/A"}'))
-
-        # [2026-08-17] 명시적 직진 모드(README §0.5.9, 조향 데드존 + 코너감속 둘 다 이 상태를
-        # 참고) 표시 — 확정까지 남은 프레임 수를 같이 보여줘서, 직전 몇 프레임이 이미
-        # 저곡률이었는지(곧 확정될지)를 실차에서 바로 확인할 수 있게 한다.
-        is_straight = getattr(controller, 'is_straight', False)
-        straight_frames = getattr(controller, '_straight_frames', 0)
-        straight_confirm = getattr(controller, 'straight_confirm_frames', 0)
-        straight_color = (0, 200, 0) if is_straight else (140, 140, 140)
-        straight_text = f'확정({straight_frames}프레임, 조향+속도 적용)' if is_straight else f'대기({straight_frames}/{straight_confirm})'
-        lines.append((f'직진모드: {straight_text}', (10, 8 + 32 * len(lines)), straight_color, 18,
-                       f'Straight mode: {"CONFIRMED (steer+speed)" if is_straight else f"waiting({straight_frames}/{straight_confirm})"}'))
 
         # DA(주행가능영역) 면적 — DL_DA_MAX_AREA_PX 실측 튜닝용. 원래 da_debug라는 별도
         # 창이었는데 조향 상태랑 같이 한눈에 보고 싶다는 요청으로 이 창에 합쳤다(2026-08-06).
@@ -1882,19 +2017,9 @@ class TrackDriverNode(Node):
             (10, 8 + 32 * len(lines)), (255, 255, 255), 18,
             f'DA seed width:{da_seed_width}px'))
 
-        # [2026-08-10] DL_CENTER_MODE='ll' 전용 — 노란선 기준 현재 차선 판정(lane_side)과
-        # 이번 프레임 저신뢰 추정(간격 재구성/잔상) 사용 여부. 후자가 True면
-        # _lane_drive()가 SPEED_LL_DEGRADED로 속도를 강제 제한 중이라는 뜻이라 빨강으로
-        # 강조 — 요청 반영("디버깅 페이지에도 띄울것").
-        if LANE_DETECTOR_BACKEND == 'dl' and DL_CENTER_MODE == 'll':
-            lane_side = getattr(slide, 'lane_side', None) if slide is not None else None
-            ll_degraded = getattr(slide, 'll_degraded', False) if slide is not None else False
-            degraded_kr = f'저신뢰(속도 {SPEED_LL_DEGRADED:.0f} 제한)' if ll_degraded else '정상'
-            degraded_en = f'DEGRADED (capped {SPEED_LL_DEGRADED:.0f})' if ll_degraded else 'OK'
-            side_color = (0, 0, 220) if ll_degraded else (255, 255, 255)
-            lines.append((
-                f'LL 차선:{lane_side} {degraded_kr}', (10, 8 + 32 * len(lines)), side_color, 18,
-                f'LL side:{lane_side} {degraded_en}'))
+        # [2026-08-18] SPEED_LL_DEGRADED 표시 블록 제거 — DL_CENTER_MODE='ll' 전용이었는데
+        # 현재 항상 'da'라 이 조건 자체가 죽어있었다(요청 반영, 위 target_speed 계산부의
+        # 동일 제거 사유 참고).
 
         canvas = np.full((8 + 32 * len(lines) + 16, 380, 3), 30, dtype=np.uint8)
         put_text_kr_multi(canvas, lines)
@@ -1947,13 +2072,73 @@ class TrackDriverNode(Node):
         cv2.imshow('vesc_debug', canvas)
         cv2.waitKey(1)
 
+    # [DEBUG_VIZ_IMU] IMU(/imu) 연동이 실제로 살아있는지 + 지금 imu_yaw 값이 얼마인지를
+    # 한눈에 보여주는 창(2026-08-18, _debug_viz_vesc()와 동일 패턴). 좌회전(_do_left_turn())을
+    # IMU yaw closed-loop로 바꾼 뒤, 실차에서 "IMU가 진짜 살아있는지"와 "좌회전 중 목표각까지
+    # 얼마나 남았는지"를 눈으로 볼 수단이 없어서 추가 — TURN_YAW_TARGET_DEG류 실측 튜닝 때
+    # 이 창을 보면서 좌회전이 실제로 몇 도에서 끝나는지, yaw 부호가 기대한 방향인지 확인할 것
+    # (부호 규약 자체가 pose_estimator.py 기준 "실차 미검증"이라 이 창으로 처음 확인해야 함).
+    # control_loop()에서 매 주기 호출.
+    def _debug_viz_imu(self):
+        now = time.time()
+        if self._imu_t is None:
+            color = (0, 0, 220)
+            text_kr, text_en = '/imu 메시지 수신 안 됨', 'NO MESSAGE RECEIVED YET'
+        else:
+            age = now - self._imu_t
+            if age > IMU_STALE_SEC:
+                color = (0, 140, 255)
+                text_kr, text_en = f'수신 끊김 (마지막 {age:.1f}초 전)', f'STALE (last {age:.1f}s ago)'
+            else:
+                color = (0, 200, 0)
+                text_kr, text_en = f'정상 수신 중 ({age*1000:.0f}ms 전)', f'LIVE ({age*1000:.0f}ms ago)'
+
+        yaw_deg = math.degrees(self.imu_yaw)
+        canvas = np.full((360, 380, 3), 30, dtype=np.uint8)
+        lines = [
+            (f'IMU 연동: {text_kr}', (10, 8), color, 16, f'IMU link: {text_en}'),
+            (f'imu_yaw: {yaw_deg:+7.2f}° ({self.imu_yaw:+.3f} rad)', (10, 44),
+             (255, 255, 255), 18, f'imu_yaw: {yaw_deg:+7.2f} deg'),
+        ]
+
+        turn_active = self._turn_yaw_start is not None
+        if turn_active:
+            # S0_SIGNAL(§신호등, 2026-08-20 S0_WAIT_GREEN+S2_INTERSECTION 통합)에서 진행 중인
+            # 좌회전은 "S2 교차로 → S3 지름길 진입" 좌회전, S3_SHORTCUT에서 진행 중이면
+            # "S3 → S1 진출" 좌회전이다(_do_left_turn()의 next_state 분기와 동일한 판별 기준).
+            yaw_target = (TURN_YAW_TARGET_DEG if self.mission_state == MissionState.S0_SIGNAL
+                          else TURN_EXIT_YAW_TARGET_DEG)
+            turned_deg = math.degrees(self._yaw_delta(self._turn_yaw_start))
+            lines.append((
+                f'좌회전 중: {abs(turned_deg):5.1f}° / {yaw_target:.1f}° (부호 {turned_deg:+.1f}°)',
+                (10, 76), (0, 255, 255), 16,
+                f'TURNING: {abs(turned_deg):5.1f} / {yaw_target:.1f} deg (signed {turned_deg:+.1f})'))
+        else:
+            lines.append(('좌회전 진행 중 아님', (10, 76), (150, 150, 150), 14, 'not turning'))
+
+        put_text_kr_multi(canvas, lines)
+        cv2.rectangle(canvas, (0, 0), (canvas.shape[1] - 1, canvas.shape[0] - 1), color, 3)
+
+        # 방위 다이얼 — atan2(y,x) 규약 그대로(0도=+x축, 반시계 증가) 그린 것뿐이라 실제
+        # 좌/우회전과 화살표 회전방향이 맞는지는 이 창으로 실차에서 직접 봐야 한다(부호
+        # 규약 미검증, 위 주석 참고). "값이 지금 이거다"를 시각적으로 보여주는 용도.
+        cx, cy, r = canvas.shape[1] // 2, 250, 90
+        cv2.circle(canvas, (cx, cy), r, (90, 90, 90), 2)
+        cv2.circle(canvas, (cx, cy), 3, (255, 255, 255), -1)
+        nx = int(cx + r * math.cos(self.imu_yaw))
+        ny = int(cy - r * math.sin(self.imu_yaw))
+        cv2.arrowedLine(canvas, (cx, cy), (nx, ny), (0, 255, 0), 2, tipLength=0.15)
+
+        cv2.imshow('imu_debug', canvas)
+        cv2.waitKey(1)
+
     # [DEBUG_VIZ_AVOID_HOLD] avoid-hold(§2.32, avoid_hold_improvement_proposal.md) 전용
     # 상태창 — 2026-08-15에 추가. 지금 유예가 걸려있는지/왜 걸렸는지/직전엔 왜 풀렸는지/
     # 방향 힌트가 뭔지를 실차에서 한눈에 보기 위한 것과 동시에, 이 기능이 새로 들여온
     # 파라미터 중 실측이 안 된 값들을 매 프레임 같이 띄워서 "이 숫자는 아직 지어낸
     # 값"이라는 걸 계속 상기시키는 용도(실측 절차는 avoid_hold_measurement_todo.md 참고).
-    # 아래 6개(RATE_GAIN/SEC_MAX/RELEASE_DIST_M/DA_AREA_JUMP_RATIO/DIR_BIAS_PX/
-    # SPEED_AVOID_HOLD_BLOCKED)는 그 문서에 적힌 측정 절차를 실차에서 그대로 따라가며
+    # 아래 5개(RATE_GAIN/SEC_MAX/RELEASE_DIST_M/DA_AREA_JUMP_RATIO/DIR_BIAS_PX)는
+    # 그 문서에 적힌 측정 절차를 실차에서 그대로 따라가며
     # 이 창의 실시간 값을 관찰하는 용도로도 쓰인다(예: da_area_jump가 실제 통과 순간에만
     # True로 뜨는지, 노이즈 프레임에서도 뜨는지 여기서 직접 눈으로 확인). control_loop()
     # 에서 매 주기 호출.
@@ -2003,15 +2188,90 @@ class TrackDriverNode(Node):
              (10, 178), UNMEASURED, 12,
              f'RATE_GAIN={AVOID_HOLD_RATE_GAIN} SEC_MAX={AVOID_HOLD_SEC_MAX} '
              f'RELEASE_DIST_M={AVOID_HOLD_RELEASE_DIST_M}'),
-            (f'DA_AREA_JUMP_RATIO={AVOID_HOLD_DA_AREA_JUMP_RATIO}   DIR_BIAS_PX={AVOID_HOLD_DIR_BIAS_PX}px'
-             f'   SPEED_BLOCKED={SPEED_AVOID_HOLD_BLOCKED}',
+            (f'DA_AREA_JUMP_RATIO={AVOID_HOLD_DA_AREA_JUMP_RATIO}   DIR_BIAS_PX={AVOID_HOLD_DIR_BIAS_PX}px',
              (10, 198), UNMEASURED, 12,
              f'DA_AREA_JUMP_RATIO={AVOID_HOLD_DA_AREA_JUMP_RATIO} '
-             f'DIR_BIAS_PX={AVOID_HOLD_DIR_BIAS_PX} SPEED_BLOCKED={SPEED_AVOID_HOLD_BLOCKED}'),
+             f'DIR_BIAS_PX={AVOID_HOLD_DIR_BIAS_PX}'),
         ]
-        canvas = np.full((222, 620, 3), 30, dtype=np.uint8)
+        # [2026-08-19] "어떤 라이다 클러스터를 보고 판단했는지" 미니 BEV 패널 — 위 텍스트
+        # 줄의 'front=.. dist=..'는 숫자로만 알려주는데, 벽/다른 차량 등 여러 클러스터가 같은
+        # 전방 ROI에 동시에 잡혀도 실제로 '이 결정에 쓰인' 게 어느 점 묶음인지는 안 보였다.
+        # [2026-08-19 수정] 처음엔 트리거 "순간"에만 스냅샷해 유예 내내 고정 표시했는데,
+        # 그러면 avoid_hold가 다시 트리거되기 전까진 패널이 그대로 멈춰있어("이 창 멈췄나?"
+        # 오해 재현됨) — perc_obstacle()이 매 틱 갱신하는 self._obstacle_cluster_x/y(현재
+        # 타겟 클러스터)/self._obstacle_front_all_x/y(같은 ROI 배경점)를 매 프레임 그대로
+        # 그리는 라이브 표시로 바꿨다. 장애물이 실제로 안 보이면(전방 ROI에 아무 점도 없으면)
+        # 패널도 정직하게 빈 채로 나온다 — 그게 "멈춤"이 아니라 "지금 아무것도 안 잡힘"이라는
+        # 뜻임을 밑에 텍스트로 같이 알려준다. "왜 아직 유예 중인지"는 _avoid_hold_trigger_*
+        # (트리거 시점 스냅샷, _update_avoid_hold() 참고)를 오른쪽 텍스트로 별도 표시한다.
+        PANEL_W, PANEL_H = 200, 200
+        panel_x0, panel_y0 = 15, 226
+        canvas = np.full((panel_y0 + PANEL_H + 12, 620, 3), 30, dtype=np.uint8)
         put_text_kr_multi(canvas, lines)
         cv2.rectangle(canvas, (0, 0), (canvas.shape[1] - 1, canvas.shape[0] - 1), active_color, 3)
+
+        cv2.putText(canvas, 'LIVE FRONT LIDAR CLUSTER (매틱 갱신)',
+                    (panel_x0, panel_y0 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1, cv2.LINE_AA)
+
+        bev = canvas[panel_y0:panel_y0 + PANEL_H, panel_x0:panel_x0 + PANEL_W]
+        FRONT_X_MAX_V, FRONT_Y_HALF_V = 5.0, 1.5   # perc_obstacle() FRONT ROI와 동일(표시축척용 재선언)
+        PPM = min(PANEL_H / (FRONT_X_MAX_V + 0.3), PANEL_W / (2 * FRONT_Y_HALF_V + 0.6))
+        EX, EY = PANEL_W // 2, PANEL_H - 8
+
+        def to_px(wx, wy):
+            return (int(EX - wy * PPM), int(EY - wx * PPM))
+
+        for d in (1, 2, 3, 4, 5):
+            if d > FRONT_X_MAX_V + 0.3:
+                break
+            cv2.circle(bev, (EX, EY), int(d * PPM), (55, 55, 55), 1)
+        cv2.rectangle(bev, to_px(0.0, FRONT_Y_HALF_V), to_px(FRONT_X_MAX_V, -FRONT_Y_HALF_V), (0, 150, 150), 1)
+
+        all_x = self._obstacle_front_all_x   # 매틱 갱신되는 라이브 값(perc_obstacle())
+        all_y = self._obstacle_front_all_y
+        for i in range(all_x.size):
+            px, py = to_px(float(all_x[i]), float(all_y[i]))
+            if 0 <= px < PANEL_W and 0 <= py < PANEL_H:
+                cv2.circle(bev, (px, py), 2, (90, 90, 90), -1)   # 같은 ROI의 다른 점(미사용, 회색)
+
+        cl_x = self._obstacle_cluster_x       # 매틱 갱신되는 라이브 값 — 지금 avoid_hold 트리거
+        cl_y = self._obstacle_cluster_y       # 판정(obstacle_front/obstacle_dist)에 쓰이는 바로 그 클러스터
+        for i in range(cl_x.size):
+            px, py = to_px(float(cl_x[i]), float(cl_y[i]))
+            if 0 <= px < PANEL_W and 0 <= py < PANEL_H:
+                cv2.circle(bev, (px, py), 4, (0, 0, 255), -1)    # 실제 판정에 쓰인 타겟 클러스터(빨강)
+
+        if all_x.size == 0:
+            cv2.putText(bev, '(전방 ROI에 점 없음)', (8, PANEL_H - 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1, cv2.LINE_AA)
+
+        cv2.circle(bev, (EX, EY), 5, (255, 220, 0), -1)          # 자차 위치
+        cv2.rectangle(bev, (0, 0), (PANEL_W - 1, PANEL_H - 1), (80, 80, 80), 1)
+
+        info_x = panel_x0 + PANEL_W + 24
+        info_lines = [
+            ('빨강=현재 avoid_hold 판정에 쓰이는 클러스터', (info_x, panel_y0 - 4), (255, 255, 255), 13,
+             'red = cluster currently used'),
+            ('회색=같은 ROI의 다른 점(미사용)', (info_x, panel_y0 + 18), (150, 150, 150), 12,
+             'gray = other ROI points (unused)'),
+            (f'── 마지막 트리거 시점(hold_sec 재시작 순간) 스냅샷 ──',
+             (info_x, panel_y0 + 44), (110, 160, 255), 12,
+             '-- last trigger-moment snapshot --'),
+            (f'원인={self._avoid_hold_trigger_cause or "(아직 없음)"}  '
+             f'클러스터 {self._avoid_hold_trigger_cluster_pts}점'
+             f'/전체클러스터 {self._avoid_hold_trigger_group_count}개',
+             (info_x, panel_y0 + 66), (255, 255, 255), 12,
+             f'cause={self._avoid_hold_trigger_cause or "(none)"} '
+             f'pts={self._avoid_hold_trigger_cluster_pts}/{self._avoid_hold_trigger_group_count}'),
+            (f'거리={self._avoid_hold_trigger_obstacle_dist:.2f}m  '
+             f'폭={self._avoid_hold_trigger_obstacle_width:.2f}m  '
+             f'{self._avoid_hold_trigger_obstacle_type}/{self._avoid_hold_trigger_obstacle_side}',
+             (info_x, panel_y0 + 88), (255, 255, 255), 12,
+             f'dist={self._avoid_hold_trigger_obstacle_dist:.2f}m '
+             f'width={self._avoid_hold_trigger_obstacle_width:.2f}m '
+             f'{self._avoid_hold_trigger_obstacle_type}/{self._avoid_hold_trigger_obstacle_side}'),
+        ]
+        put_text_kr_multi(canvas, info_lines)
 
         cv2.imshow('avoid_hold_debug', canvas)
         cv2.waitKey(1)
@@ -2126,7 +2386,7 @@ class TrackDriverNode(Node):
                 f'보임(추정 속도={target_speed_est:+.2f}m/s) — 오검출/오판 의심',
                 throttle_duration_sec=1.0)
 
-    # ── B1-라바콘: 보로노이 편차 기반 P제어 ──
+    # ── B1-라바콘: 좌우 콘 클러스터 중앙 경로 추종([2026-08-19] 보로노이에서 교체) ──
     def _handle_lavacon(self):
         """
         Phase.LAVACON 동안 항상 활성(트리거 조건 없음).
@@ -2425,6 +2685,8 @@ class TrackDriverNode(Node):
             self._debug_viz_steer()
         if DEBUG_VIZ_VESC:
             self._debug_viz_vesc()
+        if DEBUG_VIZ_IMU:
+            self._debug_viz_imu()
         if DEBUG_VIZ_AVOID_HOLD:
             self._debug_viz_avoid_hold()
         if DEBUG_VIZ_SIGNAL and self.mission_state == MissionState.S0_SIGNAL:
@@ -2460,7 +2722,7 @@ class TrackDriverNode(Node):
           [LANE] 차선편차px(검출여부) stale=LANE_STALE_SEC 이상 새 추론결과 없음(1) 여부
                  (SPEED_LANE_STALE로 강제감속 중이라는 뜻 — 코너 아닌데 감속되면 이거 확인)
                  / obs = 라이다 전방장애물(거리m,좌우,타입)
-          lava   = 라바콘 보로노이 편차(구간종료 판정)
+          lava   = 라바콘 좌우 클러스터 중앙 편차(구간종료 판정)
           trigL  = 라바콘 진입: 본선카운트/기준 (좌클러스터,우클러스터 검출여부)
           trigV  = 차량 진입:   본선카운트/기준
           [LAVA-ROI] 라바콘 트리거 ROI(전방0.3~3.0m,좌우2.0m) 안에 잡힌 점 개수(pts)와
