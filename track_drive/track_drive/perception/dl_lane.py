@@ -219,6 +219,8 @@ from ..config import (
     # [2026-08-15] avoid-hold 개선 적용2(da 연속성 보조트리거)/적용3(방향 힌트) — README §2.32,
     # avoid_hold_improvement_proposal.md
     AVOID_HOLD_DA_AREA_JUMP_RATIO, AVOID_HOLD_DIR_BIAS_PX,
+    # [2026-08-20] da 근접 컷(obstacle-cut, ENABLE_OBSTACLE_CUT) — README §2.5x 참고
+    LANE_WIDTH_M, OBSTACLE_CUT_NEAR_M, OBSTACLE_CUT_LANE_HALF_WIDTH_PX, OBSTACLE_CUT_MIN_REMAIN_PX,
     # DL_LL_ALGO='yw'(팀원 작성, main 기본) 전용
     DL_LL_YELLOW_GAP_INIT_PX, DL_LL_YELLOW_GAP_EMA_ALPHA,
     DL_LL_YELLOW_GAP_MIN_PX, DL_LL_YELLOW_GAP_MAX_PX,
@@ -571,6 +573,12 @@ class DLSlideWindow(SlideWindow):
         self.da_clip_cut_left_x = [None] * self.n_slices   # 이 밴드에서 왼쪽 경계로 잘라낸 x좌표(px, ROI 좌표계). None=왼쪽은 안 잘림
         self.da_clip_cut_right_x = [None] * self.n_slices  # 오른쪽 동일
         self.da_clip_bias_px = [None] * self.n_slices       # avoid-hold 적용3(AVOID_HOLD_DIR_BIAS_PX)이 가상경계 기준점을 이 밴드에서 실제로 얼마나(부호 포함, px) 밀었는지. 실측/잔상(①) 밴드는 항상 None
+
+        # [2026-08-20] da 근접 컷(_clip_da_by_obstacle(), ENABLE_OBSTACLE_CUT) — 이번 프레임
+        # 실제로 컷이 적용됐는지/어느 열(px) 범위를 잘랐는지. visualize() 오버레이 + track_drive.py
+        # 디버그 창(_debug_viz_obstacle_cut())이 getattr(self.lane_detector._slide, ...)로 조회.
+        self.obstacle_cut_active = False
+        self.obstacle_cut_col_range = None
 
         # [2026-08-10] 최근 DL_DEBUG_HISTORY_LEN 프레임의 offset(디바운스 이후 최종값)을
         # 들고 있다가 [2026-08-11] 'dl_lane' 창 맨 아래에 스파크라인으로 그린다(예전엔
@@ -957,6 +965,80 @@ class DLSlideWindow(SlideWindow):
                 # 다시 판단한다).
 
         return clipped, virtual_used
+
+    def _clip_da_by_obstacle(self, da_mask, obstacle_y_m, confirmed):
+        """[2026-08-20] da 근접 컷(ENABLE_OBSTACLE_CUT) — `_clip_da_by_ll()`(위)의
+        가상경계(②)와 `_apply_vehicle_margin()`에 이은 이 파일의 세 번째 "근거(픽셀)
+        없이 강제로 da를 클리핑"하는 함수. 다만 여기서는 근거가 픽셀이 아니라
+        라이다+YOLO로 확정된 외부 신호(`confirmed`)다.
+
+        [설계 배경] 장애물/방해차량을 da 안전마진(`_apply_vehicle_margin()`, §2.30)의
+        국소 침식만으로 피하게 두면 반응이 장애물 바로 앞에서만 완만하게 걸린다.
+        Pure Pursuit lookahead를 늘려서 더 멀리부터 보게 하는 안도 검토했으나
+        curvature=2·sin(α)/ld 공식상 ld(lookahead 거리)가 커질수록 같은 횡편차라도
+        곡률 추정이 오히려 희석되는 역효과만 확인돼(README §2.5x) 폐기했다. 대신
+        "차량↔장애물 사이 구간의 da를 장애물 쪽 절반만 통째로 잘라 갈림길을
+        뚜렷하게 만드는" 방식으로 전환했다 — 이러면 Pure Pursuit이 평소 코너/분기를
+        따라가듯 자연스럽게 이른 조향을 낸다.
+
+        [컷의 먼 경계를 obstacle_dist로 계산하지 않는 이유] 이 함수가 호출되는
+        시점엔(트리거 확정 조건, config.py OBSTACLE_CUT_TRIGGER_X_MAX_M=1.0 참고)
+        장애물까지 실측거리가 항상 DL_BEV_FAR_LIMIT_M(0.7m, da BEV 캔버스의 표현
+        한계)보다 가깝거나 비슷하다 — 즉 da 안에는 애초에 "장애물보다 먼 행(row)"이
+        따로 존재하지 않는다. 그래서 컷의 먼 경계는 그냥 캔버스 자체의 끝(row 0,
+        detect()에서 이미 DL_BEV_FAR_CROP_ROW로 크롭된 상태)으로 두고, 가까운
+        경계만 차량 바로 앞 고정값(OBSTACLE_CUT_NEAR_M)으로 잡는다 — 그 사이는
+        전부 컷 대상.
+
+        ★부호규약 주의(실차 미검증, 반드시 저속에서 먼저 확인)★ obstacle_y_m은
+        perc_obstacle_cut_trigger()가 라이다로 잰 값으로, 이 저장소 관례상 +가 좌측
+        이다(TargetPassing.choose_side()가 "obstacle_y>0(좌측) → +1(우측 통과)"로
+        쓰는 것과 동일 부호). da BEV 캔버스는 이미지 좌표계라 x가 클수록 화면
+        오른쪽(=물리적 우측)이므로, 장애물이 좌측(obstacle_y_m>0)이면 캔버스에서
+        작은 x(왼쪽) 절반을 잘라야 한다 — 반대로 자르면 열린 쪽이 아니라 장애물
+        쪽으로 조향하게 되는 치명적 버그이니 실차 첫 테스트에서 반드시 확인할 것.
+
+        입력 : da_mask — (roi_h, roi_w) uint8 이진마스크
+               obstacle_y_m — 장애물 횡위치(m, +좌측). None이면 컷 안 함.
+               confirmed — 위 트리거(라이다 AND YOLO, 디바운스 통과)가 True로
+                           확정했는지. False면 그대로 반환(컷 없음).
+        출력 : clipped da_mask(원본과 shape 동일). 부수효과로 self.obstacle_cut_active/
+               self.obstacle_cut_col_range를 이번 프레임 상태로 갱신(visualize() 디버그용).
+        """
+        self.obstacle_cut_active = False
+        self.obstacle_cut_col_range = None
+        if not confirmed or obstacle_y_m is None:
+            return da_mask
+
+        h, w = da_mask.shape
+        vehicle_x = self.vehicle_center_x
+        half_width_px = (OBSTACLE_CUT_LANE_HALF_WIDTH_PX if OBSTACLE_CUT_LANE_HALF_WIDTH_PX is not None
+                          else LANE_WIDTH_M * DL_PIXELS_PER_METER)
+        near_row_px = int(np.clip(h - OBSTACLE_CUT_NEAR_M * DL_PIXELS_PER_METER, 0, h))
+
+        if obstacle_y_m > 0:   # 장애물 좌측(라이다 +y=좌측) → 좌측(작은 x) 절반 클리핑
+            x0, x1 = int(np.clip(vehicle_x - half_width_px, 0, w)), int(np.clip(vehicle_x, 0, w))
+        else:                  # 장애물 우측 → 우측(큰 x) 절반 클리핑
+            x0, x1 = int(np.clip(vehicle_x, 0, w)), int(np.clip(vehicle_x + half_width_px, 0, w))
+        if x1 <= x0 or near_row_px <= 0:
+            return da_mask
+
+        # [안전장치] 클리핑 후 열린(반대) 쪽에 da가 최소폭 이상 남는지 확인 —
+        # 안 남으면(da가 그 구간에서 통째로 비면) pure_pursuit.control()의
+        # "path 없으면 직전 조향각 유지(held)" 폴백이 걸려, 회피가 가장 필요한
+        # 순간 조향이 오히려 얼어붙는다(세션 초반에 다룬 그 문제) — 이럴 땐 컷을
+        # 포기하고 원본을 그대로 둔다("차선책" 원칙, _apply_vehicle_margin()과 동일).
+        open_region = da_mask[0:near_row_px, :]
+        open_cols = np.nonzero(np.any(open_region > 0, axis=0))[0]
+        open_cols = open_cols[(open_cols < x0) | (open_cols >= x1)]
+        if open_cols.size == 0 or (open_cols.max() - open_cols.min()) < OBSTACLE_CUT_MIN_REMAIN_PX:
+            return da_mask
+
+        clipped = da_mask.copy()
+        clipped[0:near_row_px, x0:x1] = 0
+        self.obstacle_cut_active = True
+        self.obstacle_cut_col_range = (x0, x1)
+        return clipped
 
     def _split_ll_by_yellow(self, ll_mask, yellow_roi):
         """ll_mask(흰/노랑 구분 없는 차선 이진마스크)를 커넥티드 컴포넌트 단위로
@@ -1650,7 +1732,8 @@ class DLSlideWindow(SlideWindow):
 
         return self._path_ok_confirmed
 
-    def detect(self, raw_bgr, da_prob, ll_prob, yellow_mask, avoid_hold=False, direction_hint=0, v_mps=0.0):
+    def detect(self, raw_bgr, da_prob, ll_prob, yellow_mask, avoid_hold=False, direction_hint=0, v_mps=0.0,
+               obstacle_y_m=None, obstacle_cut_confirmed=False):
         """입력 : raw_bgr — 원본 카메라 프레임 그대로의 (H,W,3) BGR(크롭/리사이즈 없음)
                  da_prob, ll_prob — 위와 같은 (H,W) float32 foreground 확률(모델은 360행
                    고정이지만 TwinLiteNetEngine.infer_raw()가 이미 원본 크기로 업샘플링해서 줌)
@@ -1667,6 +1750,10 @@ class DLSlideWindow(SlideWindow):
                    track_drive.py TargetPassing.choose_side()가 반환한 -1/0/+1(lane_offset과
                    동일한 "우측+" 부호규약) — _clip_da_by_ll()의 실측/잔상이 전혀 없는
                    최후수단(가상경계) 폴백에서만 기준점을 이 방향으로 살짝 기울이는 데 쓴다.
+                 obstacle_y_m, obstacle_cut_confirmed — [2026-08-20] da 근접 컷
+                   (_clip_da_by_obstacle(), ENABLE_OBSTACLE_CUT). track_drive.py의
+                   perc_obstacle_cut_trigger()가 라이다 AND YOLO로 확정한 값을
+                   set_obstacle()을 거쳐 넘겨준다. DL_CENTER_MODE=='da' 전용.
           출력 : lane_valid, offset, lookahead, lane_center, path — 기존 SlideWindow.calc_center()와
                  동일한 계약(같은 4-tuple+path 형태)이지만, 계산은 da 중심선 기준으로 직접 한다.
           내부에서 DL_ROI_Y0:DL_ROI_Y1(원본 프레임 절대 픽셀)만 잘라서 da 중심선을 뽑는다.
@@ -1893,6 +1980,12 @@ class DLSlideWindow(SlideWindow):
                     )
                     self.ll_band_reason = [None] * self.n_slices
             else:
+                # [2026-08-20] da 근접 컷 — ll 클리핑 이후, 차폭 안전마진 침식 이전에
+                # 적용한다(_apply_vehicle_margin()이 그 위에 다시 침식을 걸어주므로 레이어
+                # 순서가 자연스럽게 쌓인다). ENABLE_OBSTACLE_CUT=False면 obstacle_cut_confirmed가
+                # 항상 False라 여기서 사실상 아무 일도 안 한다(그대로 반환).
+                da_mask = self._clip_da_by_obstacle(da_mask, obstacle_y_m, obstacle_cut_confirmed)
+
                 # [2026-08-14] 중심선 계산에만 안전마진을 적용한다 — self.da_mask_roi(아래,
                 # 디버그 시각화용)는 침식 전 원본을 그대로 담아야 "da가 실제로 어디까지
                 # 검출됐는지"와 "마진 때문에 얼마나 물러났는지"를 구분해서 볼 수 있다.
@@ -2072,6 +2165,15 @@ class DLSlideWindow(SlideWindow):
             if self.ll_yellow_mask_roi is not None:
                 overlay[self.ll_yellow_mask_roi > 0] = (0, 255, 255)   # 노란선
             cv2.addWeighted(overlay, 0.35, self.vis, 0.65, 0, dst=self.vis)
+
+            # [2026-08-20] da 근접 컷(_clip_da_by_obstacle(), ENABLE_OBSTACLE_CUT) — 이번
+            # 프레임 실제로 클리핑한 열(px) 범위를 마젠타 사각형으로 표시. da_clip_band_virtual
+            # (①/② 틱, ll 클리핑용)과는 별개 오버레이 — 근접 컷은 밴드 단위가 아니라 한
+            # 사각형이라 별도로 그린다.
+            if self.obstacle_cut_active and self.obstacle_cut_col_range is not None:
+                x0, x1 = self.obstacle_cut_col_range
+                near_row_px = int(np.clip(self.roi_h - OBSTACLE_CUT_NEAR_M * DL_PIXELS_PER_METER, 0, self.roi_h))
+                cv2.rectangle(self.vis, (x0, 0), (x1, near_row_px), (255, 0, 255), 2)
 
             # corridor(DL_CENTER_MODE='ll_da') 전용: 밴드별로 채택된 corridor 경계
             # (1/3번째 ll 선)를 자홍색 세로 틱으로 표시 — sanity check를 통과해
@@ -2455,6 +2557,11 @@ class DLLaneDetector:
         # 읽어 self.lane_path 갱신을 가드한다 — hough/classic_cv처럼 이 속성이 없는
         # 백엔드는 getattr 기본값(valid)으로 조용히 폴백해 기존 동작 그대로 유지된다.
         self.path_ok = False
+        # [2026-08-20] da 근접 컷(_clip_da_by_obstacle(), ENABLE_OBSTACLE_CUT) — track_drive.py가
+        # 매 틱 set_obstacle()로 갱신하면 _worker()가 다음 추론 때 avoid_hold와 같은 락으로
+        # 같이 읽어 DLSlideWindow.detect()에 넘긴다.
+        self._latest_obstacle_y = None
+        self._latest_obstacle_cut_confirmed = False
         self._latest_result = (False, 0.0, 0.0, default_center, [], None)
         # 디버그 창에 띄울 최근 프레임(초록/빨강 오버레이가 이미 그려진 vis, da/ll 원본 마스크).
         # 워커 스레드가 여기 값만 갱신하고, 실제 cv2.imshow()는 show_debug_windows()가
@@ -2497,6 +2604,15 @@ class DLLaneDetector:
         with self._lock:
             self._latest_v_mps = float(v_mps)
 
+    def set_obstacle(self, y_m, confirmed):
+        """[2026-08-20] track_drive.py의 perc_lane()이 매 틱 호출 — da 근접 컷
+        (_clip_da_by_obstacle(), ENABLE_OBSTACLE_CUT) 트리거 상태를 다음 추론에
+        반영한다(set_avoid_hold()/set_speed()와 동일 관례). 단순 대입이라 별도 검증
+        없이 저장한다. y_m=None이면 장애물 횡위치 정보 없음(confirmed도 무시됨)."""
+        with self._lock:
+            self._latest_obstacle_y = None if y_m is None else float(y_m)
+            self._latest_obstacle_cut_confirmed = bool(confirmed)
+
     def _worker(self):
         """추론 워커 — 이 스레드 안에서는 절대 cv2.imshow()/cv2.waitKey()를 호출하지 않는다.
         OpenCV HighGUI(GTK 백엔드)가 스레드 세이프하지 않아서, 메인 스레드(다른 디버그
@@ -2511,6 +2627,8 @@ class DLLaneDetector:
                 avoid_hold = self._latest_avoid_hold
                 avoid_hold_side = self._latest_avoid_hold_side
                 v_mps = self._latest_v_mps
+                obstacle_y = self._latest_obstacle_y
+                obstacle_cut_confirmed = self._latest_obstacle_cut_confirmed
             if frame is None:
                 time.sleep(0.005)
                 continue
@@ -2522,7 +2640,8 @@ class DLLaneDetector:
                 )
                 lane_valid, offset, lookahead, lane_center, path = self._slide.detect(
                     raw_bgr, da_prob, ll_prob, yellow_mask,
-                    avoid_hold=avoid_hold, direction_hint=avoid_hold_side, v_mps=v_mps
+                    avoid_hold=avoid_hold, direction_hint=avoid_hold_side, v_mps=v_mps,
+                    obstacle_y_m=obstacle_y, obstacle_cut_confirmed=obstacle_cut_confirmed,
                 )
                 debug_img = self._slide.vis
             except Exception as e:

@@ -653,6 +653,58 @@ AVOID_HOLD_DIR_BIAS_PX = 20.0   # ≈ PASS_OFFSET(80.0, "7. 기타" 절, 실측 
 #   수단이 없어 무한정 고정되는 구조였다. avoid_hold 타이머/DA 클리핑 방향 편향(적용3,
 #   AVOID_HOLD_DIR_BIAS_PX 위 참고)은 그대로 유지 — 요청 반영(속도캡 소비부만 제거).
 
+# ── [2026-08-20] da 근접 컷(obstacle-cut) — avoid_hold(위)와 완전히 독립된 신규 메커니즘 ──
+#   배경: 장애물/방해차량이 잡혔을 때 da 안전마진(§2.30)의 국소 침식만으로는 반응이
+#   너무 완만하다(장애물 바로 앞에서만 살짝 밈) — lookahead를 늘려도 Pure Pursuit
+#   curvature=2·sin(α)/ld 공식상 ld가 커질수록 오히려 반응이 희석되는 역효과만
+#   확인됨(README §2.5x 참고, "lookahead 확장" 검토 후 폐기). 대신 차량↔장애물 사이
+#   구간의 da를 장애물 쪽 절반만 통째로 잘라("근접 컷") 갈림길을 뚜렷하게 만드는
+#   방식으로 전환 — perception/dl_lane.py _clip_da_by_obstacle() 참고.
+#   ENABLE_OBSTACLE_CUT=False가 기본값이다 — 부호규약(장애물 쪽을 정확히 잘라야
+#   하는지 반대로 잘라 오히려 장애물 쪽으로 조향하게 되는지)이 실차 미검증이라,
+#   반드시 정지/저속에서 먼저 확인 후 켤 것.
+ENABLE_OBSTACLE_CUT = False   # 최상위 스위치 — ENABLE_BEHAVIOR/TEST_DISABLE_B2_B3와 무관하게 독립적으로 켜고 끔
+
+# ── da 근접 컷 진입 트리거 (perc_obstacle_cut_trigger(), track_drive.py) ──
+#   perc_lavacon_trigger()와 동일한 "라이다 AND YOLO 카메라" 이중확인 패턴이지만,
+#   perc_obstacle()의 공유 ROI(FRONT_X_MAX/FRONT_Y_HALF, 다른 B2/B3/avoid_hold
+#   소비처와 공유)를 재사용하지 않고 이 트리거 전용의 독립 라이다 ROI를 새로 잡는다
+#   — 나중에 그 소비처들의 튜닝이 이 트리거와 갈라져도 서로 간섭하지 않게.
+#   [2026-08-20] 트리거 거리 1.0m는 da BEV 캔버스의 표현 한계(DL_BEV_FAR_LIMIT_M=0.7m)
+#   보다 살짝 여유를 둔 값 — 디바운스(OBSTACLE_CUT_TRIGGER_FRAMES)가 끝나는 시점이
+#   da가 실제로 컷을 보여줄 수 있는 경계(0.7m) 바로 앞에 오도록 확정했다(더 멀리
+#   보는 것 자체는 의미 없음 — da가 0.7m보다 먼 거리를 표현 못 해서 어차피 컷의
+#   "먼 경계"는 항상 캔버스 끝으로 클램프된다).
+OBSTACLE_CUT_TRIGGER_X_MAX_M  = 1.0   # 실차 미검증(2026-08-20 논의로 확정)
+OBSTACLE_CUT_TRIGGER_Y_HALF_M = 0.55  # 횡방향 반폭 — LANE_WIDTH_M(0.4m) 기준 한 차선+여유, 실차 미검증 추정치
+OBSTACLE_CUT_TRIGGER_FRAMES   = 3     # 라이다 AND YOLO 연속확인 프레임 수(디바운스) — 실차 미검증
+
+# ── da 근접 컷 지오메트리 + 유지/해제 타이머 ──
+#   [2026-08-20] 트리거 확정 시점엔 obstacle_dist가 항상 0.7~1.0m(=da 크롭 한계 이내)
+#   이므로 컷의 먼 경계를 obstacle_dist로 계산하지 않는다 — "지금 보이는 da 전체
+#   깊이"를 그대로 먼 경계로 쓰고, 가까운 경계만 아래 OBSTACLE_CUT_NEAR_M로 고정한다.
+OBSTACLE_CUT_NEAR_M = 0.3                 # 컷의 차량쪽 고정 경계(m) — 실차 미검증
+OBSTACLE_CUT_LANE_HALF_WIDTH_PX = None    # None이면 LANE_WIDTH_M*DL_PIXELS_PER_METER로 초기화 시 계산(정적값 — _ll_active_half_width() 등 다른 서브시스템 상태에 안 엮음)
+OBSTACLE_CUT_MIN_REMAIN_PX = 40.0         # [2026-08-20] 클리핑 후 밴드에 이 폭(px) 미만만 남으면 그 밴드는 컷을 건너뛴다
+                                           #   — da가 완전히 비면 pure_pursuit.control()의 "path 없으면 직전값 유지(held)"
+                                           #   폴백이 걸려 회피가 가장 필요한 순간 조향이 얼어붙는 위험(초기 세션에서
+                                           #   다룬 그 문제) 재발 방지. 실차 미검증 추정치.
+#   [2026-08-20] 해제는 진입과 동일한 전용 트리거 ROI(위 OBSTACLE_CUT_TRIGGER_*)로
+#   재계산한 "clear" 상태를 쓴다 — perc_obstacle()의 공유 ROI(범위가 다름)를 쓰면
+#   해제 타이밍이 트리거 설계 의도와 어긋난다.
+OBSTACLE_CUT_HOLD_SEC_MIN = 2.0           # 진입 확정 후 라이다/YOLO가 뭐라 하든 무조건 유지하는 최소시간 — 실차 미검증
+OBSTACLE_CUT_RELEASE_DIST_M = 1.5         # 해제 판단용 라이다 클리어 거리(트리거 1.0m보다 크게, 히스테리시스) — 실차 미검증
+OBSTACLE_CUT_RELEASE_CONFIRM_FRAMES = 4   # 해제 디바운스 — AVOID_HOLD_RELEASE_CONFIRM_FRAMES와 동일 관례, 실차 미검증
+
+# ── 컷 활성 중 속도 캡(물리적 회피 여유 확보) ──
+#   [2026-08-20] da 가시범위(0.7m)와 실제 축거(WHEELBASE_M=0.335m) 기준 원호 기하
+#   계산 결과, 필요 횡이동(≈0.3m, 차폭 절반+장애물 반폭+여유)을 확보하려면 조향각
+#   20°대 후반~30° 근방이 나와야 하고 그게 겨우 0.7m 안에 들어오는 수준(15°는 0.82m
+#   필요해서 못 들어옴) — 여유가 얇다. ANGLE_RATE_MAX 램프업 시간까지 감안하면 더
+#   줄어든다. 거리를 늘릴 순 없어도 속도를 낮추면 같은 거리를 지나는 데 걸리는
+#   시간이 늘어 램프업 여유가 커진다 — 실차 미검증, 물리적 여유 실측 후 재조정 필요.
+SPEED_OBSTACLE_CUT = 8.0
+
 # [2026-08-10] DL_CENTER_MODE='ll' 내부에서 실제 밴드 중심 계산 알고리즘을 고르는
 #   2차 스위치 — 같은 날 두 사람이 독립적으로 서로 다른 재설계를 했다(origin/main
 #   병합 시 두 구현이 정면으로 겹쳐 병합 커밋에서 "둘 다 남기고 전환 가능하게" 하기로
@@ -1142,6 +1194,11 @@ DEBUG_VIZ_AVOID_HOLD = False
 #   [2026-08-11] smooth-imu-yaw-rate 브랜치(0c0d88b)에서 수동 포팅 — 라바콘 실차 테스트 중
 #   라이다 창과 함께 켜 두고 나머지는 꺼둔 상태(요청 반영).
 
+# [2026-08-20] da 근접 컷(obstacle-cut, ENABLE_OBSTACLE_CUT 주석 참고) 전용 상태창 —
+#   라이다 raw/YOLO raw/AND확정/유지타이머 잔여시간/해제카운터를 avoid_hold_debug와
+#   같은 구조로 한곳에 모아 보여준다(track_drive.py _debug_viz_obstacle_cut()).
+DEBUG_VIZ_OBSTACLE_CUT = False
+
 
 # #############################################################
 # 6. 미션 State / 실차 테스트 범위 제한
@@ -1342,6 +1399,23 @@ LAVACON_LINE_TRACK_MAX_JUMP_M   = 0.6   # 직전 박스 같은 라인 점과의 
 YOLO_CONE_INPUT_SIZE = 640     # cone_best_n.onnx export 시 imgsz와 반드시 일치시킬 것
 YOLO_CONE_CONF_THRESHOLD = 0.5 # 이 신뢰도 이상인 검출만 인정(모델이 nms=True로 export돼 좌표 디코딩은 불필요)
 YOLO_CONE_MODEL_PATH = None    # None이면 yolo_ros/cone_best_n.onnx(형제 디렉터리)를 자동으로 찾음(perception/yolo_cone.py 참고)
+
+# ── [2026-08-20] 방해차량 카메라 이중확인 (perception/yolo_vehicle.py, YOLOv8n ONNX) ──
+#   da 근접 컷(ENABLE_OBSTACLE_CUT, 위 참고) 전용 — fix/da-corridor-near-band-margin
+#   브랜치(커밋 3be0fb6)에서 이식. 파인튜닝된 전용 모델(cone_best_n.onnx 같은) 없이,
+#   COCO 사전학습 yolov8n.pt를 그대로 ONNX(nms=True) 내보내기해서 'car'(class_id 2)
+#   클래스만 필터링해 쓴다 — 이식 브랜치에서 raw 캡처(lap_005_raw_2734,
+#   pseudo_dataset_v2)로 육안 확인한 결과 신뢰도 0.15~0.78 범위로 실제 방해차량
+#   (RC카 모형)이 정확히 박싱됨을 확인했고, 'truck' 클래스는 카트/의자를 최고
+#   신뢰도(0.81)로 오탐해 제외됐다(그대로 유지) — YOLO_VEHICLE_CLASS_ID=2 하나만 쓴다.
+#   yolo_ros/yolov8n_car.onnx는 opset=12로 변환 시도했으나 실패해 실제로는 opset=18로
+#   내보내졌다 — Jetson onnxruntime 버전이 opset 18을 지원 못 하면 로드 자체가
+#   실패할 수 있음(실차 미검증, 실패 시 라이다 단독 판정으로 자동 폴백하게 설계됨).
+YOLO_VEHICLE_INPUT_SIZE = 640
+YOLO_VEHICLE_CONF_THRESHOLD = 0.3  # 이식 브랜치 실측 신뢰도 범위(0.15~0.78) 하한 근처 — 실차 미검증
+YOLO_VEHICLE_CLASS_ID = 2          # COCO 클래스 id — 'car'만 씀('truck'은 오탐 확인돼 제외)
+YOLO_VEHICLE_MODEL_PATH = None     # None이면 yolo_ros/yolov8n_car.onnx(형제 디렉터리)를 자동으로 찾음(perception/yolo_vehicle.py 참고)
+DEBUG_VIZ_YOLO_VEHICLE = False     # 방해차량 YOLO 검출 박스 디버그 창 (perception/yolo_vehicle.py)
 
 # ── 신호등 색상상태 YOLO (perception/yolo_signal_state.py, YOLOv8n ONNX) ──
 #   [2026-08-19] datasets/signal_state/(라벨링 워크플로는 그쪽 README 참고)로 파인튜닝한

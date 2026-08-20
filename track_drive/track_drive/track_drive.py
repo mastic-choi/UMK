@@ -41,6 +41,7 @@ from .perception.lane_util import CameraProcessor, SlideWindow
 from .perception.dl_lane import DLLaneDetector
 from .perception.traffic_signal import SignalDetector
 from .perception.yolo_cone import YoloConeDetector
+from .perception.yolo_vehicle import YoloVehicleDetector
 from .perception.yolo_signal import YoloSignalDetector
 from .perception.yolo_signal_state import YoloSignalStateDetector
 from .controller.obstacle_avoidance import ObstacleAvoidance, AvoidPhase
@@ -235,6 +236,22 @@ class TrackDriverNode(Node):
         # [2-6 방해차량 트리거]
         self.vehicle_trigger       = False   # 라이다 디바운스 통과 → B3 진입 트리거
         self._vehicle_trigger_cnt  = 0       # 동시검출 연속 프레임 수(디바운스 카운터)
+
+        # [2026-08-20] da 근접 컷(ENABLE_OBSTACLE_CUT) — TargetPassing(B2/B3 FSM)과
+        # avoid_hold_active(§2.32)와는 완전히 독립된 상태. avoid_hold_active는 이미
+        # DL 워커의 _clip_da_by_ll() 재활성화용으로 쓰이고 있어(perception/dl_lane.py),
+        # 재사용하면 두 메커니즘이 뒤섞인다.
+        self.vehicle_detected_yolo_cut = False   # 이번 프레임 YOLO 'car' 원시 검출(근접컷 전용 인스턴스)
+        self._obstacle_cut_trigger_cnt = 0       # (라이다 근접 AND YOLO car) 연속확인 프레임 수(디바운스)
+        self.obstacle_cut_trigger      = False   # 위 디바운스가 OBSTACLE_CUT_TRIGGER_FRAMES 넘겨 확정됐는지
+        self._obstacle_cut_y           = None    # 트리거 확정 순간의 장애물 횡위치(m, +좌측) — set_obstacle()에 넘길 값
+        self._obstacle_cut_until_t     = 0.0     # 이 시각까지는 obstacle_cut_active=True 유지
+        self.obstacle_cut_active       = False   # perc_lane()이 set_obstacle()로 DL 백엔드에 전달하는 최종 상태
+        self._obstacle_cut_hold_start_t = 0.0    # 최소유지시간(OBSTACLE_CUT_HOLD_SEC_MIN) 판정 기준 시각
+        self._obstacle_cut_release_cnt  = 0      # 해제 판단용 라이다 클리어 연속 프레임 수(디바운스 카운터)
+        self.obstacle_cut_release_reason = ''    # 디버그용 — 'floor_and_lidar_clear' 등
+        self._obstacle_cut_lidar_near = False    # 디버그용 — 이번 프레임 트리거 ROI에 라이다 점이 잡혔는지(원시값)
+
         # [2-7 장애물 위치 판단]
         self.lane_center   = 320.0           # 차선 중앙 x좌표(px) — 첫 카메라 프레임 전까지 화면 중앙 기본값
 
@@ -252,6 +269,20 @@ class TrackDriverNode(Node):
                 f'YOLO 콘 검출기 초기화 실패, 라바콘 트리거는 라이다 단독 판정으로 폴백합니다: {e}'
             )
             self.yolo_cone_detector = None
+
+        # [2026-08-20] da 근접 컷(ENABLE_OBSTACLE_CUT) 전용 YOLO 차량 검출기 — 이 저장소의
+        # 다른 YOLO 검출기와 동일 패턴(초기화 실패 시 None, 라이다 단독 판정으로 폴백).
+        # ENABLE_OBSTACLE_CUT=False(기본값)면 초기화 자체를 건너뛴다 — 이미 dl_lane/
+        # yolo_cone/yolo_signal 세 개가 돌고 있는 상황에서 안 쓰는 4번째 추론 스레드를
+        # 굳이 띄워 자원경합을 더할 이유가 없다(꺼져있을 땐 정말로 아무 영향 없게).
+        self.yolo_vehicle_cut_detector = None
+        if ENABLE_OBSTACLE_CUT:
+            try:
+                self.yolo_vehicle_cut_detector = YoloVehicleDetector(logger=self.get_logger())
+            except Exception as e:
+                self.get_logger().error(
+                    f'YOLO 차량(근접컷) 검출기 초기화 실패, 근접 컷 트리거는 라이다 단독 판정으로 폴백합니다: {e}'
+                )
 
         # [2026-08-19, 파일럿] 신호등 배경판 위치 탐지용 YOLO — YOLO_SIGNAL_ENABLE=False가
         # 기본값이라(datasets/yolo_signal_pilot 스모크테스트 데이터뿐, 실데이터 재학습 전)
@@ -502,10 +533,16 @@ class TrackDriverNode(Node):
     # [2] 인지 (Perception)
     # #########################################################
     def perceive_all(self):
-        self.perc_lane()        # 비전
+        self.perc_lane()        # 비전 — set_obstacle()가 여기서 "직전 틱"의 obstacle_cut_active를
+                                 #   DL 백엔드로 넘긴다(set_avoid_hold()와 동일한 1틱 지연 허용, 아래 참고)
         self.perc_signal()      # 비전
         self.perc_obstacle()    # 라이다
         self._update_avoid_hold()  # 라이다(위 obstacle_front/dist 기반) — perc_obstacle() 직후여야 함
+        # [2026-08-20] da 근접 컷(ENABLE_OBSTACLE_CUT) — 라이다+YOLO AND 트리거 → 유지/해제
+        #   타이머 순서. TargetPassing(B2/B3)/avoid_hold_active와 독립된 별개 상태머신.
+        self.perc_yolo_vehicle_cut()      # 비전 (YOLO, perc_obstacle_cut_trigger()가 라이다와 AND 결합해서 씀)
+        self.perc_obstacle_cut_trigger()  # 라이다+비전 → 근접 컷 진입 트리거(디바운스)
+        self._update_obstacle_cut_hold()  # 최소유지시간 + 라이다 클리어 디바운스로 유지/해제 판단
         self.perc_lavacon()     # 라이다
         self.perc_yolo_cone()   # 비전 (YOLO, perc_lavacon_trigger()가 라이다와 AND 결합해서 씀)
         self.perc_yolo_signal_state() # 비전 (YOLO, 아직 비교용 — _debug_viz_signal_status()에서만 씀)
@@ -527,6 +564,20 @@ class TrackDriverNode(Node):
             return
         self.cone_detected_yolo = self.yolo_cone_detector.detect(self.img_front)
         self.yolo_cone_detector.show_debug_windows()  # 메인 스레드에서만 호출(yolo_cone.py 주석 참고)
+
+    # [2026-08-20] da 근접 컷 전용 YOLO 차량 이중확인 (ENABLE_OBSTACLE_CUT)
+    #   입력 self.img_front → 출력 self.vehicle_detected_yolo_cut
+    #   perc_yolo_cone()과 동일 패턴 — yolo_vehicle.py가 별도 스레드에서 자기 페이스로
+    #   추론하므로 여기선 논블로킹으로 최신 결과만 받아온다. perc_yolo_vehicle()(다른
+    #   브랜치, near_obstacle 트리거용)과는 별개 인스턴스/용도다.
+    def perc_yolo_vehicle_cut(self):
+        if not ENABLE_OBSTACLE_CUT or self.yolo_vehicle_cut_detector is None:
+            self.vehicle_detected_yolo_cut = False
+            return
+        if self.img_front is None:
+            return
+        self.vehicle_detected_yolo_cut = self.yolo_vehicle_cut_detector.detect(self.img_front)
+        self.yolo_vehicle_cut_detector.show_debug_windows()  # 메인 스레드에서만 호출
 
     # [2-4b] 신호등 색상상태 YOLO (비교용, 아직 주행 판단에는 미연결)
     #   입력 self.img_front → 출력 self.signal_*_on_yolo
@@ -570,6 +621,11 @@ class TrackDriverNode(Node):
         # set_speed()/config.py DL_DA_REAR_MARGIN_* 주석 참고). hough/classic_cv처럼 이
         # 메서드가 없는 백엔드는 set_avoid_hold()와 동일하게 getattr로 조용히 건너뛴다.
         getattr(self.lane_detector, 'set_speed', lambda *_a, **_k: None)(self.v_mps)
+        # [2026-08-20] da 근접 컷(ENABLE_OBSTACLE_CUT) 상태도 같이 넘긴다 — set_avoid_hold()와
+        # 동일한 1틱 지연 허용(위 주석 참고). obstacle_cut_active=False면(기본, 또는 아직
+        # 트리거 전) _clip_da_by_obstacle()이 그대로 통과시키므로 영향 없다.
+        getattr(self.lane_detector, 'set_obstacle', lambda *_a, **_k: None)(
+            self._obstacle_cut_y, self.obstacle_cut_active)
 
         # hough_lane.py의 HoughLaneDetector를 사용하여 차선 인식 수행
         valid, offset, lookahead, lane_center, path, debug_img = self.lane_detector.detect(self.img_front)
@@ -1062,6 +1118,120 @@ class TrackDriverNode(Node):
         # _draw_lavacon_ema_bev()가 이 값을 그대로 "박스별 검출 + 좌우 EMA 차선" 시각화에 쓴다.
         if DEBUG_VIZ_LAVACON_EMA and self._lavacon_boxes_prev is not None:
             self._draw_lavacon_ema_bev(self._lavacon_boxes_prev, path_m)
+
+    # [2026-08-20] da 근접 컷(ENABLE_OBSTACLE_CUT) 진입 트리거 — perc_lavacon_trigger()와
+    #   동일한 "라이다 AND YOLO 카메라" 이중확인 패턴이지만, perc_obstacle()의 공유 ROI
+    #   (FRONT_X_MAX/FRONT_Y_HALF, 다른 B2/B3/avoid_hold 소비처와 공유)를 재사용하지
+    #   않고 이 목적 전용의 독립 라이다 ROI(OBSTACLE_CUT_TRIGGER_X_MAX_M/Y_HALF_M)를
+    #   새로 계산한다 — 그 소비처들의 튜닝이 나중에 이 트리거와 갈라져도 서로 간섭하지
+    #   않게(config.py 해당 상수 주석 참고).
+    #   입력 self.lidar_ranges, self.vehicle_detected_yolo_cut(perc_yolo_vehicle_cut()이 먼저 채워둠)
+    #   출력 self.obstacle_cut_trigger, self._obstacle_cut_y(트리거 확정 순간 장애물 횡위치, m, +좌측)
+    def perc_obstacle_cut_trigger(self):
+        if not ENABLE_OBSTACLE_CUT:
+            self._obstacle_cut_trigger_cnt = 0
+            self.obstacle_cut_trigger = False
+            return
+
+        BODY_LO, BODY_HI = 215, 305   # perc_obstacle()/perc_lavacon_trigger()와 동일(차체 자기가림)
+
+        if self.lidar_ranges is None:
+            self._obstacle_cut_trigger_cnt = 0
+            self.obstacle_cut_trigger = False
+            self._obstacle_cut_lidar_near = False
+            return
+
+        ranges = np.array(self.lidar_ranges, dtype=np.float32)
+        ranges[~np.isfinite(ranges)] = 0.0
+        ranges[ranges <= 0.0] = 0.0
+        n = len(ranges)
+        if BODY_MASK_ENABLED and n > BODY_LO:
+            ranges[BODY_LO:min(BODY_HI, n)] = 0.0
+
+        m = min(n, 360)
+        deg = np.linspace(0.0, 2.0 * math.pi, m, endpoint=False) - math.radians(LIDAR_ANGLE_OFFSET_DEG)
+        r = ranges[:m]
+        x = r * np.cos(deg)          # 전방(+앞)
+        y = r * np.sin(deg)          # 횡방향(+좌/-우, perc_lavacon_trigger()와 동일 규약)
+        roi_mask = ((r > 0.0) & (x > 0.0) & (x < OBSTACLE_CUT_TRIGGER_X_MAX_M)
+                    & (np.abs(y) < OBSTACLE_CUT_TRIGGER_Y_HALF_M))
+
+        lidar_near = bool(np.any(roi_mask))
+        self._obstacle_cut_lidar_near = lidar_near
+        if lidar_near:
+            idx = np.where(roi_mask)[0]
+            nearest = idx[int(np.argmin(r[idx]))]  # 가장 가까운 점의 횡위치를 대표값으로
+            self._obstacle_cut_y = float(y[nearest])
+
+        # YOLO 검출기 초기화 실패 시(self.yolo_vehicle_cut_detector is None) 카메라 확인
+        # 자체가 불가능하므로, perc_lavacon_trigger()와 동일 원칙으로 라이다 단독 판정으로 폴백.
+        cam_confirmed = (self.vehicle_detected_yolo_cut
+                          if self.yolo_vehicle_cut_detector is not None else True)
+        confirmed_now = lidar_near and cam_confirmed
+        self._obstacle_cut_trigger_cnt = self._obstacle_cut_trigger_cnt + 1 if confirmed_now else 0
+        self.obstacle_cut_trigger = self._obstacle_cut_trigger_cnt >= OBSTACLE_CUT_TRIGGER_FRAMES
+
+    # [2026-08-20] da 근접 컷 유지/해제 타이머 — "카메라에서 장애물이 잠깐 안 보인다고
+    #   회피가 바로 꺼지면 안 된다"(요청 원문)에 대한 대응. avoid_hold(§2.32)와 완전히
+    #   독립된 상태이며, avoid_hold와 정확히 같은 이유(README §2.32: "카메라가 차량
+    #   앞코에 있어 장애물을 지나치는 순간 즉시 원래 폭으로 돌아와... 너무 이른 복귀가
+    #   충돌로 이어질 위험")를 이 컷 메커니즘에도 그대로 적용한다.
+    #   설계:
+    #     진입: perc_obstacle_cut_trigger()가 디바운스 통과시키는 순간 hold-start 시각을 찍는다.
+    #     최소유지(floor): OBSTACLE_CUT_HOLD_SEC_MIN 동안은 라이다/YOLO가 뭐라 하든 무조건 유지.
+    #     해제: floor를 넘긴 뒤 "진입과 동일한 전용 트리거 ROI"가 더 이상 아무것도 안 잡음이
+    #           OBSTACLE_CUT_RELEASE_CONFIRM_FRAMES 연속 유지돼야 해제한다 — 일부러 YOLO는
+    #           여기서 다시 안 본다(카메라가 옆/뒤로 빠진 차를 놓치는 건 정상 현상이지 "회피가
+    #           끝났다"는 근거가 아니므로, 진입 확신에만 쓰고 퇴장 판단에는 안 쓴다).
+    #   perc_obstacle()의 공유 obstacle_front/obstacle_dist(범위가 다름, 5.0m/1.5m)가 아니라
+    #   위 트리거와 같은 독립 ROI로 재계산한 clear 상태를 쓴다 — 범위가 다르면 해제 타이밍이
+    #   트리거 설계 의도와 어긋난다.
+    def _update_obstacle_cut_hold(self):
+        if not ENABLE_OBSTACLE_CUT:
+            self.obstacle_cut_active = False
+            return
+
+        now = time.time()
+        if self.obstacle_cut_trigger:
+            if self._obstacle_cut_until_t <= now:   # 새 진입(직전엔 비활성이었음)
+                self._obstacle_cut_hold_start_t = now
+            self._obstacle_cut_until_t = now + OBSTACLE_CUT_HOLD_SEC_MIN
+            self._obstacle_cut_release_cnt = 0
+        else:
+            # 트리거 ROI가 클리어됐는지(라이다만, YOLO는 안 봄 — 위 클래스 주석 참고)
+            lidar_clear = self.lidar_ranges is not None and self._obstacle_cut_roi_clear()
+            self._obstacle_cut_release_cnt = self._obstacle_cut_release_cnt + 1 if lidar_clear else 0
+
+        floor_elapsed = (now - self._obstacle_cut_hold_start_t) >= OBSTACLE_CUT_HOLD_SEC_MIN
+        was_active = self.obstacle_cut_active
+        if (was_active and floor_elapsed
+                and self._obstacle_cut_release_cnt >= OBSTACLE_CUT_RELEASE_CONFIRM_FRAMES):
+            self._obstacle_cut_until_t = now
+            self.obstacle_cut_release_reason = 'floor_and_lidar_clear'
+
+        self.obstacle_cut_active = now < self._obstacle_cut_until_t
+        if was_active and not self.obstacle_cut_active and self.obstacle_cut_release_reason != 'floor_and_lidar_clear':
+            self.obstacle_cut_release_reason = 'timeout'
+
+    def _obstacle_cut_roi_clear(self):
+        """perc_obstacle_cut_trigger()와 동일한 전용 ROI(OBSTACLE_CUT_RELEASE_DIST_M로
+        약간 넓힌 히스테리시스 거리)에 아무 점도 안 잡히는지 — 해제 판단 전용이라
+        obstacle_cut_trigger 계산과 별개로 다시 라이다를 훑는다(가벼운 연산)."""
+        BODY_LO, BODY_HI = 215, 305
+        ranges = np.array(self.lidar_ranges, dtype=np.float32)
+        ranges[~np.isfinite(ranges)] = 0.0
+        ranges[ranges <= 0.0] = 0.0
+        n = len(ranges)
+        if BODY_MASK_ENABLED and n > BODY_LO:
+            ranges[BODY_LO:min(BODY_HI, n)] = 0.0
+        m = min(n, 360)
+        deg = np.linspace(0.0, 2.0 * math.pi, m, endpoint=False) - math.radians(LIDAR_ANGLE_OFFSET_DEG)
+        r = ranges[:m]
+        x = r * np.cos(deg)
+        y = r * np.sin(deg)
+        roi_mask = ((r > 0.0) & (x > 0.0) & (x < OBSTACLE_CUT_RELEASE_DIST_M)
+                    & (np.abs(y) < OBSTACLE_CUT_TRIGGER_Y_HALF_M))
+        return not bool(np.any(roi_mask))
 
     # [2-4b] 라바콘 좌우 클러스터 검출 + YOLO 카메라 이중확인 → B1_LAVACON 진입 트리거
     #   입력 self.lidar_ranges, self.cone_detected_yolo(perc_yolo_cone()이 먼저 채워둠)
@@ -1955,6 +2125,14 @@ class TrackDriverNode(Node):
         # 백엔드엔 이 속성이 없으니 getattr로 조회(다른 DL 전용 속성과 동일 관례).
         if getattr(self.lane_detector, 'near_band_stale', False):
             target_speed = min(target_speed, SPEED_LANE_STALE)
+        # [2026-08-20] da 근접 컷 활성 중 속도 캡(config.py SPEED_OBSTACLE_CUT 주석 —
+        # 원호 기하 계산상 물리적 회피 여유가 얇아서 추가). self.obstacle_cut_active는
+        # ENABLE_OBSTACLE_CUT=True + 실제 트리거·유지타이머를 거쳐야만 True가 되고,
+        # _update_obstacle_cut_hold()가 스스로 풀어주는 해제 경로가 있으므로 아래
+        # SPEED_AVOID_HOLD_BLOCKED(삭제됨, §2.43)처럼 "풀 방법 없이 무한정 고정"되는
+        # 구조가 아니다.
+        if self.obstacle_cut_active:
+            target_speed = min(target_speed, SPEED_OBSTACLE_CUT)
         # [2026-08-18] avoid-hold 적용4(SPEED_AVOID_HOLD_BLOCKED 안전판) 삭제 — 실차 테스트에서
         # "속도 5 고정" 증상의 실제 원인으로 확인됨(README §2.43). TEST_DISABLE_B2_B3=True라
         # 실제 회피 기동(옆차선 이동)은 꺼져있는데 이 캡만 무관하게 계속 걸려서, 트리거를
@@ -2446,6 +2624,56 @@ class TrackDriverNode(Node):
         cv2.imshow('avoid_hold_debug', canvas)
         cv2.waitKey(1)
 
+    # [DEBUG_VIZ_OBSTACLE_CUT] da 근접 컷(ENABLE_OBSTACLE_CUT) 전용 상태창 —
+    #   avoid_hold_debug와 같은 구조(텍스트 줄로 라이다 raw/YOLO raw/AND확정/유지타이머
+    #   잔여시간/해제카운터를 한곳에 모아 보여줌). 실측 안 된 파라미터도 항상 같이
+    #   띄운다(config.py OBSTACLE_CUT_* 주석 참고).
+    def _debug_viz_obstacle_cut(self):
+        now = time.time()
+        remaining = max(0.0, self._obstacle_cut_until_t - now)
+        active_color = (0, 200, 0) if self.obstacle_cut_active else (110, 110, 110)
+        slide = getattr(self.lane_detector, '_slide', None)
+        col_range = getattr(slide, 'obstacle_cut_col_range', None)
+
+        UNMEASURED = (60, 160, 255)
+        lines = [
+            (f'OBSTACLE-CUT: {"활성" if self.obstacle_cut_active else "대기"}  '
+             f'(남은 {remaining:.2f}s / floor={OBSTACLE_CUT_HOLD_SEC_MIN:.2f}s)',
+             (10, 8), active_color, 17,
+             f'OBSTACLE-CUT: {"ACTIVE" if self.obstacle_cut_active else "idle"} '
+             f'({remaining:.2f}s left / floor={OBSTACLE_CUT_HOLD_SEC_MIN:.2f}s)'),
+            (f'직전 해제 사유: {self.obstacle_cut_release_reason or "(아직 없음)"}   '
+             f'장애물 y={self._obstacle_cut_y if self._obstacle_cut_y is not None else "N/A"}',
+             (10, 34), (255, 255, 255), 14,
+             f'last release: {self.obstacle_cut_release_reason or "(none)"}'),
+            (f'트리거 — 라이다 근접={self._obstacle_cut_lidar_near}  '
+             f'YOLO car={self.vehicle_detected_yolo_cut}  '
+             f'AND확정={self._obstacle_cut_trigger_cnt}/{OBSTACLE_CUT_TRIGGER_FRAMES}',
+             (10, 62), (255, 255, 255), 13,
+             f'trigger — lidar={self._obstacle_cut_lidar_near} yolo={self.vehicle_detected_yolo_cut} '
+             f'confirm={self._obstacle_cut_trigger_cnt}/{OBSTACLE_CUT_TRIGGER_FRAMES}'),
+            (f'해제 진행 — 라이다클리어 {self._obstacle_cut_release_cnt}/{OBSTACLE_CUT_RELEASE_CONFIRM_FRAMES}',
+             (10, 84), (200, 200, 200), 13,
+             f'release progress {self._obstacle_cut_release_cnt}/{OBSTACLE_CUT_RELEASE_CONFIRM_FRAMES}'),
+            (f'컷 열(px) 범위 = {col_range}  (da BEV 좌표계)',
+             (10, 106), (255, 0, 255), 13, f'cut col range = {col_range}'),
+            (f'YOLO 검출기: {"정상" if self.yolo_vehicle_cut_detector is not None else "초기화실패→라이다단독폴백"}',
+             (10, 128), (255, 255, 255), 12,
+             f'yolo detector: {"OK" if self.yolo_vehicle_cut_detector is not None else "FAILED->lidar-only"}'),
+            ('── ★ 전 파라미터 실차 미검증 ★', (10, 152), UNMEASURED, 13,
+             '-- ALL PARAMS UNMEASURED --'),
+            (f'TRIGGER X_MAX={OBSTACLE_CUT_TRIGGER_X_MAX_M}m Y_HALF={OBSTACLE_CUT_TRIGGER_Y_HALF_M}m  '
+             f'NEAR_M={OBSTACLE_CUT_NEAR_M}m  SPEED_CAP={SPEED_OBSTACLE_CUT}',
+             (10, 174), UNMEASURED, 12,
+             f'trigger_x={OBSTACLE_CUT_TRIGGER_X_MAX_M} y_half={OBSTACLE_CUT_TRIGGER_Y_HALF_M} '
+             f'near={OBSTACLE_CUT_NEAR_M} speed_cap={SPEED_OBSTACLE_CUT}'),
+        ]
+        canvas = np.full((198, 620, 3), 30, dtype=np.uint8)
+        put_text_kr_multi(canvas, lines)
+        cv2.rectangle(canvas, (0, 0), (canvas.shape[1] - 1, canvas.shape[0] - 1), active_color, 3)
+        cv2.imshow('obstacle_cut_debug', canvas)
+        cv2.waitKey(1)
+
     # [DEBUG_VIZ_SIGNAL, 신규 2026-08-18] 신호등 인식 "한눈에 보기" 창 — traffic_signal.py의
     # signal4_roi(§1, ROI를 확대해 원 하나하나를 보여줌)/signal4_board_search(이번 프레임에
     # 시도한 후보 박스 전부)와 달리, 이 창은 전체 카메라 원본 위에 "지금 어디를 보고 있는지"
@@ -2933,6 +3161,8 @@ class TrackDriverNode(Node):
             self._debug_viz_imu()
         if DEBUG_VIZ_AVOID_HOLD:
             self._debug_viz_avoid_hold()
+        if DEBUG_VIZ_OBSTACLE_CUT:
+            self._debug_viz_obstacle_cut()
         if DEBUG_VIZ_SIGNAL and self.mission_state in (MissionState.S0_WAIT_GREEN, MissionState.S2_INTERSECTION):
             self._debug_viz_signal_status()
 
