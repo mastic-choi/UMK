@@ -2162,13 +2162,19 @@ class DLSlideWindow(SlideWindow):
             cv2.addWeighted(overlay, 0.35, self.vis, 0.65, 0, dst=self.vis)
 
             # [2026-08-20] da 근접 컷(_clip_da_by_obstacle(), ENABLE_OBSTACLE_CUT) — 실차
-            # 주행 중 "지금 자르고 있는지"를 한눈에 보려는 목적으로, 마젠타 반투명 채움 +
-            # 굵은 "CUT" 라벨을 실제 자른 열(px) 범위에 그린다(윤곽선만이던 이전 버전보다
-            # 더 눈에 띄게 — 운전하면서 흘끗 봐도 알아채야 해서). da_clip_band_virtual
-            # (①/② 틱, ll 클리핑용)과는 별개 오버레이 — 근접 컷은 밴드 단위가 아니라 한
-            # 사각형이라 별도로 그린다. 컷이 안 걸린 프레임에도(꺼짐/트리거 전) 좌상단에
-            # "OBSTACLE CUT: enabled/off" 한 줄은 항상 띄워, 기능 자체가 켜져 있는지부터
-            # 확인할 수 있게 한다.
+            # 주행 중 "지금 자르고 있는지"를 한눈에 보려는 목적으로, 반투명 채움 + 굵은
+            # "CUT" 라벨을 실제 자른 열(px) 범위에 그린다. da_clip_band_virtual(①/② 틱,
+            # ll 클리핑용)과는 별개 오버레이 — 근접 컷은 밴드 단위가 아니라 한 사각형이라
+            # 별도로 그린다. 컷이 안 걸린 프레임에도(꺼짐/트리거 전) 좌상단에 "OBSTACLE
+            # CUT: enabled/off" 한 줄은 항상 띄워, 기능 자체가 켜져 있는지부터 확인할 수
+            # 있게 한다.
+            # [2026-08-20 색 변경] 원래 마젠타였는데 draw_path()의 최종 경로(자홍색,
+            # lane_util.py DRAW_PATH_COLOR=(255,0,255))와 정확히 같은 색이라, 컷 영역
+            # 안을 지나는 경로선이 반투명 채움에 묻혀 안 보이는 문제가 있었다("way가 어떻게
+            # 찍히는지 안 보인다" 요청 반영) — 팔레트에서 안 쓰던 빨강으로 바꿔서 경로선이
+            # 항상 위에 또렷하게 보이게 했다. draw_path()가 이 함수보다 나중에 호출되므로
+            # (visualize() 흐름상 컷 사각형이 먼저 그려지고 경로가 그 위에 덧그려짐)
+            # 색만 구분되면 항상 경로가 컷 위에 보인다.
             cut_status = 'enabled(대기)' if ENABLE_OBSTACLE_CUT else 'off'
             cv2.putText(self.vis, f'OBSTACLE CUT: {cut_status}', (8, self.roi_h - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 200), 1, cv2.LINE_AA)
@@ -2176,14 +2182,14 @@ class DLSlideWindow(SlideWindow):
                 x0, x1 = self.obstacle_cut_col_range
                 near_row_px = int(np.clip(self.roi_h - OBSTACLE_CUT_NEAR_M * DL_PIXELS_PER_METER, 0, self.roi_h))
                 cut_fill = self.vis.copy()
-                cv2.rectangle(cut_fill, (x0, 0), (x1, near_row_px), (255, 0, 255), -1)
+                cv2.rectangle(cut_fill, (x0, 0), (x1, near_row_px), (0, 0, 255), -1)
                 cv2.addWeighted(cut_fill, 0.4, self.vis, 0.6, 0, dst=self.vis)
-                cv2.rectangle(self.vis, (x0, 0), (x1, near_row_px), (255, 0, 255), 2)
+                cv2.rectangle(self.vis, (x0, 0), (x1, near_row_px), (0, 0, 255), 2)
                 label_y = min(self.roi_h - 10, near_row_px + 18)
                 cv2.putText(self.vis, 'CUT', (x0 + 4, label_y),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2, cv2.LINE_AA)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
                 cv2.putText(self.vis, 'OBSTACLE CUT: ACTIVE', (8, self.roi_h - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.46, (255, 0, 255), 2, cv2.LINE_AA)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 0, 255), 2, cv2.LINE_AA)
 
             # corridor(DL_CENTER_MODE='ll_da') 전용: 밴드별로 채택된 corridor 경계
             # (1/3번째 ll 선)를 자홍색 세로 틱으로 표시 — sanity check를 통과해
