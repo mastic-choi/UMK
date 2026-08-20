@@ -1474,9 +1474,12 @@ YOLO_CONE_MODEL_PATH = None    # None이면 yolo_ros/cone_best_n.onnx(형제 디
 #   직접 NMS용 파라미터)는 더 이상 필요 없어 삭제 — perception/yolo_vehicle.py도 콘/구
 #   vehicle 모델과 같은 단순 파싱으로 되돌림.
 YOLO_VEHICLE_INPUT_SIZE = 640
-YOLO_VEHICLE_CONF_THRESHOLD = 0.5  # [2026-08-20 §2.57] 전용 모델 실측 분포 없음(정적 이미지
-                                    # 재추론 미실시) — ultralytics 기본값으로 시작, 실차/이미지
-                                    # 재추론 후 반드시 재조정할 것(실차 미검증)
+YOLO_VEHICLE_CONF_THRESHOLD = 0.6  # [2026-08-20 §2.57] 처음엔 실측 분포 없이 ultralytics
+                                    # 기본값(0.5)으로 시작.
+                                    # [2026-08-21 §2.60] v1.2.0 실측 결과 신뢰도가 0.7 밑으로
+                                    # 안 내려가는 것 확인 — 오탐 여유를 두면서도 정탐은 그대로
+                                    # 다 통과시키도록 0.6으로 상향(0.7 그대로 쓰면 여유가 없어
+                                    # 경계선 프레임을 놓칠 수 있음)
 YOLO_VEHICLE_CLASS_ID = 0          # [2026-08-20 §2.57] target_vehicle_best.onnx 클래스 id
                                     # (nc=1, 'target_vehicle' 하나뿐이라 0부터 시작 — COCO
                                     # class_id=2였던 이전 모델과 다름, 반드시 같이 바꿀 것)
