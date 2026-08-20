@@ -39,6 +39,7 @@
 import argparse
 import json
 import math
+import os
 import select
 import sys
 import termios
@@ -63,6 +64,7 @@ SPEED_STEP = 1.0
 SPEED_CLAMP = 100.0
 
 WINDOW_NAME = 'manual_drive_raw'
+DEFAULT_OUT_DIR = os.path.expanduser('~/xycar_ws/src/raw')
 
 
 def get_key(settings, timeout=0.0):
@@ -208,7 +210,7 @@ class ManualDriveCollector(Node):
 
 def main(args=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument('--out_dir', default='./lane_seg/data/manual_drive')
+    parser.add_argument('--out_dir', default=DEFAULT_OUT_DIR)
     parser.add_argument('--init_speed', type=float, default=5.0)
     parser.add_argument('--save_hz', type=float, default=10.0,
                          help='초당 저장 프레임 수 (0이면 카메라 콜백마다 매번 저장)')

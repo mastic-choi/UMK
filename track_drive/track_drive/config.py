@@ -694,7 +694,7 @@ OBSTACLE_CUT_MIN_REMAIN_PX = 25.0         # [2026-08-20] 클리핑 후 밴드에
 #   재계산한 "clear" 상태를 쓴다 — perc_obstacle()의 공유 ROI(범위가 다름)를 쓰면
 #   해제 타이밍이 트리거 설계 의도와 어긋난다.
 OBSTACLE_CUT_HOLD_SEC_MIN = 2.0           # 진입 확정 후 라이다/YOLO가 뭐라 하든 무조건 유지하는 최소시간 — 실차 미검증
-OBSTACLE_CUT_RELEASE_DIST_M = 1.5         # 해제 판단용 라이다 클리어 거리(트리거 1.0m보다 크게, 히스테리시스) — 실차 미검증
+OBSTACLE_CUT_RELEASE_DIST_M = 1.0         # [2026-08-20] 1.5→1.0(요청 반영, 트리거와 동일 — 히스테리시스 없앰). 실차 미검증
 OBSTACLE_CUT_RELEASE_CONFIRM_FRAMES = 4   # 해제 디바운스 — AVOID_HOLD_RELEASE_CONFIRM_FRAMES와 동일 관례, 실차 미검증
 
 # ── 컷 활성 중 속도 캡(물리적 회피 여유 확보) ──
@@ -704,7 +704,7 @@ OBSTACLE_CUT_RELEASE_CONFIRM_FRAMES = 4   # 해제 디바운스 — AVOID_HOLD_R
 #   필요해서 못 들어옴) — 여유가 얇다. ANGLE_RATE_MAX 램프업 시간까지 감안하면 더
 #   줄어든다. 거리를 늘릴 순 없어도 속도를 낮추면 같은 거리를 지나는 데 걸리는
 #   시간이 늘어 램프업 여유가 커진다 — 실차 미검증, 물리적 여유 실측 후 재조정 필요.
-SPEED_OBSTACLE_CUT = 8.0
+SPEED_OBSTACLE_CUT = 12.0  # [2026-08-20] 8.0 → 12.0(요청 반영, 사실상 무영향 수준으로 완화)
 
 # [2026-08-10] DL_CENTER_MODE='ll' 내부에서 실제 밴드 중심 계산 알고리즘을 고르는
 #   2차 스위치 — 같은 날 두 사람이 독립적으로 서로 다른 재설계를 했다(origin/main
@@ -1206,42 +1206,29 @@ DEBUG_VIZ_OBSTACLE_CUT = True   # [2026-08-20] 실차 검증 시작과 함께 �
 # #############################################################
 # 6. 미션 State / 실차 테스트 범위 제한
 # #############################################################
-# [2026-08-20, 임시] 배경판+색상상태 YOLO 동시 테스트 위해 S0_WAIT_GREEN으로 전환 —
-#   yolo_signal_detector(배경판)는 detect_s2() 경로로만 호출돼 S0/S2 상태가 아니면 아예 안
-#   돈다(track_drive.py perc_signal() 참고). 테스트 끝나면 S1_LANE_FOLLOW로 되돌릴 것.
-START_STATE     = MissionState.S1_LANE_FOLLOW
-ENABLE_BEHAVIOR = False   # S1에서 라바콘/장애물/추월 Behavior를 켤지 여부(최상위 스위치)
-# [2026-08-19] 라바콘(B1)·고정장애물(B2)·방해차량 추월(B3) 전부 끄고 순수 차선주행(B0_NORMAL)만
-#   쓰도록 요청 반영 — False면 control_loop()에서 run_behavior_fsm()/apply_behavior_override()
-#   자체를 호출하지 않고 behavior_state를 매 프레임 B0_NORMAL로 고정한다(track_drive.py:2939-2943).
-#   [2026-08-11] 라바콘(B1) 실차 테스트를 위해 True로 켬. TEST_FORCE_BEHAVIOR=True와 함께
-#   있으면 S2 교차로 없이도 시작부터 라바콘 단독 테스트 가능. B2/B3까지 실차 테스트 범위를
-#   넓힐 준비가 되기 전까지는 TEST_DISABLE_B2_B3=True로 B2/B3 발동 자체는 계속 막아둔 상태.
-# [2026-08-19] 신호등 단독 테스트하느라 잠깐 False로 꺼뒀던 걸 다시 True로 복귀 — YOLO
-#   라바콘 인식·좌우 라이다 값은 잡히는데 이 스위치가 꺼져 있어서 run_behavior_fsm() 자체가
-#   안 불려 B1 전환이 안 되던 문제(2706행 게이트) 확인 후 되돌림.
+# [2026-08-20] 전체 미션(S0→S4) 상태전환 복구 시작 — S0_WAIT_GREEN부터 정상 출발.
+#   (직전엔 YOLO 신호등 단독 테스트 중 S1_LANE_FOLLOW로 바꿔둔 채 주석만 S0로 되돌린다고
+#   적어놓고 실제 코드는 안 고쳐서 어긋나 있었음 — 이번에 코드를 주석 의도에 맞게 정정.)
+START_STATE     = MissionState.S0_WAIT_GREEN
+ENABLE_BEHAVIOR = True   # S1에서 라바콘/장애물/추월 Behavior를 켤지 여부(최상위 스위치)
+# [2026-08-20] 전체 미션 파이프라인 복구 — 아래 세 TEST_* 격리 플래그를 모두 원복하고
+#   S0→S1→S2→S3→S4 전체 상태전환 + B1/B2/B3 Behavior를 한 번에 실차 검증하는 단계로 전환.
+#   (S2/S3 좌회전 각도·속도, B2/B3 트리거는 그동안 개별 격리 테스트로만 검증됐고 전체
+#   파이프라인으로 이어붙여서 돌린 적은 없다 — 상태전환 사이 값 리셋/타이밍이 실제로
+#   맞물리는지는 이번 실차 테스트에서 처음 확인하는 것이니 주의.)
 
-# ── 실차 테스트 범위 제한 ──
-#   지금 단계에서 실차로 검증 가능한 건 딱 세 가지: ①신호등 인식 후 출발(S0)
-#   ②차선주행(S1) ③라바콘 주행(B1). 나머지(S2 교차로/S3 지름길)는 아직 실차
-#   미검증(좌회전 각도·속도 placeholder)이라 테스트 중 의도치 않게 발동하면 위험할
-#   수 있어 아래 플래그로 강제로 꺼둔다. → 좌회전 튜닝 끝나면 False로 되돌릴 것.
-TEST_DISABLE_INTERSECTION = True
+# ── 실차 테스트 범위 제한 (전부 해제) ──
+TEST_DISABLE_INTERSECTION = False
 #   True: 정지선을 감지해도 감속→S2_INTERSECTION 전환을 아예 안 함(차선주행만 계속).
 #   False: 원래대로 정지선 감지 시 감속 후 S2로 정상 전환.
-# [2026-08-11] B2/B3 실차 테스트 시작 — True → False. 라바콘(B1) 격리 테스트는 이 값과
-#   무관(B1엔 트리거 조건이 없음, apply_behavior_override() 참고)하니 그대로 True 둬도
-#   B1은 계속 검증 가능하다.
-TEST_DISABLE_B2_B3 = True
+TEST_DISABLE_B2_B3 = False
 #   True: Phase가 FIXED_OBSTACLE/VEHICLE로 넘어가도 트리거 검사를 건너뛰고
 #         B0_NORMAL로 고정(B1 끝난 뒤 계속 일반 차선주행만 함).
 #   False: 원래대로 SAFETY_DIST/OVERTAKE_TRIGGER 트리거 검사해서 B2/B3 정상 발동.
-TEST_FORCE_BEHAVIOR = True
+TEST_FORCE_BEHAVIOR = False
 #   True: _behavior_enabled를 시작부터 강제 True로 켜서, 교차로를 끈 채로도
 #         라바콘(B1)만 독립적으로 실차 검증할 수 있게 한다.
 #   False: 원래대로 S2 교차로 직진 신호를 받아야만 Behavior가 켜짐.
-#   → 전체 미션 테스트로 넘어갈 때는 TEST_DISABLE_INTERSECTION=False와 함께
-#     이것도 False로 되돌릴 것(둘 다 켜두면 시나리오 순서가 어긋난다).
 
 # [2026-08-11] B2(정지 장애물) Hybrid A* 대안(USE_HYBRID_ASTAR_FOR_B2) 삭제.
 #   대신 _da_avoidance_failed() 게이트 + TargetPassing(실측 기반 하드코딩)로 대체
@@ -1888,7 +1875,7 @@ PP_TUNE_PRESETS = {
         PP_LOOKAHEAD_SPEED_ANCHOR=12.0,
         PP_WHEELBASE_PX=20, PP_ALPHA=0.9, PP_LD_FLOOR_PX=120.19, PP_DX_DEADZONE_PX=5,
 
-        PP_LOOKAHEAD_CURVATURE_GAIN=110, PP_LOOKAHEAD_MIN_PX=80,
+        PP_LOOKAHEAD_CURVATURE_GAIN=120, PP_LOOKAHEAD_MIN_PX=80,
         SPEED_CORNER_MIN=10.0, CORNER_SIGN_EMA_ALPHA=0.15, LANE_LOOKAHEAD_REF=220.0,
         SPEED_ACCEL_STEP=0.4, CORNER_HOLD_DECAY_LO=0.92, CORNER_HOLD_DECAY_HI=0.97,
         CORNER_MIN_RADIUS_PX=250.0, CORNER_MIN_SPEED_SCALE=0.35,

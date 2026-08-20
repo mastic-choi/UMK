@@ -1713,6 +1713,37 @@ way가 어떻게 찍히는지/lookahead가 어떻게 생기는지 보고 싶다"
 (`perception/dl_lane.py` `visualize()`, 컷이 경로보다 먼저 그려져 나중에 그려지는 경로가 자연히
 그 위에 덧그려짐).
 
+### 2.56 `obstacle_cut_debug` 창에 YOLO 차량검출 카메라 프레임 + 트리거 라이다 ROI를 합침 (2026-08-20)
+
+**요청 배경:** da 근접 컷(`ENABLE_OBSTACLE_CUT`)의 진입 트리거는 "라이다 근접 AND YOLO 차량검출"인데,
+기존엔 YOLO 원시 박스가 `yolo_vehicle_result`라는 별도 창, 라이다 근접 여부는 `obstacle_cut_debug`
+창의 텍스트 한 줄(`라이다 근접=True/False`)로만 나뉘어 있었다 — AND 조건 중 어느 쪽이 안 잡혀서
+트리거가 안 걸리는지(카메라가 못 봤는지/라이다 ROI에 안 잡혔는지) 확인하려면 창 두 개를 오가며
+대조해야 했다.
+
+**수정:** `yolo_vehicle.py`의 `YoloVehicleDetector.show_debug_windows()`(전용 `cv2.imshow` 창)를
+`get_latest_debug_frame()`(그리기만 된 프레임을 스레드세이프하게 반환, imshow는 안 함)으로 교체하고,
+`track_drive.py`의 `perc_yolo_vehicle_cut()`에서 더 이상 전용 창을 안 띄운다. 대신 `_debug_viz_obstacle_cut()`
+하나가:
+- **좌측**에 YOLO 카메라 프레임(원본+검출박스, `get_latest_debug_frame()`으로 가져와 표시용으로만
+  종횡비 무시 리사이즈 — `yolo_vehicle.py` `preprocess()`와 동일 관례)을,
+- **우측**에 실제 트리거에 쓰이는 라이다 ROI를 `avoid_hold_debug`(§2.47)와 같은 미니 BEV 패널
+  구조로 — `OBSTACLE_CUT_TRIGGER_X_MAX_M`×`OBSTACLE_CUT_TRIGGER_Y_HALF_M` 박스(청록 테두리)를
+  "검증범위"로 그대로 그리고, 그 안에 실제로 잡힌 점(빨강)과 표시범위(박스보다 약간 넓게 잡은
+  여백, 박스 밖 점이 왜 트리거가 안 됐는지도 보이게) 안의 나머지 배경점(회색)을 매틱 갱신해서
+  같이 보여준다,
+- **하단**에 기존 텍스트 상태 줄(active/idle, 해제 사유, AND확정 카운터, 컷 열 범위, 미검증
+  파라미터 목록 등, §2.49~§2.52에서 만든 그대로)을 그대로 이어붙인다.
+
+`perc_obstacle_cut_trigger()`가 `_obstacle_cut_bg_x/y`(표시범위 내 배경점)·`_obstacle_cut_roi_x/y`
+(실제 트리거 ROI 안 점)를 `avoid_hold`의 `_obstacle_front_all_x/y`/`_obstacle_cluster_x/y`(§2.47)와
+동일한 패턴으로 매틱 갱신해 인스턴스 속성에 남기고, `_debug_viz_obstacle_cut()`이 이를 그대로
+그린다.
+
+**알려진 한계:** 카메라 프레임을 `CAM_W×CAM_H`로 단순 리사이즈해 원본 종횡비가 살짝 왜곡된다 —
+박스 위치/모양이 아주 약간 눌려 보일 수 있지만 "검출 여부"를 눈으로 확인하는 용도라 지금은 문제
+삼지 않는다.
+
 ---
 
 ## 3. 라바콘 (B1_LAVACON)

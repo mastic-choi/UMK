@@ -90,10 +90,17 @@ class YoloSignalEngine:
 
         available = set(ort.get_available_providers())
         if providers is None:
-            # yolo_cone.py의 cone_best_n.onnx가 TensorRT 빌드 실패(§주석 참고, ~456초 지연 뒤
-            # CUDA로 조용히 폴백)를 겪은 것과 같은 부류의 문제가 nms=True export 모델 전반에
-            # 있을 수 있어 TensorRT는 처음부터 제외하고 CUDA로 바로 간다. 실차에서 TensorRT가
-            # 이 모델도 정상 동작하는 게 확인되면 그때 우선순위 재검토.
+            # [2026-08-20 실기 확인] 추측이 아니라 실제로 TensorrtExecutionProvider를 켜서
+            # 검증함 — InferenceSession() 생성 자체는 245.7초만에 "성공"(그래프 파티셔닝 후
+            # NMS 없는 서브그래프만 TRT 엔진 빌드됨)하지만, 첫 sess.run() 시점에 NMS가 포함된
+            # 서브그래프 엔진 빌드가 "TRT-16198: Layers missing empty tensor support"로 실패,
+            # onnxruntime이 그 시점에야 CUDAExecutionProvider로 조용히 자동 폴백한다 —
+            # yolo_cone.py의 cone_best_n.onnx(§주석 참고, ~456초 지연)와 동일한 실패모드.
+            # 즉 TensorRT를 priority에 넣어두면 매 기동마다 이 ~4분 지연만 추가되고 실제로는
+            # 못 쓴다. dl_lane.py의 TwinLiteNet(NMS 없음)은 TensorRT가 정상 동작하므로 그쪽
+            # priority는 그대로 두고, 이 모델(nms=True export)만 TensorRT를 건너뛰고 바로
+            # CUDA로 간다. 재시도하려면 재학습 시 nms=False로 export하고 NMS를 후처리에서
+            # 직접 구현해야 함 — export 방식을 안 바꾸면 재검증할 필요 없음.
             priority = ['CUDAExecutionProvider', 'CPUExecutionProvider']
             providers = [p for p in priority if p in available] or ['CPUExecutionProvider']
 

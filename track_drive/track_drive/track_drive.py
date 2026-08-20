@@ -251,6 +251,13 @@ class TrackDriverNode(Node):
         self._obstacle_cut_release_cnt  = 0      # 해제 판단용 라이다 클리어 연속 프레임 수(디바운스 카운터)
         self.obstacle_cut_release_reason = ''    # 디버그용 — 'floor_and_lidar_clear' 등
         self._obstacle_cut_lidar_near = False    # 디버그용 — 이번 프레임 트리거 ROI에 라이다 점이 잡혔는지(원시값)
+        # [2026-08-20] _debug_viz_obstacle_cut() BEV 패널용 — avoid_hold_debug의
+        # _obstacle_front_all_x/y·_obstacle_cluster_x/y와 동일 패턴(매틱 갱신되는 라이브 값).
+        # bg_*는 표시범위 안의 배경점 전부(회색), roi_*는 실제 트리거 ROI 안에 잡힌 점만(빨강).
+        self._obstacle_cut_bg_x  = np.array([])
+        self._obstacle_cut_bg_y  = np.array([])
+        self._obstacle_cut_roi_x = np.array([])
+        self._obstacle_cut_roi_y = np.array([])
 
         # [2-7 장애물 위치 판단]
         self.lane_center   = 320.0           # 차선 중앙 x좌표(px) — 첫 카메라 프레임 전까지 화면 중앙 기본값
@@ -583,7 +590,8 @@ class TrackDriverNode(Node):
         if self.img_front is None:
             return
         self.vehicle_detected_yolo_cut = self.yolo_vehicle_cut_detector.detect(self.img_front)
-        self.yolo_vehicle_cut_detector.show_debug_windows()  # 메인 스레드에서만 호출
+        # [2026-08-20] 여기서 별도 창으로 안 띄운다 — _debug_viz_obstacle_cut()이
+        # get_latest_debug_frame()으로 이 프레임을 가져다 라이다 ROI 패널과 한 창에 합쳐 그린다.
 
     # [2-4b] 신호등 색상상태 YOLO (비교용, 아직 주행 판단에는 미연결)
     #   입력 self.img_front → 출력 self.signal_*_on_yolo
@@ -1148,6 +1156,8 @@ class TrackDriverNode(Node):
             self._obstacle_cut_trigger_cnt = 0
             self.obstacle_cut_trigger = False
             self._obstacle_cut_lidar_near = False
+            self._obstacle_cut_bg_x = self._obstacle_cut_bg_y = np.array([])
+            self._obstacle_cut_roi_x = self._obstacle_cut_roi_y = np.array([])
             return
 
         ranges = np.array(self.lidar_ranges, dtype=np.float32)
@@ -1171,6 +1181,14 @@ class TrackDriverNode(Node):
             idx = np.where(roi_mask)[0]
             nearest = idx[int(np.argmin(r[idx]))]  # 가장 가까운 점의 횡위치를 대표값으로
             self._obstacle_cut_y = float(y[nearest])
+
+        # [2026-08-20] _debug_viz_obstacle_cut() BEV 패널용 라이브 스냅샷 — ROI보다 조금
+        # 넓게 잡아서(여백 없으면 박스 바로 밖 점이 왜 트리거 안 됐는지 안 보임) 배경으로
+        # 같이 그린다. roi_mask 안쪽만 별도로 빼서 "실제로 트리거에 쓰인 점"을 구분.
+        disp_mask = ((r > 0.0) & (x > 0.0) & (x < OBSTACLE_CUT_TRIGGER_X_MAX_M + 1.0)
+                     & (np.abs(y) < OBSTACLE_CUT_TRIGGER_Y_HALF_M + 0.45))
+        self._obstacle_cut_bg_x, self._obstacle_cut_bg_y = x[disp_mask], y[disp_mask]
+        self._obstacle_cut_roi_x, self._obstacle_cut_roi_y = x[roi_mask], y[roi_mask]
 
         # YOLO 검출기 초기화 실패 시(self.yolo_vehicle_cut_detector is None) 카메라 확인
         # 자체가 불가능하므로, perc_lavacon_trigger()와 동일 원칙으로 라이다 단독 판정으로 폴백.
@@ -2637,48 +2655,123 @@ class TrackDriverNode(Node):
     #   avoid_hold_debug와 같은 구조(텍스트 줄로 라이다 raw/YOLO raw/AND확정/유지타이머
     #   잔여시간/해제카운터를 한곳에 모아 보여줌). 실측 안 된 파라미터도 항상 같이
     #   띄운다(config.py OBSTACLE_CUT_* 주석 참고).
+    # [2026-08-20] YOLO 차량검출(카메라) + 그 판정에 실제로 쓰인 라이다 ROI를 텍스트
+    # 상태 한 창에 합쳐서 그린다 — 원래는 YOLO 원시 박스가 'yolo_vehicle_result'라는
+    # 별도 창, 라이다 근접 여부는 이 창의 텍스트 한 줄(True/False)로만 나뉘어 있어서
+    # "욜로는 car라는데 라이다는 왜 안 잡히나/그 반대" 같은 AND 불일치 원인을 창 두 개를
+    # 오가며 봐야 했다 — 카메라 박스와 라이다 ROI 안 점을 나란히 놓고 바로 대조할 수 있게
+    # 한 창으로 합침(요청 반영). yolo_vehicle.py는 이제 전용 창을 안 띄우고
+    # get_latest_debug_frame()으로 프레임만 넘긴다(해당 함수 주석 참고).
     def _debug_viz_obstacle_cut(self):
         now = time.time()
         remaining = max(0.0, self._obstacle_cut_until_t - now)
         active_color = (0, 200, 0) if self.obstacle_cut_active else (110, 110, 110)
         slide = getattr(self.lane_detector, '_slide', None)
         col_range = getattr(slide, 'obstacle_cut_col_range', None)
-
         UNMEASURED = (60, 160, 255)
-        lines = [
+
+        # --- 상단 카메라(YOLO)/라이다 BEV 패널 레이아웃 -------------------------------
+        CAM_W, CAM_H = 300, 220
+        cam_x0, cam_y0 = 10, 34
+        PANEL_W, PANEL_H = 240, CAM_H
+        panel_x0, panel_y0 = cam_x0 + CAM_W + 20, cam_y0
+        text_y0 = cam_y0 + CAM_H + 16
+
+        canvas = np.full((text_y0 + 164, panel_x0 + PANEL_W + 10, 3), 30, dtype=np.uint8)
+
+        headline = [
             (f'OBSTACLE-CUT: {"활성" if self.obstacle_cut_active else "대기"}  '
              f'(남은 {remaining:.2f}s / floor={OBSTACLE_CUT_HOLD_SEC_MIN:.2f}s)',
              (10, 8), active_color, 17,
              f'OBSTACLE-CUT: {"ACTIVE" if self.obstacle_cut_active else "idle"} '
              f'({remaining:.2f}s left / floor={OBSTACLE_CUT_HOLD_SEC_MIN:.2f}s)'),
+        ]
+        lines = [
             (f'직전 해제 사유: {self.obstacle_cut_release_reason or "(아직 없음)"}   '
              f'장애물 y={self._obstacle_cut_y if self._obstacle_cut_y is not None else "N/A"}',
-             (10, 34), (255, 255, 255), 14,
+             (10, text_y0), (255, 255, 255), 14,
              f'last release: {self.obstacle_cut_release_reason or "(none)"}'),
             (f'트리거 — 라이다 근접={self._obstacle_cut_lidar_near}  '
              f'YOLO car={self.vehicle_detected_yolo_cut}  '
              f'AND확정={self._obstacle_cut_trigger_cnt}/{OBSTACLE_CUT_TRIGGER_FRAMES}',
-             (10, 62), (255, 255, 255), 13,
+             (10, text_y0 + 28), (255, 255, 255), 13,
              f'trigger — lidar={self._obstacle_cut_lidar_near} yolo={self.vehicle_detected_yolo_cut} '
              f'confirm={self._obstacle_cut_trigger_cnt}/{OBSTACLE_CUT_TRIGGER_FRAMES}'),
             (f'해제 진행 — 라이다클리어 {self._obstacle_cut_release_cnt}/{OBSTACLE_CUT_RELEASE_CONFIRM_FRAMES}',
-             (10, 84), (200, 200, 200), 13,
+             (10, text_y0 + 50), (200, 200, 200), 13,
              f'release progress {self._obstacle_cut_release_cnt}/{OBSTACLE_CUT_RELEASE_CONFIRM_FRAMES}'),
             (f'컷 열(px) 범위 = {col_range}  (da BEV 좌표계)',
-             (10, 106), (255, 0, 255), 13, f'cut col range = {col_range}'),
+             (10, text_y0 + 72), (255, 0, 255), 13, f'cut col range = {col_range}'),
             (f'YOLO 검출기: {"정상" if self.yolo_vehicle_cut_detector is not None else "초기화실패→라이다단독폴백"}',
-             (10, 128), (255, 255, 255), 12,
+             (10, text_y0 + 94), (255, 255, 255), 12,
              f'yolo detector: {"OK" if self.yolo_vehicle_cut_detector is not None else "FAILED->lidar-only"}'),
-            ('── ★ 전 파라미터 실차 미검증 ★', (10, 152), UNMEASURED, 13,
+            ('── ★ 전 파라미터 실차 미검증 ★', (10, text_y0 + 118), UNMEASURED, 13,
              '-- ALL PARAMS UNMEASURED --'),
             (f'TRIGGER X_MAX={OBSTACLE_CUT_TRIGGER_X_MAX_M}m Y_HALF={OBSTACLE_CUT_TRIGGER_Y_HALF_M}m  '
              f'NEAR_M={OBSTACLE_CUT_NEAR_M}m  SPEED_CAP={SPEED_OBSTACLE_CUT}',
-             (10, 174), UNMEASURED, 12,
+             (10, text_y0 + 140), UNMEASURED, 12,
              f'trigger_x={OBSTACLE_CUT_TRIGGER_X_MAX_M} y_half={OBSTACLE_CUT_TRIGGER_Y_HALF_M} '
              f'near={OBSTACLE_CUT_NEAR_M} speed_cap={SPEED_OBSTACLE_CUT}'),
         ]
-        canvas = np.full((198, 620, 3), 30, dtype=np.uint8)
-        put_text_kr_multi(canvas, lines)
+        put_text_kr_multi(canvas, headline + lines)
+
+        # --- 카메라(YOLO 원시 박스) 패널 -------------------------------------------
+        cam_vis = (self.yolo_vehicle_cut_detector.get_latest_debug_frame()
+                   if self.yolo_vehicle_cut_detector is not None else None)
+        cam_region = canvas[cam_y0:cam_y0 + CAM_H, cam_x0:cam_x0 + CAM_W]
+        if cam_vis is not None:
+            # 종횡비 유지 없이 단순 리사이즈(표시 전용 — yolo_vehicle.py preprocess()와
+            # 동일 관례, "검출 여부"만 보면 되고 좌표 왜곡은 이 창의 목적에 영향 없음).
+            cam_region[:] = cv2.resize(cam_vis, (CAM_W, CAM_H), interpolation=cv2.INTER_LINEAR)
+        else:
+            reason = ('DEBUG_VIZ_YOLO_VEHICLE 확인' if self.yolo_vehicle_cut_detector is not None
+                      else '검출기 초기화 실패')
+            cv2.putText(cam_region, f'카메라 프레임 없음 ({reason})', (8, CAM_H // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (140, 140, 140), 1, cv2.LINE_AA)
+        cv2.rectangle(canvas, (cam_x0, cam_y0), (cam_x0 + CAM_W - 1, cam_y0 + CAM_H - 1), (80, 80, 80), 1)
+        cv2.putText(canvas, 'YOLO VEHICLE CAM', (cam_x0, cam_y0 - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1, cv2.LINE_AA)
+
+        # --- 라이다 ROI(트리거에 실제 쓰인 박스) BEV 패널 ---------------------------
+        cv2.putText(canvas, 'LIDAR TRIGGER ROI (매틱 갱신)', (panel_x0, panel_y0 - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1, cv2.LINE_AA)
+        bev = canvas[panel_y0:panel_y0 + PANEL_H, panel_x0:panel_x0 + PANEL_W]
+        DISP_X_MAX = OBSTACLE_CUT_TRIGGER_X_MAX_M + 1.0
+        DISP_Y_HALF = OBSTACLE_CUT_TRIGGER_Y_HALF_M + 0.45
+        PPM = min(PANEL_H / (DISP_X_MAX + 0.2), PANEL_W / (2 * DISP_Y_HALF + 0.2))
+        EX, EY = PANEL_W // 2, PANEL_H - 8
+
+        def to_px(wx, wy):
+            return (int(EX - wy * PPM), int(EY - wx * PPM))
+
+        for d in (0.5, 1.0, 1.5, 2.0):
+            if d > DISP_X_MAX:
+                break
+            cv2.circle(bev, (EX, EY), int(d * PPM), (55, 55, 55), 1)
+        # 실제 트리거 박스(OBSTACLE_CUT_TRIGGER_X_MAX_M x Y_HALF_M) — "검증범위" 그 자체
+        cv2.rectangle(bev, to_px(0.0, OBSTACLE_CUT_TRIGGER_Y_HALF_M),
+                      to_px(OBSTACLE_CUT_TRIGGER_X_MAX_M, -OBSTACLE_CUT_TRIGGER_Y_HALF_M),
+                      (0, 255, 255), 1)
+
+        bg_x, bg_y = self._obstacle_cut_bg_x, self._obstacle_cut_bg_y
+        for i in range(bg_x.size):
+            px, py = to_px(float(bg_x[i]), float(bg_y[i]))
+            if 0 <= px < PANEL_W and 0 <= py < PANEL_H:
+                cv2.circle(bev, (px, py), 2, (90, 90, 90), -1)   # 표시범위 안 배경점(미트리거, 회색)
+
+        roi_x, roi_y = self._obstacle_cut_roi_x, self._obstacle_cut_roi_y
+        for i in range(roi_x.size):
+            px, py = to_px(float(roi_x[i]), float(roi_y[i]))
+            if 0 <= px < PANEL_W and 0 <= py < PANEL_H:
+                cv2.circle(bev, (px, py), 4, (0, 0, 255), -1)   # 트리거 박스 안(실제 판정에 쓰인 점, 빨강)
+
+        if bg_x.size == 0:
+            cv2.putText(bev, '(표시범위 안 점 없음)', (8, PANEL_H - 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1, cv2.LINE_AA)
+
+        cv2.circle(bev, (EX, EY), 5, (255, 220, 0), -1)          # 자차 위치
+        cv2.rectangle(bev, (0, 0), (PANEL_W - 1, PANEL_H - 1), (80, 80, 80), 1)
+
         cv2.rectangle(canvas, (0, 0), (canvas.shape[1] - 1, canvas.shape[0] - 1), active_color, 3)
         cv2.imshow('obstacle_cut_debug', canvas)
         cv2.waitKey(1)

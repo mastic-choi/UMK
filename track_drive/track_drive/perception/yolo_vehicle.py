@@ -238,16 +238,15 @@ class YoloVehicleDetector:
             vehicle_detected, _detections = self._latest_result
         return vehicle_detected
 
-    def show_debug_windows(self):
-        """★ 반드시 메인 스레드에서만 호출할 것 ★ (yolo_cone.py/dl_lane.py와 동일한 이유)."""
-        if not DEBUG_VIZ_YOLO_VEHICLE:
-            return
+    def get_latest_debug_frame(self):
+        """최신 시각화 프레임(카메라 원본 + 검출 박스)을 스레드 세이프하게 반환만 한다
+        (cv2.imshow는 호출하지 않음) — track_drive.py의 _debug_viz_obstacle_cut()이 이
+        프레임을 라이다 BEV 패널과 한 창에 합쳐서 그린다(2026-08-20, 이 검출기 전용
+        'yolo_vehicle_result' 창을 따로 안 띄우고 obstacle_cut_debug 창 하나로 합침 —
+        욜로판정과 그 판정에 쓰인 라이다 ROI를 한눈에 대조해서 보고 싶다는 요청 반영).
+        DEBUG_VIZ_YOLO_VEHICLE=False면 _worker()가 애초에 vis를 안 만들어서 항상 None."""
         with self._lock:
-            vis = self._latest_debug
-        if vis is None:
-            return
-        cv2.imshow('yolo_vehicle_result', vis)
-        cv2.waitKey(1)
+            return self._latest_debug
 
     def stop(self):
         self._stopped = True

@@ -2766,11 +2766,11 @@ class DLLaneDetector:
             boosted = abs(steer_deg_final - steer_deg_raw) > 1e-3
             final_color = (0, 140, 255) if boosted else (255, 255, 255)  # 주황=부스트 개입중
             steer_text = f'조향:{steer_deg_raw:+.1f}도 -> 증폭된 실제조향:{steer_deg_final:+.1f}도'
-            put_text_kr(vis, steer_text, (5, vis.shape[0] - 34), font_size=18, color_bgr=final_color,
+            put_text_kr(vis, steer_text, (5, vis.shape[0] - 46), font_size=18, color_bgr=final_color,
                         fallback=f'steer:{steer_deg_raw:+.1f}deg -> boosted:{steer_deg_final:+.1f}deg')
         if ctrl_speed is not None:
             speed_text = f'발행 speed: {ctrl_speed:+.2f}'
-            put_text_kr(vis, speed_text, (5, vis.shape[0] - 12), font_size=18, color_bgr=(255, 255, 255),
+            put_text_kr(vis, speed_text, (5, vis.shape[0] - 24), font_size=18, color_bgr=(255, 255, 255),
                         fallback=f'pub speed:{ctrl_speed:+.2f}')
         cv2.imshow('dl_lane', vis)
         cv2.waitKey(1)
