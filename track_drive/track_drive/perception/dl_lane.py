@@ -220,6 +220,12 @@ from ..config import (
     # avoid_hold_improvement_proposal.md
     AVOID_HOLD_DA_AREA_JUMP_RATIO, AVOID_HOLD_DIR_BIAS_PX,
     # [2026-08-20] da 근접 컷(obstacle-cut, ENABLE_OBSTACLE_CUT) — README §2.5x 참고
+    # [2026-08-20 버그수정] ENABLE_OBSTACLE_CUT이 visualize()(cut_status 표시)에서 실제로
+    # 쓰이는데 이 import 목록에 빠져 있었다 — DEBUG_VIZ_DL_LANE이 꺼져 있는 동안엔 그
+    # 코드 자체가 안 돌아서 안 드러났다가, §2.54에서 DEBUG_VIZ_DL_LANE을 다시 켜면서 매
+    # 프레임 NameError로 dl_lane 창이 아예 안 뜨는 문제로 나타났다("디버깅 창이 안 뜬다"
+    # 요청 반영).
+    ENABLE_OBSTACLE_CUT,
     LANE_WIDTH_M, OBSTACLE_CUT_NEAR_M, OBSTACLE_CUT_LANE_HALF_WIDTH_PX, OBSTACLE_CUT_MIN_REMAIN_PX,
     # DL_LL_ALGO='yw'(팀원 작성, main 기본) 전용
     DL_LL_YELLOW_GAP_INIT_PX, DL_LL_YELLOW_GAP_EMA_ALPHA,
