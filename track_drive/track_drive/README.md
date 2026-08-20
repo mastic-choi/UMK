@@ -2316,6 +2316,32 @@ B3 진입 자체가 막혀버리는 역효과가 날 수 있으니 실차에서 
 즉 이제 veto는 "둘 다 뭔가 봤는데 서로 다른 자리를 보고 있다"가 아니라 "YOLO가 가리키는 자리엔
 라이다가 아무것도 못 봤다"는 진짜 불일치일 때만 발동한다. 실차 미검증.
 
+### 5.4 트랙 순서 게이트 반전 — "B2 먼저"에서 "B3(방해차량) 먼저"로 (2026-08-21)
+§5.2(2026-08-20)에서 "대회 트랙은 고정장애물(B2)이 항상 이동장애물(B3)보다 먼저 나온다"는 확인을
+받아 B2 통과 전엔 vehicle 타입도 B2로 취급하는 게이트를 넣었었다. 이번 요청으로 그 순서가
+반대(B3가 먼저)로 뒤집혀, 게이트 자체를 반전시켰다 — §5.2를 대체하는 게 아니라 그 구조를 그대로
+반대 방향에 적용한 것.
+
+**수정한 곳:**
+- `run_behavior_fsm()`의 `Phase.OBSTACLE_ZONE` 분기: `obstacle_cut_type=='vehicle' and
+  self._b2_passed` → `'B3'`(§5.2 이전) 였던 조건을 `obstacle_cut_type=='fixed' and
+  self._b3_passed` → `'B2'`로 뒤집었다. 즉 `_b3_passed`가 아직 `False`면 `obstacle_cut_type`이
+  `'fixed'`로 잡혀도 `'B3'`로 취급 — B3를 먼저 확정 짓기 전엔 B2로 오분류돼 먼저 통과 처리되는
+  사고를 막는다(§5.2와 대칭 원리, 대상만 바뀜).
+- `_active_yolo_stage()`: `Phase.OBSTACLE_ZONE`에서 `'cone' if not self._b2_passed else
+  'vehicle'` → `'vehicle' if not self._b3_passed else 'cone'`로 반전 — B3가 지나기 전까진
+  차량 YOLO만 돌리고(콘 카메라는 유휴), B3가 끝난 뒤에야 콘 YOLO로 전환된다.
+- `__init__`의 `self._b2_passed`/`self._b3_passed` 초기화 주변 주석, `_debug_viz_obstacle_cut()`
+  주석도 새 순서에 맞춰 갱신.
+
+**영향받지 않는 것:** `_mark_behavior_passed()`/Phase.DONE 전환 조건(`_b2_passed and
+_b3_passed` 둘 다 필요)은 순서와 무관해 그대로. `_b2_passed`/`_b3_passed`를 매 바퀴 리셋하는
+`RESET_PHASE_EACH_LAP` 경로도 대칭이라 손댈 필요 없음.
+
+**알려진 한계 (실차 미검증):** §5.2와 마찬가지로 "B3가 B2보다 항상 먼저 나온다"는 전제가 확실할
+때만 안전 — 트랙 순서가 실제로 바뀌었는지, 혹은 상황(예: 코스 구성 변경)에 따라 다시 바뀔 수
+있는지 실차에서 재확인할 것.
+
 ---
 
 ## 6. 실측값 기록 (캘리브레이션)

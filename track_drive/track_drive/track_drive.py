@@ -351,22 +351,21 @@ class TrackDriverNode(Node):
         # ── 판단/제어 상태 ──
         self.mission_state  = START_STATE
         self.behavior_state = BehaviorState.B0_NORMAL
-        # [2026-08-21, 임시] B2(고정장애물=콘) 회피 단독 검증 — Phase.LAVACON(B1 진입 대기,
+        # [2026-08-21, 임시] B2/B3(고정장애물/방해차량) 단독 검증 — Phase.LAVACON(B1 진입 대기,
         # 실제 회피는 없는 placeholder라 건너뛰어도 손해 없음)을 건너뛰고 시작부터 바로
-        # Phase.OBSTACLE_ZONE으로 진입한다. _b2_passed는 기본값 False 그대로 둔다 —
-        # _active_yolo_stage()가 Phase.OBSTACLE_ZONE에서 "_b2_passed가 아니면 콘, 이면 차량"
-        # 스테이지를 고르므로(위 참고) False라야 카메라가 콘 모델에 물려 obstacle_cut_type이
-        # 'fixed'(B2)로 잡힌다. [이전엔 B3(방해차량) 단독 검증용으로 여길 True로 켜뒀었음 —
-        # B3 검증을 다시 하려면 True로, 그리고 아래처럼 이 값 자체를 되돌릴 것.]
+        # Phase.OBSTACLE_ZONE으로 진입한다. _b2_passed/_b3_passed는 기본값 False 그대로 둔다 —
+        # _active_yolo_stage()가 Phase.OBSTACLE_ZONE에서 "_b3_passed가 아니면 차량, 이면 콘"
+        # 스테이지를 고르므로(위 참고, 2026-08-21 요청 반영으로 B3 먼저 순서로 뒤집힘) 둘 다
+        # False인 기본 상태론 차량 모델이 먼저 물린다.
         self.phase          = Phase.OBSTACLE_ZONE
         # [2026-08-15] Phase.OBSTACLE_ZONE 통합(da_based_b2b3_proposal.md B안) —
         # B2/B3 각각 최소 한 번 완료됐는지 추적. 둘 다 True가 돼야 Phase.DONE으로
         # 넘어간다(_mark_behavior_passed() 참고).
         # [2026-08-20] 대회 트랙은 고정장애물(B2)이 항상 이동장애물(B3)보다 먼저
-        # 나오는 게 확정된 순서라(요청 반영) — run_behavior_fsm()에서 B3 트리거를
-        # self._b2_passed가 True일 때만 받아들이도록 순서를 강제한다(아래 참고).
-        self._b2_passed = False   # [2026-08-21] B2 단독 검증 중 — RESET_PHASE_EACH_LAP=True면
-                                   # 매 바퀴 1843~1844행에서 어차피 Phase.LAVACON/False로 리셋됨
+        # 나오는 게 확정된 순서라고 봤었으나(§5.2), [2026-08-21, 요청 반영] 순서가
+        # "이동장애물(B3) → 고정장애물(B2)"로 뒤집혔다 — run_behavior_fsm()에서 B2 트리거를
+        # self._b3_passed가 True일 때만 받아들이도록 순서를 강제한다(아래 참고, §5.4).
+        self._b2_passed = False
         self._b3_passed = False
         # [2026-08-20] 요청 반영 — B2/B3 실제 처리를 da 근접 컷(obstacle_cut_active) 기반으로
         # 바꾸면서 추가. obstacle_cut_active 진입 순간 'B2'/'B3' 중 하나를 latch해뒀다가,
@@ -598,9 +597,12 @@ class TrackDriverNode(Node):
     #   같다(스레드/세션은 살아있지만 GPU/CPU 추론 자체는 안 돎).
     #
     #   매핑: S0_SIGNAL(신호등 판단 대기) → 신호등. S1_LANE_FOLLOW 중 Phase.LAVACON(B1
-    #   진입 대기) → 콘. Phase.OBSTACLE_ZONE 중 B2(고정장애물=콘 1개) 아직 안 지났으면 →
-    #   콘, 지났으면(B3 방해차량 대기) → 차량. Phase.DONE(다음 교차로 신호등 대기) → 신호등.
+    #   진입 대기) → 콘. Phase.OBSTACLE_ZONE 중 B3(방해차량) 아직 안 지났으면 → 차량,
+    #   지났으면(B2 고정장애물=콘 1개 대기) → 콘. Phase.DONE(다음 교차로 신호등 대기) → 신호등.
     #   S3_SHORTCUT/S4_FINISH는 카메라 YOLO 자체가 불필요해 전부 끈다.
+    #   [2026-08-21, 요청 반영] 트랙 순서를 "B3(방해차량) → B2(고정장애물)"로 뒤집었다 —
+    #   §5.2/§5.4가 강제하던 "B2 먼저" 게이트를 반대로 바꾼 것과 짝을 맞춘 것(아래
+    #   Phase.OBSTACLE_ZONE 분기, run_behavior_fsm() 참고).
     #
     #   [2026-08-20] §1.16은 신호등 YOLO를 "S3/S4 포함 항상 켜서 오탐률을 전체 구간에서
     #   로그로 본다"는 의도로 상시 가동시켰는데, 이번 요청으로 그 부분을 뒤집는다 —
@@ -614,7 +616,7 @@ class TrackDriverNode(Node):
             if self.phase == Phase.LAVACON:
                 return 'cone'
             if self.phase == Phase.OBSTACLE_ZONE:
-                return 'cone' if not self._b2_passed else 'vehicle'
+                return 'vehicle' if not self._b3_passed else 'cone'
             return 'signal'  # Phase.DONE — 다음 교차로 신호등 보드 대기
         return None  # S3_SHORTCUT/S4_FINISH — 카메라 YOLO 불필요
 
@@ -2232,13 +2234,14 @@ class TrackDriverNode(Node):
             if self.obstacle_cut_active and self._obscut_zone_tag is None:
                 # obstacle_cut_type: perc_obstacle_cut_trigger()가 YOLO 콘/차량 이중확인으로
                 # 매 틱 갱신해두는 값을 트리거 활성화 순간 스냅샷 — 'fixed'(라바콘=B2) 아니면
-                # 'vehicle'(방해차량=B3). 트랙 순서가 "B2 → B3"로 고정이라는 걸 확인받았으므로
-                # (§5.2와 동일 원칙), _b2_passed가 아직 False면 타입이 vehicle로 잡혀도 B2로
-                # 취급한다 — 초반 오분류로 B3를 먼저 통과 처리해버리는 사고를 원천 차단.
-                if self.obstacle_cut_type == 'vehicle' and self._b2_passed:
-                    self._obscut_zone_tag = 'B3'
-                else:
+                # 'vehicle'(방해차량=B3). [2026-08-21, 요청 반영] 트랙 순서가 "B3 → B2"로
+                # 뒤집혔다(§5.4, 기존 §5.2 "B2 먼저" 게이트의 반대) — _b3_passed가 아직
+                # False면 타입이 fixed로 잡혀도 B3로 취급한다 — 초반 오분류로 B2를 먼저
+                # 통과 처리해버리는 사고를 원천 차단.
+                if self.obstacle_cut_type == 'fixed' and self._b3_passed:
                     self._obscut_zone_tag = 'B2'
+                else:
+                    self._obscut_zone_tag = 'B3'
 
             if self._obscut_zone_tag is not None and not self.obstacle_cut_active:
                 self._mark_behavior_passed(self._obscut_zone_tag)
@@ -2886,7 +2889,7 @@ class TrackDriverNode(Node):
         # [2026-08-21] B2(고정장애물=콘)/B3(방해차량) 공용 창 — obstacle_cut 메커니즘 자체가
         # 라이다 ROI/트리거/유지타이머까지 완전히 공유라(perc_obstacle_cut_trigger() 참고)
         # 창 대부분은 손 안 대고, 카메라 패널/검출값 텍스트만 지금 활성 스테이지
-        # (_active_yolo_stage(), Phase.OBSTACLE_ZONE에서 _b2_passed 기준 'cone'/'vehicle')에
+        # (_active_yolo_stage(), Phase.OBSTACLE_ZONE에서 _b3_passed 기준 'vehicle'/'cone')에
         # 맞춰 콘 검출기 ↔ 차량 검출기를 동적으로 바꿔 보여준다.
         cam_stage = self._active_yolo_stage()
         if cam_stage == 'vehicle':
