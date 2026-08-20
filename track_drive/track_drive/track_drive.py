@@ -268,6 +268,10 @@ class TrackDriverNode(Node):
         self._obstacle_cut_lidar_side = None   # 'L'/'R'/None(lidar_near 아니었으면)
         self._obstacle_cut_yolo_side  = None   # 'L'/'R'/None(YOLO 미검출)
         self._obstacle_cut_side_veto  = False  # True면 이번 틱 좌우 불일치로 vehicle_seen 취소됨
+        # [2026-08-21] obstacle_cut_active 진입 순간 PP_LOOKAHEAD_CURVATURE_GAIN을
+        # PP_CURVATURE_BOOST_GAIN으로 잠깐 올려두는 타이머 — 이 시각까지는 부스트 유지
+        # (_update_obstacle_cut_hold()가 진입 엣지에서 세팅, _lane_steer()가 매틱 소비).
+        self._pp_curvature_boost_until_t = 0.0
         # [2026-08-20] _debug_viz_obstacle_cut() BEV 패널용 — avoid_hold_debug의
         # _obstacle_front_all_x/y·_obstacle_cluster_x/y와 동일 패턴(매틱 갱신되는 라이브 값).
         # bg_*는 표시범위 안의 배경점 전부(회색), roi_*는 실제 트리거 ROI 안에 잡힌 점만(빨강).
@@ -1399,6 +1403,11 @@ class TrackDriverNode(Node):
         self.obstacle_cut_active = now < self._obstacle_cut_until_t
         if was_active and not self.obstacle_cut_active and self.obstacle_cut_release_reason != 'floor_and_lidar_clear':
             self.obstacle_cut_release_reason = 'timeout'
+        # [2026-08-21] obstacle_cut 진입 엣지(직전엔 비활성 → 이번 틱 활성)에서만 부스트
+        # 타이머를 새로 찍는다 — 활성 유지 중에는 안 건드려서(재진입 아닌 한) 1초가 매틱
+        # 늘어나 계속 부스트 상태로 안 남게 한다. config.py PP_CURVATURE_BOOST_GAIN 주석 참고.
+        if not was_active and self.obstacle_cut_active:
+            self._pp_curvature_boost_until_t = now + PP_CURVATURE_BOOST_SEC
 
     def _obstacle_cut_roi_clear(self):
         """perc_obstacle_cut_trigger()와 동일한 전용 ROI(OBSTACLE_CUT_RELEASE_DIST_M로
@@ -2481,6 +2490,14 @@ class TrackDriverNode(Node):
         if not path or vehicle_x is None:
             return self.pure_pursuit.prev_steer_deg
         vehicle_xy = (vehicle_x, path[0][1] if vehicle_y_px is None else vehicle_y_px)
+        # [2026-08-21] obstacle_cut 진입 후 PP_CURVATURE_BOOST_SEC 동안만
+        # lookahead_curvature_gain을 PP_CURVATURE_BOOST_GAIN으로 올린다 — pure_pursuit
+        # 인스턴스가 하나뿐이라(__init__ 참고) 매틱 여기서 스위칭해도 다른 호출부
+        # (_handle_lavacon() 등, near_obstacle=False 경로)에도 그대로 적용된다.
+        # _update_obstacle_cut_hold()가 타이머만 세팅, 실제 반영은 여기서.
+        self.pure_pursuit.lookahead_curvature_gain = (
+            PP_CURVATURE_BOOST_GAIN if time.time() < self._pp_curvature_boost_until_t
+            else PP_LOOKAHEAD_CURVATURE_GAIN)
         return self.pure_pursuit.control(path, vehicle_xy, speed=self._speed_for_lookahead(),
                                           imu_curvature_px=self._imu_curvature_px(),
                                           near_obstacle=near_obstacle)

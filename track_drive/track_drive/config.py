@@ -947,6 +947,16 @@ PP_LOOKAHEAD_MAX_PX = 180.7        # lookahead 상한 — 150.0→180.7(그리�
 PP_LOOKAHEAD_CURVATURE_GAIN = 224.8  # 직전 프레임 curvature가 클수록(코너) lookahead를 줄이는 게인 — 100.0→224.8(그리드서치)
 PP_LOOKAHEAD_MIN_PX = 62.61        # 코너에서 lookahead가 줄어들 수 있는 하한 — 40.0→62.61(그리드서치)
 
+# [2026-08-21, 요청 반영] da 근접 컷(obstacle_cut_active, B2/B3 회피) 진입 순간
+#   PP_LOOKAHEAD_CURVATURE_GAIN을 잠깐 이 값으로 올렸다가 PP_CURVATURE_BOOST_SEC 뒤
+#   원래 값(프리셋 적용 후의 PP_LOOKAHEAD_CURVATURE_GAIN, 예: speed15=120)으로 복귀시킨다
+#   (_update_obstacle_cut_hold() 진입 엣지 감지 + _lane_steer() 적용, track_drive.py 참고).
+#   회피 진입 순간 코너 감쇠를 세게 걸어 lookahead를 짧게 당겨서(=조향을 더 촘촘/민감하게)
+#   장애물 근접 구간에서의 반응성을 순간적으로 높이려는 의도 — 실차 미검증, speed15 기준
+#   요청값 180 그대로 사용(프리셋 무관하게 항상 이 값으로 튐).
+PP_CURVATURE_BOOST_GAIN = 180.0
+PP_CURVATURE_BOOST_SEC  = 1.0
+
 # [2026-08-19] speed_lookahead_px = BASE + GAIN*(speed - ANCHOR)의 ANCHOR(요청 반영) —
 #   기존엔 ANCHOR가 암묵적으로 0(=BASE가 "speed=0일 때" 값)이라, 실제로는 절대 안 나오는
 #   speed=0 지점을 기준으로 삼다 보니 config.py만 봐서는 "지금 주행속도에서 lookahead가

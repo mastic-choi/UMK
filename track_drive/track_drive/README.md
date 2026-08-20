@@ -475,6 +475,24 @@ config.py `PP_*` 블록 상단 주석에 남겨둔 "이 커밋 이전 값"으로
 `--samples 400` 규모의 정식 재실행 및 사용자 확인 없이는 `PP_TUNE_PRESETS`에 새 프리셋을 추가하지
 않는다(§0.5.12/§0.5.13과 동일 절차 — 정식 실행 후 사용자 확인 후에만 config.py 반영).
 
+### 0.5.15 da 근접 컷(obstacle_cut_active) 진입 순간 `PP_LOOKAHEAD_CURVATURE_GAIN` 1초 부스트 (2026-08-21)
+요청 반영 — B2/B3 회피(da 근접 컷, §4/§5) 진입 순간 pure pursuit이 순간적으로 더 촘촘하게
+추종하도록, `obstacle_cut_active`가 켜지는 엣지에서 `lookahead_curvature_gain`을
+`PP_CURVATURE_BOOST_GAIN`(180.0, speed15 프리셋 기준 요청값)으로 `PP_CURVATURE_BOOST_SEC`
+(1.0초)간 올렸다가 원래 값(프리셋 적용 후의 `PP_LOOKAHEAD_CURVATURE_GAIN`, speed15=120)으로
+되돌린다. 게인이 커질수록 코너 curvature 감쇠가 세져 lookahead가 더 짧아진다(`control()`의
+`curvature_damp = 1/(1+gain*damp_curvature)` 공식, §0.5 상단 클래스 주석 참고) — 즉 회피
+기동 시작 순간에만 짧게 더 민감한 조향을 걸겠다는 의도.
+
+구현: `_update_obstacle_cut_hold()`가 `was_active→active` 전환(재진입 아닌 최초 진입)에서만
+`self._pp_curvature_boost_until_t = now + PP_CURVATURE_BOOST_SEC`를 찍고, `_lane_steer()`가
+매 틱 `pure_pursuit.control()` 호출 직전에 그 시각까지인지 보고
+`self.pure_pursuit.lookahead_curvature_gain`을 스위칭한다. `PurePursuitController` 인스턴스가
+`self.pure_pursuit` 하나뿐이라 `_handle_lavacon()` 등 다른 호출부에도 그대로 걸린다(당시
+obstacle_cut_active와 무관하게 부스트 중이면 적용됨 — 의도된 동작인지는 실차 재검증 필요).
+실차 미검증 — 부스트가 걸리는 순간 조향이 과민해지는지, 회피 중 오히려 흔들림을 키우는지
+먼저 서행/정지 개입 가능 상태로 확인할 것.
+
 ---
 
 ## 1. 신호등 (`MissionState.S0_SIGNAL` — 출발/교차로 공용) — 통합 4구 신호등
