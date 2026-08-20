@@ -663,7 +663,8 @@ AVOID_HOLD_DIR_BIAS_PX = 20.0   # ≈ PASS_OFFSET(80.0, "7. 기타" 절, 실측 
 #   ENABLE_OBSTACLE_CUT=False가 기본값이다 — 부호규약(장애물 쪽을 정확히 잘라야
 #   하는지 반대로 잘라 오히려 장애물 쪽으로 조향하게 되는지)이 실차 미검증이라,
 #   반드시 정지/저속에서 먼저 확인 후 켤 것.
-ENABLE_OBSTACLE_CUT = False   # 최상위 스위치 — ENABLE_BEHAVIOR/TEST_DISABLE_B2_B3와 무관하게 독립적으로 켜고 끔
+ENABLE_OBSTACLE_CUT = True    # [2026-08-20] 실차 테스트 시작 — 스케일카, 사용자가 직접 지켜보며 저속 검증 진행
+                               # ENABLE_BEHAVIOR/TEST_DISABLE_B2_B3와 무관하게 독립적으로 켜고 끔
 
 # ── da 근접 컷 진입 트리거 (perc_obstacle_cut_trigger(), track_drive.py) ──
 #   perc_lavacon_trigger()와 동일한 "라이다 AND YOLO 카메라" 이중확인 패턴이지만,
@@ -1197,7 +1198,7 @@ DEBUG_VIZ_AVOID_HOLD = False
 # [2026-08-20] da 근접 컷(obstacle-cut, ENABLE_OBSTACLE_CUT 주석 참고) 전용 상태창 —
 #   라이다 raw/YOLO raw/AND확정/유지타이머 잔여시간/해제카운터를 avoid_hold_debug와
 #   같은 구조로 한곳에 모아 보여준다(track_drive.py _debug_viz_obstacle_cut()).
-DEBUG_VIZ_OBSTACLE_CUT = False
+DEBUG_VIZ_OBSTACLE_CUT = True   # [2026-08-20] 실차 검증 시작과 함께 켬 — dl_lane 창의 마젠타 오버레이와 같이 볼 것
 
 
 # #############################################################
@@ -1415,7 +1416,7 @@ YOLO_VEHICLE_INPUT_SIZE = 640
 YOLO_VEHICLE_CONF_THRESHOLD = 0.3  # 이식 브랜치 실측 신뢰도 범위(0.15~0.78) 하한 근처 — 실차 미검증
 YOLO_VEHICLE_CLASS_ID = 2          # COCO 클래스 id — 'car'만 씀('truck'은 오탐 확인돼 제외)
 YOLO_VEHICLE_MODEL_PATH = None     # None이면 yolo_ros/yolov8n_car.onnx(형제 디렉터리)를 자동으로 찾음(perception/yolo_vehicle.py 참고)
-DEBUG_VIZ_YOLO_VEHICLE = False     # 방해차량 YOLO 검출 박스 디버그 창 (perception/yolo_vehicle.py)
+DEBUG_VIZ_YOLO_VEHICLE = True      # [2026-08-20] 실차 검증 시작과 함께 켬 — 카메라가 실제로 'car'를 보는지 원시 박스로 확인용
 
 # ── 신호등 색상상태 YOLO (perception/yolo_signal_state.py, YOLOv8n ONNX) ──
 #   [2026-08-19] datasets/signal_state/(라벨링 워크플로는 그쪽 README 참고)로 파인튜닝한
