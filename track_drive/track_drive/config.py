@@ -684,9 +684,9 @@ OBSTACLE_CUT_TRIGGER_FRAMES   = 3     # 라이다 AND YOLO 연속확인 프레�
 #   [2026-08-20] 트리거 확정 시점엔 obstacle_dist가 항상 0.7~1.0m(=da 크롭 한계 이내)
 #   이므로 컷의 먼 경계를 obstacle_dist로 계산하지 않는다 — "지금 보이는 da 전체
 #   깊이"를 그대로 먼 경계로 쓰고, 가까운 경계만 아래 OBSTACLE_CUT_NEAR_M로 고정한다.
-OBSTACLE_CUT_NEAR_M = 0.3                 # 컷의 차량쪽 고정 경계(m) — 실차 미검증
+OBSTACLE_CUT_NEAR_M = 0.1                 # 컷의 차량쪽 고정 경계(m) — 차량 뒤 더 넓은 범위 차단(기존 0.3→0.1, 2026-08-20)
 OBSTACLE_CUT_LANE_HALF_WIDTH_PX = None    # None이면 LANE_WIDTH_M*DL_PIXELS_PER_METER로 초기화 시 계산(정적값 — _ll_active_half_width() 등 다른 서브시스템 상태에 안 엮음)
-OBSTACLE_CUT_MIN_REMAIN_PX = 40.0         # [2026-08-20] 클리핑 후 밴드에 이 폭(px) 미만만 남으면 그 밴드는 컷을 건너뛴다
+OBSTACLE_CUT_MIN_REMAIN_PX = 25.0         # [2026-08-20] 클리핑 후 밴드에 이 폭(px) 미만만 남으면 그 밴드는 컷을 건너뛴다 (40→25로 낮춤)
                                            #   — da가 완전히 비면 pure_pursuit.control()의 "path 없으면 직전값 유지(held)"
                                            #   폴백이 걸려 회피가 가장 필요한 순간 조향이 얼어붙는 위험(초기 세션에서
                                            #   다룬 그 문제) 재발 방지. 실차 미검증 추정치.
