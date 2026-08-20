@@ -1227,11 +1227,13 @@ DEBUG_VIZ_SIGNAL_DETAIL = False  # 신호등 후보탐색 과정 디버그 창 2
 #   (perc_signal() 참고) 이 로그도 안 찍힌다 — Hough 경로로 되돌렸을 때만 의미 있음.
 #   (track_drive.py perc_signal())
 DEBUG_LOG_SIGNAL     = True
-DEBUG_VIZ_YOLO_CONE  = True   # [2026-08-21] B2(고정장애물=콘) 회피 검증 중 켬 — obstacle_cut_debug
-                               # 창의 카메라 패널이 이 vis 프레임을 그대로 가져다 쓴다(꺼져 있으면
-                               # yolo_cone.py _worker()가 vis 자체를 안 만들어 "카메라 프레임 없음"만
-                               # 뜬다). yolo_vehicle.py DEBUG_VIZ_YOLO_VEHICLE과 동일 관례 — 검증
-                               # 끝나면 False로 되돌릴 것.
+DEBUG_VIZ_YOLO_CONE  = False  # [2026-08-21, 요청 반영] 콘 원시검출 큰 창('yolo_cone_result',
+                               # yolo_cone.py show_debug_windows())을 끄기 위해 다시 False로.
+                               # 주의 — 이 플래그가 obstacle_cut_debug 창의 카메라 패널(cam_stage
+                               # =='cone'일 때)에 쓰는 vis 프레임도 같이 만드므로, 꺼두면 그 패널도
+                               # "카메라 프레임 없음"으로 같이 빈다(yolo_cone.py _worker() 참고,
+                               # yolo_vehicle.py DEBUG_VIZ_YOLO_VEHICLE과 동일 관례). B2 카메라
+                               # 패널까지 다시 보려면 True로 되돌릴 것.
 # [2026-08-20] 배경판+색상상태 YOLO 동시 테스트 끝나서 다시 False로 되돌림(요청 반영,
 #   디버그창 전체 끄기).
 DEBUG_VIZ_YOLO_SIGNAL = False  # 신호등 배경판 YOLO 검출 박스 디버그 창 (perception/yolo_signal.py)
