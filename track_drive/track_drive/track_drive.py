@@ -139,14 +139,19 @@ class TrackDriverNode(Node):
         self.signal_left_confirmed     = False
         self._sig_straight_cnt = 0   # signal_straight_on 연속 유지 프레임 수
         self._sig_left_cnt     = 0   # signal_left_on 연속 유지 프레임 수
+        # [2026-08-20] S1→S0_SIGNAL 진입 트리거를 정지선에서 "신호등 보드 자체가 인식되는
+        # 시점"으로 교체 — perc_signal()이 이제 S1_LANE_FOLLOW 중에도 detect_s2()를 돌려,
+        # 색상과 무관하게 4구 보드 자체가 잡혔는지(SignalDetector.s2_chosen_idx>=0)만 본다.
+        self.signal_board_confirmed = False
+        self._sig_board_cnt = 0      # 보드 인식(색상 무관) 연속 유지 프레임 수
         # [2026-08-19] YOLO 신호등 색상상태 검출(perception/yolo_signal.py) 비교용 — 위
         # signal_*_on(Hough Circle)과 나란히 보기만 하고 아직 FSM 판단에는 안 씀(YOLO_SIGNAL_*
         # config.py 주석 참고).
         self.signal_red_on_yolo      = False
         self.signal_straight_on_yolo = False
         self.signal_left_on_yolo     = False
-        self.stopline = False            # 굵은 가로 흰선(정지선/지름길 끝 단서)
-        self._stopline_cooldown_t = 0.0  # 이 시각까지 정지선 재감지 무시
+        self.stopline = False            # 굵은 가로 흰선(정지선/지름길 끝 단서, S3 진출·바퀴카운트용)
+        self._signal_reentry_cooldown_t = 0.0  # 이 시각까지 신호등 보드 재감지(S0_SIGNAL 재진입) 무시
         self._last_stopline_t = 0.0      # [10] 정지선을 마지막으로 본 시각(교차로 근처 기동 금지용)
         # [2-3 장애물(전방/측면)]
         self.obstacle_front = False   # 전방 장애물
@@ -302,11 +307,9 @@ class TrackDriverNode(Node):
         self._prev_angle_out = 0.0    # [5] 직전 발행 조향각(변화율 제한용)
         self._pid_prev_error = 0.0
         self._pid_integral   = 0.0
-        self._turn_yaw_start = None   # 좌회전 진행 중 플래그 (None=미회전)
-        self._turn_frame_cnt = 0      # 좌회전 경과 프레임 수
+        self._turn_dist      = None   # 좌회전 진행 중 누적 이동거리(m, None=미회전) — [2026-08-20] IMU yaw 대신 거리 기반
         self._s2_commit_dist = None   # S2 신호 확정 후 물리적 분기 커밋 구간 누적 이동거리(m, None=미진입)
         self._s2_commit_dir  = None   # 커밋 구간에서 진행 중인 방향 ('straight'/'left')
-        self._approach_t0    = None   # [진입] 정지선 감지 후 감속 시작 시각
         self._exit_approach_t0 = None # [진출] S3 탈출 정지선 감지 후 감속 시작 시각
         self._shortcut_t0    = None   # 지름길 진입 시각(끝감지 타이밍용)
         self._shortcut_ref_yaw = None # S3 진입 1초 후 기록한 기준 yaw (탈출 좌회전 전 보정용)
@@ -535,8 +538,8 @@ class TrackDriverNode(Node):
     # [2-4b] 신호등 색상상태 YOLO (비교용, 아직 주행 판단에는 미연결)
     #   입력 self.img_front → 출력 self.signal_*_on_yolo
     #   yolo_signal_state.py가 별도 스레드에서 자기 페이스로 추론하므로 여기선 논블로킹으로
-    #   최신 결과만 받아온다(perc_yolo_cone()과 동일한 패턴). perc_signal()과 달리 S0/S2가
-    #   아닐 때도 항상 돌린다 — 실차 영상 전체 구간에서 이 모델이 얼마나 오탐하는지도
+    #   최신 결과만 받아온다(perc_yolo_cone()과 동일한 패턴). perc_signal()과 달리 상태 무관하게
+    #   (S3/S4 포함) 항상 돌린다 — 실차 영상 전체 구간에서 이 모델이 얼마나 오탐하는지도
     #   같이 보고 싶어서(정상 주행 중 신호등 아닌 걸 신호로 잘못 잡는지 확인 목적).
     def perc_yolo_signal_state(self):
         if self.yolo_signal_state_detector is None:
@@ -681,16 +684,33 @@ class TrackDriverNode(Node):
         SIG_CONFIRM_FRAMES 연속 유지를 확인해 confirmed로 승격시켜, 단발성 오검출/오검출실패가
         바로 FSM 전환(출발/좌회전)으로 새는 걸 막는다(라바콘/차량 트리거와 동일한 패턴).
         DEBUG_LOG_SIGNAL=True면(기본값) 매 프레임 _log_signal_debug()로 실패 원인+힌트를 찍는다
-        — DEBUG_VIZ_SIGNAL(창)과 별개 스위치라 터미널 로그만 원하면 이것만 켜도 됨."""
+        — DEBUG_VIZ_SIGNAL(창)과 별개 스위치라 터미널 로그만 원하면 이것만 켜도 됨.
+
+        [2026-08-20] S1_LANE_FOLLOW 중에도 detect_s2()를 돌리도록 확장(요청 반영) — 예전엔
+        S0_SIGNAL 진입 후에야 신호등을 "보기" 시작해서, 그 진입 자체는 정지선(바닥 흰선)
+        검출이 트리거였다. 그런데 "정지선을 밟아야 신호를 읽기 시작한다"는 신호등 자체를
+        인식하는 것과는 다른 신호원이라, 정지선 인식이 어긋나면(치우침/블러 등) 신호등이
+        이미 빨간불인데도 계속 차선주행 속도로 접근하는 상황이 가능했다. 이제 S1 중에도
+        보드 인식 자체(색상 무관, SignalDetector.s2_chosen_idx>=0)를 매 프레임 확인해
+        _s1_lane_follow()가 이걸로 S0_SIGNAL 진입을 트리거한다 — 정지선은 더 이상 이 전환에
+        관여하지 않는다(다른 용도— _shortcut_end()/_update_lap()/교차로 근처 기동 금지—는
+        그대로 유지)."""
         if self.img_front is None:
             return
+        if self.mission_state not in (MissionState.S1_LANE_FOLLOW, MissionState.S0_SIGNAL):
+            return
 
-        if self.mission_state == MissionState.S0_SIGNAL:
-            self.signal_red_on, self.signal_straight_on, self.signal_left_on = \
-                self.signal_detector.detect_s2(self.img_front)
-            if self.yolo_signal_detector is not None:
-                self.yolo_signal_detector.show_debug_windows()  # 메인 스레드 전용(yolo_signal.py 주석 참고)
+        self.signal_red_on, self.signal_straight_on, self.signal_left_on = \
+            self.signal_detector.detect_s2(self.img_front)
+        if self.yolo_signal_detector is not None:
+            self.yolo_signal_detector.show_debug_windows()  # 메인 스레드 전용(yolo_signal.py 주석 참고)
 
+        if self.mission_state == MissionState.S1_LANE_FOLLOW:
+            # S0_SIGNAL 진입 트리거용 — 색상은 아직 안 보고 "보드 자체가 잡혔는가"만 본다.
+            board_seen = self.signal_detector.s2_chosen_idx >= 0
+            self._sig_board_cnt = self._sig_board_cnt + 1 if board_seen else 0
+            self.signal_board_confirmed = self._sig_board_cnt >= SIG_CONFIRM_FRAMES
+        else:  # S0_SIGNAL — 직진/좌회전 색상 확정
             self._sig_straight_cnt = self._sig_straight_cnt + 1 if self.signal_straight_on else 0
             self._sig_left_cnt     = self._sig_left_cnt + 1 if self.signal_left_on else 0
             self.signal_straight_confirmed = self._sig_straight_cnt >= SIG_CONFIRM_FRAMES
@@ -1381,7 +1401,7 @@ class TrackDriverNode(Node):
         self._pid_integral   = 0.0
         self.ctrl_angle = 0.0
         self.ctrl_speed = SPEED_STOP
-        # S0_SIGNAL 진입 시 신호값 초기화 (안정화는 S1 감속구간에서 이미 완료)
+        # S0_SIGNAL 진입 시 신호값 초기화 (색상 확정은 이 state 진입 후부터 새로 시작)
         if new_state == MissionState.S0_SIGNAL:
             self.signal_red_on      = False
             self.signal_straight_on = False
@@ -1392,17 +1412,19 @@ class TrackDriverNode(Node):
             self._sig_left_cnt     = 0
             self._s2_commit_dist = None
             self._s2_commit_dir  = None
-        # S1 진입 시 감속 플래그 초기화
+        # S1 진입 시 처리
         if new_state == MissionState.S1_LANE_FOLLOW:
-            self._approach_t0 = None
             # [2026-08-20] S0_SIGNAL 통합 이후 이 state는 출발 때 1번 + 매 바퀴 교차로에서
             # 반복 진입하므로, prev_state만으로는 "진짜 첫 출발"을 구분할 수 없다(항상
             # S0_SIGNAL이라 같음) — self._departed로 직접 추적한다.
+            # 다음 접근에서 신호등 보드를 새로 인식할 수 있도록 리셋(재진입마다 항상).
+            self._sig_board_cnt = 0
+            self.signal_board_confirmed = False
             if not self._departed:
                 self._departed = True
-                # 정지선 오검출 억제 + 바퀴 기준점 리셋은 진짜 출발 시점에만 필요 —
+                # 신호등 오검출 억제 + 바퀴 기준점 리셋은 진짜 출발 시점에만 필요 —
                 # 신호 대기하며 서 있던 시간이 1바퀴 시간에 섞이지 않도록 한다.
-                self._stopline_cooldown_t = time.time() + STOPLINE_COOLDOWN
+                self._signal_reentry_cooldown_t = time.time() + SIGNAL_REENTRY_COOLDOWN
                 self._lap_t0 = time.time()
                 self._yaw_accum = 0.0
                 self._prev_yaw_accum_ref = self.imu_yaw
@@ -1419,7 +1441,15 @@ class TrackDriverNode(Node):
             그때마다 _behavior_enabled=True로 Behavior(B1→B2→B3)가 바로 활성화된다
             (README §대회 규정 요약: 라바콘 등은 출발 직후부터 시작). Behavior가 조향/속도를
             전담하는 구간에서는 여기서 PID를 돌리지 않는다(적분 오염 방지) — 아래 조기 return.
-          - 정지선을 감지하면 S0_SIGNAL(교차로 재진입)로 전환해 다음 분기를 판단한다.
+          - [2026-08-20] 정지선이 아니라 "신호등 보드가 인식되는 시점"(signal_board_confirmed,
+            perc_signal() 참고)에 서행 구간 없이 곧장 S0_SIGNAL(교차로 재진입)로 전환한다
+            (요청 반영). 정지선(바닥 흰선) 검출은 신호등 자체를 보는 것과는 다른 신호원이라,
+            정지선 인식이 어긋나면 신호등이 이미 빨간불인데도 계속 차선주행 속도로 접근하는
+            상황이 가능했다 — 신호등 보드 자체를 트리거로 쓰면 그 간극이 없다. 실제 정지는
+            S0_SIGNAL 진입 후 그 상태의 매 프레임 기본 동작(_s0_signal(): 신호 미확정=
+            사실상 빨간불이면 속도 0)이 대신한다 — 신호가 이미 확정돼 있었다면(직전 바퀴의
+            잔상 등) 정지 없이 바로 커밋 구간으로 넘어갈 수도 있는데, _change_state()가
+            S0_SIGNAL 진입 시 signal_*_confirmed를 항상 리셋하므로 그런 오작동은 없다.
         """
         # Behavior가 조향을 전담하는 구간에서는 Mission의 차선 PID를 건너뛴다.
         # phase==LAVACON이어도 좌우 클러스터 동시검출 트리거(_lavacon_engaged)가 확정되기 전까지는
@@ -1429,22 +1459,13 @@ class TrackDriverNode(Node):
         if self._obstacle_active or self._overtake_active:
             return
 
-        if self._approach_t0 is not None:
-            # 감속 구간: 차선 조향 유지 + 극저속 → 거의 정지 상태로 S0_SIGNAL 진입
-            elapsed = time.time() - self._approach_t0
-            self.ctrl_angle = self._lane_steer()
-            self.ctrl_speed = APPROACH_SPEED
-            self._prev_speed = APPROACH_SPEED
-            if elapsed >= APPROACH_TIME:
-                self._change_state(MissionState.S0_SIGNAL)
-        else:
-            self._lane_drive()
-            # TEST_DISABLE_INTERSECTION=True면 정지선을 감지해도 아래 조건이 항상 False가 되어
-            # _approach_t0가 절대 세팅되지 않음 → S0_SIGNAL 재진입 자체가 원천 차단되고
-            # 계속 이 else 분기(_lane_drive)만 반복하며 차선주행을 이어간다.
-            if (not TEST_DISABLE_INTERSECTION and self.stopline
-                    and time.time() >= self._stopline_cooldown_t):  # 정지선 감지(쿨다운 지난 뒤만)
-                self._approach_t0 = time.time()                             # 감속 구간 시작
+        self._lane_drive()
+        # TEST_DISABLE_INTERSECTION=True면 신호등 보드를 인식해도 아래 조건이 항상 False가 되어
+        # S0_SIGNAL 재진입 자체가 원천 차단되고 계속 이 함수(_lane_drive)만 반복하며
+        # 차선주행을 이어간다.
+        if (not TEST_DISABLE_INTERSECTION and self.signal_board_confirmed
+                and time.time() >= self._signal_reentry_cooldown_t):  # 보드 인식(쿨다운 지난 뒤만)
+            self._change_state(MissionState.S0_SIGNAL)
 
     # ── S0_SIGNAL: 4구 신호등 판단 — 출발선/교차로 공용 (정지 후 신호로 경로 판단) ──
     def _s0_signal(self):
@@ -1452,7 +1473,9 @@ class TrackDriverNode(Node):
         4구 신호등 앞에서 정지한 채 판독한다. [2026-08-20] 원래 출발(S0_WAIT_GREEN)과 교차로
         (S2_INTERSECTION)로 나뉘어 있던 걸 하나로 합쳤다 — 둘 다 로직이 완전히 같았기 때문
         (정지 → 4구 신호 판독 → 직진/좌회전 확정). 이 state는 출발 직후 1번, 이후 매 바퀴
-        트랙 중앙 분기점에서 재진입한다.
+        트랙 중앙 분기점에서 재진입한다. START_STATE=S0_SIGNAL이라 맨 처음 진입도 이 경로를
+        그대로 타므로, 출발이든 교차로 재진입이든 "신호 미확정=사실상 빨간불이면 정지"가
+        동일하게 적용된다(아래 1번, 별도 "정지" 이벤트/타이머 없이 매 프레임 기본값으로).
           1. 진입 즉시 정지 (기본값 STOP, 명시적 신호만 출발/재출발)
           2. 직진 초록(signal_straight_confirmed) → 커밋 구간(S2_COMMIT_DIST_M) 거쳐 S1 복귀
              + Behavior 활성화(라바콘부터 진행 — README §대회 규정 요약대로 출발 직후에도 매번 켠다)
@@ -1470,21 +1493,21 @@ class TrackDriverNode(Node):
              타므로 출발 직후에도 짧게(≈S2_COMMIT_DIST_M=1m) 이 구간을 거친다 — 출발선은 직선이라
              문제는 없을 것으로 보이나 실차 미검증.
         """
-        if self._turn_yaw_start is not None:
+        if self._turn_dist is not None:
             self._do_left_turn(next_state=MissionState.S3_SHORTCUT)
             return
 
         if self._s2_commit_dist is not None:
             self.ctrl_angle = 0.0
             self.ctrl_speed = APPROACH_SPEED
-            self._s2_commit_dist += self._commit_speed_mps() * 0.05  # 20Hz 제어주기(control_loop) 가정
+            self._s2_commit_dist += self._speed_mps_fallback(APPROACH_SPEED) * 0.05  # 20Hz 제어주기(control_loop) 가정
             if self._s2_commit_dist >= S2_COMMIT_DIST_M:
                 commit_dir = self._s2_commit_dir
                 self._s2_commit_dist = None
                 self._s2_commit_dir  = None
                 if commit_dir == 'straight':
                     self._behavior_enabled = True
-                    self._stopline_cooldown_t = time.time() + STOPLINE_COOLDOWN
+                    self._signal_reentry_cooldown_t = time.time() + SIGNAL_REENTRY_COOLDOWN
                     self._change_state(MissionState.S1_LANE_FOLLOW)
                 else:
                     self._begin_left_turn()
@@ -1514,7 +1537,7 @@ class TrackDriverNode(Node):
         시작하지 않고, 정지선이 실제로 잡히거나 SHORTCUT_MAX_T에 도달해 _shortcut_end()가
         확정된 뒤에야 진출 시퀀스(감속+좌회전)로 넘어간다.
         """
-        if self._turn_yaw_start is not None:
+        if self._turn_dist is not None:
             self._do_left_turn(next_state=MissionState.S1_LANE_FOLLOW)
             return
 
@@ -1574,44 +1597,32 @@ class TrackDriverNode(Node):
 
     # ── 좌회전 공통 (실차 전환: 후진 없이 무난한 좌회전) ──
     def _begin_left_turn(self):
-        self._turn_yaw_start = self.imu_yaw   # closed-loop 기준점(IMU 죽었을 때만 미사용)
-        self._turn_frame_cnt = 0
+        self._turn_dist = 0.0   # 거리 적분 시작(0m부터 목표거리까지)
         self.get_logger().info('좌회전 시작')
 
     def _do_left_turn(self, next_state):
         """무난한(후진 없는) 좌회전 후 next_state로 전환.
 
-        [2026-08-18] 종료 판정을 프레임 카운트(open-loop)에서 IMU yaw 실측
-        기반(closed-loop)으로 변경. IMU가 살아있으면(_imu_live()) 실제 회전각
-        (_yaw_delta(_turn_yaw_start))이 목표(trn_yaw_target, config.py TURN_YAW_TARGET_DEG류)에
-        도달했을 때 끝낸다 — 같은 (조향각, 속도) 명령이어도 배터리 전압 강하·노면·속도
-        변동에 따라 실제 요레이트가 매번 달라질 수 있어, "N프레임 지남"보다 정확하다.
-        trn_f(TURN_FRAMES류)는 이제 트리거가 아니라 IMU가 죽어있을 때만 걸리는 안전
-        타임아웃 상한이다 — 무한 회전 방지 + IMU 장애 시 예전과 동일한 동작으로 열화."""
+        [2026-08-20] 종료 판정을 IMU yaw 실측 기반(closed-loop)에서 실측거리 기반으로
+        되돌렸다(요청 반영, config.py "좌회전 공통" 절 주석 참고). 고정 조향각(trn_ang)을
+        고정 이동거리(trn_dist)만큼 유지하다가 끝낸다 — S2_COMMIT_DIST_M(_s0_signal())과
+        동일한 적분 패턴(_speed_mps_fallback(), VESC 실측 + 명령속도 폴백)이라 IMU 없이도
+        VESC 장애 시 무한 회전 없이 항상 끝난다."""
         if next_state == MissionState.S3_SHORTCUT:
-            trn_ang, trn_spd, trn_f, trn_yaw_target = (
-                TURN_ANGLE, TURN_SPEED, TURN_FRAMES, TURN_YAW_TARGET_DEG)
+            trn_ang, trn_spd, trn_dist = TURN_ANGLE, TURN_SPEED, TURN_DIST_M
         else:
-            trn_ang, trn_spd, trn_f, trn_yaw_target = (
-                TURN_EXIT_ANGLE, TURN_EXIT_SPEED, TURN_EXIT_FRAMES, TURN_EXIT_YAW_TARGET_DEG)
+            trn_ang, trn_spd, trn_dist = TURN_EXIT_ANGLE, TURN_EXIT_SPEED, TURN_EXIT_DIST_M
 
-        turn_done = self._turn_frame_cnt >= trn_f   # IMU 죽었을 때를 위한 안전 타임아웃
-        if self._imu_live():
-            yaw_turned_deg = abs(math.degrees(self._yaw_delta(self._turn_yaw_start)))
-            turn_done = turn_done or yaw_turned_deg >= trn_yaw_target
-
-        if not turn_done:
+        if self._turn_dist < trn_dist:
             self.ctrl_angle = trn_ang
             self.ctrl_speed = trn_spd
+            self._turn_dist += self._speed_mps_fallback(trn_spd) * 0.05  # 20Hz 제어주기(control_loop) 가정
         else:
             self.get_logger().info('좌회전 완료')
-            self._turn_yaw_start = None
-            self._turn_frame_cnt = 0
+            self._turn_dist = None
             if next_state == MissionState.S1_LANE_FOLLOW:
-                self._stopline_cooldown_t = time.time() + STOPLINE_COOLDOWN
+                self._signal_reentry_cooldown_t = time.time() + SIGNAL_REENTRY_COOLDOWN
             self._change_state(next_state)
-            return
-        self._turn_frame_cnt += 1
 
     def _yaw_delta(self, start):
         """현재 yaw - start (−π~π wrap)"""
@@ -1883,16 +1894,19 @@ class TrackDriverNode(Node):
             return abs(self.v_mps) / METERS_PER_SPEED_UNIT
         return self._prev_speed
 
-    def _commit_speed_mps(self):
-        """_s0_signal()의 커밋 구간 이동거리 적분에 쓸 현재 속도(m/s) 추정.
-        VESC 실측이 살아있으면(_vesc_live()) 그 값을 그대로 쓴다 — S2_COMMIT_DIST_M을
-        이 값으로 적분하면 대회 당일 실속도가 얼마든 실제 이동거리 기준으로 맞는다.
-        VESC가 죽어있을 때만 APPROACH_SPEED(명령속도)를 METERS_PER_SPEED_UNIT으로
-        환산해 폴백한다 — 예전 시간 기반(S2_COMMIT_T)이 암묵적으로 가정하던 것과
-        동일한 근사치라 VESC 장애 시에도 이전과 같은 동작으로 안전하게 열화된다."""
+    def _speed_mps_fallback(self, cmd_speed):
+        """거리 적분(_s2_commit_dist/_turn_dist)에 쓸 현재 속도(m/s) 추정.
+        VESC 실측이 살아있으면(_vesc_live()) 그 값을 그대로 쓴다 — 대회 당일 실속도가
+        얼마든 실제 이동거리 기준으로 맞는다. VESC가 죽어있을 때만 그 구간에서 명령
+        중인 속도(cmd_speed, 모터단위)를 METERS_PER_SPEED_UNIT으로 환산해 폴백한다 —
+        예전 시간 기반(S2_COMMIT_T)이 암묵적으로 가정하던 것과 동일한 근사치라 VESC
+        장애 시에도 이전과 같은 동작으로 안전하게 열화되고, 거리 적분 자체가 멈춰
+        무한정 그 구간에 머무는(예: 좌회전 조향을 계속 유지하는) 상황이 없다.
+        [2026-08-20] S2_COMMIT_DIST_M 전용이던 _commit_speed_mps()를 일반화 —
+        _do_left_turn()의 거리 기반 좌회전 종료 판정에도 동일 철학으로 재사용한다."""
         if self._vesc_live():
             return abs(self.v_mps)
-        return APPROACH_SPEED * METERS_PER_SPEED_UNIT
+        return cmd_speed * METERS_PER_SPEED_UNIT
 
     def _lane_steer(self, path=None, vehicle_x=None):
         """path(ROI 픽셀좌표 경로, 가까운점→먼점)를 pure_pursuit(controller/pure_pursuit.py)로
@@ -2055,7 +2069,7 @@ class TrackDriverNode(Node):
                 text_kr, text_en = f'정상 수신 중 ({age*1000:.0f}ms 전)', f'LIVE ({age*1000:.0f}ms ago)'
 
         gain_fed = abs(self.v_mps) >= VESC_MIN_SPEED_MPS
-        canvas = np.full((160, 380, 3), 30, dtype=np.uint8)
+        canvas = np.full((190, 380, 3), 30, dtype=np.uint8)
         lines = [
             (f'VESC 연동: {text_kr}', (10, 8), color, 16, f'VESC link: {text_en}'),
             (f'v_mps: {self.v_mps:+.3f} m/s', (10, 44), (255, 255, 255), 20,
@@ -2066,6 +2080,19 @@ class TrackDriverNode(Node):
             ('토픽: /vesc_speed_erpm (std_msgs/Float32, vesc_speed_bridge.py 경유)',
              (10, 108), (180, 180, 180), 12, 'topic: /vesc_speed_erpm'),
         ]
+        # [2026-08-20] 좌회전(_do_left_turn())을 실측거리 기반으로 되돌리며, 진행상황
+        # 표시를 IMU 창(_debug_viz_imu(), 예전 yaw 기반)에서 여기로 옮겼다 — 이제 좌회전
+        # 진행 판정이 VESC 적분(_turn_dist)이라 이 창이 더 맞는 위치.
+        turn_active = self._turn_dist is not None
+        if turn_active:
+            trn_dist_target = (TURN_DIST_M if self.mission_state == MissionState.S0_SIGNAL
+                                else TURN_EXIT_DIST_M)
+            lines.append((
+                f'좌회전 중: {self._turn_dist:.2f}m / {trn_dist_target:.2f}m',
+                (10, 140), (0, 255, 255), 16,
+                f'TURNING: {self._turn_dist:.2f} / {trn_dist_target:.2f} m'))
+        else:
+            lines.append(('좌회전 진행 중 아님', (10, 140), (150, 150, 150), 14, 'not turning'))
         put_text_kr_multi(canvas, lines)
         cv2.rectangle(canvas, (0, 0), (canvas.shape[1] - 1, canvas.shape[0] - 1), color, 3)
 
@@ -2073,11 +2100,10 @@ class TrackDriverNode(Node):
         cv2.waitKey(1)
 
     # [DEBUG_VIZ_IMU] IMU(/imu) 연동이 실제로 살아있는지 + 지금 imu_yaw 값이 얼마인지를
-    # 한눈에 보여주는 창(2026-08-18, _debug_viz_vesc()와 동일 패턴). 좌회전(_do_left_turn())을
-    # IMU yaw closed-loop로 바꾼 뒤, 실차에서 "IMU가 진짜 살아있는지"와 "좌회전 중 목표각까지
-    # 얼마나 남았는지"를 눈으로 볼 수단이 없어서 추가 — TURN_YAW_TARGET_DEG류 실측 튜닝 때
-    # 이 창을 보면서 좌회전이 실제로 몇 도에서 끝나는지, yaw 부호가 기대한 방향인지 확인할 것
-    # (부호 규약 자체가 pose_estimator.py 기준 "실차 미검증"이라 이 창으로 처음 확인해야 함).
+    # 한눈에 보여주는 창(2026-08-18, _debug_viz_vesc()와 동일 패턴). [2026-08-20] 좌회전
+    # (_do_left_turn())을 실측거리 기반으로 되돌리며 좌회전 진행상황 표시는
+    # _debug_viz_vesc()로 옮겼다 — 이제 좌회전이 IMU를 참조하지 않는다. 이 창은 여전히
+    # _s3_shortcut()의 헤딩홀드(_shortcut_ref_yaw)가 IMU를 쓰므로 그 값 확인용으로 남긴다.
     # control_loop()에서 매 주기 호출.
     def _debug_viz_imu(self):
         now = time.time()
@@ -2094,27 +2120,12 @@ class TrackDriverNode(Node):
                 text_kr, text_en = f'정상 수신 중 ({age*1000:.0f}ms 전)', f'LIVE ({age*1000:.0f}ms ago)'
 
         yaw_deg = math.degrees(self.imu_yaw)
-        canvas = np.full((360, 380, 3), 30, dtype=np.uint8)
+        canvas = np.full((360, 380, 3), 30, dtype=np.uint8)  # 방위 다이얼(cy=250, r=90)까지 포함하는 높이
         lines = [
             (f'IMU 연동: {text_kr}', (10, 8), color, 16, f'IMU link: {text_en}'),
             (f'imu_yaw: {yaw_deg:+7.2f}° ({self.imu_yaw:+.3f} rad)', (10, 44),
              (255, 255, 255), 18, f'imu_yaw: {yaw_deg:+7.2f} deg'),
         ]
-
-        turn_active = self._turn_yaw_start is not None
-        if turn_active:
-            # S0_SIGNAL(§신호등, 2026-08-20 S0_WAIT_GREEN+S2_INTERSECTION 통합)에서 진행 중인
-            # 좌회전은 "S2 교차로 → S3 지름길 진입" 좌회전, S3_SHORTCUT에서 진행 중이면
-            # "S3 → S1 진출" 좌회전이다(_do_left_turn()의 next_state 분기와 동일한 판별 기준).
-            yaw_target = (TURN_YAW_TARGET_DEG if self.mission_state == MissionState.S0_SIGNAL
-                          else TURN_EXIT_YAW_TARGET_DEG)
-            turned_deg = math.degrees(self._yaw_delta(self._turn_yaw_start))
-            lines.append((
-                f'좌회전 중: {abs(turned_deg):5.1f}° / {yaw_target:.1f}° (부호 {turned_deg:+.1f}°)',
-                (10, 76), (0, 255, 255), 16,
-                f'TURNING: {abs(turned_deg):5.1f} / {yaw_target:.1f} deg (signed {turned_deg:+.1f})'))
-        else:
-            lines.append(('좌회전 진행 중 아님', (10, 76), (150, 150, 150), 14, 'not turning'))
 
         put_text_kr_multi(canvas, lines)
         cv2.rectangle(canvas, (0, 0), (canvas.shape[1] - 1, canvas.shape[0] - 1), color, 3)
@@ -2285,8 +2296,10 @@ class TrackDriverNode(Node):
     # 않게 역할을 분리했다 — 이 창은 배경판 위치를 YOLO_SIGNAL_ENABLE에 따라 YOLO 또는 HSV
     # 자동크롭으로 찾고, 점등 색상 판정은 항상 HSV/circle 기반(circle_brightness 등)인 하이브리드
     # 결과만 보여준다. YOLO 단독 색상상태 예측과 직접 비교하고 싶으면 두 창을 나란히 띄워 볼 것.
-    # perc_signal()이 S0/S2 상태에서만 detect_s2()를 돌리므로(그 외 상태는 self.signal_detector가
-    # 갱신 안 됨) control_loop()에서도 같은 상태일 때만 호출한다.
+    # [2026-08-20] perc_signal()이 이제 S1_LANE_FOLLOW 중에도 detect_s2()를 돌리므로(S0_SIGNAL
+    # 진입 트리거를 정지선 대신 "보드 인식"으로 바꾼 것과 연동) control_loop()에서도 S1/S0
+    # 둘 다에서 호출한다. S1 중엔 색상 확정 카운터(_sig_straight_cnt/_sig_left_cnt)가 아직
+    # 안 돌므로(perc_signal() 참고) 그 대신 보드 인식 카운터(_sig_board_cnt)를 보여준다.
     def _debug_viz_signal_status(self):
         if self.img_front is None:
             return
@@ -2298,25 +2311,36 @@ class TrackDriverNode(Node):
         box_color = (0, 200, 0) if ok else (0, 0, 220)
         cv2.rectangle(vis, (l, t), (r, b), box_color, 2, cv2.LINE_AA)
 
-        state_kr = ('좌회전' if self.signal_left_on else
-                    '직진'   if self.signal_straight_on else
-                    '정지(빨강)' if self.signal_red_on else '미검출')
-        confirmed = self.signal_left_confirmed or self.signal_straight_confirmed
-        confirm_kr = ('좌회전 확정' if self.signal_left_confirmed else
-                       '직진 확정'   if self.signal_straight_confirmed else '대기 중')
-        confirm_color = (0, 200, 0) if confirmed else (0, 140, 255)
-
         board_src_kr = 'YOLO' if YOLO_SIGNAL_ENABLE else 'HSV자동크롭'
 
-        lines = [
-            (f'{self.mission_state.name}  [배경판:{board_src_kr}+색상:HSV]', (10, 8), (255, 255, 255), 18,
-             f'{self.mission_state.name}  [board:{board_src_kr}+color:HSV]'),
-            (f'이번 프레임: {state_kr}', (10, 40), (255, 255, 255) if ok else (0, 0, 220), 20,
-             f'This frame: {state_kr}'),
-            (f'확정: {confirm_kr} (직진 {self._sig_straight_cnt}/{SIG_CONFIRM_FRAMES}  '
-             f'좌회전 {self._sig_left_cnt}/{SIG_CONFIRM_FRAMES})',
-             (10, 72), confirm_color, 18, f'Confirmed: {confirm_kr}'),
-        ]
+        if self.mission_state == MissionState.S1_LANE_FOLLOW:
+            confirm_color = (0, 200, 0) if self.signal_board_confirmed else (0, 140, 255)
+            lines = [
+                (f'{self.mission_state.name}  [배경판:{board_src_kr}] — S0_SIGNAL 진입 대기 중',
+                 (10, 8), (255, 255, 255), 18, f'{self.mission_state.name}  [board:{board_src_kr}]'),
+                (f'이번 프레임 보드 인식: {"O" if ok else "X"}', (10, 40),
+                 (255, 255, 255) if ok else (0, 0, 220), 20, f'Board seen this frame: {"YES" if ok else "NO"}'),
+                (f'확정: {"보드 확정(곧 정지)" if self.signal_board_confirmed else "대기 중"} '
+                 f'({self._sig_board_cnt}/{SIG_CONFIRM_FRAMES})',
+                 (10, 72), confirm_color, 18, f'Confirmed: board={self.signal_board_confirmed}'),
+            ]
+        else:
+            state_kr = ('좌회전' if self.signal_left_on else
+                        '직진'   if self.signal_straight_on else
+                        '정지(빨강)' if self.signal_red_on else '미검출')
+            confirmed = self.signal_left_confirmed or self.signal_straight_confirmed
+            confirm_kr = ('좌회전 확정' if self.signal_left_confirmed else
+                           '직진 확정'   if self.signal_straight_confirmed else '대기 중')
+            confirm_color = (0, 200, 0) if confirmed else (0, 140, 255)
+            lines = [
+                (f'{self.mission_state.name}  [배경판:{board_src_kr}+색상:HSV]', (10, 8), (255, 255, 255), 18,
+                 f'{self.mission_state.name}  [board:{board_src_kr}+color:HSV]'),
+                (f'이번 프레임: {state_kr}', (10, 40), (255, 255, 255) if ok else (0, 0, 220), 20,
+                 f'This frame: {state_kr}'),
+                (f'확정: {confirm_kr} (직진 {self._sig_straight_cnt}/{SIG_CONFIRM_FRAMES}  '
+                 f'좌회전 {self._sig_left_cnt}/{SIG_CONFIRM_FRAMES})',
+                 (10, 72), confirm_color, 18, f'Confirmed: {confirm_kr}'),
+            ]
         if not ok:
             lines.append((f'실패 사유: {sd.s2_reject_reason}', (10, 100), (0, 0, 220), 16,
                            f'Fail: {sd.s2_reject_reason}'))
@@ -2672,8 +2696,8 @@ class TrackDriverNode(Node):
         20Hz(0.05초)마다 호출되는 제어의 심장.
         매 주기 '인지 → 판단 → 제어 → 발행' 한 사이클을 순서대로 실행한다.
         ※ Behavior 게이팅: S1(차선주행) 상태이면서 _behavior_enabled=True일 때만 B1/B2/B3가 작동.
-          [2026-08-20] S0_SIGNAL "직진" 확정 시 항상 켜지므로(출발 포함), S0_SIGNAL/S3 구간과
-          정지선 감속 구간(_approach_t0)에서만 꺼져 있다.
+          [2026-08-20] S0_SIGNAL "직진" 확정 시 항상 켜지므로(출발 포함), S0_SIGNAL/S3 구간에서만
+          꺼져 있다.
         """
         self.perceive_all()                 # 1. 인지
         self._update_lap()                  #    바퀴 카운트(누적 yaw + 정지선)
@@ -2689,7 +2713,7 @@ class TrackDriverNode(Node):
             self._debug_viz_imu()
         if DEBUG_VIZ_AVOID_HOLD:
             self._debug_viz_avoid_hold()
-        if DEBUG_VIZ_SIGNAL and self.mission_state == MissionState.S0_SIGNAL:
+        if DEBUG_VIZ_SIGNAL and self.mission_state in (MissionState.S1_LANE_FOLLOW, MissionState.S0_SIGNAL):
             self._debug_viz_signal_status()
 
         if ENABLE_BEHAVIOR and self.mission_state == MissionState.S1_LANE_FOLLOW and self._behavior_enabled:
@@ -2795,7 +2819,8 @@ class TrackDriverNode(Node):
         """DEBUG_LOG_SIGNAL 전용 상세 로그. 전역 DEBUG_LOG의 [SIG] 요약 줄(0.5초 주기, roi/circles/
         reason/bright만 나열)과 달리, 신호등이 "왜" 안 잡히는지 단계별 원인 + 대응 힌트를 붙여서
         찍는다 — DEBUG_LOG를 꺼둔 채로 신호등만 디버깅하고 싶을 때 이것만 켜면 됨.
-        perc_signal()에서 S0/S2 상태일 때만 호출된다(그 외 상태는 detect_s2() 자체를 안 돌림).
+        perc_signal()에서 S1_LANE_FOLLOW/S0_SIGNAL 상태일 때만 호출된다(그 외 상태는
+        detect_s2() 자체를 안 돌림, [2026-08-20] S1 확장 — perc_signal() 참고).
         0.2초 스로틀(대략 4~5프레임당 1번, 20Hz 기준) — 매 프레임 찍으면 터미널이 너무 빨리
         흘러가서 오히려 못 읽는다."""
         sd = self.signal_detector

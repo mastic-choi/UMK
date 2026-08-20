@@ -212,25 +212,31 @@ CORNER_IMU_CONFIRM_KAPPA_PX = 1.0 / CORNER_MIN_RADIUS_PX  # = 0.004 — 이 이�
 CORNER_IMU_MIN_SCALE = 0.5  # IMU가 "회전 거의 없음"을 보고해도 비전신호 기반 감속을 최소 이만큼은 남겨두는 하한
 
 # ── 좌회전 공통 (S2→S3 진입, S3→S1 진출) — 전부 실차 튜닝 필요한 임시값 ──
-#   [2026-08-18] 종료 판정을 프레임 카운트(open-loop)에서 IMU yaw 실측 기반(closed-loop)으로
-#   변경. 같은 (TURN_ANGLE, TURN_SPEED) 명령이어도 배터리 전압 강하·노면·속도 변동에 따라
-#   실제 요레이트(초당 회전각)가 매번 조금씩 달라질 수 있어, "N프레임 지남"보다 "실제로
-#   TURN_YAW_TARGET_DEG만큼 돌았음"이 더 정확하다(track_drive.py _do_left_turn() 참고).
-#   TURN_FRAMES/TURN_EXIT_FRAMES는 이제 트리거가 아니라 IMU가 죽어있을 때만 쓰는 안전
-#   타임아웃 상한(무한 회전 방지)이다 — _imu_live() 가드 패턴, _vesc_live()와 동일 철학.
-TURN_ANGLE           = -60.0   # [진입] S2 교차로 → S3 지름길 좌회전 조향각
-TURN_SPEED           = 15.0    # [진입] 좌회전 속도
-TURN_YAW_TARGET_DEG  = 90.0    # [진입] 목표 회전각(도) — 분기가 직각이 아니라 커브로 열려서
-                                #        정확히 90인지 미검증, 실차 재확인 필요
-TURN_FRAMES          = 40      # [진입] 안전 타임아웃 상한 프레임 수 (20Hz 기준, IMU 죽었을 때만 씀)
-TURN_EXIT_ANGLE      = -60.0   # [진출] S3 지름길 → S1 차선주행 좌회전 조향각
-TURN_EXIT_SPEED      = 15.0    # [진출] 좌회전 속도
-TURN_EXIT_YAW_TARGET_DEG = 90.0  # [진출] 목표 회전각(도) — 위와 동일 사유로 실차 재확인 필요
-TURN_EXIT_FRAMES     = 40      # [진출] 안전 타임아웃 상한 프레임 수 (IMU 죽었을 때만 씀)
+#   [2026-08-20] 종료 판정을 IMU yaw 실측 기반(closed-loop)에서 다시 실측거리 기반으로
+#   변경(요청 반영). IMU closed-loop([2026-08-18] 도입분)는 "실제로 몇 도 돌았는가"를
+#   기준으로 삼아 배터리 전압 강하 등에 따른 요레이트 변동에 안 흔들린다는 장점이 있었지만,
+#   IMU yaw 부호 규약 자체가 pose_estimator.py 기준 실차 미검증이었고(§1.13 주석 참고),
+#   사용자가 실차 튜닝 편의상 "고정 조향각을 고정 거리만큼 유지"하는 단순한 open-loop
+#   방식을 선호함 — 목표거리(TURN_DIST_M/TURN_EXIT_DIST_M)만큼 VESC 실측(v_mps) 적분
+#   거리가 쌓이면 좌회전을 끝낸다(_do_left_turn() 참고, S2_COMMIT_DIST_M과 동일한 적분
+#   패턴). IMU를 아예 참조하지 않으므로 IMU 죽음에 대한 안전 타임아웃(TURN_FRAMES류)도
+#   불필요 — 대신 VESC가 죽어있으면 _speed_mps_fallback()이 명령속도(TURN_SPEED류)를
+#   METERS_PER_SPEED_UNIT으로 환산해 폴백하므로(_commit_speed_mps()와 동일 철학) 거리
+#   적분 자체가 멈춰 무한 회전하는 상황은 없다.
+TURN_ANGLE     = -60.0   # [진입] S2 교차로 → S3 지름길 좌회전 조향각(위 "-a") — 실차 튜닝 필요
+TURN_SPEED     = 15.0    # [진입] 좌회전 속도
+TURN_DIST_M    = 1.0     # [진입] TURN_ANGLE을 유지할 이동거리(m) — 실차 미검증 초기값
+TURN_EXIT_ANGLE   = -60.0   # [진출] S3 지름길 → S1 차선주행 좌회전 조향각 — 실차 튜닝 필요
+TURN_EXIT_SPEED   = 15.0    # [진출] 좌회전 속도
+TURN_EXIT_DIST_M  = 1.0     # [진출] TURN_EXIT_ANGLE을 유지할 이동거리(m) — 실차 미검증 초기값
 
-# ── 정지선 접근 감속 (S1→S2 진입, S3→S1 진출) ──
-APPROACH_SPEED      = 2.0  # [진입] 정지선 감지 후 S2 진입 전 감속 속도
-APPROACH_TIME       = 1.0  # [진입] 감속 유지 시간(s)
+# ── 정지선 접근 감속 ──
+#   [2026-08-20] S1→S0 진입 쪽의 감속-후-전환(APPROACH_TIME 서행 구간)은 폐지 — 정지선을
+#   감지하면 곧장 S0_SIGNAL로 전환하고, 그 상태의 매 프레임 판정("신호 미확정=사실상
+#   빨간불이면 속도 0", _s0_signal() 기본 동작)이 정지를 대신한다(요청 반영: "정지"라는
+#   별도 이벤트/타이머 없이 신호 상태만으로 속도가 결정되게). APPROACH_SPEED는 신호 확정
+#   후 커밋 구간(S2_COMMIT_DIST_M)에서는 계속 쓰이므로 유지.
+APPROACH_SPEED      = 2.0  # [커밋 구간] 신호 확정 후 물리적 분기까지 직진 속도
 APPROACH_EXIT_SPEED = 2.0  # [진출] S3 탈출 정지선 감지 후 감속 속도
 APPROACH_EXIT_TIME  = 1.0  # [진출] 감속 유지 시간(s)
 
@@ -1099,13 +1105,13 @@ DEBUG_VIZ_LIDAR    = False   # 라이다 BEV 장애물 감지 디버그 창 (tra
 DEBUG_VIZ_LAVACON  = False  # 라바콘 트리거 좌우 클러스터 BEV 디버그 창 (track_drive.py)
 DEBUG_PLANNER      = False  # Hybrid A* OccupancyGrid 디버그 창 (track_drive.py, USE_HYBRID_ASTAR_FOR_B3=True일 때만 의미있음)
 DEBUG_VIZ_STEER    = False  # 조향 컨트롤러(직전값유지/현재값반영) 한글 디버그 창 (track_drive.py)
-DEBUG_VIZ_VESC     = False  # VESC 실측속도(/vesc_speed_erpm) 연동 상태(수신중/끊김/미수신) 디버그 창
+DEBUG_VIZ_VESC     = False  # VESC 실측속도(/vesc_speed_erpm) 연동 상태(수신중/끊김/미수신) +
+                             #   좌회전 진행거리(TURN_DIST_M류) 디버그 창
                              #   (track_drive.py, 2026-08-06 LQR 브랜치에서 이식)
-# [2026-08-18] 좌회전(_do_left_turn())을 IMU yaw closed-loop로 바꾼 뒤(TURN_YAW_TARGET_DEG류
-#   실측 튜닝용) — IMU(/imu) 연동이 실제로 살아있는지 + 지금 imu_yaw 값이 얼마인지 +
-#   좌회전 진행 중이면 목표각까지 얼마나 남았는지를 한 창에서 보여준다. DEBUG_VIZ_VESC와
-#   동일한 3단계 상태(미수신/끊김/정상표시) 패턴(track_drive.py _debug_viz_imu()).
-DEBUG_VIZ_IMU      = True  # IMU(/imu) 연동 상태 + 현재 yaw값 + 좌회전 진행상황 디버그 창
+# [2026-08-18] IMU(/imu) 연동이 실제로 살아있는지 + 지금 imu_yaw 값이 얼마인지를 보여주는
+#   창. [2026-08-20] 좌회전(_do_left_turn())을 실측거리 기반으로 되돌리며 좌회전 진행상황
+#   표시는 DEBUG_VIZ_VESC 창으로 옮겼다 — 이제 좌회전이 IMU를 참조하지 않으므로.
+DEBUG_VIZ_IMU      = True  # IMU(/imu) 연동 상태 + 현재 yaw값 디버그 창
 
 DEBUG_VIZ_DL_LANE    = True  # 차선 — 기본 백엔드('dl') 디버그 창 (perception/dl_lane.py)
 # [2026-08-10] offset 스파크라인이 몇 프레임을 보여줄지 — [2026-08-11] 원래 별도
@@ -1585,7 +1591,11 @@ SHORTCUT_MAX_T = 15.0    # 지름길 최대 주행시간(s, 끝 못 찾을 때 �
 # SHORTCUT_MAX_T보다 충분히 작아야 하며, 실차에서 지름길 실제 통과시간을 재서 합류부
 # 도달 직전 시점으로 맞출 것 — 지금은 미실측 추정치.
 SHORTCUT_VISION_CUTOFF_T = 10.0
-STOPLINE_COOLDOWN = 3.0  # 상태 복귀 후 이 시간(s)간 정지선 재감지 무시(따다닥 전환 방지)
+# [2026-08-20] 이름을 STOPLINE_COOLDOWN → SIGNAL_REENTRY_COOLDOWN으로 변경 — S0_SIGNAL
+#   재진입 트리거가 정지선에서 신호등 보드 인식(signal_board_confirmed)으로 바뀌면서
+#   (track_drive.py perc_signal()/_s1_lane_follow() 참고), 이 쿨다운도 "정지선 재감지"가
+#   아니라 "신호등 보드 재감지" 무시 시간이 됐다. 값(3.0s)은 그대로 유지.
+SIGNAL_REENTRY_COOLDOWN = 3.0  # 상태 복귀 후 이 시간(s)간 신호등 보드 재감지 무시(따다닥 전환 방지)
 
 # ── 인식 끊김 보상 / 교차로 근처 기동 금지 ──
 OBSTACLE_HOLD_T = 0.6                   # 마지막 관측 후 이 시간(s)까지는 장애물이 있다고 본다
