@@ -674,7 +674,9 @@ AVOID_HOLD_DIR_BIAS_PX = 20.0   # ≈ PASS_OFFSET(80.0, "7. 기타" 절, 실측 
 #   ENABLE_OBSTACLE_CUT=False가 기본값이다 — 부호규약(장애물 쪽을 정확히 잘라야
 #   하는지 반대로 잘라 오히려 장애물 쪽으로 조향하게 되는지)이 실차 미검증이라,
 #   반드시 정지/저속에서 먼저 확인 후 켤 것.
-ENABLE_OBSTACLE_CUT = True    # [2026-08-20] 실차 테스트 시작 — 스케일카, 사용자가 직접 지켜보며 저속 검증 진행
+ENABLE_OBSTACLE_CUT = False   # [2026-08-20, 임시] 신호등 YOLO(signal-whiteboard-autocrop 병합분)
+                               # 단독 테스트를 위해 잠시 끔 — 방해차량 YOLO 검출기 자체를 안 띄운다.
+                               # 라인주행+초반출발+신호등 인식만 볼 것. 검증 끝나면 True로 되돌릴 것.
                                # ENABLE_BEHAVIOR/TEST_DISABLE_B2_B3와 무관하게 독립적으로 켜고 끔
 
 # ── da 근접 컷 진입 트리거 (perc_obstacle_cut_trigger(), track_drive.py) ──
@@ -1231,21 +1233,24 @@ DEBUG_VIZ_OBSTACLE_CUT = True   # [2026-08-20] 실차 검증 시작과 함께 �
 #   주석 참고, 출발선/교차로 재진입 모두 같은 SignalDetector.detect_s2() 재사용) — 값은
 #   그대로 "맨 처음 신호등 판독" 지점이라 의미상 동일하다.
 START_STATE     = MissionState.S0_SIGNAL
-ENABLE_BEHAVIOR = True   # S1에서 라바콘/장애물/추월 Behavior를 켤지 여부(최상위 스위치)
-# [2026-08-20] 전체 미션 파이프라인 복구 — 아래 세 TEST_* 격리 플래그를 모두 원복하고
-#   S0→S1→S2→S3→S4 전체 상태전환 + B1/B2/B3 Behavior를 한 번에 실차 검증하는 단계로 전환.
-#   (S2/S3 좌회전 각도·속도, B2/B3 트리거는 그동안 개별 격리 테스트로만 검증됐고 전체
-#   파이프라인으로 이어붙여서 돌린 적은 없다 — 상태전환 사이 값 리셋/타이밍이 실제로
-#   맞물리는지는 이번 실차 테스트에서 처음 확인하는 것이니 주의.)
+# [2026-08-20, 임시] 신호등 YOLO(signal-whiteboard-autocrop 병합분) 단독 검증 — 차량검출
+#   (ENABLE_OBSTACLE_CUT)/라바콘검출(YOLO_CONE_ENABLE) YOLO를 위에서 이미 끔. 이번 테스트
+#   범위는 딱 두 가지: ①초반 출발(S0_SIGNAL 신호 판독 후 출발) ②라인주행(S1) 중 신호등
+#   재인식+정지. B1/B2/B3 Behavior가 카메라 확인 없이 라이다 단독으로 오발동해 테스트를
+#   흐리지 않도록 ENABLE_BEHAVIOR도 같이 끈다 — 검증 끝나면 전체 파이프라인 복구 상태
+#   (ENABLE_BEHAVIOR=True, TEST_DISABLE_B2_B3=False)로 되돌릴 것.
+ENABLE_BEHAVIOR = False  # S1에서 라바콘/장애물/추월 Behavior를 켤지 여부(최상위 스위치)
 
-# ── 실차 테스트 범위 제한 (전부 해제) ──
+# ── 실차 테스트 범위 제한 ──
 TEST_DISABLE_INTERSECTION = False
 #   True: 신호등 보드 인식(signal_board_confirmed, README §1.15 이전엔 정지선 self.stopline
 #         기준이었음)이 확정돼도 감속→S0_SIGNAL 재진입을 아예 안 함(차선주행만 계속).
-#   False: 원래대로 신호등 보드 인식 확정 시 감속 후 S0_SIGNAL로 정상 전환.
-TEST_DISABLE_B2_B3 = False
+#   False: 원래대로 신호등 보드 인식 확정 시 감속 후 S0_SIGNAL로 정상 전환. — 이번 테스트가
+#         보고 싶은 게 바로 이 재진입(라인주행 중 신호등 인식)이라 False 유지.
+TEST_DISABLE_B2_B3 = True
 #   True: Phase가 FIXED_OBSTACLE/VEHICLE로 넘어가도 트리거 검사를 건너뛰고
-#         B0_NORMAL로 고정(B1 끝난 뒤 계속 일반 차선주행만 함).
+#         B0_NORMAL로 고정(B1 끝난 뒤 계속 일반 차선주행만 함). ENABLE_BEHAVIOR=False와
+#         이중으로 걸어 B2/B3가 어떤 경로로도 안 켜지게 한다(안전판).
 #   False: 원래대로 SAFETY_DIST/OVERTAKE_TRIGGER 트리거 검사해서 B2/B3 정상 발동.
 TEST_FORCE_BEHAVIOR = False
 #   True: _behavior_enabled를 시작부터 강제 True로 켜서, 교차로를 끈 채로도
