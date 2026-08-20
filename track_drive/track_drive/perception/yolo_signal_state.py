@@ -267,7 +267,7 @@ class YoloSignalStateDetector:
             vis = self._latest_debug
         if vis is None:
             return
-        cv2.imshow('yolo_signal_state_result', vis)
+        cv2.imshow('YOLO_신호등', vis)
         cv2.waitKey(1)
 
     def stop(self):

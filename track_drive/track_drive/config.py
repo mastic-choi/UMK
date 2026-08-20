@@ -32,9 +32,14 @@ import numpy as np
 # #############################################################
 
 class MissionState(Enum):
-    S0_WAIT_GREEN   = 0  # 3구 신호등 초록불 대기 후 출발
+    # [2026-08-20] 원래 S0_WAIT_GREEN(출발선 신호등)/S2_INTERSECTION(교차로 신호등)로
+    # 나뉘어 있었는데, 둘 다 "정지 → 4구 신호등 판독 → 직진/좌회전 확정" 로직이
+    # 완전히 동일해서(같은 SignalDetector.detect_s2()를 재사용) S0_SIGNAL 하나로
+    # 통합했다(track_drive.py _s0_signal() 참고, README §1). 이 state는 출발 직후 1회,
+    # 이후 매 바퀴 트랙 중앙 분기점에서 재진입한다 — "이번이 진짜 첫 출발인지"는
+    # track_drive.py의 self._departed 플래그로 별도 추적(값 자체엔 영향 없음).
+    S0_SIGNAL       = 0  # 4구 신호등 판단 (출발선/교차로 공용, 정지→직진·좌회전 확정)
     S1_LANE_FOLLOW  = 1  # 차선인식 주행 (라바콘·고정장애물·추월 Behavior를 이 상태 안에서 처리)
-    S2_INTERSECTION = 2  # 4구 신호등 교차로 (정지→라이다 경로판단→직진/좌회전)
     S3_SHORTCUT     = 3  # 지름길 (직진, 끝에서 좌회전)
     S4_FINISH       = 4  # 종료
 
@@ -1023,7 +1028,13 @@ DEBUG_VIZ_STOPLINE   = False  # 정지선 디버그 창, 백엔드 무관 항상
 #   현재 인식 상태(정지·직진·좌회전·미검출)를 창 하나에 다 보여주도록 확장
 #   (perception/traffic_signal.py detect_s2()). 요청에 따라 기본 True로 켜둠 — 다른 항목과
 #   달리(위 2026-08-11 라바콘 테스트 메모 참고) 이 스위치는 독립적으로 True 유지할 것.
-DEBUG_VIZ_SIGNAL     = True    # 신호등 ROI/HoughCircles 디버그 창 (perception/traffic_signal.py)
+# [2026-08-19] "YOLO 단독" 결과(yolo_signal_state.py, DEBUG_VIZ_YOLO_SIGNAL_STATE)와 창을
+#   헷갈리지 않게 역할을 분리 — 이 플래그는 이제 최종 결과 창(track_drive.py
+#   _debug_viz_signal_status(), "YOLO+HSV_신호등" — 배경판 위치는 YOLO_SIGNAL_ENABLE에 따라
+#   YOLO 또는 HSV자동크롭, 점등 색상 판정은 항상 HSV/circle 기반)만 켠다. 후보 탐색 과정
+#   전체(signal4_roi/signal4_board_search)를 보고 싶으면 DEBUG_VIZ_SIGNAL_DETAIL을 따로 켤 것.
+DEBUG_VIZ_SIGNAL     = True    # 신호등 최종 결과("YOLO+HSV_신호등") 디버그 창 (track_drive.py _debug_viz_signal_status())
+DEBUG_VIZ_SIGNAL_DETAIL = False  # 신호등 후보탐색 과정 디버그 창 2개(signal4_roi/signal4_board_search) — 평소엔 꺼서 창 수를 줄임 (perception/traffic_signal.py)
 # DEBUG_LOG_SIGNAL: 신호등 전용 상세 진단 로그. 전역 DEBUG_LOG(0.5초 주기 요약 [SIG] 한 줄)와는
 #   별개로, 이 플래그가 켜지면 S0/S2 상태에서 매 프레임 "왜 못 잡았는지"(원 개수 부족/배치 불량/
 #   밝기 대비 부족 등) 원인을 자세히 찍는다 — DEBUG_LOG를 꺼도 이것만 켜서 신호등만 디버깅 가능.
@@ -1045,24 +1056,24 @@ DEBUG_VIZ_AVOID_HOLD = True
 # #############################################################
 # 6. 미션 State / 실차 테스트 범위 제한
 # #############################################################
-# [2026-08-19, 임시] 신호등 인식만 단독 테스트하려고 S0_WAIT_GREEN으로 잠깐 바꿔둠 —
-#   perc_signal()/_debug_viz_signal_status()가 S0_WAIT_GREEN·S2_INTERSECTION일 때만 도는데
-#   원래 START_STATE=S1_LANE_FOLLOW라 신호등 코드 자체가 아예 안 돌고 있었다. 실제 대회
-#   주행/전체 미션 테스트할 땐 반드시 S1_LANE_FOLLOW로 되돌릴 것.
-START_STATE     = MissionState.S0_WAIT_GREEN
+# [2026-08-19, 임시] 신호등 인식만 단독 테스트하려고 S0_SIGNAL로 잠깐 바꿔둠 —
+#   perc_signal()/_debug_viz_signal_status()가 S0_SIGNAL일 때만 도는데 원래
+#   START_STATE=S1_LANE_FOLLOW라 신호등 코드 자체가 아예 안 돌고 있었다. 차선/라바콘 등
+#   신호등 이외 기능만 다시 테스트하려면 S1_LANE_FOLLOW로 되돌릴 것.
+START_STATE     = MissionState.S0_SIGNAL
 ENABLE_BEHAVIOR = False   # S1에서 라바콘/장애물/추월 Behavior를 켤지 여부(최상위 스위치)
 #   [2026-08-11] 라바콘(B1) 실차 테스트를 위해 True로 켬. TEST_FORCE_BEHAVIOR=True와 함께
 #   있으면 S2 교차로 없이도 시작부터 라바콘 단독 테스트 가능. B2/B3까지 실차 테스트 범위를
 #   넓힐 준비가 되기 전까지는 TEST_DISABLE_B2_B3=True로 B2/B3 발동 자체는 계속 막아둔 상태.
 
 # ── 실차 테스트 범위 제한 ──
-#   지금 단계에서 실차로 검증 가능한 건 딱 세 가지: ①신호등 인식 후 출발(S0)
-#   ②차선주행(S1) ③라바콘 주행(B1). 나머지(S2 교차로/S3 지름길)는 아직 실차
+#   지금 단계에서 실차로 검증 가능한 건 딱 세 가지: ①신호등 인식 후 출발(S0_SIGNAL)
+#   ②차선주행(S1) ③라바콘 주행(B1). 나머지(교차로 재진입/S3 지름길)는 아직 실차
 #   미검증(좌회전 각도·속도 placeholder)이라 테스트 중 의도치 않게 발동하면 위험할
 #   수 있어 아래 플래그로 강제로 꺼둔다. → 좌회전 튜닝 끝나면 False로 되돌릴 것.
 TEST_DISABLE_INTERSECTION = True
-#   True: 정지선을 감지해도 감속→S2_INTERSECTION 전환을 아예 안 함(차선주행만 계속).
-#   False: 원래대로 정지선 감지 시 감속 후 S2로 정상 전환.
+#   True: 정지선을 감지해도 감속→S0_SIGNAL 재진입을 아예 안 함(차선주행만 계속).
+#   False: 원래대로 정지선 감지 시 감속 후 S0_SIGNAL로 정상 전환.
 # [2026-08-11] B2/B3 실차 테스트 시작 — True → False. 라바콘(B1) 격리 테스트는 이 값과
 #   무관(B1엔 트리거 조건이 없음, apply_behavior_override() 참고)하니 그대로 True 둬도
 #   B1은 계속 검증 가능하다.
@@ -1421,7 +1432,10 @@ SIG4_BOARD_CROP_MARGIN = 0.35    # 후보 박스에 이 비율만큼 여유를 �
 # 스모크테스트 전용, 조명/배경 다양성 없음) 기준 학습본이면 기본값은 False로 둘 것. 실데이터
 # (다른 세션 여러 번)로 재학습한 모델로 교체 전까지 켜면 이 파일럿 환경에만 과적합된 채로
 # 실차에 올라간다 — 지금 yolo_ros/에 있는 파일이 파일럿용인지 본학습용인지 확인 후 켤 것.
-YOLO_SIGNAL_ENABLE = False
+# [2026-08-19] 위 경고(파일럿 15장 학습본이면 끄기)에도 불구하고 "YOLO+HSV_신호등" 디버그
+# 창에서 실제 YOLO 배경판탐지가 반영된 결과를 보려고 테스트용으로 켬 — 실전 주행/최종
+# 판단에 이 결과를 쓰기 전에는 재학습된 모델로 교체 여부를 다시 확인할 것.
+YOLO_SIGNAL_ENABLE = True
 YOLO_SIGNAL_INPUT_SIZE = 640     # export 시 imgsz와 반드시 일치시킬 것 (train_pilot.md 참고)
 YOLO_SIGNAL_CONF_THRESHOLD = 0.5 # 이 신뢰도 이상인 검출만 board 후보로 인정
 YOLO_SIGNAL_MODEL_PATH = None    # None이면 yolo_ros/signal_board_best_n.onnx(형제 디렉터리) 자동탐색

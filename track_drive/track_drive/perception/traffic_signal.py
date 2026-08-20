@@ -29,7 +29,7 @@ from ..config import (
     SIG4_UNSHARP_ENABLE, SIG4_UNSHARP_AMOUNT, SIG4_UNSHARP_SIGMA,
     SIG4_CIRCLE_SAT_MAX,
     SIG4_FALLBACK_MAX_BOARD_FRAC,
-    DEBUG_VIZ_SIGNAL,
+    DEBUG_VIZ_SIGNAL, DEBUG_VIZ_SIGNAL_DETAIL,
     YOLO_SIGNAL_ENABLE, YOLO_SIGNAL_MAX_CANDIDATES, YOLO_SIGNAL_CROP_MARGIN,
 )
 SIG4_VERT_DIFF_MAX  = SIG4_MAX_RADIUS * 2
@@ -62,10 +62,11 @@ class SignalDetector:
         self.roi = None
         self.vis = None
 
-        # ── [진단] track_drive._print_debug() 가 S0/S2 상태에서 읽는 값들 ──
+        # ── [진단] track_drive._print_debug() 가 S0_SIGNAL 상태에서 읽는 값들 ──
         #   신호등 인식이 '어느 단계에서' 막혔는지 로그로 좁히기 위한 것.
-        #   S0도 S2와 동일한 detect_s2()를 재사용하므로(대회 규정 변경) 진단 필드도 하나로 통합.
-        #   이 속성들이 없으면 START_STATE 를 S0_WAIT_GREEN 으로 되돌리는 순간
+        #   출발/교차로가 동일한 detect_s2()를 재사용하고(대회 규정 변경) 미션 state도
+        #   S0_SIGNAL 하나로 통합됐으므로(2026-08-20) 진단 필드도 하나로 통합.
+        #   이 속성들이 없으면 START_STATE 를 S0_SIGNAL 로 되돌리는 순간
         #   _print_debug() 가 AttributeError 로 죽는다.
         self.s2_roi_px        = (0, 0, 0, 0)  # ROI 픽셀좌표 (top, bottom, left, right)
         self.s2_circle_count  = 0             # HoughCircles 가 찾은 원 개수
@@ -465,7 +466,7 @@ class SignalDetector:
             self.straight_on = straight_lit and not left_lit
             self.red_on      = red_lit and not (left_lit or straight_lit)
 
-        if DEBUG_VIZ_SIGNAL:
+        if DEBUG_VIZ_SIGNAL_DETAIL:
             self._draw_debug_viz(all_circles, chosen)
             self._draw_debug_board_search(frame, roi_boxes, self.s2_chosen_idx)
 
@@ -477,7 +478,7 @@ class SignalDetector:
           - 굵은 원(초록=점등/회색=꺼짐) + R/Y/L/S 라벨 + 밝기값: 배치검사를 통과해
             실제 판정에 쓰인 4개(chosen이 None이면 이 단계까지 못 왔다는 뜻)
           - 좌상단 텍스트 3줄: 현재 인식 상태 / ROI 픽셀좌표 / 원검출 개수+실패사유
-        DEBUG_VIZ_SIGNAL=True일 때 detect_s2()에서만 호출된다."""
+        DEBUG_VIZ_SIGNAL_DETAIL=True일 때 detect_s2()에서만 호출된다."""
         s = SIG4_VIZ_SCALE
         vis = cv2.resize(self.roi, None, fx=s, fy=s, interpolation=cv2.INTER_NEAREST)
 
@@ -513,7 +514,7 @@ class SignalDetector:
         ②이번 프레임에 시도한 후보 전부(자동탐색=주황, 마지막 고정폴백=파랑)
         ③채택된 후보(있으면 초록 굵은 테두리)를 겹쳐 그린다. _board_candidates()가 흰
         배경판을 실제로 얼마나 잘/잘못 찾는지 한눈에 보려는 순수 디버그 창(판단 로직에는
-        영향 없음) — DEBUG_VIZ_SIGNAL=True일 때 detect_s2()에서만 호출된다."""
+        영향 없음) — DEBUG_VIZ_SIGNAL_DETAIL=True일 때 detect_s2()에서만 호출된다."""
         h, w = frame.shape[:2]
         vis = frame.copy()
 
