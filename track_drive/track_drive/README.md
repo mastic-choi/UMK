@@ -57,7 +57,7 @@ Hybrid A* 경로계획(B2 대안, 보존용)은 `planner/`에 모여 있습니�
   심판이 화면을 볼 수 있어야 함), **팀원2**는 트랙에서 차량을 따라다니며 벌점 상황 등에서 차량 터치 등 필요
   조치를 수행.
 
-### 출발 절차 (신호등 인식 출발, `MissionState.S0_WAIT_GREEN`)
+### 출발 절차 (신호등 인식 출발, `MissionState.S0_SIGNAL`)
 - 출발 지점: Gate(통과감지장치)와 4구 신호등 사이. 심판이 신호등을 빨간불→파란불로 전환하는 순간부터
   주행시간(랩타임) 측정 시작(중간 노란불 대기 없음).
 - **파란불 전 출발(신호위반)**: 10초 벌초 + 재출발 기회. 재출발에서도 빨간불에 출발하면 추가 10초 벌초 +
@@ -98,7 +98,7 @@ Hybrid A* 경로계획(B2 대안, 보존용)은 `planner/`에 모여 있습니�
 - **추월 방향**: 방해차량이 주행 "안 하는" 차선 쪽으로만 추월 가능(같은 쪽 추월 시도는 차선이탈로 간주).
 - 뒤에서 추돌(가해) / 추돌당함(피해) 모두 각각 **10초 벌초**. 피해 시엔 50cm 이내로 앞으로 옮길 수 있음.
 
-### 지름길 분기 신호 (`MissionState.S2_INTERSECTION`, 1바퀴 주행 후)
+### 지름길 분기 신호 (`MissionState.S0_SIGNAL` 재진입, 1바퀴 주행 후)
 - 트랙 중앙 분기점 4구 신호등(좌회전 화살표 포함)에서 **좌회전(지름길) 신호**가 켜지면 지름길 진입 가능.
 - 좌회전(지름길) 신호는 **2바퀴째 시작 또는 3바퀴째(마지막 바퀴) 시작 중 랜덤으로 딱 한 번만** 등장 —
   나머지는 항상 초록만 점등(직진 확정). 즉 지름길 선택 기회는 3바퀴 중 **정확히 한 번**.
@@ -477,13 +477,15 @@ config.py `PP_*` 블록 상단 주석에 남겨둔 "이 커밋 이전 값"으로
 
 ---
 
-## 1. 신호등 (S0 출발 / S2 교차로) — 통합 4구 신호등
+## 1. 신호등 (`MissionState.S0_SIGNAL` — 출발/교차로 공용) — 통합 4구 신호등
 
-S0(출발)/S2(교차로) 모두 `SignalDetector.detect_s2()`(`perception/traffic_signal.py`) 하나로 처리합니다 —
-S0는 초록(직진 위치)만 점등하면 출발, S2는 초록만=직진 / 초록+빨강 동시=좌회전. `SIG_CONFIRM_FRAMES`(3프레임)
-연속 확정돼야 `signal_straight_confirmed`/`signal_left_confirmed`로 승격되는 디바운스가 있습니다.
+출발과 교차로 모두 `SignalDetector.detect_s2()`(`perception/traffic_signal.py`) 하나로 처리하고,
+[2026-08-20]부터는 미션 state 자체도 `S0_SIGNAL` 하나로 합쳐졌습니다(§1.12) — 출발 지점에선 초록
+(직진 위치)만 점등하면 출발, 교차로 재진입 시엔 초록만=직진 / 초록+빨강 동시=좌회전.
+`SIG_CONFIRM_FRAMES`(3프레임) 연속 확정돼야 `signal_straight_confirmed`/`signal_left_confirmed`로
+승격되는 디바운스가 있습니다.
 
-**수정할 곳:** `config.py` `START_STATE` (`S0_WAIT_GREEN` / `S2_INTERSECTION`).
+**수정할 곳:** `config.py` `START_STATE` (`MissionState.S0_SIGNAL`).
 
 **디버그:** `DEBUG_VIZ_SIGNAL`(기본 True) → `signal4_roi` 창(ROI 확대 + 판정에 쓰인 4개 원 표시),
 `signal4_board_search` 창(§1.1, 전체 프레임 위에 이번 프레임에 시도한 ROI 후보 전부 표시),
@@ -706,10 +708,10 @@ auto+20 fallback)이 "성공"으로 나왔고 45개 연속 구간으로 흩어�
 `frame_958~960` — 같은 물리적 rig가 랩 후반에 다시 잡힘)뿐이고 나머지 샘플(16·358·430·
 774·890·954·1221 등)은 전부 사람·의자·문·벽 등 클러터 오탐이었다.
 
-**중요한 완화 요인:** `detect_s2()`는 `perc_signal()`에서 `mission_state`가
-`S0_WAIT_GREEN`/`S2_INTERSECTION`일 때만 호출된다(`track_drive.py`) — 실주행의 대부분(S1
-차선주행)에서는 이 함수 자체가 안 불려서 랩 전체에 흩어진 오탐 대부분은 실제로 무해하다.
-위험은 차량이 실제로 S0/S2로 멈춰/지나가는 그 짧은 창에 오탐이 우연히 겹칠 때뿐이다.
+**중요한 완화 요인:** `detect_s2()`는 `perc_signal()`에서 `mission_state`가 `S0_SIGNAL`일 때만
+호출된다(`track_drive.py`) — 실주행의 대부분(S1 차선주행)에서는 이 함수 자체가 안 불려서 랩 전체에
+흩어진 오탐 대부분은 실제로 무해하다. 위험은 차량이 실제로 신호등 앞에 멈춰/지나가는 그 짧은 창에
+오탐이 우연히 겹칠 때뿐이다.
 
 **디바운스(`SIG_CONFIRM_FRAMES=3`) 시뮬레이션 — 실제로 뚫리는 사례 확인:** "연속 3프레임
 이상 같은 state"로 전체 랩을 스캔한 결과 단 2구간만 해당했다 — `frame_55~57`(STR, 진짜)과
@@ -904,7 +906,7 @@ RAW)에서 뽑은 값이라 완전히 다른 조명/거리 조건에서 다시 �
 기존 두 창은 `SignalDetector` 내부 상태만 보여줘서 디바운스(확정) 여부는 안 나왔는데
 (그건 `track_drive.py` 쪽 상태라 `SignalDetector`가 모른다), 이 창은 그 둘을 합쳐서
 "인식됐다"와 "그래서 FSM이 실제로 확정 처리했다"를 구분해서 보여준다. `control_loop()`에서
-`DEBUG_VIZ_SIGNAL`이 켜져 있고 `mission_state`가 S0/S2일 때만 그린다(그 외 상태는
+`DEBUG_VIZ_SIGNAL`이 켜져 있고 `mission_state`가 `S0_SIGNAL`일 때만 그린다(그 외 상태는
 `perc_signal()`이 `detect_s2()`를 아예 안 돌려서 표시할 값이 없음).
 
 **검증:** 이 환경엔 ROS2가 없어 노드 자체는 못 띄운다(CLAUDE.md) — `SimpleNamespace`로
@@ -952,6 +954,103 @@ N프레임 돌면 목표 회전각만큼 돌 것이다"라는 가정 하나에�
 "직각이 아니라 커브로 열린다"는 기록이 있어 실제로는 90도가 아닐 수 있다. IMU yaw 부호규약도
 `pose_estimator.py`에 "실차 미검증"이라 적혀 있던 것과 같은 계열이라, 실차에서 좌회전 방향에
 맞게 부호가 맞는지 반드시 먼저 확인할 것.
+
+### 1.14 `MissionState.S0_WAIT_GREEN`/`S2_INTERSECTION` → `S0_SIGNAL` 통합 + Behavior 활성 시점 정정 (2026-08-20)
+
+**배경:** 출발선 신호등(구 S0)과 교차로 신호등(구 S2)이 로직상 완전히 같았다(같은
+`SignalDetector.detect_s2()`를 정지 상태에서 판독 → 직진/좌회전 확정) — `_s0_wait_green()`/
+`_s2_intersection()` 두 함수로 중복 구현돼 있던 걸 `_s0_signal()` 하나로 합쳤다. 이 state는 출발
+직후 1번, 이후 매 바퀴 트랙 중앙 분기점에서 재진입한다. §1.12/§1.13의 거리 기반 커밋 구간
+(`S2_COMMIT_DIST_M`/`_s2_commit_dist`)과 IMU yaw closed-loop 좌회전은 이 통합과 별개로 그대로
+적용된다 — `_s0_signal()`이 이름만 바뀐 옛 `_s2_intersection()`이다.
+
+**같이 바로잡은 규정 불일치:** 위 "대회 규정 요약"(§미션 순서, 공식 PDF 기준)을 다시 보면 실제 순서는
+"신호등 인식 출발 → 라바콘 → 차선 → 고정장애물 → 방해차량 → (2·3바퀴 중 한 번만) 지름길 분기 신호"다
+— Behavior(B1/B2/B3)는 **출발 직후부터** 활성화돼야 한다. 그런데 통합 전 코드는 `_behavior_enabled`를
+오직 구 S2(교차로) 직진 확정 시에만 True로 켜서, 첫 바퀴는 Behavior가 꺼진 채로 라바콘 구간을 그냥
+차선주행으로 지나치게 되어 있었다. 상태를 하나로 합치면서 "직진 확정 시 항상 `_behavior_enabled=True`"로
+통일해 이 문제도 같이 해결됐다.
+
+**"진짜 첫 출발" 구분:** state가 하나로 합쳐지면서 `prev_state == S0_WAIT_GREEN` 같은 비교로는 더 이상
+"이번이 출발인지 교차로 재진입인지"를 구분할 수 없다(둘 다 `S0_SIGNAL`). 바퀴 타이머/yaw 누적 기준점
+(`_lap_t0`/`_yaw_accum`)은 최초 1회만 리셋해야 하므로, `self._departed` 플래그로 직접 추적한다
+(`_change_state()` 참고).
+
+**알려진 한계 (실차 미검증):**
+- 통합으로 인해 출발 직후에도 `S2_COMMIT_DIST_M`(≈1m) 커밋 구간을 거치게 됐다(기존엔 즉시 S1 진입) —
+  출발선이 직선 구간이라 문제는 없을 것으로 보이나 실차로 확인 안 됨.
+- 이론상 출발선 신호등이 오검출로 좌회전 패턴(초록+빨강 동시)을 잠깐 보이면 출발 직후 좌회전 시퀀스가
+  시작될 위험이 있다 — `SIG_CONFIRM_FRAMES`(3연속) 디바운스로 완화되지만 실차 별도 검증 안 됨. 출발선
+  신호등에 실제로 좌회전 램프가 물리적으로 존재/점등되는지도 확인 필요.
+- `_debug_viz_imu()`의 좌회전 목표각 판별(`mission_state == S0_SIGNAL` → 진입 좌회전 / 그 외 → 진출
+  좌회전)도 이번 통합에 맞춰 갱신 — 병합 중 발견된 부분이라 별도 실차 재검증 필요.
+
+### 1.15 `_do_left_turn()` 종료 판정 — IMU yaw 실측 기반 → 실측거리 기반으로 되돌림 (2026-08-20)
+
+**배경:** §1.13에서 IMU yaw closed-loop로 바꾼 지 이틀 만에 다시 되돌린다. IMU 방식은 "실제로
+몇 도 돌았는가"를 직접 재는 장점이 있었지만, IMU yaw 부호 규약 자체가 `pose_estimator.py` 기준
+실차 미검증 상태였고(§1.13 "알려진 한계" 참고), 실차 튜닝 단계에서는 "정해진 조향각을 정해진
+거리만큼 유지"하는 단순한 open-loop 쪽이 대응하기 쉽다는 요청을 반영했다. 좌회전 진입 트리거
+지점(신호가 좌회전으로 확정되는 순간, `signal_left_confirmed`)부터 물리적 분기까지는 이미
+§1.12의 `S2_COMMIT_DIST_M` 커밋 구간이 VESC 실측 적분으로 거리 기반 처리 중이었으므로, 좌회전
+자체(조향을 트는 구간)도 같은 적분 패턴으로 통일했다.
+
+**수정:**
+- `config.py`: `TURN_YAW_TARGET_DEG`/`TURN_EXIT_YAW_TARGET_DEG`(목표 회전각)와
+  `TURN_FRAMES`/`TURN_EXIT_FRAMES`(IMU 죽었을 때만 쓰던 안전 타임아웃)를 삭제하고,
+  `TURN_DIST_M`/`TURN_EXIT_DIST_M`(조향각을 유지할 이동거리, m)로 대체. `TURN_ANGLE`/
+  `TURN_EXIT_ANGLE`(조향각, 실차 튜닝 대상 "`-a`")과 `TURN_SPEED`/`TURN_EXIT_SPEED`는 이름 그대로 유지.
+- `track_drive.py`: `_begin_left_turn()`이 `_turn_yaw_start`(IMU yaw 스냅샷) 대신
+  `_turn_dist = 0.0`으로 거리 누적을 시작한다. `_do_left_turn()`은 매 제어주기
+  `_turn_dist`에 실제 이동거리를 더해가다가(`_speed_mps_fallback()`, 아래 참고) 목표
+  거리(`TURN_DIST_M`/`TURN_EXIT_DIST_M`)에 도달하면 조향을 끝내고 `next_state`로 전환한다.
+  `_imu_live()`/`_yaw_delta()` 의존은 좌회전 로직에서 완전히 빠졌다(다른 곳— `_s3_shortcut()`
+  헤딩홀드, `_imu_corner_confirm_scale()` 등—에서는 계속 사용).
+- 거리 적분에 쓰던 `_commit_speed_mps()`(§1.12, S2 커밋 구간 전용)를 `_speed_mps_fallback(cmd_speed)`로
+  일반화 — VESC 실측(`_vesc_live()`)이 살아있으면 그 값, 죽어있으면 그 구간에서 명령 중인 속도
+  (`cmd_speed`)를 `METERS_PER_SPEED_UNIT`으로 환산해 폴백한다. 좌회전 구간은 `TURN_SPEED`/
+  `TURN_EXIT_SPEED`를 `cmd_speed`로 넘겨 재사용 — IMU 없이도 VESC 장애 시 거리 적분이 멈춰
+  무한 회전하는 상황이 없다(IMU 타임아웃 상한이 하던 안전판 역할을 이 폴백이 대신 흡수).
+- `_debug_viz_imu()`(IMU 창)에서 좌회전 진행상황 표시를 제거하고 `_debug_viz_vesc()`(VESC 창)로
+  옮김 — 이제 좌회전 진행 판정이 VESC 적분 기반이라 그쪽이 더 맞는 위치.
+
+**같이 없앤 것 — S1→S0 진입 정지 시퀀스 단순화:** 정지선 감지 후 `APPROACH_TIME`(1초) 동안
+서행하다가 `S0_SIGNAL`로 전환하던 단계(`_approach_t0`)도 함께 폐지했다(요청 반영: "정지"를
+별도 이벤트/타이머가 아니라 신호 상태만으로 결정되게). `START_STATE=S0_SIGNAL`이라 맨 처음
+출발도 이미 같은 경로를 타고 있었으므로, 출발 시점과 매 바퀴 교차로 재진입 시점의 동작이
+동일해졌다.
+
+**진입 트리거를 정지선에서 신호등 보드 인식으로 교체:** 위 정지 시퀀스 단순화 직후,
+"S0_SIGNAL 진입 트리거가 정지선이 아니라 신호등 인식이어야 하지 않냐"는 재확인을 받고
+추가로 수정했다. `perc_signal()`이 `SignalDetector.detect_s2()`를 **S0_SIGNAL 상태일 때만**
+돌리는 구조였기 때문에(신호등 색상 판독 자체가 이미 그 state 안에 있어야만 실행됨), 정지선을
+그대로 진입 트리거로 남겨두면 "신호등 자체를 인식하는 것"과 "그 인식을 시작하는 시점"이
+서로 다른 신호원(信號源)이 되는 모순이 있었다 — 정지선 인식이 어긋나면 신호가 이미 빨간불인데도
+차선주행 속도로 계속 접근하는 상황이 가능했다.
+
+**수정:** `perc_signal()`을 `S1_LANE_FOLLOW` 중에도 `detect_s2()`를 돌리도록 확장했다. S1 중엔
+색상은 아직 안 보고 "보드 자체가 잡혔는가"(`SignalDetector.s2_chosen_idx >= 0`, 색상 무관)만
+`SIG_CONFIRM_FRAMES` 연속 유지로 디바운스해 `signal_board_confirmed`로 승격시킨다(직진/좌회전
+색상 확정용 `_sig_straight_cnt`/`_sig_left_cnt`와 동일한 패턴, 새 카운터 `_sig_board_cnt`).
+`_s1_lane_follow()`는 이제 `self.stopline` 대신 `self.signal_board_confirmed`로 `S0_SIGNAL`
+전환을 트리거한다. 재진입 디바운스 쿨다운도 이름을 `STOPLINE_COOLDOWN` → `SIGNAL_REENTRY_COOLDOWN`,
+`_stopline_cooldown_t` → `_signal_reentry_cooldown_t`로 바꿔 실제 의미와 맞췄다(값 3.0초는
+그대로). `self.stopline`/`check_stopline()` 자체는 삭제하지 않았다 — 바퀴 카운트(`_update_lap()`)와
+지름길 진출 감지(`_shortcut_end()`)에는 여전히 쓰인다.
+
+**알려진 한계 (전부 실차 미검증):**
+- `TURN_DIST_M`/`TURN_EXIT_DIST_M`(둘 다 초기값 1.0m)은 지어낸 값 — 분기가 config.py 기존
+  주석대로 "직각이 아니라 커브로 열린다"는 점을 감안하면, 조향각(`TURN_ANGLE`)·속도(`TURN_SPEED`)
+  조합에 따라 "차선을 다시 잡기 충분한 거리"가 달라진다. 실차에서 `_debug_viz_vesc()` 창으로
+  진행거리를 보며 반복 튜닝 필요.
+- 신호등 보드 인식 즉시 `S0_SIGNAL`로 전환하는 방식은 서행 완충 구간이 없어, 인식 시점의
+  차량 속도가 높으면 실제 정지 위치가 신호등/정지선을 넘어설 수 있다 — 실차에서 접근 속도별로
+  확인할 것.
+- `detect_s2()`(4구 원 검출)는 원래 "가까이서 4개 원이 뚜렷이 보여야" 성공하도록 설계돼
+  있어서(§1.1~§1.10 참고), 아직 멀리서부터 안정적으로 "보드가 있다"만 판별하는 용도로
+  검증된 적은 없다 — S1 중 `s2_chosen_idx>=0`이 기대만큼 일찍(충분한 정지거리를 두고) 뜨는지
+  실차에서 `_debug_viz_signal_status()` 창(S1 중에도 표시하도록 이번에 확장)으로 확인 필요.
+  너무 늦게 뜨면 정지선 트리거 대비 오히려 정지 여유가 줄어들 수 있다.
 
 ---
 

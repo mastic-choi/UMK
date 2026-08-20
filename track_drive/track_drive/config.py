@@ -32,9 +32,14 @@ import numpy as np
 # #############################################################
 
 class MissionState(Enum):
-    S0_WAIT_GREEN   = 0  # 3구 신호등 초록불 대기 후 출발
+    # [2026-08-20] 원래 S0_WAIT_GREEN(출발선 신호등)/S2_INTERSECTION(교차로 신호등)로
+    # 나뉘어 있었는데, 둘 다 "정지 → 4구 신호등 판독 → 직진/좌회전 확정" 로직이
+    # 완전히 동일해서(같은 SignalDetector.detect_s2()를 재사용) S0_SIGNAL 하나로
+    # 통합했다(track_drive.py _s0_signal() 참고, README §1). 이 state는 출발 직후 1회,
+    # 이후 매 바퀴 트랙 중앙 분기점에서 재진입한다 — "이번이 진짜 첫 출발인지"는
+    # track_drive.py의 self._departed 플래그로 별도 추적(값 자체엔 영향 없음).
+    S0_SIGNAL       = 0  # 4구 신호등 판단 (출발선/교차로 공용, 정지→직진·좌회전 확정)
     S1_LANE_FOLLOW  = 1  # 차선인식 주행 (라바콘·고정장애물·추월 Behavior를 이 상태 안에서 처리)
-    S2_INTERSECTION = 2  # 4구 신호등 교차로 (정지→라이다 경로판단→직진/좌회전)
     S3_SHORTCUT     = 3  # 지름길 (직진, 끝에서 좌회전)
     S4_FINISH       = 4  # 종료
 
@@ -207,25 +212,31 @@ CORNER_IMU_CONFIRM_KAPPA_PX = 1.0 / CORNER_MIN_RADIUS_PX  # = 0.004 — 이 이�
 CORNER_IMU_MIN_SCALE = 0.5  # IMU가 "회전 거의 없음"을 보고해도 비전신호 기반 감속을 최소 이만큼은 남겨두는 하한
 
 # ── 좌회전 공통 (S2→S3 진입, S3→S1 진출) — 전부 실차 튜닝 필요한 임시값 ──
-#   [2026-08-18] 종료 판정을 프레임 카운트(open-loop)에서 IMU yaw 실측 기반(closed-loop)으로
-#   변경. 같은 (TURN_ANGLE, TURN_SPEED) 명령이어도 배터리 전압 강하·노면·속도 변동에 따라
-#   실제 요레이트(초당 회전각)가 매번 조금씩 달라질 수 있어, "N프레임 지남"보다 "실제로
-#   TURN_YAW_TARGET_DEG만큼 돌았음"이 더 정확하다(track_drive.py _do_left_turn() 참고).
-#   TURN_FRAMES/TURN_EXIT_FRAMES는 이제 트리거가 아니라 IMU가 죽어있을 때만 쓰는 안전
-#   타임아웃 상한(무한 회전 방지)이다 — _imu_live() 가드 패턴, _vesc_live()와 동일 철학.
-TURN_ANGLE           = -60.0   # [진입] S2 교차로 → S3 지름길 좌회전 조향각
-TURN_SPEED           = 15.0    # [진입] 좌회전 속도
-TURN_YAW_TARGET_DEG  = 90.0    # [진입] 목표 회전각(도) — 분기가 직각이 아니라 커브로 열려서
-                                #        정확히 90인지 미검증, 실차 재확인 필요
-TURN_FRAMES          = 40      # [진입] 안전 타임아웃 상한 프레임 수 (20Hz 기준, IMU 죽었을 때만 씀)
-TURN_EXIT_ANGLE      = -60.0   # [진출] S3 지름길 → S1 차선주행 좌회전 조향각
-TURN_EXIT_SPEED      = 15.0    # [진출] 좌회전 속도
-TURN_EXIT_YAW_TARGET_DEG = 90.0  # [진출] 목표 회전각(도) — 위와 동일 사유로 실차 재확인 필요
-TURN_EXIT_FRAMES     = 40      # [진출] 안전 타임아웃 상한 프레임 수 (IMU 죽었을 때만 씀)
+#   [2026-08-20] 종료 판정을 IMU yaw 실측 기반(closed-loop)에서 다시 실측거리 기반으로
+#   변경(요청 반영). IMU closed-loop([2026-08-18] 도입분)는 "실제로 몇 도 돌았는가"를
+#   기준으로 삼아 배터리 전압 강하 등에 따른 요레이트 변동에 안 흔들린다는 장점이 있었지만,
+#   IMU yaw 부호 규약 자체가 pose_estimator.py 기준 실차 미검증이었고(§1.13 주석 참고),
+#   사용자가 실차 튜닝 편의상 "고정 조향각을 고정 거리만큼 유지"하는 단순한 open-loop
+#   방식을 선호함 — 목표거리(TURN_DIST_M/TURN_EXIT_DIST_M)만큼 VESC 실측(v_mps) 적분
+#   거리가 쌓이면 좌회전을 끝낸다(_do_left_turn() 참고, S2_COMMIT_DIST_M과 동일한 적분
+#   패턴). IMU를 아예 참조하지 않으므로 IMU 죽음에 대한 안전 타임아웃(TURN_FRAMES류)도
+#   불필요 — 대신 VESC가 죽어있으면 _speed_mps_fallback()이 명령속도(TURN_SPEED류)를
+#   METERS_PER_SPEED_UNIT으로 환산해 폴백하므로(_commit_speed_mps()와 동일 철학) 거리
+#   적분 자체가 멈춰 무한 회전하는 상황은 없다.
+TURN_ANGLE     = -60.0   # [진입] S2 교차로 → S3 지름길 좌회전 조향각(위 "-a") — 실차 튜닝 필요
+TURN_SPEED     = 15.0    # [진입] 좌회전 속도
+TURN_DIST_M    = 1.0     # [진입] TURN_ANGLE을 유지할 이동거리(m) — 실차 미검증 초기값
+TURN_EXIT_ANGLE   = -60.0   # [진출] S3 지름길 → S1 차선주행 좌회전 조향각 — 실차 튜닝 필요
+TURN_EXIT_SPEED   = 15.0    # [진출] 좌회전 속도
+TURN_EXIT_DIST_M  = 1.0     # [진출] TURN_EXIT_ANGLE을 유지할 이동거리(m) — 실차 미검증 초기값
 
-# ── 정지선 접근 감속 (S1→S2 진입, S3→S1 진출) ──
-APPROACH_SPEED      = 2.0  # [진입] 정지선 감지 후 S2 진입 전 감속 속도
-APPROACH_TIME       = 1.0  # [진입] 감속 유지 시간(s)
+# ── 정지선 접근 감속 ──
+#   [2026-08-20] S1→S0 진입 쪽의 감속-후-전환(APPROACH_TIME 서행 구간)은 폐지 — 정지선을
+#   감지하면 곧장 S0_SIGNAL로 전환하고, 그 상태의 매 프레임 판정("신호 미확정=사실상
+#   빨간불이면 속도 0", _s0_signal() 기본 동작)이 정지를 대신한다(요청 반영: "정지"라는
+#   별도 이벤트/타이머 없이 신호 상태만으로 속도가 결정되게). APPROACH_SPEED는 신호 확정
+#   후 커밋 구간(S2_COMMIT_DIST_M)에서는 계속 쓰이므로 유지.
+APPROACH_SPEED      = 2.0  # [커밋 구간] 신호 확정 후 물리적 분기까지 직진 속도
 APPROACH_EXIT_SPEED = 2.0  # [진출] S3 탈출 정지선 감지 후 감속 속도
 APPROACH_EXIT_TIME  = 1.0  # [진출] 감속 유지 시간(s)
 
@@ -242,7 +253,7 @@ APPROACH_EXIT_TIME  = 1.0  # [진출] 감속 유지 시간(s)
 #   [2026-08-18] 시간 기반(S2_COMMIT_T=1.0s)에서 거리 기반으로 변경 — 대회 주행 때
 #   APPROACH_SPEED 근방 실제 속도가 튜닝 시점과 달라지면 "몇 초 동안 직진"은 물리적
 #   분기 지점과 안 맞을 수 있다(속도가 빠르면 못 미치고, 느리면 지나침). 대신
-#   track_drive.py _s2_intersection()이 매 제어주기 VESC 실측(self.v_mps, m/s)을
+#   track_drive.py _s0_signal()이 매 제어주기 VESC 실측(self.v_mps, m/s)을
 #   적분해 이 거리(m)를 채웠는지로 판단한다 — METERS_PER_SPEED_UNIT의 저속 회귀
 #   신뢰도 문제(speed=5/10 두 점 회귀라 APPROACH_SPEED=2.0 같은 저속엔 못 미더움,
 #   위 예전 주석 참고)와 무관하게 실제 이동거리 기준으로 맞는다. VESC가
@@ -1153,13 +1164,13 @@ DEBUG_VIZ_LAVACON_EMA = False  # 라바콘 박스 클러스터링 검출 + 좌�
 DEBUG_VIZ_LAVACON_SHOW_PATH = False
 DEBUG_PLANNER      = False  # Hybrid A* OccupancyGrid 디버그 창 (track_drive.py, USE_HYBRID_ASTAR_FOR_B3=True일 때만 의미있음)
 DEBUG_VIZ_STEER    = False  # 조향 컨트롤러(직전값유지/현재값반영) 한글 디버그 창 (track_drive.py)
-DEBUG_VIZ_VESC     = False  # VESC 실측속도(/vesc_speed_erpm) 연동 상태(수신중/끊김/미수신) 디버그 창
+DEBUG_VIZ_VESC     = False  # VESC 실측속도(/vesc_speed_erpm) 연동 상태(수신중/끊김/미수신) +
+                             #   좌회전 진행거리(TURN_DIST_M류) 디버그 창
                              #   (track_drive.py, 2026-08-06 LQR 브랜치에서 이식)
-# [2026-08-18] 좌회전(_do_left_turn())을 IMU yaw closed-loop로 바꾼 뒤(TURN_YAW_TARGET_DEG류
-#   실측 튜닝용) — IMU(/imu) 연동이 실제로 살아있는지 + 지금 imu_yaw 값이 얼마인지 +
-#   좌회전 진행 중이면 목표각까지 얼마나 남았는지를 한 창에서 보여준다. DEBUG_VIZ_VESC와
-#   동일한 3단계 상태(미수신/끊김/정상표시) 패턴(track_drive.py _debug_viz_imu()).
-DEBUG_VIZ_IMU      = False  # IMU(/imu) 연동 상태 + 현재 yaw값 + 좌회전 진행상황 디버그 창
+# [2026-08-18] IMU(/imu) 연동이 실제로 살아있는지 + 지금 imu_yaw 값이 얼마인지를 보여주는
+#   창. [2026-08-20] 좌회전(_do_left_turn())을 실측거리 기반으로 되돌리며 좌회전 진행상황
+#   표시는 DEBUG_VIZ_VESC 창으로 옮겼다 — 이제 좌회전이 IMU를 참조하지 않으므로.
+DEBUG_VIZ_IMU      = True  # IMU(/imu) 연동 상태 + 현재 yaw값 디버그 창
 
 DEBUG_VIZ_DL_LANE    = True  # 차선 — 기본 백엔드('dl') 디버그 창 (perception/dl_lane.py)
 # [2026-08-10] offset 스파크라인이 몇 프레임을 보여줄지 — [2026-08-11] 원래 별도
@@ -1177,7 +1188,13 @@ DEBUG_VIZ_STOPLINE   = False  # 정지선 디버그 창, 백엔드 무관 항상
 #   현재 인식 상태(정지·직진·좌회전·미검출)를 창 하나에 다 보여주도록 확장
 #   (perception/traffic_signal.py detect_s2()). 요청에 따라 기본 True로 켜둠 — 다른 항목과
 #   달리(위 2026-08-11 라바콘 테스트 메모 참고) 이 스위치는 독립적으로 True 유지할 것.
-DEBUG_VIZ_SIGNAL     = False    # 신호등 ROI/HoughCircles 디버그 창 (perception/traffic_signal.py)
+# [2026-08-19] "YOLO 단독" 결과(yolo_signal_state.py, DEBUG_VIZ_YOLO_SIGNAL_STATE)와 창을
+#   헷갈리지 않게 역할을 분리 — 이 플래그는 이제 최종 결과 창(track_drive.py
+#   _debug_viz_signal_status(), "YOLO+HSV_신호등" — 배경판 위치는 YOLO_SIGNAL_ENABLE에 따라
+#   YOLO 또는 HSV자동크롭, 점등 색상 판정은 항상 HSV/circle 기반)만 켠다. 후보 탐색 과정
+#   전체(signal4_roi/signal4_board_search)를 보고 싶으면 DEBUG_VIZ_SIGNAL_DETAIL을 따로 켤 것.
+DEBUG_VIZ_SIGNAL     = True    # 신호등 최종 결과("YOLO+HSV_신호등") 디버그 창 (track_drive.py _debug_viz_signal_status())
+DEBUG_VIZ_SIGNAL_DETAIL = False  # 신호등 후보탐색 과정 디버그 창 2개(signal4_roi/signal4_board_search) — 평소엔 꺼서 창 수를 줄임 (perception/traffic_signal.py)
 # DEBUG_LOG_SIGNAL: 신호등 전용 상세 진단 로그. 전역 DEBUG_LOG(0.5초 주기 요약 [SIG] 한 줄)와는
 #   별개로, 이 플래그가 켜지면 S0/S2 상태에서 매 프레임 "왜 못 잡았는지"(원 개수 부족/배치 불량/
 #   밝기 대비 부족 등) 원인을 자세히 찍는다 — DEBUG_LOG를 꺼도 이것만 켜서 신호등만 디버깅 가능.
@@ -1206,10 +1223,14 @@ DEBUG_VIZ_OBSTACLE_CUT = True   # [2026-08-20] 실차 검증 시작과 함께 �
 # #############################################################
 # 6. 미션 State / 실차 테스트 범위 제한
 # #############################################################
-# [2026-08-20] 전체 미션(S0→S4) 상태전환 복구 시작 — S0_WAIT_GREEN부터 정상 출발.
+# [2026-08-20] 전체 미션(S0→S4) 상태전환 복구 시작 — S0_SIGNAL부터 정상 출발.
 #   (직전엔 YOLO 신호등 단독 테스트 중 S1_LANE_FOLLOW로 바꿔둔 채 주석만 S0로 되돌린다고
 #   적어놓고 실제 코드는 안 고쳐서 어긋나 있었음 — 이번에 코드를 주석 의도에 맞게 정정.)
-START_STATE     = MissionState.S0_WAIT_GREEN
+# [2026-08-20, signal-whiteboard-autocrop 브랜치 병합] START_STATE는 원래 S0_WAIT_GREEN
+#   이었으나, 그 상태와 S2_INTERSECTION이 S0_SIGNAL 하나로 통합됐다(위 MissionState enum
+#   주석 참고, 출발선/교차로 재진입 모두 같은 SignalDetector.detect_s2() 재사용) — 값은
+#   그대로 "맨 처음 신호등 판독" 지점이라 의미상 동일하다.
+START_STATE     = MissionState.S0_SIGNAL
 ENABLE_BEHAVIOR = True   # S1에서 라바콘/장애물/추월 Behavior를 켤지 여부(최상위 스위치)
 # [2026-08-20] 전체 미션 파이프라인 복구 — 아래 세 TEST_* 격리 플래그를 모두 원복하고
 #   S0→S1→S2→S3→S4 전체 상태전환 + B1/B2/B3 Behavior를 한 번에 실차 검증하는 단계로 전환.
@@ -1219,8 +1240,9 @@ ENABLE_BEHAVIOR = True   # S1에서 라바콘/장애물/추월 Behavior를 켤�
 
 # ── 실차 테스트 범위 제한 (전부 해제) ──
 TEST_DISABLE_INTERSECTION = False
-#   True: 정지선을 감지해도 감속→S2_INTERSECTION 전환을 아예 안 함(차선주행만 계속).
-#   False: 원래대로 정지선 감지 시 감속 후 S2로 정상 전환.
+#   True: 신호등 보드 인식(signal_board_confirmed, README §1.15 이전엔 정지선 self.stopline
+#         기준이었음)이 확정돼도 감속→S0_SIGNAL 재진입을 아예 안 함(차선주행만 계속).
+#   False: 원래대로 신호등 보드 인식 확정 시 감속 후 S0_SIGNAL로 정상 전환.
 TEST_DISABLE_B2_B3 = False
 #   True: Phase가 FIXED_OBSTACLE/VEHICLE로 넘어가도 트리거 검사를 건너뛰고
 #         B0_NORMAL로 고정(B1 끝난 뒤 계속 일반 차선주행만 함).
@@ -1677,8 +1699,12 @@ SIG4_BOARD_CROP_MARGIN = 0.35    # 후보 박스에 이 비율만큼 여유를 �
 # 스모크테스트 전용, 조명/배경 다양성 없음) 기준 학습본이면 기본값은 False로 둘 것. 실데이터
 # (다른 세션 여러 번)로 재학습한 모델로 교체 전까지 켜면 이 파일럿 환경에만 과적합된 채로
 # 실차에 올라간다 — 지금 yolo_ros/에 있는 파일이 파일럿용인지 본학습용인지 확인 후 켤 것.
-# [2026-08-20] 배경판+색상상태 YOLO 동시 테스트를 위해 켬 — 위 경고대로 지금 yolo_ros/의
-#   signal_board_best_n.onnx가 파일럿(스모크테스트)용인지 본학습본인지 확인 후 사용할 것.
+# [2026-08-19] 위 경고(파일럿 15장 학습본이면 끄기)에도 불구하고 "YOLO+HSV_신호등" 디버그
+# 창에서 실제 YOLO 배경판탐지가 반영된 결과를 보려고 테스트용으로 켬 — 실전 주행/최종
+# 판단에 이 결과를 쓰기 전에는 재학습된 모델로 교체 여부를 다시 확인할 것.
+# [2026-08-20] 배경판+색상상태 YOLO 동시 테스트를 위해서도 켠 상태 유지 — 위 경고대로 지금
+#   yolo_ros/의 signal_board_best_n.onnx가 파일럿(스모크테스트)용인지 본학습본인지 확인 후
+#   사용할 것.
 YOLO_SIGNAL_ENABLE = True
 YOLO_SIGNAL_INPUT_SIZE = 640     # export 시 imgsz와 반드시 일치시킬 것 (train_pilot.md 참고)
 YOLO_SIGNAL_CONF_THRESHOLD = 0.5 # 이 신뢰도 이상인 검출만 board 후보로 인정
@@ -1734,7 +1760,11 @@ SHORTCUT_MAX_T = 15.0    # 지름길 최대 주행시간(s, 끝 못 찾을 때 �
 # SHORTCUT_MAX_T보다 충분히 작아야 하며, 실차에서 지름길 실제 통과시간을 재서 합류부
 # 도달 직전 시점으로 맞출 것 — 지금은 미실측 추정치.
 SHORTCUT_VISION_CUTOFF_T = 10.0
-STOPLINE_COOLDOWN = 3.0  # 상태 복귀 후 이 시간(s)간 정지선 재감지 무시(따다닥 전환 방지)
+# [2026-08-20] 이름을 STOPLINE_COOLDOWN → SIGNAL_REENTRY_COOLDOWN으로 변경 — S0_SIGNAL
+#   재진입 트리거가 정지선에서 신호등 보드 인식(signal_board_confirmed)으로 바뀌면서
+#   (track_drive.py perc_signal()/_s1_lane_follow() 참고), 이 쿨다운도 "정지선 재감지"가
+#   아니라 "신호등 보드 재감지" 무시 시간이 됐다. 값(3.0s)은 그대로 유지.
+SIGNAL_REENTRY_COOLDOWN = 3.0  # 상태 복귀 후 이 시간(s)간 신호등 보드 재감지 무시(따다닥 전환 방지)
 
 # ── 인식 끊김 보상 / 교차로 근처 기동 금지 ──
 OBSTACLE_HOLD_T = 0.6                   # 마지막 관측 후 이 시간(s)까지는 장애물이 있다고 본다
