@@ -2237,6 +2237,18 @@ SHIFT(`PASS_OFFSET=80px`, §6.1 실측 기반) → ALONGSIDE(장애물 안 보�
 안정적으로 반응하는지 확인 안 됨. 두 대상의 물리적 크기가 달라 `OBSTACLE_CUT_NEAR_M`/컷 폭 등
 기존 §2.51 파라미터가 B2/B3 양쪽에 동시에 맞는 값인지도 재검증 필요.
 
+### 4.4 B2(고정장애물) 전용 최소유지시간 단축 (2026-08-21)
+요청 반영 — B2는 정지해 있는 콘이라 회피가 끝나면 바로 지나쳐가는데, B3(방해차량)와 같은
+`OBSTACLE_CUT_HOLD_SEC_MIN`(2.0초)을 그대로 쓰면 이미 다 지나간 뒤에도 컷이 한참 남아있었다
+(요청 원문: cut이 "등장했다가 사라지는" 게 너무 길다). 새 상수 `OBSTACLE_CUT_HOLD_SEC_MIN_FIXED`
+(0.5초)를 추가하고, `_update_obstacle_cut_hold()`가 새 진입 순간(`self._obstacle_cut_until_t <= now`)
+`self.obstacle_cut_type`('fixed'면 0.5초, 그 외는 기존 2.0초)로 최소유지시간을 골라
+`self._obstacle_cut_hold_sec_min`에 저장 — 이후 `floor_elapsed` 판정과 `obstacle_cut_debug`
+디버그창의 `floor=` 표시 모두 이 값을 쓴다. `perc_obstacle_cut_trigger()`가 같은 틱 안에서 먼저
+`obstacle_cut_type`을 확정해두므로(`perceive_all()` 호출 순서) 진입 순간 바로 읽어도 안전하다.
+해제 디바운스(`OBSTACLE_CUT_RELEASE_CONFIRM_FRAMES`)는 B2/B3 공용으로 그대로 유지 — 이번 변경은
+"floor"(최소 유지 시간)만 낮춘 것. 실차 미검증.
+
 ---
 
 ## 5. 차량회피/추월 (B3_VEHICLE)
@@ -2285,6 +2297,24 @@ Phase.DONE 전환 조건(`_mark_behavior_passed()` — B2/B3 둘 다 완료돼�
 **알려진 한계 (실차 미검증):** 이 게이트는 "B2 전에 B3가 절대 안 나온다"는 전제가 확실할 때만
 안전하다 — 실제 대회 트랙에서 예외적으로 두 장애물이 근접 배치되거나 순서가 바뀌는 경우가 있다면
 B3 진입 자체가 막혀버리는 역효과가 날 수 있으니 실차에서 순서를 재확인할 것.
+
+### 5.3 좌우 교차검증 veto를 "불일치=취소"에서 "YOLO 쪽에 라이다 점 없음=취소"로 완화 (2026-08-21)
+§0.5.15/직전 커밋(2026-08-21)에서 추가한 라이다-YOLO 좌우 교차검증(`perc_obstacle_cut_trigger()`)이
+너무 엄격했다 — 라이다 ROI 안의 "가장 가까운 점 하나"만으로 `lidar_side`를 정하다 보니, 실제로는
+장애물이 라이다에 양쪽(예: 차체 여러 지점이 좌우로 걸쳐 잡히는 경우)으로 찍히는데 그중 가장 가까운
+점이 우연히 YOLO 반대쪽이면 진짜 방해차량인데도 `vehicle_seen`이 통째로 취소됐다(요청 반영).
+
+**수정:** `lidar_side != yolo_side`로 어긋나도 곧바로 veto하지 않는다 — 먼저 트리거 ROI
+(`roi_mask`) 안에 YOLO가 가리키는 쪽(`y>0`=L / `y<0`=R)에 라이다 점이 실제로 있는지 다시 확인해서:
+- **있으면(=좌우 양쪽 다 찍힌 경우)**: veto하지 않고, YOLO가 가리키는 쪽 점들 중 가장 가까운 점으로
+  `self._obstacle_cut_y`를 다시 골라 컷 방향 자체를 YOLO 검출 방향으로 맞춘다(이 값이 그대로
+  `perc_lane()`→`set_obstacle()`로 넘어가 실제 da 클리핑 방향을 결정, §4.3 참고).
+  `self._obstacle_cut_lidar_side`도 `yolo_side`로 갱신해 디버그창엔 "일치"로 보인다.
+- **없으면(=YOLO가 가리키는 쪽엔 라이다 점이 아예 없음)**: 기존과 동일하게 진짜 불일치로 보고
+  `vehicle_seen=False` + `_obstacle_cut_side_veto=True`.
+
+즉 이제 veto는 "둘 다 뭔가 봤는데 서로 다른 자리를 보고 있다"가 아니라 "YOLO가 가리키는 자리엔
+라이다가 아무것도 못 봤다"는 진짜 불일치일 때만 발동한다. 실차 미검증.
 
 ---
 

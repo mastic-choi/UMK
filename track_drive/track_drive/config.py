@@ -708,7 +708,13 @@ OBSTACLE_CUT_MIN_REMAIN_PX = 25.0         # [2026-08-20] 클리핑 후 밴드에
 #   [2026-08-20] 해제는 진입과 동일한 전용 트리거 ROI(위 OBSTACLE_CUT_TRIGGER_*)로
 #   재계산한 "clear" 상태를 쓴다 — perc_obstacle()의 공유 ROI(범위가 다름)를 쓰면
 #   해제 타이밍이 트리거 설계 의도와 어긋난다.
-OBSTACLE_CUT_HOLD_SEC_MIN = 2.0           # 진입 확정 후 라이다/YOLO가 뭐라 하든 무조건 유지하는 최소시간 — 실차 미검증
+OBSTACLE_CUT_HOLD_SEC_MIN = 2.0           # 진입 확정 후 라이다/YOLO가 뭐라 하든 무조건 유지하는 최소시간(B3/방해차량 기준) — 실차 미검증
+# [2026-08-21, 요청 반영] B2(고정장애물=콘)는 정지해 있어 회피가 끝나면 바로 지나쳐가므로,
+#   B3와 같은 2.0초를 그대로 쓰면 이미 다 지나간 뒤에도 컷이 오래 남아있는다(요청 원문:
+#   "cut이 등장했다가 사라지는 게" 너무 김). B2로 진입할 때만 이 값을 최소유지시간으로 쓴다
+#   (_update_obstacle_cut_hold() 진입 순간 self.obstacle_cut_type으로 분기, README §4.3 참고).
+#   OBSTACLE_CUT_RELEASE_CONFIRM_FRAMES 해제 디바운스는 그대로 공유 — 이 값은 "floor"만 낮춘다.
+OBSTACLE_CUT_HOLD_SEC_MIN_FIXED = 0.5     # B2(고정장애물) 전용 최소유지시간 — 실차 미검증
 OBSTACLE_CUT_RELEASE_DIST_M = 1.0         # [2026-08-20] 1.5→1.0(요청 반영, 트리거와 동일 — 히스테리시스 없앰). 실차 미검증
 OBSTACLE_CUT_RELEASE_CONFIRM_FRAMES = 4   # 해제 디바운스 — AVOID_HOLD_RELEASE_CONFIRM_FRAMES와 동일 관례, 실차 미검증
 

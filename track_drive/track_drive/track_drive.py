@@ -260,6 +260,9 @@ class TrackDriverNode(Node):
         self._obstacle_cut_until_t     = 0.0     # 이 시각까지는 obstacle_cut_active=True 유지
         self.obstacle_cut_active       = False   # perc_lane()이 set_obstacle()로 DL 백엔드에 전달하는 최종 상태
         self._obstacle_cut_hold_start_t = 0.0    # 최소유지시간(OBSTACLE_CUT_HOLD_SEC_MIN) 판정 기준 시각
+        # [2026-08-21] 이번 진입에 적용 중인 최소유지시간 — B2(fixed)면 OBSTACLE_CUT_HOLD_SEC_MIN_FIXED,
+        # 그 외(B3/vehicle 등)는 OBSTACLE_CUT_HOLD_SEC_MIN. _update_obstacle_cut_hold() 진입 순간 결정.
+        self._obstacle_cut_hold_sec_min = OBSTACLE_CUT_HOLD_SEC_MIN
         self._obstacle_cut_release_cnt  = 0      # 해제 판단용 라이다 클리어 연속 프레임 수(디바운스 카운터)
         self.obstacle_cut_release_reason = ''    # 디버그용 — 'floor_and_lidar_clear' 등
         self._obstacle_cut_lidar_near = False    # 디버그용 — 이번 프레임 트리거 ROI에 라이다 점이 잡혔는지(원시값)
@@ -1334,6 +1337,13 @@ class TrackDriverNode(Node):
         # 위에서 lidar_near일 때만 갱신되므로 그 경우에만 비교한다. y>0=좌측 규약(위 x,y
         # 계산부 주석)과 yolo_vehicle.py get_latest_side()의 'L'/'R'은 둘 다 전방 카메라/
         # 라이다 기준 같은 실세계 좌우라 부호만 맞춰주면 바로 비교 가능하다.
+        # [2026-08-21 수정, 요청 반영] "가장 가까운 점 하나"만으로 정한 lidar_side가 YOLO와
+        # 어긋나도, ROI 안에 YOLO가 가리키는 쪽 점이 실제로 있으면(=좌우 양쪽 다 찍힌 경우,
+        # 가장 가까운 점이 우연히 반대쪽이었을 뿐) 더 이상 veto하지 않는다 — 대신 YOLO가
+        # 가리키는 쪽 점들 중 가장 가까운 점으로 self._obstacle_cut_y를 다시 골라, 실제
+        # 컷 방향이 YOLO 검출 방향을 따라가게 한다(set_obstacle()이 이 값을 그대로 씀,
+        # perc_lane() 참고). veto는 이제 "YOLO가 가리키는 쪽엔 라이다 점이 아예 없다"는
+        # 진짜 불일치일 때만 발동한다.
         self._obstacle_cut_lidar_side = self._obstacle_cut_yolo_side = None
         self._obstacle_cut_side_veto = False
         if vehicle_seen and lidar_near and self.yolo_vehicle_cut_detector is not None:
@@ -1341,8 +1351,15 @@ class TrackDriverNode(Node):
             lidar_side = 'L' if self._obstacle_cut_y > 0.0 else 'R'
             self._obstacle_cut_lidar_side, self._obstacle_cut_yolo_side = lidar_side, yolo_side
             if yolo_side is not None and yolo_side != lidar_side:
-                vehicle_seen = False
-                self._obstacle_cut_side_veto = True
+                yolo_side_mask = roi_mask & ((y > 0.0) if yolo_side == 'L' else (y < 0.0))
+                if np.any(yolo_side_mask):
+                    yolo_side_idx = np.where(yolo_side_mask)[0]
+                    nearest_yolo_side = yolo_side_idx[int(np.argmin(r[yolo_side_idx]))]
+                    self._obstacle_cut_y = float(y[nearest_yolo_side])
+                    self._obstacle_cut_lidar_side = yolo_side
+                else:
+                    vehicle_seen = False
+                    self._obstacle_cut_side_veto = True
         # 두 검출기 다 초기화 실패면(드묾) perc_lavacon_trigger()와 동일 원칙으로 라이다
         # 단독 판정으로 폴백(카메라 확인 자체를 생략, cam_confirmed=True).
         both_cams_unavailable = self.yolo_cone_detector is None and self.yolo_vehicle_cut_detector is None
@@ -1386,14 +1403,21 @@ class TrackDriverNode(Node):
         if self.obstacle_cut_trigger:
             if self._obstacle_cut_until_t <= now:   # 새 진입(직전엔 비활성이었음)
                 self._obstacle_cut_hold_start_t = now
-            self._obstacle_cut_until_t = now + OBSTACLE_CUT_HOLD_SEC_MIN
+                # [2026-08-21] B2(고정장애물)는 정지해 있어 회피가 끝나면 바로 지나쳐가므로
+                # B3(방해차량, OBSTACLE_CUT_HOLD_SEC_MIN)보다 짧은 최소유지시간을 쓴다 —
+                # perc_obstacle_cut_trigger()가 바로 이번 틱에 obstacle_cut_type을 이미
+                # 확정해뒀으므로(같은 틱 내 호출 순서, perceive_all() 참고) 여기서 바로 읽어도 된다.
+                self._obstacle_cut_hold_sec_min = (
+                    OBSTACLE_CUT_HOLD_SEC_MIN_FIXED if self.obstacle_cut_type == 'fixed'
+                    else OBSTACLE_CUT_HOLD_SEC_MIN)
+            self._obstacle_cut_until_t = now + self._obstacle_cut_hold_sec_min
             self._obstacle_cut_release_cnt = 0
         else:
             # 트리거 ROI가 클리어됐는지(라이다만, YOLO는 안 봄 — 위 클래스 주석 참고)
             lidar_clear = self.lidar_ranges is not None and self._obstacle_cut_roi_clear()
             self._obstacle_cut_release_cnt = self._obstacle_cut_release_cnt + 1 if lidar_clear else 0
 
-        floor_elapsed = (now - self._obstacle_cut_hold_start_t) >= OBSTACLE_CUT_HOLD_SEC_MIN
+        floor_elapsed = (now - self._obstacle_cut_hold_start_t) >= self._obstacle_cut_hold_sec_min
         was_active = self.obstacle_cut_active
         if (was_active and floor_elapsed
                 and self._obstacle_cut_release_cnt >= OBSTACLE_CUT_RELEASE_CONFIRM_FRAMES):
@@ -2885,10 +2909,10 @@ class TrackDriverNode(Node):
 
         headline = [
             (f'OBSTACLE-CUT: {"활성" if self.obstacle_cut_active else "대기"}  '
-             f'(남은 {remaining:.2f}s / floor={OBSTACLE_CUT_HOLD_SEC_MIN:.2f}s)',
+             f'(남은 {remaining:.2f}s / floor={self._obstacle_cut_hold_sec_min:.2f}s)',
              (10, 8), active_color, 17,
              f'OBSTACLE-CUT: {"ACTIVE" if self.obstacle_cut_active else "idle"} '
-             f'({remaining:.2f}s left / floor={OBSTACLE_CUT_HOLD_SEC_MIN:.2f}s)'),
+             f'({remaining:.2f}s left / floor={self._obstacle_cut_hold_sec_min:.2f}s)'),
         ]
         lines = [
             (f'직전 해제 사유: {self.obstacle_cut_release_reason or "(아직 없음)"}   '
