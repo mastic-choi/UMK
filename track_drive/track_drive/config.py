@@ -963,6 +963,13 @@ PP_LOOKAHEAD_MIN_PX = 62.61        # 코너에서 lookahead가 줄어들 수 있
 PP_CURVATURE_BOOST_GAIN = 180.0
 PP_CURVATURE_BOOST_SEC  = 1.0
 
+# [2026-08-21] 움직이는 방해차량(obstacle_cut_type=='vehicle') 감지 진입 엣지에서
+#   PP_VEHICLE_LOOKAHEAD_FIX_SEC 동안 lookahead_px를 이 값으로 고정(적응형 계산 스킵).
+#   이 구간에선 lookahead_curvature_gain도 평상시 값(PP_LOOKAHEAD_CURVATURE_GAIN)으로
+#   유지 — 고정된 lookahead에 curvature 부스트를 같이 걸 이유가 없다(요청 반영).
+PP_VEHICLE_LOOKAHEAD_FIX_PX  = 100.0
+PP_VEHICLE_LOOKAHEAD_FIX_SEC = 0.5
+
 # [2026-08-19] speed_lookahead_px = BASE + GAIN*(speed - ANCHOR)의 ANCHOR(요청 반영) —
 #   기존엔 ANCHOR가 암묵적으로 0(=BASE가 "speed=0일 때" 값)이라, 실제로는 절대 안 나오는
 #   speed=0 지점을 기준으로 삼다 보니 config.py만 봐서는 "지금 주행속도에서 lookahead가

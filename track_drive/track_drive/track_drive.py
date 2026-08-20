@@ -275,6 +275,9 @@ class TrackDriverNode(Node):
         # PP_CURVATURE_BOOST_GAIN으로 잠깐 올려두는 타이머 — 이 시각까지는 부스트 유지
         # (_update_obstacle_cut_hold()가 진입 엣지에서 세팅, _lane_steer()가 매틱 소비).
         self._pp_curvature_boost_until_t = 0.0
+        # avoid_hold 새 트리거(=da 마진 확장) 시점에 obstacle_type=='vehicle'면 세팅 —
+        # 이 시각까지 lookahead 고정(_update_avoid_hold()가 세팅, _lane_steer()가 소비).
+        self._pp_vehicle_lookahead_fix_until_t = 0.0
         # [2026-08-20] _debug_viz_obstacle_cut() BEV 패널용 — avoid_hold_debug의
         # _obstacle_front_all_x/y·_obstacle_cluster_x/y와 동일 패턴(매틱 갱신되는 라이브 값).
         # bg_*는 표시범위 안의 배경점 전부(회색), roi_*는 실제 트리거 ROI 안에 잡힌 점만(빨강).
@@ -1206,6 +1209,11 @@ class TrackDriverNode(Node):
                 self._avoid_hold_trigger_cause = (
                     'lidar' if (self.obstacle_front and self.obstacle_dist < AVOID_HOLD_TRIGGER_DIST_M)
                     else 'da_jump')
+                # da 마진 확장(avoid_hold)이 걸리는 이 시점이 실제 "차량 감지" 순간이다 —
+                # obstacle_cut_active(ENABLE_OBSTACLE_CUT+라이다근접+YOLO+디바운스)는 훨씬
+                # 늦게/드물게 걸려서 여기 걸어야 lookahead 고정이 실제로 동작한다.
+                if self.obstacle_type == 'vehicle':
+                    self._pp_vehicle_lookahead_fix_until_t = now + PP_VEHICLE_LOOKAHEAD_FIX_SEC
             self._avoid_hold_until_t = now + self.avoid_hold_hold_sec
 
         # ③ 조기 해제 판정용 상태 갱신 — obstacle_front가 True인 동안(=아직 가까움)은
@@ -2522,12 +2530,17 @@ class TrackDriverNode(Node):
         # 인스턴스가 하나뿐이라(__init__ 참고) 매틱 여기서 스위칭해도 다른 호출부
         # (_handle_lavacon() 등, near_obstacle=False 경로)에도 그대로 적용된다.
         # _update_obstacle_cut_hold()가 타이머만 세팅, 실제 반영은 여기서.
+        now_t = time.time()
+        vehicle_lookahead_fix = now_t < self._pp_vehicle_lookahead_fix_until_t
+        # lookahead를 고정하는 동안은 curvature 부스트를 겹쳐 걸지 않고 평상시 게인으로 둔다(요청 반영).
         self.pure_pursuit.lookahead_curvature_gain = (
-            PP_CURVATURE_BOOST_GAIN if time.time() < self._pp_curvature_boost_until_t
+            PP_LOOKAHEAD_CURVATURE_GAIN if vehicle_lookahead_fix
+            else PP_CURVATURE_BOOST_GAIN if now_t < self._pp_curvature_boost_until_t
             else PP_LOOKAHEAD_CURVATURE_GAIN)
-        return self.pure_pursuit.control(path, vehicle_xy, speed=self._speed_for_lookahead(),
-                                          imu_curvature_px=self._imu_curvature_px(),
-                                          near_obstacle=near_obstacle)
+        return self.pure_pursuit.control(
+            path, vehicle_xy, speed=self._speed_for_lookahead(),
+            imu_curvature_px=self._imu_curvature_px(), near_obstacle=near_obstacle,
+            lookahead_override_px=PP_VEHICLE_LOOKAHEAD_FIX_PX if vehicle_lookahead_fix else None)
 
     # [DEBUG_VIZ_STEER] 조향 컨트롤러가 이번 주기에 "새로 계산"했는지(초록/현재값 반영)
     # "직전 조향각을 그대로 유지"했는지(주황/직전값 유지)를 별도 창으로 바로 확인.
