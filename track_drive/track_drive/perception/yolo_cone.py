@@ -277,7 +277,11 @@ class YoloConeDetector:
             vis = self._latest_debug
         if vis is None:
             return
-        cv2.imshow('yolo_cone_result', vis)
+        # [2026-08-21, 요청 반영] 화면을 너무 많이 차지해서 표시 직전에만 아주 작게 축소한다
+        # (원본 해상도 vis 자체·get_latest_debug_frame()이 돌려주는 프레임·검출 좌표 계산에는
+        # 영향 없음 — 순전히 이 창의 표시 크기만 줄이는 것).
+        small = cv2.resize(vis, (160, 120), interpolation=cv2.INTER_AREA)
+        cv2.imshow('yolo_cone_result', small)
         cv2.waitKey(1)
 
     def stop(self):
