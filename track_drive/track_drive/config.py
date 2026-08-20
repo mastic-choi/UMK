@@ -1184,6 +1184,8 @@ DEBUG_VIZ_SIGNAL     = False    # 신호등 ROI/HoughCircles 디버그 창 (perc
 #   (track_drive.py perc_signal())
 DEBUG_LOG_SIGNAL     = True
 DEBUG_VIZ_YOLO_CONE  = False  # 라바콘 YOLO 검출 박스 디버그 창 (perception/yolo_cone.py)
+# [2026-08-20] 배경판+색상상태 YOLO 동시 테스트 끝나서 다시 False로 되돌림(요청 반영,
+#   디버그창 전체 끄기).
 DEBUG_VIZ_YOLO_SIGNAL = False  # 신호등 배경판 YOLO 검출 박스 디버그 창 (perception/yolo_signal.py)
 DEBUG_VIZ_YOLO_SIGNAL_STATE = False  # 신호등 색상상태 YOLO 검출 박스 디버그 창 (perception/yolo_signal_state.py) — _debug_viz_signal_status()의 Hough 비교와는 별개로 raw 검출 박스만 보고 싶을 때
 # [2026-08-15] avoid-hold(§2.32) 전용 상태창 — 지금 유예가 걸려있는지/왜 걸렸는지/방향
@@ -1204,9 +1206,9 @@ DEBUG_VIZ_OBSTACLE_CUT = True   # [2026-08-20] 실차 검증 시작과 함께 �
 # #############################################################
 # 6. 미션 State / 실차 테스트 범위 제한
 # #############################################################
-# [2026-08-19] 신호등 단독 테스트(S0_WAIT_GREEN) 끝나고 S1_LANE_FOLLOW로 복귀 — 신호등
-#   대기 없이 차선 추종부터 바로 시작. 신호등 인식만 다시 단독 테스트하려면 위 이력대로
-#   S0_WAIT_GREEN으로 잠깐 바꿔서 쓸 것(그때만 perc_signal()/_debug_viz_signal_status()가 돈다).
+# [2026-08-20, 임시] 배경판+색상상태 YOLO 동시 테스트 위해 S0_WAIT_GREEN으로 전환 —
+#   yolo_signal_detector(배경판)는 detect_s2() 경로로만 호출돼 S0/S2 상태가 아니면 아예 안
+#   돈다(track_drive.py perc_signal() 참고). 테스트 끝나면 S1_LANE_FOLLOW로 되돌릴 것.
 START_STATE     = MissionState.S1_LANE_FOLLOW
 ENABLE_BEHAVIOR = False   # S1에서 라바콘/장애물/추월 Behavior를 켤지 여부(최상위 스위치)
 # [2026-08-19] 라바콘(B1)·고정장애물(B2)·방해차량 추월(B3) 전부 끄고 순수 차선주행(B0_NORMAL)만
@@ -1397,6 +1399,13 @@ LAVACON_LINE_TRACK_MAX_JUMP_M   = 0.6   # 직전 박스 같은 라인 점과의 
 #   AND로 추가한다 — 라이다 단독 클러스터 판정은 벽 모서리 등에서 오검출 여지가 있어서,
 #   실제로 콘(cone) 클래스가 화면에 잡힐 때만 진입을 인정하도록 이중화한다.
 #   [2026-08-11] smooth-imu-yaw-rate 브랜치(0c0d88b)에서 수동 포팅.
+# [2026-08-20] ENABLE_BEHAVIOR=False(라바콘/장애물/추월 Behavior 전체 비활성, 순수
+#   차선주행만 사용) 상태인데도 perc_yolo_cone()이 매 프레임 백그라운드에서 계속 돌고
+#   있어서(track_drive.py perceive_all()) 요청 반영으로 끈다 — YOLO_SIGNAL_ENABLE과
+#   동일 패턴으로, False면 track_drive.py가 YoloConeDetector 자체를 생성하지 않는다
+#   (self.yolo_cone_detector=None, perc_yolo_cone()이 None 체크로 조용히 스킵).
+#   라바콘(B1) 실차 테스트를 다시 시작하면 True로 되돌릴 것.
+YOLO_CONE_ENABLE = False
 YOLO_CONE_INPUT_SIZE = 640     # cone_best_n.onnx export 시 imgsz와 반드시 일치시킬 것
 YOLO_CONE_CONF_THRESHOLD = 0.5 # 이 신뢰도 이상인 검출만 인정(모델이 nms=True로 export돼 좌표 디코딩은 불필요)
 YOLO_CONE_MODEL_PATH = None    # None이면 yolo_ros/cone_best_n.onnx(형제 디렉터리)를 자동으로 찾음(perception/yolo_cone.py 참고)
@@ -1672,7 +1681,9 @@ SIG4_BOARD_CROP_MARGIN = 0.35    # 후보 박스에 이 비율만큼 여유를 �
 # 스모크테스트 전용, 조명/배경 다양성 없음) 기준 학습본이면 기본값은 False로 둘 것. 실데이터
 # (다른 세션 여러 번)로 재학습한 모델로 교체 전까지 켜면 이 파일럿 환경에만 과적합된 채로
 # 실차에 올라간다 — 지금 yolo_ros/에 있는 파일이 파일럿용인지 본학습용인지 확인 후 켤 것.
-YOLO_SIGNAL_ENABLE = False
+# [2026-08-20] 배경판+색상상태 YOLO 동시 테스트를 위해 켬 — 위 경고대로 지금 yolo_ros/의
+#   signal_board_best_n.onnx가 파일럿(스모크테스트)용인지 본학습본인지 확인 후 사용할 것.
+YOLO_SIGNAL_ENABLE = True
 YOLO_SIGNAL_INPUT_SIZE = 640     # export 시 imgsz와 반드시 일치시킬 것 (train_pilot.md 참고)
 YOLO_SIGNAL_CONF_THRESHOLD = 0.5 # 이 신뢰도 이상인 검출만 board 후보로 인정
 YOLO_SIGNAL_MODEL_PATH = None    # None이면 yolo_ros/signal_board_best_n.onnx(형제 디렉터리) 자동탐색

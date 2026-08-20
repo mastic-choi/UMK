@@ -326,28 +326,23 @@ class TwinLiteNetEngine:
 
         available = set(ort.get_available_providers())
         if providers is None:
-            # [2026-08-14 실차 확인] 원래는 TensorRT EP > CUDA EP > CPU EP 순이었다 —
-            # 그 순서 자체는 이전 모델(twinlitenetplus_medium_v2.onnx)에서 TensorRT가
-            # 정상 동작해서 붙인 우선순위였다(아래 model_path FileNotFoundError 메시지가
-            # 안내하는 v1.2.0 모델로 교체되기 전 기준). 그런데 오늘 새로 교체된
-            # twinlitenetplus_kmu_v1.2.0.onnx는 trt_cache가 전혀 없는 상태에서(교체 직후라
-            # 당연함) TensorRT 엔진을 처음부터 빌드하는데, 실측(standalone 스크립트로 직접
-            # infer_raw() 호출) 결과 4분 넘게도 첫 추론 한 번이 안 끝났다 — yolo_cone.py의
-            # cone_best_n.onnx가 겪은 것과 같은 부류의 문제다(그쪽은 TRT가 그 모델 자체를
-            # 아예 못 빌드해서 ~456초 뒤에야 조용히 CUDA로 자동 폴백, yolo_cone.py
-            # YoloConeEngine.__init__ 주석 참고). xydrive는 재출발/재테스트마다 프로세스를
-            # 새로 띄우므로(xydrive 함수가 매번 kill -9 후 재실행), 이 지연이 매번
-            # 반복되면 사실상 추론이 한 번도 안 끝난 채로 계속 재시작만 되는 상태가 된다
-            # (실측 재현됨 — DA/LL 디버그 창이 안 뜨고 lane_valid가 계속 False였던 원인).
-            # CUDAExecutionProvider로 강제해보니 로드 0.3초, 첫 추론 0.9초, 이후 ~5.7fps로
-            # da_prob이 정상 범위(최대 0.99, DL_FG_THRESHOLD=0.5 초과 비율 27%)로 나와
-            # 모델 자체는 문제 없음을 확인했다 — 그래서 이 모델도 cone과 동일하게 CUDA를
-            # 우선한다. TensorRT는 교집합에서 아예 제외한다(교집합에 넣어두면 provider
-            # 리스트에 남아 다음 로드 때 다시 그 긴 빌드를 시도할 여지가 있음 — 완전히
-            # 배제하는 게 cone과 같은 방식). 이 모델용 trt_cache가 나중에 실제로 완성되고
-            # (수 분 이상 켜둔 채 기다려서) TensorRT가 더 빠르다는 게 실측되면 그때
-            # 되돌릴 것 — 지금은 "매번 멈춰있는 것보다 확실히 도는 것"을 우선한다.
-            priority = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+            # [2026-08-14 실차 확인 → 2026-08-20 재시도] twinlitenetplus_kmu_v1.2.0.onnx로
+            # 교체한 직후, trt_cache가 전혀 없는 상태에서 TensorRT 최초 엔진 빌드가 4분 넘게
+            # 안 끝나(§README 2.31) CUDAExecutionProvider로 강제 전환했었다 — 그 전
+            # 모델(twinlitenetplus_medium_v2.onnx)에서는 TensorRT가 정상 동작했었다는 전례가
+            # 있어서(이번 재시도 근거), 최초 빌드 지연 자체가 "영구 실패"가 아니라 "trt_cache가
+            # 없어서 매번 처음부터 다시 빌드"였을 가능성이 있다고 보고 TensorRT를 다시 1순위로
+            # 되돌린다(요청 반영: "DA 검출 텐서RT 다시 시도, 저번에 잘됐었는데").
+            # ★ 최초 1회는 trt_cache(아래 provider_options)가 비어있어 엔진 빌드에 수십초~
+            # 수분이 걸릴 수 있다 — 이전 실측(4분 넘게 첫 추론 미완료)보다 오래 걸릴 수 있으니
+            # 첫 실행은 도중에 노드를 kill하지 말고 끝까지 기다릴 것(xydrive처럼 프로세스를
+            # 재시작마다 새로 띄우는 방식이면, 빌드 완료 전에 매번 재시작될 경우 캐시가 한 번도
+            # 안 만들어져 계속 이 지연을 반복하게 된다 — DA/LL 디버그 창이 한참 안 뜨는 게
+            # 정상이니 당황하지 말 것). 두 번째 실행부터는 trt_cache(models/trt_cache/)를
+            # 재사용해 CUDA 수준(로드 0.3초/첫 추론 0.9초)으로 빨라질 것으로 기대 — 만약 이번에도
+            # 몇 분 넘게 안 끝나면 cone_best_n.onnx와 같은 TRT-16198류 실패로 보고 다시 CUDA
+            # 우선으로 되돌릴 것.
+            priority = ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
             providers = [p for p in priority if p in available] or ['CPUExecutionProvider']
 
         provider_options = []
@@ -2701,23 +2696,14 @@ class DLLaneDetector:
         with self._lock:
             return self._latest_result
 
-    def show_debug_windows(self, lookahead_xy=None, lookahead_px=None, v_mps=None,
+    def show_debug_windows(self, lookahead_xy=None, lookahead_px=None, ctrl_speed=None,
                             steer_deg_raw=None, steer_deg_final=None):
-        """da(초록)/ll(흰선=흰색·노란선=노랑) 오버레이 + (모드에 따라) 좌우 슬라이딩
-        윈도우/corridor 경계가 그려진 result에 da/ll/노란선 원본 이진마스크를 위→아래로
-        이어붙여 창 하나(`dl_lane`)로 띄운다 — result/da/ll/yellow 순서로 세로 스택.
-        [2026-08-06] 예전엔 3개 별도 창(dl_lane_result/da/ll)이었는데, 창이 흩어져 있으면
-        서로 다른 위치에 배치해야 해서 실차 테스트 중 한눈에 비교하기 불편하다는 피드백으로
-        하나로 합쳤다. [2026-08-07] ll을 흰선/노란선으로 분리(_split_ll_by_yellow())하면서
-        노란선만 따로 보이는 패널을 추가했다(result 패널에 이미 색으로 겹쳐 그려지긴 하지만,
-        da/ll 전체 위에 옅게 깔린 것보다 노란선만 100% 불투명하게 보이는 게 dash가 끊기는지
-        확인하기 더 쉽다). da/ll/yellow는 원래 1채널 이진마스크라 result(3채널 BGR)와 그대로
-        못 이어붙이므로 BGR로 변환 후 vconcat한다 — 넷 다 같은 ROI에서 나온 동일 shape(BEV
-        캔버스 크기)이라 폭이 항상 맞는다. [2026-08-10 도입, 2026-08-11 정리] 맨 아래에
-        offset 디바운스 스파크라인(`DLSlideWindow._build_offset_sparkline()`, 폭을 이
-        패널들과 같은 self.roi_w로 맞춰서 만듦)을 한 장 더 붙인다 — 원래 여기 붙던 config
-        튜닝값 텍스트 목록(대부분 고정값이라 코드/config.py를 보면 알 수 있음)은 화면만
-        차지해서 지웠고, 실제로 매 프레임 눈으로 봐야 하는 스파크라인만 남겼다.
+        """[2026-08-20, 요청 반영: "디버그창 간소화 — da 파랑+경로 찍힌 result 1개만
+        남기고 조향/증폭조향/발행 spd는 그 안에 텍스트로"] 예전엔 result(da 파랑 오버레이+
+        경로)/da/ll/speed 4패널을 세로로 이어붙여 창 하나(`dl_lane`)로 띄웠는데, 이제 result
+        패널 하나만 그대로 띄우고 나머지 세 패널(원본 이진마스크 da/ll, speed 전용 패널)과
+        맨 아래 offset 스파크라인은 뺐다 — da/ll은 이미 result에 색으로 겹쳐 그려져 있어
+        정보 손실이 없고, speed는 아래에서 텍스트로 result 위에 직접 찍는다.
 
         lookahead_xy(있으면) : pure_pursuit.PurePursuitController가 직전에 계산한 look-ahead
         목표점, (x, y) — self.lane_path와 같은 da ROI 픽셀좌표계라 result 패널에 좌표 변환
@@ -2728,22 +2714,20 @@ class DLLaneDetector:
         프레임 이내 오차, 디버깅 목적엔 무시 가능). path가 아직 없으면(첫 프레임) 호출측이
         None을 넘기고, 이 경우 마커를 그리지 않는다.
 
-        v_mps(있으면) : 현재 실측 속도(m/s, track_drive.py self.v_mps) — [2026-08-17g]
-        맨 아래 노란선(yellow) 전용 패널을 없애고 그 자리에 이 값을 표시한다(요청 반영:
-        "yellow 부분을 제거하고 현 속도를 거기에 표시"). 노란선 자체는 result 패널에 이미
-        색으로 겹쳐 그려지므로 정보 손실은 없다. [2026-08-19] 직진/커브대응 2상태 분기
-        (pure_pursuit의 명시적 직진 모드, README §0.5.9) 자체를 제거하면서 이 패널이
-        같이 표시하던 상태 텍스트도 함께 뺐다(요청 반영) — 이제 컨트롤러는 항상
-        "커브대응" 파라미터 하나만 쓴다.
+        ctrl_speed(있으면) : 지금 실제로 모터에 발행되고 있는 speed(track_drive.py
+        self.ctrl_speed, control_loop()의 self.drive(ctrl_angle, ctrl_speed)로 나가는 값) —
+        [2026-08-20 이전까지는 실측 v_mps를 찍었는데] "발행되고 있는 spd를 보고 싶다"는
+        요청으로 명령값(공급/publish 값)으로 교체했다. 실측 속도가 필요하면 vesc_debug
+        창(DEBUG_VIZ_VESC)을 별도로 켤 것.
 
-        steer_deg_raw/steer_deg_final(있으면) : [2026-08-19, 요청 반영] pure_pursuit의
-        wheelbase 부스트(controller/pure_pursuit.py PP_WHEELBASE_BOOST_* 참고) "전" 1차
-        조향각(last_pre_boost_steer_deg)과 "후"(필터+클램프까지 다 거쳐 실제로 차에 나가는
-        prev_steer_deg)를 ll 패널 상단에 같이 찍는다 — 부스트가 지금 실제로 얼마나 개입
-        중인지 화면만 보고 바로 비교할 수 있게. lookahead_xy와 동일하게 _lane_steer()가
-        이번 틱에 아직 안 돌았을 때는 직전 틱 값(0.05s 이내 오차, 무시 가능). 둘 다
-        None이면(호출측이 안 넘기거나 pure_pursuit이 아직 없는 초기 프레임) 아무것도
-        안 그린다.
+        steer_deg_raw/steer_deg_final(있으면) : [2026-08-19] pure_pursuit의 wheelbase
+        부스트(controller/pure_pursuit.py PP_WHEELBASE_BOOST_* 참고) "전" 1차 조향각
+        (last_pre_boost_steer_deg, "조향")과 "후"(필터+클램프까지 다 거쳐 실제로 차에
+        나가는 prev_steer_deg, "증폭된 실제조향")를 함께 찍는다 — 부스트가 지금 실제로
+        얼마나 개입 중인지 화면만 보고 바로 비교할 수 있게. lookahead_xy와 동일하게
+        _lane_steer()가 이번 틱에 아직 안 돌았을 때는 직전 틱 값(0.05s 이내 오차, 무시
+        가능). 둘 다 None이면(호출측이 안 넘기거나 pure_pursuit이 아직 없는 초기 프레임)
+        아무것도 안 그린다.
         ★ 반드시 메인 스레드(ROS 콜백/타이머가 도는 스레드)에서만 호출할 것 ★ — 워커
         스레드가 cv2.imshow를 직접 부르지 않는 이유는 _worker()/DLSlideWindow.visualize()
         주석 참고. track_drive.py의 perc_lane()이 detect() 직후 이 메서드를 호출한다
@@ -2751,7 +2735,7 @@ class DLLaneDetector:
         if not DEBUG_VIZ_DL_LANE:
             return
         with self._lock:
-            vis, da_mask, ll_mask, ll_yellow_mask, sparkline = self._latest_debug
+            vis = self._latest_debug[0]
         if vis is None:
             return
         if lookahead_xy is not None:
@@ -2764,33 +2748,19 @@ class DLLaneDetector:
                     vis, f'ld:{lookahead_px:.0f}px', (lx + 8, ly - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1
                 )
-        da_bgr = cv2.cvtColor(da_mask, cv2.COLOR_GRAY2BGR)
-        ll_bgr = cv2.cvtColor(ll_mask, cv2.COLOR_GRAY2BGR)
-        # [2026-08-19] ll 패널 상단에 조향각 원본(부스트 전)/최종(부스트+필터+클램프,
-        # 실제로 나가는 값)을 같이 표시 — 위 show_debug_windows() docstring 참고. 값이
-        # 다르면(=지금 부스트가 개입 중) 최종값을 주황으로 강조해 한눈에 띄게 한다.
+        # 조향/발행 speed는 result 패널 하단에 텍스트로 얹는다 — 값이 다르면(=지금 부스트가
+        # 개입 중) 최종값을 주황으로 강조해 한눈에 띄게 한다.
         if steer_deg_raw is not None and steer_deg_final is not None:
             boosted = abs(steer_deg_final - steer_deg_raw) > 1e-3
             final_color = (0, 140, 255) if boosted else (255, 255, 255)  # 주황=부스트 개입중
-            steer_text = f'조향 원본:{steer_deg_raw:+.1f}도 -> 최종:{steer_deg_final:+.1f}도'
-            put_text_kr(ll_bgr, steer_text, (5, 24), font_size=18, color_bgr=final_color,
-                        fallback=f'raw:{steer_deg_raw:+.1f}deg -> final:{steer_deg_final:+.1f}deg')
-        # [2026-08-17g] 예전엔 여기 노란선(ll_yellow_mask) 전용 패널이 있었다(노란선만
-        # 100% 불투명하게 보여 dash 끊김 확인용, ll_yellow_mask.shape 크기). 요청 반영으로
-        # 제거하고 같은 크기 패널에 속도를 표시한다 — 노란선 자체는 result 패널 오버레이에
-        # 이미 보이므로 이 패널이 없어져도 정보 손실은 없다. [2026-08-19] 직진/커브대응
-        # 상태 텍스트는 그 2상태 분기 자체를 제거하면서 함께 뺐다(요청 반영).
-        speed_bgr = np.zeros((*ll_yellow_mask.shape, 3), dtype=np.uint8)
-        if v_mps is not None:
-            speed_text = f'speed: {v_mps:+.2f} m/s'
-            put_text_kr(speed_bgr, speed_text, (10, 8), font_size=22, color_bgr=(255, 255, 255),
-                        fallback=f'speed:{v_mps:+.2f}m/s')
-        for label, panel in (('result', vis), ('da', da_bgr), ('ll', ll_bgr), ('speed', speed_bgr)):
-            cv2.putText(panel, label, (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-        stack = [vis, da_bgr, ll_bgr, speed_bgr]
-        if sparkline is not None:
-            stack.append(sparkline)
-        cv2.imshow('dl_lane', cv2.vconcat(stack))
+            steer_text = f'조향:{steer_deg_raw:+.1f}도 -> 증폭된 실제조향:{steer_deg_final:+.1f}도'
+            put_text_kr(vis, steer_text, (5, vis.shape[0] - 34), font_size=18, color_bgr=final_color,
+                        fallback=f'steer:{steer_deg_raw:+.1f}deg -> boosted:{steer_deg_final:+.1f}deg')
+        if ctrl_speed is not None:
+            speed_text = f'발행 speed: {ctrl_speed:+.2f}'
+            put_text_kr(vis, speed_text, (5, vis.shape[0] - 12), font_size=18, color_bgr=(255, 255, 255),
+                        fallback=f'pub speed:{ctrl_speed:+.2f}')
+        cv2.imshow('dl_lane', vis)
         cv2.waitKey(1)
 
     def stop(self):

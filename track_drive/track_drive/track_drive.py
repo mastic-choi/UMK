@@ -262,13 +262,19 @@ class TrackDriverNode(Node):
         # 초기화가 실패하면 _build_lane_detector()의 dl→hough 폴백과 달리 대체 백엔드가
         # 없으므로(카메라 이중확인 자체가 선택사항), None으로 두고 perc_lavacon_trigger()가
         # "카메라 확인 불가 시 라이다 단독 판정으로 폴백"하도록 한다 — 원인은 에러 로그로 남긴다.
-        try:
-            self.yolo_cone_detector = YoloConeDetector(logger=self.get_logger())
-        except Exception as e:
-            self.get_logger().error(
-                f'YOLO 콘 검출기 초기화 실패, 라바콘 트리거는 라이다 단독 판정으로 폴백합니다: {e}'
-            )
-            self.yolo_cone_detector = None
+        # [2026-08-20] YOLO_SIGNAL_ENABLE과 동일 패턴으로 YOLO_CONE_ENABLE 게이트 추가(요청
+        # 반영) — ENABLE_BEHAVIOR=False로 라바콘 자체를 안 쓰는 지금, 이 검출기가 매 프레임
+        # 백그라운드에서 계속 도는 게 순전한 오버헤드라 꺼둔다(config.py YOLO_CONE_ENABLE
+        # 주석 참고). perc_yolo_cone()은 self.yolo_cone_detector=None일 때 조용히 스킵한다.
+        self.yolo_cone_detector = None
+        if YOLO_CONE_ENABLE:
+            try:
+                self.yolo_cone_detector = YoloConeDetector(logger=self.get_logger())
+            except Exception as e:
+                self.get_logger().error(
+                    f'YOLO 콘 검출기 초기화 실패, 라바콘 트리거는 라이다 단독 판정으로 폴백합니다: {e}'
+                )
+                self.yolo_cone_detector = None
 
         # [2026-08-20] da 근접 컷(ENABLE_OBSTACLE_CUT) 전용 YOLO 차량 검출기 — 이 저장소의
         # 다른 YOLO 검출기와 동일 패턴(초기화 실패 시 None, 라이다 단독 판정으로 폴백).
@@ -638,12 +644,15 @@ class TrackDriverNode(Node):
         #   엄밀히는 직전 틱 값(0.05s 이내 오차, 디버깅 목적엔 무시 가능).
         lookahead_xy = self.pure_pursuit.last_target_xy
         lookahead_px = self.pure_pursuit.last_lookahead_px
-        # [2026-08-19] wheelbase 부스트 전/후 조향각도 같이 넘겨서 ll 패널 상단에 표시한다
-        # (perception/dl_lane.py show_debug_windows() steer_deg_raw/steer_deg_final 주석,
-        # 요청 반영) — lookahead_xy와 동일하게 이번 틱 _lane_steer() 실행 전 시점이라
+        # [2026-08-19] wheelbase 부스트 전/후 조향각도 같이 넘겨서 result 패널 하단에
+        # 표시한다(perception/dl_lane.py show_debug_windows() steer_deg_raw/steer_deg_final
+        # 주석, 요청 반영) — lookahead_xy와 동일하게 이번 틱 _lane_steer() 실행 전 시점이라
         # 직전 틱 값(0.05s 이내 오차, 무시 가능).
+        # [2026-08-20] 디버그창 간소화(요청 반영) — v_mps(실측) 대신 self.ctrl_speed(지금
+        # drive()로 실제 발행 중인 speed 명령값)를 넘긴다. show_debug_windows() docstring
+        # ctrl_speed 주석 참고.
         getattr(self.lane_detector, 'show_debug_windows', lambda *a, **k: None)(
-            lookahead_xy, lookahead_px, self.v_mps,
+            lookahead_xy, lookahead_px, self.ctrl_speed,
             steer_deg_raw=self.pure_pursuit.last_pre_boost_steer_deg,
             steer_deg_final=self.pure_pursuit.prev_steer_deg)
 

@@ -1646,6 +1646,54 @@ ROI에 벽/다른 물체 점이 같이 잡혀도 실제로 트리거 판단에 �
 `SPEED_OBSTACLE_CUT`/`OBSTACLE_CUT_TRIGGER_Y_HALF_M` 등 실측 튜닝 순서로 진행 예정(§2.51 "알려진 한계"
 그대로 유효).
 
+### 2.53 `dl_lane` 디버그창 4패널(result/da/ll/speed) → result 1개로 간소화 + DA 추론 TensorRT 재시도 (2026-08-20)
+
+**배경:** ①실차 GPU 부하를 줄이려고 디버그창을 최소화하는 김에, `dl_lane` 창이 세로로 4패널(result/da/
+ll/speed)+스파크라인까지 붙어 있던 걸 "da 파랑+경로가 이미 다 그려진 result 패널 1개만 남기고 조향/
+발행 speed는 텍스트로 얹어달라"는 요청 반영. ②`ENABLE_BEHAVIOR=False`인데도 라바콘 YOLO
+(`perc_yolo_cone()`)가 매 프레임 백그라운드에서 계속 돌고 있어 순전한 오버헤드였음 — `YOLO_SIGNAL_ENABLE`과
+동일 패턴으로 `YOLO_CONE_ENABLE` 게이트 추가, 기본 `False`. ③§2.31에서 DA 추론(TwinLiteNetPlus)을
+TensorRT 최초 엔진 빌드가 4분 넘게 안 끝나 CUDA EP로 강제 전환했었는데, 그 이전 모델
+(`twinlitenetplus_medium_v2.onnx`)에서는 TensorRT가 정상 동작했던 전례가 있어("저번에 잘됐었는데") 이번
+모델(`twinlitenetplus_kmu_v1.2.0.onnx`)도 trt_cache만 한 번 완성되면 될 가능성이 있다고 보고 재시도.
+
+**수정:**
+- `perception/dl_lane.py` `show_debug_windows()` — da/ll 원본 이진마스크 패널·speed 전용 패널·
+  offset 스파크라인의 `vconcat` 스택을 제거하고 result 패널(`self.vis`, 이미 da 파랑 오버레이+경로+
+  offset/lane_center 텍스트 포함) 하나만 `cv2.imshow('dl_lane', vis)`. 기존 ll 패널 상단에 있던
+  "조향 원본→최종" 텍스트와 speed 패널의 속도 텍스트를 이 result 패널 하단으로 옮김. speed 표시값도
+  실측 `v_mps` 대신 **지금 실제로 모터에 발행 중인 명령값** `self.ctrl_speed`로 교체(요청: "발행되고
+  있는 spd").
+- `config.py`/`track_drive.py` — `YOLO_CONE_ENABLE`(기본 `False`) 신설, `False`면
+  `self.yolo_cone_detector`를 아예 생성하지 않음(`perc_yolo_cone()`은 `None` 체크로 조용히 스킵).
+  라바콘 실차 테스트 재개 시 `True`로 되돌릴 것.
+- `perception/dl_lane.py` `TwinLiteNetEngine.__init__()` — provider 우선순위를
+  `['CUDAExecutionProvider', 'CPUExecutionProvider']` → `['TensorrtExecutionProvider',
+  'CUDAExecutionProvider', 'CPUExecutionProvider']`로 되돌림.
+
+**알려진 한계 / 주의:** DA TensorRT 재시도는 **실차 미검증**. `models/trt_cache/`가 비어 있는 상태에서
+첫 실행은 엔진 빌드에 §2.31 실측(4분+)보다 오래 걸릴 수 있고, 그 사이 DA/LL 디버그창이 하나도 안 뜨는
+게 정상이다 — `xydrive`처럼 프로세스를 매 재시도마다 `kill -9` 후 새로 띄우는 방식이면 **빌드 완료 전에
+계속 재시작될 경우 trt_cache가 영영 안 만들어져 매번 이 지연을 반복**하게 되니, 첫 실행만은 절대 중간에
+죽이지 말고 끝까지 기다릴 것. 몇 분 넘게 첫 추론이 안 끝나면 `cone_best_n.onnx`와 같은 `TRT-16198`류
+실패로 보고 §2.31 방식(CUDA 우선)으로 되돌릴 것 — 이 경우 `models/trt_cache/`에 남은 미완성 캐시도
+같이 지우고 되돌리는 게 안전하다(다음 로드가 그 캐시를 재사용 시도하다 다시 멈출 수 있음).
+
+### 2.54 §2.53 TensorRT 재시도 실차 확인 → `DEBUG_VIZ_DL_LANE` 재활성화 (2026-08-20)
+
+**확인:** 실차 노드 기동 로그에서 `[dl_lane] TwinLiteNet ONNX 세션 로드 완료 |
+최우선 provider=TensorrtExecutionProvider (요청순위=['TensorrtExecutionProvider',
+'CUDAExecutionProvider', 'CPUExecutionProvider'])`를 확인 — §2.53에서 우려했던 최초 빌드 지연 없이
+즉시 로드됐는데, 이는 8/14(§2.31) 당시 시도가 실제로는 백그라운드에서 끝까지 완주해 `trt_cache/`에
+`.engine`이 남아있었고 이번에 그 캐시를 재사용했기 때문으로 파악됨(신호등 `yolo_signal`/
+`yolo_signal_state`는 원래부터 TensorRT를 요청하지 않는 `[CUDA, CPU]` 우선순위라 무관 — 콘 검출
+모델의 `TRT-16198` 실패 전례 때문에 처음부터 예방적으로 제외돼 있었음, §2.31 문단 참고).
+
+**후속 조치:** §2.48(디버그창 정리) 때 다 같이 꺼뒀던 `DEBUG_VIZ_DL_LANE`을 다시 `True`로 켬 —
+TensorRT 전환이 잘 됐는지 확인했으니 `dl_lane` result 패널(§2.53에서 1개로 간소화한 그 창)로 실주행
+중 da/조향/발행speed를 계속 눈으로 확인하기 위함. 나머지 `DEBUG_VIZ_*`는 §2.48 요청("일단 모든
+디버그창 꺼줘") 그대로 꺼진 채 유지.
+
 ---
 
 ## 3. 라바콘 (B1_LAVACON)
