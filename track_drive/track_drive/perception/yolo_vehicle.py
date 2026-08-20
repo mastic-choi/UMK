@@ -3,18 +3,24 @@
 #=============================================
 # yolo_vehicle.py — YOLOv8n(ONNX Runtime) 기반 방해차량 카메라 이중확인.
 #
-# yolo_cone.py와 거의 동일한 구조다(같은 실시간 전략: 별도 데몬 스레드에서 자기
-# 페이스로 추론, detect()는 논블로킹으로 최신 결과 반환, cv2.imshow()는 메인
-# 스레드에서만). 차이는 두 가지뿐이다:
-#   ① 모델이 파인튜닝된 전용 모델(cone_best_n.onnx)이 아니라 COCO 사전학습
-#      yolov8n.pt를 그대로 ONNX(nms=True)로 내보낸 것 — 클래스가 80개라
-#      YOLO_VEHICLE_CLASS_ID('car'=2)로 걸러야 한다(콘 모델은 클래스가 1개뿐이라
-#      이 필터가 없었다).
-#   ② 그래서 신뢰도가 콘 모델만큼 높지 않다(실측 0.15~0.78, 평균 0.3대) — 배경
-#      소품(카트/의자 등)을 다른 클래스로 오탐하는 사례도 확인됨(config.py
-#      YOLO_VEHICLE_* 주석 참고). track_drive.py가 이 결과를 라이다 근접판정과
-#      AND로 묶고 프레임 디바운스(YOLO_VEHICLE_CONFIRM_FRAMES)까지 걸어서 쓴다 —
-#      이 모듈 자체는 "이번 프레임 car가 보이는가"만 답한다.
+# yolo_cone.py와 거의 동일한 실시간 전략(별도 데몬 스레드에서 자기 페이스로 추론,
+# detect()는 논블로킹으로 최신 결과 반환, cv2.imshow()는 메인 스레드에서만)이지만,
+# 출력 후처리가 다르다:
+#   [2026-08-20 §2.57 이전] COCO 사전학습 yolov8n.pt를 그대로 ONNX(nms=True)로 내보낸
+#   yolov8n_car.onnx를 썼다 — 클래스 80개라 YOLO_VEHICLE_CLASS_ID('car'=2)로 걸러야
+#   했고, 신뢰도도 낮았다(실측 0.15~0.78, 평균 0.3대). 롤백/비교용으로 yolo_ros/에
+#   그대로 남아있음.
+#   [2026-08-20 §2.57] 대회에서 실제 회피 대상인 그 차량 한 대(#46, TRAXXAS 검정/연두)
+#   뒷모습 전용으로 파인튜닝한 target_vehicle_best.onnx(nc=1 'target_vehicle',
+#   class_id=0)로 교체. **이 모델은 nms=False로 export됨** — TensorRT가 NMS 내장
+#   그래프에서 실패하던 문제(TRT-16198, cone/구 vehicle 모델 공통 이슈)를 export 단계
+#   에서 피하기 위해서다. 그 대가로 output0가 이미 NMS된 [x1,y1,x2,y2,conf,cls]가
+#   아니라 raw [1, 4+nc, num_anchors]([cx,cy,w,h]+클래스점수, 아직 박스 후보가 안
+#   걸러짐)라서, 여기서 좌표 디코딩 + cv2.dnn.NMSBoxes 직접 수행이 필요하다(콘 모델/
+#   구 vehicle 모델은 이 단계가 아예 없었다).
+# track_drive.py가 이 결과를 라이다 근접판정과 AND로 묶고 프레임 디바운스
+# (YOLO_VEHICLE_CONFIRM_FRAMES)까지 걸어서 쓴다 — 이 모듈 자체는 "이번 프레임
+# target_vehicle이 보이는가"만 답한다.
 #=============================================
 import os
 import threading
@@ -33,26 +39,30 @@ else:
 
 from ..config import (
     YOLO_VEHICLE_INPUT_SIZE, YOLO_VEHICLE_CONF_THRESHOLD, YOLO_VEHICLE_CLASS_ID,
-    YOLO_VEHICLE_MODEL_PATH, DEBUG_VIZ_YOLO_VEHICLE, FPS_LOG_PERIOD_SEC,
+    YOLO_VEHICLE_NMS_IOU_THRESHOLD, YOLO_VEHICLE_MODEL_PATH, DEBUG_VIZ_YOLO_VEHICLE,
+    FPS_LOG_PERIOD_SEC,
 )
 
 
 def _default_model_path():
-    """yolov8n_car.onnx 기본 경로 — yolo_cone.py _default_model_path()와 동일한
+    """target_vehicle_best.onnx 기본 경로 — yolo_cone.py _default_model_path()와 동일한
     경로 규칙(realpath로 --symlink-install 심볼릭 링크를 해소한 뒤 세 단계 위로
-    올라가 yolo_ros/에 닿음). 그쪽 함수 주석 참고."""
+    올라가 yolo_ros/에 닿음). 그쪽 함수 주석 참고.
+    [2026-08-20 §2.57] 옛 yolov8n_car.onnx(COCO, nms=True)는 롤백/비교용으로 yolo_ros/에
+    그대로 두고, 기본 경로만 전용 파인튜닝 모델(target_vehicle_best.onnx, nc=1,
+    nms=False)로 옮김."""
     if YOLO_VEHICLE_MODEL_PATH:
         return YOLO_VEHICLE_MODEL_PATH
 
     package_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))  # .../track_drive/track_drive
     ros_pkg_root = os.path.dirname(package_dir)                                # .../track_drive (ROS 패키지 루트)
     src_dir = os.path.dirname(ros_pkg_root)                                    # .../src (또는 저장소 루트)
-    return os.path.join(src_dir, 'yolo_ros', 'yolov8n_car.onnx')
+    return os.path.join(src_dir, 'yolo_ros', 'target_vehicle_best.onnx')
 
 
 class YoloVehicleEngine:
-    """ONNX Runtime으로 YOLOv8n(NMS 포함 export, COCO 80클래스) 모델을 로드하고
-    'car' 클래스만 걸러 추론한다."""
+    """ONNX Runtime으로 YOLOv8n(nms=False export, nc=1 'target_vehicle') 전용 파인튜닝
+    모델을 로드하고, raw 출력을 직접 디코딩+NMS해 추론한다."""
 
     def __init__(self, model_path=None, providers=None, logger=None):
         if ort is None:
@@ -65,7 +75,8 @@ class YoloVehicleEngine:
         if not os.path.isfile(self.model_path):
             raise FileNotFoundError(
                 f'YOLO 차량 검출 가중치 파일을 찾을 수 없습니다: {self.model_path}\n'
-                'yolov8n.pt를 ONNX(nms=True)로 변환해 yolo_ros/yolov8n_car.onnx에 두세요.'
+                '전용 파인튜닝 모델을 yolo_ros/target_vehicle_best.onnx에 두세요 '
+                '(yolo-V8-KMU-xycar 저장소 notebooks/finetune_yolov8_local_rtx.ipynb 참고).'
             )
         self._logger = logger
 
@@ -79,12 +90,13 @@ class YoloVehicleEngine:
 
         available = set(ort.get_available_providers())
         if providers is None:
-            # [2026-08-19] cone_best_n.onnx(§0 공통주의/yolo_cone.py 참고)와 마찬가지로
-            # nms=True export는 그래프 안에 NonMaxSuppression이 들어있어 TensorRT 빌드가
-            # 실패하는 것으로 이미 확인된 실패모드가 있다(TRT-16198). 같은 export 방식이라
-            # 이 모델도 같은 문제를 겪을 가능성이 높아, 처음부터 TensorRT를 건너뛰고
-            # CUDA로 간다 — 실차 미검증(cone 모델만큼 실측 확인은 안 됨).
-            priority = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+            # [2026-08-20 §2.57] target_vehicle_best.onnx는 nms=False로 export돼 그래프
+            # 안에 NonMaxSuppression이 없다 — cone_best_n.onnx/구 yolov8n_car.onnx가 겪은
+            # TRT-16198(NMS 레이어의 빈 텐서 처리 실패)이 애초에 발생할 여지가 없으므로
+            # TensorRT를 먼저 시도한다. 다만 실차(Jetson Orin NX, JetPack 6)에서의 첫 로드는
+            # trt_cache가 비어있어 엔진 빌드로 수 분 걸릴 수 있고, 이 조합 자체는 실차
+            # 미검증 — 문제가 재현되면 cone 모델과 동일하게 CUDA로 건너뛰는 것으로 되돌릴 것.
+            priority = ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
             providers = [p for p in priority if p in available] or ['CPUExecutionProvider']
 
         provider_options = []
@@ -133,21 +145,41 @@ class YoloVehicleEngine:
         출력 : (vehicle_detected, detections) — detections는 [(x1,y1,x2,y2,conf), ...]
                (640x640 입력 스케일 좌표, yolo_cone.py와 동일하게 원본 스케일로 안
                되돌림 — 지금은 "검출 여부"만 쓴다).
-        모델이 nms=True로 export돼 output0에 이미 NMS 적용된 [x1,y1,x2,y2,conf,cls]가
-        나온다(COCO 80클래스 전체) — 여기서 YOLO_VEHICLE_CLASS_ID('car')만 골라내고
-        신뢰도 임계값을 적용한다."""
+        [2026-08-20 §2.57] target_vehicle_best.onnx는 nms=False로 export돼 output0가
+        (1, 4+nc, num_anchors)=(1, 5, 8400) raw 텐서다 — NMS도 좌표 후보 필터링도 안
+        된 상태(구 yolov8n_car.onnx/cone_best_n.onnx의 nms=True [1,N,6] 출력과는 완전히
+        다른 형식, 그쪽 함수 그대로 재사용 불가). 여기서 직접 cx,cy,w,h→x1,y1,x2,y2
+        디코딩 + 클래스 필터링 + cv2.dnn.NMSBoxes를 수행한다."""
         t0 = time.perf_counter()
         blob = self.preprocess(bgr_frame)
         outputs = self.session.run([self._output_name], {self._input_name: blob})[0]
         dt = time.perf_counter() - t0
         self._latency_ema = dt if self._latency_ema is None else 0.8 * self._latency_ema + 0.2 * dt
 
-        # outputs shape: (1, N, 6) — N은 이번 프레임 검출 수(패딩된 0행 포함 가능)
-        dets = outputs[0]
+        preds = outputs[0]                                        # (4+nc, num_anchors)
+        boxes_cxcywh = preds[:4, :].T                              # (num_anchors, 4)
+        scores = preds[4:, :]                                      # (nc, num_anchors)
+        class_ids = np.argmax(scores, axis=0)                      # (num_anchors,)
+        confs = scores[class_ids, np.arange(scores.shape[1])]      # (num_anchors,)
+
+        keep = (class_ids == YOLO_VEHICLE_CLASS_ID) & (confs >= YOLO_VEHICLE_CONF_THRESHOLD)
+        if not np.any(keep):
+            return False, []
+
+        cx, cy, w, h = boxes_cxcywh[keep].T
+        x1, y1 = cx - w / 2.0, cy - h / 2.0
+        conf_kept = confs[keep]
+
+        # 그래프에 NMS가 없으므로 여기서 직접 수행(cv2.dnn.NMSBoxes는 (x,y,w,h) 박스를
+        # 기대한다 — x2,y2가 아니라 폭/높이).
+        nms_input = np.stack([x1, y1, w, h], axis=1).tolist()
+        idxs = cv2.dnn.NMSBoxes(nms_input, conf_kept.tolist(),
+                                 YOLO_VEHICLE_CONF_THRESHOLD, YOLO_VEHICLE_NMS_IOU_THRESHOLD)
+
         detections = []
-        for x1, y1, x2, y2, conf, cls in dets:
-            if int(cls) == YOLO_VEHICLE_CLASS_ID and conf >= YOLO_VEHICLE_CONF_THRESHOLD:
-                detections.append((float(x1), float(y1), float(x2), float(y2), float(conf)))
+        for i in np.array(idxs).reshape(-1):
+            detections.append((float(x1[i]), float(y1[i]), float(x1[i] + w[i]), float(y1[i] + h[i]),
+                                float(conf_kept[i])))
 
         return (len(detections) > 0), detections
 
@@ -205,7 +237,7 @@ class YoloVehicleDetector:
                         p1 = (int(x1 * scale_x), int(y1 * scale_y))
                         p2 = (int(x2 * scale_x), int(y2 * scale_y))
                         cv2.rectangle(vis, p1, p2, (0, 255, 0), 2)
-                        cv2.putText(vis, f'car {conf:.2f}', (p1[0], max(0, p1[1] - 6)),
+                        cv2.putText(vis, f'target_vehicle {conf:.2f}', (p1[0], max(0, p1[1] - 6)),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
                     cv2.putText(vis, f'detected={vehicle_detected} n={len(detections)}',
                                 (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)

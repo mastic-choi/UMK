@@ -1398,21 +1398,30 @@ YOLO_CONE_CONF_THRESHOLD = 0.5 # 이 신뢰도 이상인 검출만 인정(모델
 YOLO_CONE_MODEL_PATH = None    # None이면 yolo_ros/cone_best_n.onnx(형제 디렉터리)를 자동으로 찾음(perception/yolo_cone.py 참고)
 
 # ── [2026-08-20] 방해차량 카메라 이중확인 (perception/yolo_vehicle.py, YOLOv8n ONNX) ──
-#   da 근접 컷(ENABLE_OBSTACLE_CUT, 위 참고) 전용 — fix/da-corridor-near-band-margin
-#   브랜치(커밋 3be0fb6)에서 이식. 파인튜닝된 전용 모델(cone_best_n.onnx 같은) 없이,
-#   COCO 사전학습 yolov8n.pt를 그대로 ONNX(nms=True) 내보내기해서 'car'(class_id 2)
-#   클래스만 필터링해 쓴다 — 이식 브랜치에서 raw 캡처(lap_005_raw_2734,
-#   pseudo_dataset_v2)로 육안 확인한 결과 신뢰도 0.15~0.78 범위로 실제 방해차량
-#   (RC카 모형)이 정확히 박싱됨을 확인했고, 'truck' 클래스는 카트/의자를 최고
-#   신뢰도(0.81)로 오탐해 제외됐다(그대로 유지) — YOLO_VEHICLE_CLASS_ID=2 하나만 쓴다.
-#   yolo_ros/yolov8n_car.onnx는 opset=12로 변환 시도했으나 실패해 실제로는 opset=18로
-#   내보내졌다 — Jetson onnxruntime 버전이 opset 18을 지원 못 하면 로드 자체가
-#   실패할 수 있음(실차 미검증, 실패 시 라이다 단독 판정으로 자동 폴백하게 설계됨).
+#   da 근접 컷(ENABLE_OBSTACLE_CUT, 위 참고) 전용. 최초 이식(fix/da-corridor-near-band-margin
+#   브랜치 3be0fb6)은 파인튜닝 모델 없이 COCO 사전학습 yolov8n.pt를 그대로 ONNX(nms=True)
+#   내보내기해서 'car'(class_id 2)만 필터링해 썼다(신뢰도 0.15~0.78, 평균 0.3대로 낮음 —
+#   yolo_ros/yolov8n_car.onnx로 롤백/비교용 보존).
+#   [2026-08-20 §2.57] 대회에서 실제로 회피해야 하는 그 차량 한 대(#46, TRAXXAS 검정/연두)
+#   뒷모습만 잡도록 전용 파인튜닝한 target_vehicle_best.onnx(yolo-V8-KMU-xycar 저장소,
+#   nc=1 'target_vehicle')로 교체 — YOLO_VEHICLE_CLASS_ID를 2(COCO car)에서 0으로 변경.
+#   **이 모델은 nms=False로 export됨**(위 COCO 모델/cone_best_n.onnx와 달리 그래프 안에
+#   NonMaxSuppression이 없음, TensorRT 빌드 시 TRT-16198로 실패하던 문제를 export 단계에서
+#   피하려는 목적) — perception/yolo_vehicle.py가 raw 출력([1,5,8400], cx/cy/w/h+클래스점수)을
+#   직접 디코딩하고 cv2.dnn.NMSBoxes로 NMS까지 수행하도록 바뀌었다(기존 nms=True 전제 파싱과
+#   호환 안 됨, 코드 참고).
 YOLO_VEHICLE_INPUT_SIZE = 640
-YOLO_VEHICLE_CONF_THRESHOLD = 0.3  # 이식 브랜치 실측 신뢰도 범위(0.15~0.78) 하한 근처 — 실차 미검증
-YOLO_VEHICLE_CLASS_ID = 2          # COCO 클래스 id — 'car'만 씀('truck'은 오탐 확인돼 제외)
-YOLO_VEHICLE_MODEL_PATH = None     # None이면 yolo_ros/yolov8n_car.onnx(형제 디렉터리)를 자동으로 찾음(perception/yolo_vehicle.py 참고)
-DEBUG_VIZ_YOLO_VEHICLE = True      # [2026-08-20] 실차 검증 시작과 함께 켬 — 카메라가 실제로 'car'를 보는지 원시 박스로 확인용
+YOLO_VEHICLE_CONF_THRESHOLD = 0.5  # [2026-08-20 §2.57] 전용 모델 실측 분포 없음(정적 이미지
+                                    # 재추론 미실시) — ultralytics 기본값으로 시작, 실차/이미지
+                                    # 재추론 후 반드시 재조정할 것(실차 미검증)
+YOLO_VEHICLE_NMS_IOU_THRESHOLD = 0.45  # [2026-08-20 §2.57] nms=False export라 여기서 직접 NMS —
+                                        # ultralytics 기본 IOU 임계값, 실차 미검증
+YOLO_VEHICLE_CLASS_ID = 0          # [2026-08-20 §2.57] target_vehicle_best.onnx 클래스 id
+                                    # (nc=1, 'target_vehicle' 하나뿐이라 0부터 시작 — COCO
+                                    # class_id=2였던 이전 모델과 다름, 반드시 같이 바꿀 것)
+YOLO_VEHICLE_MODEL_PATH = None     # None이면 yolo_ros/target_vehicle_best.onnx(형제 디렉터리)를
+                                    # 자동으로 찾음(perception/yolo_vehicle.py _default_model_path() 참고)
+DEBUG_VIZ_YOLO_VEHICLE = True      # [2026-08-20] 실차 검증 시작과 함께 켬 — 카메라가 실제로 target_vehicle을 보는지 원시 박스로 확인용
 
 # ── 신호등 색상상태 YOLO (perception/yolo_signal_state.py, YOLOv8n ONNX) ──
 #   [2026-08-19] datasets/signal_state/(라벨링 워크플로는 그쪽 README 참고)로 파인튜닝한

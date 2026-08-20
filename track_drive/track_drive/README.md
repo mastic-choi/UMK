@@ -1744,6 +1744,49 @@ way가 어떻게 찍히는지/lookahead가 어떻게 생기는지 보고 싶다"
 박스 위치/모양이 아주 약간 눌려 보일 수 있지만 "검출 여부"를 눈으로 확인하는 용도라 지금은 문제
 삼지 않는다.
 
+### 2.57 YOLO 방해차량 검출을 전용 파인튜닝 모델(`target_vehicle_best.onnx`)로 교체 — nms=False export, 직접 디코딩+NMS (2026-08-20)
+
+**배경:** §2.49에서 이식한 `yolov8n_car.onnx`는 COCO 사전학습 `yolov8n.pt`를 그대로 쓴 것이라
+`car`(class_id=2) 클래스 전반을 잡을 뿐 대회에서 실제로 회피해야 하는 그 방해차량 한 대(#46,
+TRAXXAS 검정/연두)에 특화돼 있지 않았고, 신뢰도도 낮았다(실측 0.15~0.78, 평균 0.3대). 별도
+저장소(`yolo-V8-KMU-xycar`)에서 그 차량 뒷모습 전용으로 YOLOv8n을 파인튜닝(시드 라벨링 →
+bootstrap 반복, 클래스 1개 `target_vehicle`)해 `best.onnx`를 만들었고, 이를 `yolo_ros/`에
+`target_vehicle_best.onnx`로 추가해 기본 모델로 전환했다(`yolov8n_car.onnx`는 롤백/비교용으로
+그대로 보존).
+
+**export 방식이 달라진 점(핵심):** 기존 두 모델(`cone_best_n.onnx`, `yolov8n_car.onnx`)은 모두
+`nms=True`로 export돼 그래프 안에 `NonMaxSuppression`이 포함돼 있었는데, 이 레이어가
+TensorRT 빌드를 항상 실패시키는 것으로 실차에서 확인됐다(TRT-16198, "빈 텐서 처리 실패" — §2.53
+근처 `yolo_cone.py` 주석 참고, 확인까지 약 7~8분 소요돼 노드 기동마다 지연이 반복됨). 이번
+`target_vehicle_best.onnx`는 처음부터 **`nms=False`로 export**해 이 문제를 export 단계에서
+피했다 — 그 대가로 `output0`가 이미 NMS·필터링된 `[x1,y1,x2,y2,conf,cls]`가 아니라 raw
+`[1, 4+nc, num_anchors]` = `[1, 5, 8400]`(`cx,cy,w,h` + 클래스점수, nc=1)이 나온다.
+
+**코드 수정 (`perception/yolo_vehicle.py`):**
+- `YoloVehicleEngine.infer()` — raw 출력을 직접 디코딩(`cx,cy,w,h`→`x1,y1,x2,y2`) 후
+  `cv2.dnn.NMSBoxes`로 NMS까지 수행하도록 전면 교체(기존 `[1,N,6]` 파싱 코드는 이 모델과
+  호환 안 됨). 콘/구 차량 모델의 "conf 필터링만" 패턴에서 벗어난 첫 사례.
+- `_default_model_path()` — 기본 탐색 파일명을 `yolov8n_car.onnx` → `target_vehicle_best.onnx`로 변경.
+- provider 우선순위 — 그래프에 NMS가 없어 TRT-16198이 발생할 여지가 없으므로
+  `['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']`로 TensorRT를
+  다시 최우선으로 시도하도록 변경(콘/구 차량 모델은 여전히 CUDA 직행 유지, 이 모델만 다름).
+
+**`config.py` 변경:** `YOLO_VEHICLE_CLASS_ID` `2`(COCO `car`)→`0`(`target_vehicle`, nc=1이라 0부터
+시작), `YOLO_VEHICLE_MODEL_PATH`는 `None` 유지(자동 탐색 경로가 위 기본 파일명 변경으로 이미
+새 모델을 가리킴), 새 파라미터 `YOLO_VEHICLE_NMS_IOU_THRESHOLD=0.45` 추가(직접 NMS에 필요).
+
+**검증 상태:** onnxruntime CPU provider로 입출력 shape(`[1,5,8400]`)과 디코딩+NMS 파이프라인
+전체를 무작위 이미지로 실행해 예외 없이 동작함은 확인했다(개발 환경, 실제 차량 이미지 아님).
+**실차 미검증 항목**:
+1. `YOLO_VEHICLE_CONF_THRESHOLD=0.5`(ultralytics 기본값) — 새 모델 신뢰도 분포를 실측하지
+   않은 상태의 임시값. 구 모델의 `0.3`(실측 0.15~0.78 하한 근처)처럼 정적 이미지/실차 재추론으로
+   재조정 필요.
+2. TensorRT provider가 이 모델에서 실제로 빌드에 성공하는지(Jetson Orin NX, JetPack 6) — 첫 로드
+   시 `trt_cache`가 비어있어 엔진 빌드로 수 분 걸릴 수 있음. 실패하면 콘 모델과 동일하게 CUDA
+   직행으로 되돌릴 것.
+3. `DEBUG_VIZ_YOLO_VEHICLE=True` 상태로 저속 실차 테스트 — 바운딩박스가 실제 그 차량에 잘
+   붙는지, 다른 물체(다른 색 RC카, 사람 등) 오탐은 없는지 확인(§2.49 배포 체크리스트와 동일 항목).
+
 ---
 
 ## 3. 라바콘 (B1_LAVACON)
