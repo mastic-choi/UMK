@@ -1465,17 +1465,18 @@ YOLO_CONE_MODEL_PATH = None    # None이면 yolo_ros/cone_best_n.onnx(형제 디
 #   [2026-08-20 §2.57] 대회에서 실제로 회피해야 하는 그 차량 한 대(#46, TRAXXAS 검정/연두)
 #   뒷모습만 잡도록 전용 파인튜닝한 target_vehicle_best.onnx(yolo-V8-KMU-xycar 저장소,
 #   nc=1 'target_vehicle')로 교체 — YOLO_VEHICLE_CLASS_ID를 2(COCO car)에서 0으로 변경.
-#   **이 모델은 nms=False로 export됨**(위 COCO 모델/cone_best_n.onnx와 달리 그래프 안에
-#   NonMaxSuppression이 없음, TensorRT 빌드 시 TRT-16198로 실패하던 문제를 export 단계에서
-#   피하려는 목적) — perception/yolo_vehicle.py가 raw 출력([1,5,8400], cx/cy/w/h+클래스점수)을
-#   직접 디코딩하고 cv2.dnn.NMSBoxes로 NMS까지 수행하도록 바뀌었다(기존 nms=True 전제 파싱과
-#   호환 안 됨, 코드 참고).
+#   이때는 nms=False로 export됐었다(ultralytics nms=True 옵션이 안 먹혀서) — raw 출력을
+#   perception/yolo_vehicle.py가 직접 디코딩+NMS하는 우회로 대응했었음.
+#   [2026-08-20 §2.59] 원인(ultralytics 8.3.0의 DetectionModel ONNX export가 nms 인자를
+#   참조 안 함, CoreML 전용 옵션이었음)을 찾아 export 단계에서 고쳤다 — v1.2.0부터는
+#   torchvision.ops.batched_nms를 심은 커스텀 export로 output0가 다시 정상 NMS 내장
+#   [1,N,6]이다(가중치는 v1.1.0과 동일). YOLO_VEHICLE_NMS_IOU_THRESHOLD(§2.57에서 쓰던
+#   직접 NMS용 파라미터)는 더 이상 필요 없어 삭제 — perception/yolo_vehicle.py도 콘/구
+#   vehicle 모델과 같은 단순 파싱으로 되돌림.
 YOLO_VEHICLE_INPUT_SIZE = 640
 YOLO_VEHICLE_CONF_THRESHOLD = 0.5  # [2026-08-20 §2.57] 전용 모델 실측 분포 없음(정적 이미지
                                     # 재추론 미실시) — ultralytics 기본값으로 시작, 실차/이미지
                                     # 재추론 후 반드시 재조정할 것(실차 미검증)
-YOLO_VEHICLE_NMS_IOU_THRESHOLD = 0.45  # [2026-08-20 §2.57] nms=False export라 여기서 직접 NMS —
-                                        # ultralytics 기본 IOU 임계값, 실차 미검증
 YOLO_VEHICLE_CLASS_ID = 0          # [2026-08-20 §2.57] target_vehicle_best.onnx 클래스 id
                                     # (nc=1, 'target_vehicle' 하나뿐이라 0부터 시작 — COCO
                                     # class_id=2였던 이전 모델과 다름, 반드시 같이 바꿀 것)
@@ -1483,9 +1484,9 @@ YOLO_VEHICLE_MODEL_PATH = None     # None이면 yolo_ros/target_vehicle_best.onn
                                     # 자동으로 찾음(perception/yolo_vehicle.py _default_model_path() 참고)
                                     # [2026-08-20] 가중치 파일을 yolo-V8-KMU-xycar 저장소
                                     # v1.0.0(seed_labeled 2,127장, mAP50-95=0.974) →
-                                    # v1.1.0(seed+round2 6,041장, mAP50-95=0.985)으로 교체 —
-                                    # 파일명/클래스 스키마(nc=1, class_id=0, nms=False export)는
-                                    # 동일해서 이 파일의 나머지 설정은 안 바뀜.
+                                    # v1.1.0(seed+round2 6,041장, mAP50-95=0.985) →
+                                    # [2026-08-20 §2.59] v1.2.0(가중치는 v1.1.0과 동일,
+                                    # nms 내장 export로 교체)으로 갱신.
 DEBUG_VIZ_YOLO_VEHICLE = True      # [2026-08-20] 실차 검증 시작과 함께 켬 — 카메라가 실제로 target_vehicle을 보는지 원시 박스로 확인용
 
 # ── 신호등 색상상태 YOLO (perception/yolo_signal_state.py, YOLOv8n ONNX) ──
@@ -1502,6 +1503,10 @@ DEBUG_VIZ_YOLO_VEHICLE = True      # [2026-08-20] 실차 검증 시작과 함께
 #   전환은 항상 플래그 하나로 되돌릴 수 있게 유지).
 YOLO_SIGNAL_STATE_INPUT_SIZE = 640     # signal_state_best_n.onnx export 시 imgsz와 반드시 일치시킬 것
 YOLO_SIGNAL_STATE_CONF_THRESHOLD = 0.5 # 이 신뢰도 이상인 검출만 인정(모델이 nms=True로 export돼 좌표 디코딩은 불필요) — 실차 미검증 기본값, cone과 동일하게 잡아둠
+# [2026-08-20 §2.59] target_vehicle과 같은 문제(ultralytics nms=True가 CoreML 전용이라
+# DetectionModel ONNX export엔 안 먹힘)가 여기서도 재현돼 v1.2.0으로 교체 — 가중치는
+# v1.1.0과 완전히 동일, export만 NMS 내장 커스텀 스크립트로 바뀜(output0 [1,N,6] 유지,
+# 이 파일의 파싱 코드는 원래부터 그 형식 전제라 변경 없음).
 YOLO_SIGNAL_STATE_MODEL_PATH = None    # None이면 yolo_ros/signal_state_best_n.onnx(형제 디렉터리)를 자동으로 찾음(perception/yolo_signal_state.py 참고)
 YOLO_SIGNAL_STATE_CLASS_NAMES = ('red', 'green_straight', 'green_left')  # class id(0/1/2) 순서 — datasets/signal_state/classes.txt와 반드시 일치시킬 것
 # [2026-08-20] perc_signal() 판단 소스 스위치(요청 반영, 실차 미검증) — True면 이 YOLO

@@ -2009,6 +2009,40 @@ TensorRT 빌드를 항상 실패시키는 것으로 실차에서 확인됐다(TR
 빌드 성공 여부, 실차 오탐 확인)가 v1.1.0에도 그대로 적용된다 — mAP는 v1.0.0보다 높지만 이건
 정적 검증셋 지표라, 실차 카메라 조건(조명/각도/모션블러)에서의 실측 신뢰도 분포는 아직 없다.
 
+### 2.59 `target_vehicle`/`signal_state` 둘 다 v1.2.0 — NMS 내장 ONNX export로 §2.57 우회 코드 제거 (2026-08-21)
+
+**배경:** §2.57에서 "`ultralytics model.export(..., nms=True)`를 줬는데도 output0가
+raw `[1,5,8400]`로 나온다"는 문제를 `perception/yolo_vehicle.py`가 직접 좌표 디코딩 +
+`cv2.dnn.NMSBoxes`를 수행하는 방식으로 우회했었다. `yolo-V8-KMU-xycar` 저장소에서
+원인을 다시 파봤더니 — **ultralytics 8.3.0의 `DetectionModel` ONNX export 경로가
+`nms` 인자를 아예 참조하지 않는다.** 그 옵션은 CoreML export 전용이고, 일반
+ONNX export(우리가 쓰는 경로)에는 적용된 적이 없었다(export 시 에러/경고도 없이
+조용히 무시됨). `signal_state`(`yolo_signal_state.py`)는 원래부터 다른(더 오래된)
+export로 만들어져 있어서 이 문제를 안 겪었었는데, 이번에 같은 wrapper로 재export하며
+동일 증상이 재현되는 것까지 확인됐다.
+
+**수정:** `torchvision.ops.batched_nms`를 `forward()`에 심은 커스텀 export
+스크립트(`export_onnx_with_nms.py`, conf 임계값 필터링→xywh→xyxy 변환→batched
+NMS→`[x1,y1,x2,y2,conf,cls]` 6열 고정 출력까지 그래프 안에서 처리)로 두 모델 다
+재export. **가중치 자체는 안 바뀜**(target_vehicle=v1.1.0과 동일, signal_state도
+직전과 동일) — export 방식만 교체.
+- [target_vehicle v1.2.0](https://github.com/mastic-choi/yolo-V8-KMU-xycar/releases/tag/v1.2.0),
+  [signal_state v1.2.0](https://github.com/mastic-choi/yolo-V8-KMU-xycar/releases/tag/v1.2.0-signal_state)
+  의 `best_nms.onnx`를 각각 `yolo_ros/target_vehicle_best.onnx`,
+  `yolo_ros/signal_state_best_n.onnx`로 교체. sha256 체크섬 일치 + onnxruntime로 실제
+  추론해 output shape `[1,N,6]`(N=검출개수) 확인 완료.
+- `perception/yolo_vehicle.py` `infer()`를 §2.57 이전의 단순 파싱(`for x1,y1,x2,y2,conf,cls
+  in dets`)으로 되돌림 — 좌표 디코딩/`cv2.dnn.NMSBoxes` 우회 코드 삭제.
+- `config.py` `YOLO_VEHICLE_NMS_IOU_THRESHOLD` 삭제(더 이상 안 씀). `signal_state`
+  쪽은 애초에 파싱 코드가 `[1,N,6]` 전제였어서 코드 변경 없음, 주석만 갱신.
+
+**알려진 한계:** input shape이 이전엔 고정 `(1,3,640,640)`이었는데 이번 export는
+동적(`batch/height/width`)으로 나온다 — 실제 추론 시 640×640으로 넣으면 동일하게
+동작함은 확인했지만(위 검증), onnxruntime provider(특히 TensorRT)가 동적 shape을
+얼마나 잘 받아들이는지는 아직 실차에서 안 봤다. TensorRT provider 빌드가 이번 변경으로
+전보다 나빠지거나 나아지는지도 미확인 — §2.57의 "TensorRT provider 빌드 성공 여부"
+항목과 합쳐서 다음 실차 테스트 때 같이 확인할 것.
+
 ---
 
 ## 3. 라바콘 (B1_LAVACON)
