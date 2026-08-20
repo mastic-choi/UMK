@@ -1052,6 +1052,93 @@ N프레임 돌면 목표 회전각만큼 돌 것이다"라는 가정 하나에�
   실차에서 `_debug_viz_signal_status()` 창(S1 중에도 표시하도록 이번에 확장)으로 확인 필요.
   너무 늦게 뜨면 정지선 트리거 대비 오히려 정지 여유가 줄어들 수 있다.
 
+### 1.16 신호등 판단 소스 — "YOLO+HSV" 하이브리드 → YOLO 단독(색상상태 직접 예측)으로 전환 (2026-08-20)
+
+**배경:** §1.14까지의 신호등 판단은 배경판 위치를 `YOLO_SIGNAL_ENABLE`에 따라 YOLO 또는 HSV
+자동크롭으로 찾고, 점등 색상 자체는 항상 `traffic_signal.py`의 Hough Circle
+(`circle_brightness`/`shape_ok`/`pick_best_4`)로 판정하는 하이브리드였다("YOLO+HSV",
+`DEBUG_VIZ_SIGNAL` 창 제목). 별도로 `perception/yolo_signal_state.py`(YOLOv8n,
+`signal_state_best_n.onnx`, 클래스 `red`/`green_straight`/`green_left`)가 위치+색상을
+한 스테이지로 동시 예측하는 모델을 이미 갖추고 실차 비교 창에만 붙여둔 상태였다(§ 해당 파일
+헤더 주석). 요청으로 실제 주행 판단 소스를 이 YOLO 단독 모델로 교체했다.
+
+**수정:**
+- `config.py`: `SIGNAL_USE_YOLO_STATE_FOR_DECISION = True` 신규 추가(`YOLO_SIGNAL_STATE_*`
+  블록 바로 아래) — `perc_signal()`의 판단 소스를 고르는 유일한 스위치. `False`로 되돌리면
+  기존 Hough Circle(+YOLO_SIGNAL_ENABLE 하이브리드) 경로로 즉시 복귀한다.
+  `DEBUG_VIZ_SIGNAL`(YOLO+HSV 결과 창)은 이제 판단과 무관해져 `False`로 끄고,
+  `DEBUG_VIZ_YOLO_SIGNAL_STATE`(YOLO 단독 결과 창, `YOLO_신호등`)를 `True`로 켰다 — 되돌릴 때
+  이 두 값도 같이 원복할 것.
+- `track_drive.py`:
+  - `perceive_all()`에서 `perc_yolo_signal_state()`를 `perc_signal()`보다 먼저 돌도록 순서를
+    바꿨다(예전엔 뒤쪽에서 비교용으로만 호출). `perc_signal()`이 같은 틱에 갱신된
+    `self.signal_*_on_yolo`를 그대로 판단 소스로 쓰기 때문에, 순서를 안 바꾸면 1틱 지연이
+    추가로 생긴다.
+  - `perc_signal()`: `SIGNAL_USE_YOLO_STATE_FOR_DECISION`이 켜져 있고
+    `self.yolo_signal_state_detector`가 살아있으면 `self.signal_red/straight/left_on`을
+    `self.signal_*_on_yolo`에서 그대로 채우고 `detect_s2()` 자체를 호출하지 않는다(Hough
+    연산 자체가 안 돌아 그만큼 CPU 여유가 생긴다). `S1_LANE_FOLLOW` 중 `S0_SIGNAL` 진입
+    트리거용 `board_seen`은 기존 `s2_chosen_idx>=0` 대신 "색상 클래스 중 하나라도
+    검출됐는가"로 대체했다(단일 스테이지 모델이라 배경판 bbox를 별도로 안 줌).
+  - 검출기 초기화 실패(모델 파일 없음 등, `self.yolo_signal_state_detector is None`)면
+    스위치 값과 무관하게 자동으로 기존 Hough 경로로 안전 폴백한다 — 새 인식기가 없어도
+    주행 자체가 죽지 않는다.
+
+**알려진 한계 (실차 미검증):** `signal_state_best_n.onnx`는 §1.16 작성 시점 기준 실차 주행
+판단에 처음 연결된 것이라, 이전까지의 신뢰도 실측(§1.1~§1.15의 Hough/HSV 튜닝 이력)이 그대로
+적용되지 않는다. 특히 `board_seen`(S0_SIGNAL 진입 트리거)이 색상 클래스 검출 여부에서 파생되므로
+— 신호등이 꺼져있거나(점등 전) 아직 색상 신뢰도(`YOLO_SIGNAL_STATE_CONF_THRESHOLD=0.5`) 임계값을
+못 넘는 먼 거리에서는 `detect_s2()`의 "보드 자체 검출"보다 늦게 뜰 가능성이 있다 — 실차에서
+`DEBUG_VIZ_YOLO_SIGNAL_STATE`/`YOLO_신호등` 창으로 진입 시점을 확인할 것.
+
+### 1.17 YOLO 카메라 검출기 3종을 상시 동시가동 → mission_state/phase 기반 단일 가동으로 전환 (2026-08-20)
+
+**배경:** 콘(`YoloConeDetector`)/차량(`YoloVehicleDetector`, 근접컷 전용 인스턴스)/신호등
+색상상태(`YoloSignalStateDetector`) 3개 YOLO 모델이 각자 백그라운드 스레드에서 항상 동시에
+추론을 돌리고 있었다 — 실제로는 한 시점에 하나만 필요한데(예: 라바콘 구간에선 신호등/차량
+인식이 무의미) 셋 다 매 틱 GPU/CPU를 나눠 쓰고 있었던 것. 요청 반영으로, 지금
+mission_state/phase가 실제로 필요로 하는 모델 하나만 추론시키도록 바꿨다.
+
+**수정:** `perceive_all()`(track_drive.py) 맨 앞에서 `_active_yolo_stage()`를 한 번 계산해
+`'signal'`/`'cone'`/`'vehicle'`/`None` 중 하나를 얻고, 그 결과에 따라 `perc_yolo_signal_state()`/
+`perc_yolo_vehicle_cut()`/`perc_yolo_cone()` 중 해당하는 것만 호출한다(나머지는 호출 자체를
+건너뛰고 출력값만 `False`로 둔다). 매핑:
+
+| mission_state / phase | 가동 모델 |
+|---|---|
+| `S0_SIGNAL` | 신호등 |
+| `S1_LANE_FOLLOW` + `Phase.LAVACON` | 콘 (B1 진입 대기) |
+| `S1_LANE_FOLLOW` + `Phase.OBSTACLE_ZONE`, `_b2_passed=False` | 콘 (B2=라바콘 1개 대기, §4.3) |
+| `S1_LANE_FOLLOW` + `Phase.OBSTACLE_ZONE`, `_b2_passed=True` | 차량 (B3 대기) |
+| `S1_LANE_FOLLOW` + `Phase.DONE` | 신호등 (다음 교차로 보드 대기) |
+| `S3_SHORTCUT`/`S4_FINISH` | 없음(전부 끔) |
+
+**왜 호출을 건너뛰는 것만으로 추론이 꺼지는가:** `YoloConeDetector`/`YoloVehicleDetector`/
+`YoloSignalStateDetector` 전부 `detect(frame)`이 논블로킹으로 최신 프레임을 백그라운드
+스레드의 `_latest_frame`에 얹어두기만 하고, 그 스레드가 `_latest_frame is None`이면 그냥
+5ms씩 자며 노는 구조다(`perception/yolo_cone.py` `_worker()` 참고, 셋 다 동일 패턴) —
+그래서 `detect()` 호출 자체를 안 하면(=이번 틱에 새 프레임을 안 얹으면) 그 모델은 실제
+추론을 하지 않는다. 스레드/ONNX 세션은 계속 살아있으므로 다시 필요해지면 지연 없이
+바로 이어서 돈다.
+
+**부수 효과:** §4.3에서 `perc_obstacle_cut_trigger()`의 `obstacle_cut_type`을 "콘 YOLO
+OR 차량 YOLO 중 어느 쪽이 봤는가"로 정하도록 바꿨는데, 이 gating 덕분에 B2 구간에선
+차량 검출기가, B3 구간에선 콘 검출기가 애초에 안 돌아서(`False` 고정) 그 타입 판정이
+사실상 "어느 phase에 있는가"와 동어반복이 됐다 — 두 메커니즘이 서로를 보강한다.
+
+**같이 뒤집은 것:** §1.16은 신호등 YOLO를 "S3/S4 포함 항상 켜서 오탐률을 전체 구간에서
+로그로 본다"는 의도로 상시 가동시켰는데, 이번 변경으로 그 상시가동이 없어졌다 —
+상시 오탐 로깅보다 동시 추론 개수를 줄이는 쪽(연산 자원 절약)을 우선한 것. 오탐률을
+전체 구간에서 다시 보고 싶다면 `_active_yolo_stage()`와 무관하게
+`perc_yolo_signal_state()`를 매 틱 호출하도록 되돌리면 된다(§1.16 방식으로 복귀).
+
+**알려진 한계 (실차 미검증):** phase 전환 경계에서 한 모델이 꺼지고 다른 모델이 막 켜진
+직후 몇 틱은 그 모델의 `_latest_result`가 "꺼지기 전 마지막 추론 결과"로 남아있다가
+새 프레임이 들어와야 갱신된다 — 디바운스 프레임 수(`LAVACON_TRIGGER_FRAMES` 등)에 비해
+무시할 만한 지연으로 보이나 실차 확인 안 됨. 특히 `Phase.OBSTACLE_ZONE`에서 `_b2_passed`가
+막 True가 되는 순간 콘→차량으로 전환되는데, 그 직전 틱까지의 "콘이 보임" 잔상이 한두
+틱 안에 차량 검출값으로 안 덮이는 구간이 있을 수 있다.
+
 ---
 
 ## 2. 라인트래킹 (차선주행, S1)
@@ -1886,6 +1973,24 @@ TensorRT 빌드를 항상 실패시키는 것으로 실차에서 확인됐다(TR
 3. `DEBUG_VIZ_YOLO_VEHICLE=True` 상태로 저속 실차 테스트 — 바운딩박스가 실제 그 차량에 잘
    붙는지, 다른 물체(다른 색 RC카, 사람 등) 오탐은 없는지 확인(§2.49 배포 체크리스트와 동일 항목).
 
+### 2.58 `target_vehicle_best.onnx` 가중치를 v1.0.0 → v1.1.0으로 교체 (2026-08-20)
+
+**배경:** §2.57에서 처음 붙인 가중치는 `yolo-V8-KMU-xycar` 저장소 [v1.0.0](https://github.com/mastic-choi/yolo-V8-KMU-xycar/releases/tag/v1.0.0)
+(`seed_labeled` 2,127장, mAP50-95=0.974)이었다. 그 저장소가 이후 의사라벨(pseudo-label)
+2차 라운드로 학습 데이터를 6,041장까지 늘려 재학습한 [v1.1.0](https://github.com/mastic-choi/yolo-V8-KMU-xycar/releases/tag/v1.1.0)
+(mAP50-95=0.985)을 냈고, 이번에 그 최신 가중치로 교체했다(요청 반영).
+
+**수정:** `gh release download v1.1.0 --repo mastic-choi/yolo-V8-KMU-xycar -p best.onnx`로
+받은 파일을 `yolo_ros/target_vehicle_best.onnx`(파일명 그대로, `xycar_ws/src/yolo_ros/`와
+`UMK/yolo_ros/` 양쪽 다 — [[xycar_ws 경로 컨벤션]] 참고)에 덮어썼다. 클래스 스키마(nc=1,
+`class_id=0`)와 export 방식(`nms=False`, 출력 `[1,5,8400]`)이 v1.0.0과 동일해서 — onnxruntime로
+입출력 shape 재확인 완료 — `config.py`/`perception/yolo_vehicle.py`는 코드 변경 없이 파일
+교체만으로 적용된다.
+
+**알려진 한계:** 위 §2.57 "실차 미검증 항목" 3가지(신뢰도 임계값 재조정, TensorRT provider
+빌드 성공 여부, 실차 오탐 확인)가 v1.1.0에도 그대로 적용된다 — mAP는 v1.0.0보다 높지만 이건
+정적 검증셋 지표라, 실차 카메라 조건(조명/각도/모션블러)에서의 실측 신뢰도 분포는 아직 없다.
+
 ---
 
 ## 3. 라바콘 (B1_LAVACON)
@@ -1958,6 +2063,48 @@ ONNX 모델이 TensorRT 빌드에 실패하면(당시 `cone_best_n.onnx`, `TRT-1
 
 **알려진 한계:** `LAVACON_DONE_FRAMES=80`/`YOLO_CONE_CONF_THRESHOLD=0.5` 등 실차 미검증 초기값.
 
+### 3.4 B1 실제 회피조향은 끄고 진입/탈출 트리거만 남김 — 구간 내부는 S1 차선주행으로 통과 (2026-08-20)
+
+**배경:** 상태전환 정비 작업(README §1) 중 요청 반영 — 처음엔 진입 트리거만 만나면 그
+자리에서 즉시 통과 처리하는 안으로 갔다가, "진입/탈출 두 트리거는 그대로 남기고 그 사이
+구간만 S1 라인플로우로 하자"로 정정됐다. 즉 구간의 시작/끝은 여전히 실측 트리거로 판정하되,
+그 안에서 실제 콘 회피 조향(`_handle_lavacon()`, §3.1~§3.3의 박스 스택 경로생성)은 지금
+단계에서 쓰지 않는다. 추가 로직은 나중 단계에서 다시 붙일 수 있게 구현 자체는 그대로
+남겨뒀다.
+
+**수정:**
+- `run_behavior_fsm()`(track_drive.py)의 `Phase.LAVACON` 분기 — 진입은 그대로
+  `lavacon_trigger` → `self._lavacon_engaged=True` latch. 탈출은 `process_lavacon()`이
+  매 틱 계산해두는 `lavacon_done`(우측 콘 연속 미검출)이 `LAVACON_DONE_FRAMES`만큼
+  유지되면 확정 — 이 exit 판정 블록은 원래 `_handle_lavacon()` 안에 있던 걸 그대로
+  옮겨왔다. `behavior_state`는 진입~탈출 사이에도 계속 `B0_NORMAL`로 유지한다(예전엔
+  `_lavacon_engaged`값에 따라 `B1_LAVACON`으로 바뀌었음).
+- `behavior_state`가 `B1_LAVACON`이 되는 경로 자체가 없어져서 `apply_behavior_override()`가
+  `_handle_lavacon()`을 호출하지 않는다 — 대신 `_handle_lavacon()`은 이제 값이 다시
+  살아나기 전까지 죽은 코드(unreachable)다.
+- `_s1_lane_follow()`의 Mission PID 스킵 가드도 `phase==LAVACON and _lavacon_engaged`
+  기준에서 `behavior_state==B1_LAVACON` 기준으로 바꿨다 — 안 바꾸면 `_lavacon_engaged`가
+  구간 추적용으로 다시 True가 될 때 이 가드가 오작동으로 `_lane_drive()`를 건너뛰어
+  버린다(behavior_state가 B0_NORMAL이라 조향을 대신 계산해줄 곳도 없어서 직전 각도가
+  고정된 채 멈추는 위험한 상태가 됨). 가드를 behavior_state 기준으로 바꾼 덕에
+  `_lane_drive()`가 라바콘 구간에서도 끊기지 않고 계속 돈다 — 사실상 "라바콘 구간을
+  일반 차선주행으로 통과"하는 동작.
+- `_handle_lavacon()` 내부의 exit 판정 블록(중복)은 제거하고 docstring에 "지금은
+  안 불림 + 되살릴 때 주의사항"을 남겼다.
+
+**되돌리는 법:** `_handle_lavacon()`/`process_lavacon()`/§3.1~§3.3 경로생성 코드는 전부
+그대로 남아있다. 되살리려면: (1) `run_behavior_fsm()`의 `Phase.LAVACON` 분기에서
+`behavior_state`를 `_lavacon_engaged` 값으로 `B1_LAVACON`/`B0_NORMAL` 분기하도록 되돌리고,
+(2) exit 판정 블록을 `_handle_lavacon()` 쪽으로 다시 옮기거나 최소한 한쪽에서만 돌게 하고,
+(3) `_s1_lane_follow()`의 PID 스킵 가드를 필요하면 원래 조건으로 되돌린다(behavior_state
+기준으로 남겨둬도 동작은 동일하므로 필수는 아님).
+
+**알려진 한계:** 라바콘 구간을 실제로는 회피하지 않고 일반 차선 PID로만 지나가므로, 콘이
+차선 폭 안쪽까지 침범해 있으면 충돌 위험이 있다 — 실차 트랙에서 콘 배치가 차선 폭을 벗어나지
+않는 구간에서만 임시로 쓸 것. 탈출 판정(`lavacon_done`)은 `process_lavacon()`의 우측 콘
+검출에 의존하므로, 회피 조향 없이 차선 중앙으로만 지나가도 그 검출 자체는 §3.1~§3.3과
+동일하게 라이다 원시값 기준이라 계속 유효할 것으로 보이나 실차 미검증.
+
 ---
 
 ## 4. 사물회피 (B2_OBSTACLE, 고정장애물)
@@ -1992,9 +2139,54 @@ SHIFT(`PASS_OFFSET=80px`, §6.1 실측 기반) → ALONGSIDE(장애물 안 보�
 값인데 이제 "연속길이" 기준이라 **재조정이 필요할 가능성이 높음** — 실차에서 `lidar_bev`의 `run L:`
 값을 보고 재조정할 것. `SIDE_CLEAR_CONFIRM_FRAMES=3` 등 나머지도 실차 미검증.
 
+### 4.3 B2 실제 처리를 TargetPassing → da 근접 컷(obstacle_cut)으로 이관 (2026-08-20)
+
+**배경:** 이번 대회 B2(고정장애물)의 실물이 **발포블록이 아니라 라바콘 1개**로 바뀌었다(요청
+반영). §2.49에서 "B2는 매칭되는 COCO 클래스가 없어 da 근접 컷 트리거가 반응 안 한다"고 남겨둔
+갭이, 물리적 대상이 콘으로 바뀌면서 자동으로 해소됐다 — 이미 B1(라바콘) 진입 트리거용으로
+쓰고 있던 `YoloConeDetector`를 그대로 재사용하면 B2도 똑같이 "라이다 근접 AND YOLO 카메라
+이중확인" 패턴으로 잡을 수 있다는 판단.
+
+**수정:**
+- `perc_obstacle_cut_trigger()`: 카메라 확인을 "차량 YOLO 단독"에서 "콘 YOLO OR 차량 YOLO"로
+  확장하고, 어느 쪽이 확정시켰는지로 `self.obstacle_cut_type`('fixed'=B2 / 'vehicle'=B3)을
+  기록한다. 둘 다 잡히거나 둘 다 카메라 폴백(초기화 실패)인 드문 경우엔 `perc_obstacle()`의
+  라이다 폭 기반 `obstacle_type`으로 타이브레이크, 그것도 미확정이면 트랙 순서상 먼저 나오는
+  `'fixed'`를 기본값으로 둔다.
+- `perceive_all()`: `perc_yolo_cone()`(콘 카메라 검출)을 `perc_obstacle_cut_trigger()`보다
+  앞으로 옮겼다 — 안 옮기면 그 트리거가 1틱 지연된(직전 프레임) 콘 검출값을 쓰게 된다.
+- `run_behavior_fsm()`의 `Phase.OBSTACLE_ZONE` 분기 — §3.4에서 B1에 적용한 것과 똑같은
+  패턴으로 재작성했다. `obstacle_cut_active`(라이다+YOLO AND 트리거의 hold/release 결과)가
+  True로 바뀌는 순간을 진입으로 보고 `self.obstacle_cut_type`을 스냅샷해 `_obscut_zone_tag`에
+  latch(`'fixed'`→'B2'/`'vehicle'`→'B3', §5.2의 "B2 전이면 무조건 B2" 순서 게이트도 그대로
+  적용), 다시 False로 돌아오는 순간을 탈출로 보고 `_mark_behavior_passed(tag)`를 부른다.
+  `behavior_state`는 B1처럼 계속 `B0_NORMAL`로 유지 — 실제 회피 조향/감속은
+  `perception/dl_lane.py`의 `_clip_da_by_obstacle()`(da 클리핑)과 `_lane_drive()`의
+  `SPEED_OBSTACLE_CUT` 속도캡이 behavior_state와 무관하게 이미 상시로 처리하고 있으므로,
+  `apply_behavior_override()`가 `_handle_fixed_obstacle()`/`_handle_overtake()`
+  (TargetPassing 기반)를 더 이상 호출하지 않아도 된다.
+- `_handle_fixed_obstacle()`/`_handle_overtake()`/`obstacle_avoidance.py`(TargetPassing)는
+  코드 그대로 보존 — behavior_state가 B2_OBSTACLE/B3_VEHICLE이 되는 경로가 없어져서 지금은
+  단순히 호출되지 않는 상태(unreachable)다. 되살리는 법은 각 함수 docstring 및 §5.2 참고.
+
+**전제:** `ENABLE_OBSTACLE_CUT=True`로 켜야 이 경로 전체가 동작한다(기본값 `False`) — 꺼져
+있으면 `obstacle_cut_trigger`/`obstacle_cut_active`가 항상 `False`라 Phase가 OBSTACLE_ZONE에서
+영원히 못 벗어난다(§4.1의 `TEST_DISABLE_B2_B3`와는 별개 스위치, §2.51 참고).
+
+**알려진 한계 (전부 실차 미검증):** B2(콘 1개)가 §2.49의 `OBSTACLE_CUT_TRIGGER_Y_HALF_M=0.55m`/
+`OBSTACLE_CUT_TRIGGER_X_MAX_M=1.0m` ROI 안에서 B3(RC카 모형)와 비슷한 시점에 라이다로
+잡히는지, 콘 하나만으로도 `YoloConeDetector`(원래 B1 다수 콘 검출용으로 튜닝된 신뢰도 임계값)가
+안정적으로 반응하는지 확인 안 됨. 두 대상의 물리적 크기가 달라 `OBSTACLE_CUT_NEAR_M`/컷 폭 등
+기존 §2.51 파라미터가 B2/B3 양쪽에 동시에 맞는 값인지도 재검증 필요.
+
 ---
 
 ## 5. 차량회피/추월 (B3_VEHICLE)
+
+> **[2026-08-20] §4.3 참고:** 아래 §5 본문(`perc_vehicle_trigger()`/`OVERTAKE_TRIGGER`/
+> `TargetPassing`/`_handle_overtake()`)은 실제로는 더 이상 호출되지 않는 예전 경로다 — B3의
+> 실제 진입~처리는 지금 §4.3에서 설명한 da 근접 컷(`obstacle_cut_active`, YOLO 차량+라이다 AND
+> 트리거)으로 이관됐다. 이 절은 되살릴 때를 위해 그대로 남겨둔다.
 
 **수정할 곳:** `TEST_DISABLE_B2_B3=False`, `self.phase=Phase.OBSTACLE_ZONE`(폭 `OBSTACLE_VEHICLE_WIDTH_M`
 이상 타겟만 B3로 분류).
@@ -2004,7 +2196,8 @@ SHIFT(`PASS_OFFSET=80px`, §6.1 실측 기반) → ALONGSIDE(장애물 안 보�
 방향 재평가(`_target_cuts_in()`).
 
 **알려진 한계:** 카메라/YOLO 이중확인 없이 라이다 근접만으로 트리거돼 콘을 방해차량으로 오인 진입할
-여지 있음(격리 테스트 시 특히 주의, §4.1 로그로 감지만 함).
+여지 있음(격리 테스트 시 특히 주의, §4.1 로그로 감지만 함) — §4.3 이관 이후로는 이 갭이 da 근접 컷
+쪽의 YOLO 차량 이중확인으로 대체돼 더 이상 실질적 위험은 아니다.
 
 ### 5.1 Hybrid A* 대안 — 동적 장애물용 (`USE_HYBRID_ASTAR_FOR_B3`, 2026-08-11)
 B2와 달리 "그리드/충돌검사는 매틱, 전체 재탐색은 트리거 기반"(경로 무효화/타겟 진입/주기적 4틱)으로
@@ -2014,6 +2207,26 @@ B2와 달리 "그리드/충돌검사는 매틱, 전체 재탐색은 트리거 �
 풋프린트를 실측값(`VEHICLE_WIDTH_M=0.31`/`LENGTH_M=0.64`)+여유(`ASTAR_VEHICLE_MARGIN_M=0.05`)로
 교체(하드코딩 0.45/0.70이었던 것, B2/B3 공유). 기본값 `False`(B2조차 아직 미검증이라 순서상 B2 먼저
 검증 필요) — 실차 미검증.
+
+### 5.2 B3 트리거에 "B2 통과 후" 순서 게이트 추가 (2026-08-20)
+
+**배경:** §2.34(Phase.OBSTACLE_ZONE 통합) 당시엔 "정적/동적 구분 없이 매 프레임 obstacle_type으로
+그때그때 판단하고, 어느 쪽이 먼저 끝나도 상관없다"는 전제로 설계했다. 이번에 대회 트랙 순서가
+"고정장애물(B2) → 이동장애물(B3)"로 항상 고정이라는 걸 확인받아, 그 전제가 더 강하게 좁혀졌다.
+
+기존 방식은 `obstacle_type=='vehicle'`이면 `self._b2_passed`와 무관하게 곧바로 B3로 분류했는데,
+트리거 발동 초반 몇 프레임은 `obstacle_type`/`vehicle_trigger` 디바운스 타이밍이 안 맞아 사실은
+고정장애물인데 잠깐 vehicle로 오분류될 위험이 있었다(§5 "알려진 한계"와 연결되는 문제).
+
+**수정:** `run_behavior_fsm()`(track_drive.py)에서 `triggered_vehicle` 판정에
+`self._b2_passed` 조건을 추가 — B2를 아직 한 번도 통과하지 못한 상태면 `obstacle_type`이
+`'vehicle'`로 나와도 B3로 넘어가지 않고 B2 트리거(`triggered_fixed`)만 받아들인다. 트랙 순서가
+고정이라 "B2 전이면 지금 보이는 건 무조건 B2"로 못박아 초반 오분류를 원천 차단하는 방식.
+Phase.DONE 전환 조건(`_mark_behavior_passed()` — B2/B3 둘 다 완료돼야 함)은 그대로 유지.
+
+**알려진 한계 (실차 미검증):** 이 게이트는 "B2 전에 B3가 절대 안 나온다"는 전제가 확실할 때만
+안전하다 — 실제 대회 트랙에서 예외적으로 두 장애물이 근접 배치되거나 순서가 바뀌는 경우가 있다면
+B3 진입 자체가 막혀버리는 역효과가 날 수 있으니 실차에서 순서를 재확인할 것.
 
 ---
 

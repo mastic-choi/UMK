@@ -18,12 +18,11 @@
 # 여기서는 클래스별로 신뢰도 임계값을 넘는 것 중 최댓값만 고르면 된다.
 #
 # traffic_signal.py의 SignalDetector.detect_s2()(Hough Circle 방식)와 반환 시그니처를
-# (red_on, straight_on, left_on)로 맞췄다 — 다만 perc_signal()의 실제 주행 판단(FSM 전환)에는
-# 아직 연결하지 않았다. track_drive.py는 이 결과를 self.signal_*_on_yolo에 별도로 저장해
-# _debug_viz_signal_status() 창에서 기존 Hough 결과와 나란히 보여주기만 한다 — 실차에서
-# 정확도를 충분히 확인한 뒤에 perc_signal()의 판단 소스를 교체할지 결정할 것
-# (config.py "da 블롭 선택" 항목과 같은 이유: 새 인식기를 실측 검증 없이 바로 주행 판단에
-# 연결하지 않는다).
+# (red_on, straight_on, left_on)로 맞췄다. track_drive.py는 이 결과를 self.signal_*_on_yolo에
+# 저장한다 — [2026-08-20] config.py SIGNAL_USE_YOLO_STATE_FOR_DECISION=True(요청 반영)면
+# perc_signal()이 이 값을 그대로 실제 주행 판단(FSM 전환) 소스로 쓴다(detect_s2()는 그 경우
+# 아예 안 돌림). False로 되돌리면 기존처럼 detect_s2() 결과만 쓰고 이 모듈 결과는
+# self.signal_*_on_yolo에만 남아 비교용으로 쓰인다(track_drive.py perc_signal() 참고).
 #
 # dl_lane.py/yolo_cone.py와 동일하게 추론을 별도 데몬 스레드에서 자기 페이스로 돌리고,
 # detect()는 논블로킹으로 최신 결과를 반환한다. cv2.imshow()는 메인 스레드에서만 호출해야

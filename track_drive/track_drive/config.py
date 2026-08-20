@@ -1191,22 +1191,31 @@ DEBUG_VIZ_STOPLINE   = False  # 정지선 디버그 창, 백엔드 무관 항상
 #   (perception/traffic_signal.py detect_s2()). 요청에 따라 기본 True로 켜둠 — 다른 항목과
 #   달리(위 2026-08-11 라바콘 테스트 메모 참고) 이 스위치는 독립적으로 True 유지할 것.
 # [2026-08-19] "YOLO 단독" 결과(yolo_signal_state.py, DEBUG_VIZ_YOLO_SIGNAL_STATE)와 창을
-#   헷갈리지 않게 역할을 분리 — 이 플래그는 이제 최종 결과 창(track_drive.py
+#   헷갈리지 않게 역할을 분리 — 이 플래그는 최종 결과 창(track_drive.py
 #   _debug_viz_signal_status(), "YOLO+HSV_신호등" — 배경판 위치는 YOLO_SIGNAL_ENABLE에 따라
 #   YOLO 또는 HSV자동크롭, 점등 색상 판정은 항상 HSV/circle 기반)만 켠다. 후보 탐색 과정
 #   전체(signal4_roi/signal4_board_search)를 보고 싶으면 DEBUG_VIZ_SIGNAL_DETAIL을 따로 켤 것.
-DEBUG_VIZ_SIGNAL     = True    # 신호등 최종 결과("YOLO+HSV_신호등") 디버그 창 (track_drive.py _debug_viz_signal_status())
+# [2026-08-20] SIGNAL_USE_YOLO_STATE_FOR_DECISION=True로 판단 소스를 YOLO 단독으로 바꾸면서
+#   (아래 참고) 이 "YOLO+HSV" 창은 더 이상 실제 주행 판단과 무관해져 끄고, 대신
+#   DEBUG_VIZ_YOLO_SIGNAL_STATE를 켜서 실제 판단에 쓰는 YOLO 단독 결과 창을 보여준다.
+#   Hough/HSV 경로로 되돌리면(SIGNAL_USE_YOLO_STATE_FOR_DECISION=False) 이 두 값도 같이
+#   원래대로(True/False) 되돌릴 것 — 아니면 판단에 안 쓰는 창만 보이게 된다.
+DEBUG_VIZ_SIGNAL     = False   # 신호등 "YOLO+HSV" 결과 창 (track_drive.py _debug_viz_signal_status()) — YOLO 단독 판단 중엔 꺼둠
 DEBUG_VIZ_SIGNAL_DETAIL = False  # 신호등 후보탐색 과정 디버그 창 2개(signal4_roi/signal4_board_search) — 평소엔 꺼서 창 수를 줄임 (perception/traffic_signal.py)
 # DEBUG_LOG_SIGNAL: 신호등 전용 상세 진단 로그. 전역 DEBUG_LOG(0.5초 주기 요약 [SIG] 한 줄)와는
 #   별개로, 이 플래그가 켜지면 S0/S2 상태에서 매 프레임 "왜 못 잡았는지"(원 개수 부족/배치 불량/
 #   밝기 대비 부족 등) 원인을 자세히 찍는다 — DEBUG_LOG를 꺼도 이것만 켜서 신호등만 디버깅 가능.
+#   [2026-08-20] SIGNAL_USE_YOLO_STATE_FOR_DECISION=True일 땐 detect_s2() 자체를 안 돌리므로
+#   (perc_signal() 참고) 이 로그도 안 찍힌다 — Hough 경로로 되돌렸을 때만 의미 있음.
 #   (track_drive.py perc_signal())
 DEBUG_LOG_SIGNAL     = True
 DEBUG_VIZ_YOLO_CONE  = False  # 라바콘 YOLO 검출 박스 디버그 창 (perception/yolo_cone.py)
 # [2026-08-20] 배경판+색상상태 YOLO 동시 테스트 끝나서 다시 False로 되돌림(요청 반영,
 #   디버그창 전체 끄기).
 DEBUG_VIZ_YOLO_SIGNAL = False  # 신호등 배경판 YOLO 검출 박스 디버그 창 (perception/yolo_signal.py)
-DEBUG_VIZ_YOLO_SIGNAL_STATE = False  # 신호등 색상상태 YOLO 검출 박스 디버그 창 (perception/yolo_signal_state.py) — _debug_viz_signal_status()의 Hough 비교와는 별개로 raw 검출 박스만 보고 싶을 때
+# [2026-08-20] SIGNAL_USE_YOLO_STATE_FOR_DECISION=True로 이 모델이 실제 주행 판단 소스가 되면서
+#   True로 켬(요청 반영) — 실차에서 지금 뭘 보고 판단 중인지 눈으로 확인하기 위함.
+DEBUG_VIZ_YOLO_SIGNAL_STATE = True  # 신호등 색상상태 YOLO 검출 박스 디버그 창 (perception/yolo_signal_state.py, 창 이름 'YOLO_신호등')
 # [2026-08-15] avoid-hold(§2.32) 전용 상태창 — 지금 유예가 걸려있는지/왜 걸렸는지/방향
 #   힌트/조기해제 진행상황을 한곳에 모아 보여주고, 실측 안 된 파라미터 값도 항상 같이
 #   띄워서 "이 숫자 아직 지어낸 값"이라는 걸 상기시킨다(track_drive.py
@@ -1448,6 +1457,11 @@ YOLO_VEHICLE_CLASS_ID = 0          # [2026-08-20 §2.57] target_vehicle_best.onn
                                     # class_id=2였던 이전 모델과 다름, 반드시 같이 바꿀 것)
 YOLO_VEHICLE_MODEL_PATH = None     # None이면 yolo_ros/target_vehicle_best.onnx(형제 디렉터리)를
                                     # 자동으로 찾음(perception/yolo_vehicle.py _default_model_path() 참고)
+                                    # [2026-08-20] 가중치 파일을 yolo-V8-KMU-xycar 저장소
+                                    # v1.0.0(seed_labeled 2,127장, mAP50-95=0.974) →
+                                    # v1.1.0(seed+round2 6,041장, mAP50-95=0.985)으로 교체 —
+                                    # 파일명/클래스 스키마(nc=1, class_id=0, nms=False export)는
+                                    # 동일해서 이 파일의 나머지 설정은 안 바뀜.
 DEBUG_VIZ_YOLO_VEHICLE = True      # [2026-08-20] 실차 검증 시작과 함께 켬 — 카메라가 실제로 target_vehicle을 보는지 원시 박스로 확인용
 
 # ── 신호등 색상상태 YOLO (perception/yolo_signal_state.py, YOLOv8n ONNX) ──
@@ -1457,15 +1471,25 @@ DEBUG_VIZ_YOLO_VEHICLE = True      # [2026-08-20] 실차 검증 시작과 함께
 #   "위치"만 찾아 기존 HSV 자동크롭을 대체하는 하이브리드고, 이쪽은 배경판 위치와 무관하게
 #   "지금 어떤 색이 켜져 있는지" 자체를 단일 스테이지로 직접 예측한다. 이름이 겹치지 않게
 #   전부 YOLO_SIGNAL_STATE_* 접두어를 쓴다.
-#   아직 perc_signal()의 실제 주행 판단(FSM 전환)에는 연결하지 않았다 —
-#   _debug_viz_signal_status() 창에서 기존 Hough Circle 결과(traffic_signal.py)와 나란히
-#   비교만 하는 단계. 실차 검증 후 판단 소스를 이걸로 바꿀지는 별도로 결정할 것
-#   (§"da 블롭 선택" 항목과 같은 이유 — 새 인식기를 실측 검증 없이 바로 주행 판단에
-#   연결하지 않는다).
+#   [2026-08-20] 요청 반영으로 perc_signal()의 실제 주행 판단(FSM 전환) 소스를 이걸로
+#   바꿨다 — 아래 SIGNAL_USE_YOLO_STATE_FOR_DECISION 참고. 실차에서 정확도가 기존
+#   Hough+HSV/YOLO 하이브리드보다 못하면 이 플래그 하나만 False로 되돌리면 즉시 기존
+#   경로(traffic_signal.py detect_s2())로 복귀한다(§"da 블롭 선택" 항목과 같은 이유 —
+#   전환은 항상 플래그 하나로 되돌릴 수 있게 유지).
 YOLO_SIGNAL_STATE_INPUT_SIZE = 640     # signal_state_best_n.onnx export 시 imgsz와 반드시 일치시킬 것
 YOLO_SIGNAL_STATE_CONF_THRESHOLD = 0.5 # 이 신뢰도 이상인 검출만 인정(모델이 nms=True로 export돼 좌표 디코딩은 불필요) — 실차 미검증 기본값, cone과 동일하게 잡아둠
 YOLO_SIGNAL_STATE_MODEL_PATH = None    # None이면 yolo_ros/signal_state_best_n.onnx(형제 디렉터리)를 자동으로 찾음(perception/yolo_signal_state.py 참고)
 YOLO_SIGNAL_STATE_CLASS_NAMES = ('red', 'green_straight', 'green_left')  # class id(0/1/2) 순서 — datasets/signal_state/classes.txt와 반드시 일치시킬 것
+# [2026-08-20] perc_signal() 판단 소스 스위치(요청 반영, 실차 미검증) — True면 이 YOLO
+#   단독 모델(배경판 위치+색상상태를 한 스테이지로 동시 예측)을 실제 주행 판단(FSM)에
+#   쓴다. track_drive.py perc_signal()이 매 프레임 이 값을 보고 분기한다:
+#     True  → self.signal_red/straight/left_on_yolo(perc_yolo_signal_state() 결과)를 그대로 씀,
+#             traffic_signal.py detect_s2()(Hough Circle, "YOLO+HSV" 하이브리드)는 아예 안 돌림.
+#     False → 기존과 동일하게 detect_s2()만 씀(배경판 위치는 YOLO_SIGNAL_ENABLE에 따라
+#             YOLO 또는 HSV자동크롭, 점등 색상 판정은 항상 HSV/circle 기반).
+#   self.yolo_signal_state_detector가 None이면(모델 파일 없음 등 초기화 실패) 이 값과
+#   무관하게 항상 False 경로로 안전 폴백한다(perc_signal() 참고).
+SIGNAL_USE_YOLO_STATE_FOR_DECISION = True
 
 SAFETY_DIST      = 5.0        # B2(고정장애물) 발동 거리(m)
 OVERTAKE_TRIGGER = 6.5        # B3(방해차량) 발동 거리(m)
