@@ -79,7 +79,8 @@ LANE_WIDTH_EMA_ALPHA = 0.1
 # 이 파일이 아니라 config.py를 고칠 것.
 from ..config import (
     YELLOW_LOWER, YELLOW_UPPER, DEBUG_VIZ_HOUGH_LANE,
-    YELLOW_DASH_ROI_TOP, YELLOW_DASH_ROI_BOT, YELLOW_DASH_MIN_AREA_PX,
+    YELLOW_DASH_ROI_TOP, YELLOW_DASH_ROI_BOT, YELLOW_DASH_ROI_X0, YELLOW_DASH_ROI_X1,
+    YELLOW_DASH_MIN_AREA_PX, YELLOW_DASH_MAX_AREA_PX,
     YELLOW_DASH_PRESENT_FRAMES, YELLOW_DASH_ABSENT_FRAMES, DEBUG_VIZ_DASH_COUNTER,
     CHECKER_ROI_TOP, CHECKER_ROI_BOT, CHECKER_BLACK_MAX_V,
     CHECKER_DARK_RATIO_TH, CHECKER_YELLOW_RATIO_TH, CHECKER_CONFIRM_FRAMES,
@@ -325,6 +326,15 @@ class YellowDashCounter:
     않은 파선까지 세면 안 되기 때문. 근거리 ROI 안에서 파선이 사라진다는 건 차량이
     그만큼 전진해 실제로 지나쳤다는 뜻이라, falling edge가 "지나침"에 더 가깝다.
 
+    [2026-08-21] ROI 전체 픽셀수 대신 커넥티드컴포넌트 단위로 판단하도록 변경(실제 랩
+    캡처 ~/Downloads/lap_001로 검증, 요청 반영) — 전체 픽셀수만 보면 트랙 밖 나무색
+    바닥재가 노란 파선으로 오검출됐다(config.py YELLOW_DASH_* 절 주석 참고). 컴포넌트가
+    ① 면적이 파선 하나 크기 범위(YELLOW_DASH_MIN/MAX_AREA_PX) 안이고 ② ROI 좌우 테두리에
+    안 닿아야(닿으면 ROI 밖에서 잘려 들어온 큰 덩어리의 일부라는 뜻) "파선 후보"로 인정한다.
+    가로세로비 필터는 일부러 안 씀 — 화면 가장자리의 파선은 어안렌즈 왜곡 때문에 대각선으로
+    찍혀 바운딩박스가 넓적해지므로, 세로가 길어야 한다는 조건은 오히려 진짜 파선을 놓친다
+    (frame_001583으로 재현).
+
     카운팅을 언제부터 시작할지(예: 노란 하프 출발선 검출 시점)는 이 클래스 책임이 아니다
     — 호출부가 reset()을 호출한 시점부터 셀 뿐이다. 상태머신 연결(트리거 시점에 실제로
     조향을 꺾는 것)은 아직 없음 — 우선 카운팅 자체가 실차 캡처에서 파선 하나하나를
@@ -360,11 +370,24 @@ class YellowDashCounter:
         h, w = frame.shape[:2]
         y0 = int(h * YELLOW_DASH_ROI_TOP)
         y1 = int(h * YELLOW_DASH_ROI_BOT)
-        roi = frame[y0:y1, 0:w]
+        x0 = int(w * YELLOW_DASH_ROI_X0)
+        x1 = int(w * YELLOW_DASH_ROI_X1)
+        roi = frame[y0:y1, x0:x1]
+        roi_w = roi.shape[1]
 
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, YELLOW_LOWER, YELLOW_UPPER)
-        raw_present = int(np.count_nonzero(mask)) >= YELLOW_DASH_MIN_AREA_PX
+        num, _, stats, _ = cv2.connectedComponentsWithStats(mask)
+        boxes = []   # 디버그 표시용 [(x,y,cw,ch,area,accepted)]
+        raw_present = False
+        for k in range(1, num):
+            cx, cy, cw, ch, area = stats[k]
+            if area < 30:
+                continue
+            touches_edge = (cx <= 0) or (cx + cw >= roi_w)
+            ok = (YELLOW_DASH_MIN_AREA_PX <= area <= YELLOW_DASH_MAX_AREA_PX) and not touches_edge
+            boxes.append((cx, cy, cw, ch, area, ok))
+            raw_present = raw_present or ok
 
         if raw_present:
             self._present_run += 1
@@ -380,12 +403,16 @@ class YellowDashCounter:
             self.count += 1   # falling edge = 파선이 근거리 ROI를 벗어남 = 실제로 지나침
 
         if DEBUG_VIZ_DASH_COUNTER:
-            self._draw_debug(roi, raw_present)
+            self._draw_debug(roi, boxes, raw_present)
 
         return self.count
 
-    def _draw_debug(self, roi, raw_present):
+    def _draw_debug(self, roi, boxes, raw_present):
         vis = roi.copy()
+        for cx, cy, cw, ch, area, ok in boxes:
+            cv2.rectangle(vis, (cx, cy), (cx + cw, cy + ch), GREEN if ok else RED, 2)
+            cv2.putText(vis, str(area), (cx, max(cy - 4, 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, GREEN if ok else RED, 1, cv2.LINE_AA)
         border = GREEN if self.present else (RED if raw_present else (120, 120, 120))
         cv2.rectangle(vis, (1, 1), (vis.shape[1] - 2, vis.shape[0] - 2), border, 3)
         cv2.putText(vis, f'count={self.count} present={self.present} raw={raw_present}',
