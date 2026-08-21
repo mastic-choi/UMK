@@ -835,6 +835,42 @@ DL_LL_BAND_ANCHOR_ALPHA = 0.35     # 밴드별 탐색창 중심 계산 시 "직�
 YELLOW_LOWER = np.array([15, 80, 80])
 YELLOW_UPPER = np.array([40, 255, 255])
 
+# ── 좌회전 진입 랜드마크 후보 — 끊긴 노란 중앙선(dash) 카운팅 (hough_lane.YellowDashCounter) ──
+#   [2026-08-21] "신호등→좌회전 입구" 트리거를 속도기반 거리적분(S2_COMMIT_DIST_M류) 대신
+#   실제로 보이는 노란 파선 개수로 판단하는 대안 실험(요청 반영) — 정지위치 산포·제어주기
+#   해상도 문제(TURN_DIST_M 넛지 논의 참고) 자체를 회피할 수 있다는 게 장점. 위
+#   YELLOW_LOWER/UPPER와 동일 HSV 기준으로 근거리 ROI 안 노란 픽셀 유무를 매 프레임
+#   판단하고, '있음↔없음' 전이를 디바운스해서 파선 하나가 지나갈 때마다 카운트를 올린다.
+#   ★주의★ 카운팅을 언제부터 시작할지(예: 노란 하프 출발선 검출 시점)는 아직 미정 —
+#   YellowDashCounter는 카운팅 로직만 담당하고, reset() 호출 시점은 호출부(상태머신) 책임.
+#   전부 실차 미검증 초기값.
+YELLOW_DASH_ROI_TOP = 0.60   # ROI 세로비율(0=위/원거리~1=아래/근거리) — 차량 바로 앞 근거리만 봄
+YELLOW_DASH_ROI_BOT = 0.95
+YELLOW_DASH_MIN_AREA_PX = 150     # ROI 안 노란 픽셀 수가 이 이상이어야 "파선 보임"으로 인정(잡음/반사 필터)
+YELLOW_DASH_PRESENT_FRAMES = 2    # 연속 이 프레임 이상 보여야 "파선 하나 확정"(카운트 +1)
+YELLOW_DASH_ABSENT_FRAMES  = 2    # 연속 이 프레임 이상 안 보여야 "다음 파선 대기" 상태로 재무장
+TURN_DASH_TRIGGER_COUNT = 4       # "3개 넘기고 4번째가 다가오는 순간" — count(완전히 지나친 개수)가 TURN_DASH_TRIGGER_COUNT-1(=3)이면서
+                                   #   동시에 YellowDashCounter.present가 True(4번째가 지금 보이는 중)일 때 좌회전 트리거.
+                                   #   count만으로는 판단 불가 — [2026-08-21] "보이자마자"가 아니라 "지나쳐야" 세는 걸로
+                                   #   바꿨기 때문에(hough_lane.YellowDashCounter 주석 참고), 4번째가 다가오는 중엔 아직 count=3.
+                                   #   아직 상태머신 미연결.
+
+# ── 좌회전 진입 랜드마크 — 체크무늬(흑/노랑 교차) 게이트 밴드 (hough_lane.check_checker_band()) ──
+#   [2026-08-21] 사용자가 실차 사진으로 확인해준 "노란 하프 출발선" = 흑/연노랑 체크무늬가
+#   트랙을 가로지르는 밴드(정지선처럼 단색 굵은 선이 아니라 체커 패턴). check_stopline()
+#   (perc_floor.py, 흰색 단일톤 비율 임계값)과 같은 ROI+비율 임계값 방식을 쓰되, 이건
+#   "어두운 픽셀 비율"과 "노란 픽셀 비율"이 같은 밴드 안에 동시에 일정 이상 있어야
+#   확정한다 — 그래야 맨 도로(둘 다 낮음)나 순수 노란 점선 중앙선(어두운 비율 낮음)과
+#   헷갈리지 않는다. YELLOW_LOWER/UPPER는 위 것 그대로 재사용.
+#   ★주의★ 색상값(특히 CHECKER_BLACK_MAX_V)은 사용자가 보여준 사진을 육안으로 보고 잡은
+#   추정치일 뿐 실측 HSV 샘플링을 거치지 않았다 — 실차/실제 캡처로 반드시 재조정할 것.
+CHECKER_ROI_TOP = 0.45   # ROI 세로비율 — 체크무늬는 하프 출발선이라 파선 중앙선(YELLOW_DASH_ROI)보다 더 먼 위치에서 잡힘
+CHECKER_ROI_BOT = 0.75
+CHECKER_BLACK_MAX_V = 60        # 그레이스케일 값이 이 이하면 "검정 사각형"으로 카운트
+CHECKER_DARK_RATIO_TH   = 0.15  # ROI 내 검정 비율이 이 이상이어야 함
+CHECKER_YELLOW_RATIO_TH = 0.10  # ROI 내 노란 비율이 이 이상이어야 함
+CHECKER_CONFIRM_FRAMES = 2      # 연속 이 프레임 이상 위 조건을 만족해야 "게이트 확정"(오검출 디바운스, LAP_YAW_CONFIRM_FRAMES와 동일 패턴)
+
 # [2026-08-07] ll을 흰선/노란선으로 분리하는 데 쓰는 커넥티드 컴포넌트 투표 기준
 # (DL_CENTER_MODE='ll' 전용, DLSlideWindow._split_ll_by_yellow() 참고). ll 픽셀 자체는
 #   흰/노랑 구분이 없으므로(위 YELLOW_LOWER/UPPER 주석 참고), ll_mask의 커넥티드
@@ -1137,6 +1173,11 @@ DL_DEBUG_HISTORY_LEN = 90
 DEBUG_VIZ_HOUGH_LANE = False  # 차선 — 대안 백엔드('hough') 디버그 창 (perception/hough_lane.py)
 DEBUG_VIZ_LANE       = False  # 차선 — 대안 백엔드('classic_cv') 디버그 창 (perception/lane_util.py)
 DEBUG_VIZ_STOPLINE   = False  # 정지선 디버그 창, 백엔드 무관 항상 동작 (perception/perc_floor.py)
+# [2026-08-21] 좌회전 진입 랜드마크(체커 게이트/노란 파선 카운터) 디버그 창 — 실차에서
+#   ROI/비율/카운트가 실제로 의도대로 잡히는지 눈으로 확인하기 위해 켜둠(요청 반영).
+#   신뢰도 검증 전이라 기본 True — 확정되면 다른 항목처럼 False로 내릴 것.
+DEBUG_VIZ_CHECKER_GATE = True   # 체커무늬(하프 출발선) 게이트 디버그 창 (perception/hough_lane.py CheckerBandGate)
+DEBUG_VIZ_DASH_COUNTER = True   # 노란 파선 카운터 디버그 창 (perception/hough_lane.py YellowDashCounter)
 # [2026-08-13] 신호등(S0/S2) 디버그 강화 — ROI 좌표/HoughCircles 원(후보 전체+선택된 4개)/
 #   현재 인식 상태(정지·직진·좌회전·미검출)를 창 하나에 다 보여주도록 확장
 #   (perception/traffic_signal.py detect_s2()). 요청에 따라 기본 True로 켜둠 — 다른 항목과

@@ -77,7 +77,14 @@ LANE_WIDTH_EMA_ALPHA = 0.1
 # dl_lane.py와 값을 공유하므로 config.py에서 가져온다.
 # DEBUG_VIZ_HOUGH_LANE도 config.py에 있다 — 실차 테스트 중 값을 바꾸려면
 # 이 파일이 아니라 config.py를 고칠 것.
-from ..config import YELLOW_LOWER, YELLOW_UPPER, DEBUG_VIZ_HOUGH_LANE
+from ..config import (
+    YELLOW_LOWER, YELLOW_UPPER, DEBUG_VIZ_HOUGH_LANE,
+    YELLOW_DASH_ROI_TOP, YELLOW_DASH_ROI_BOT, YELLOW_DASH_MIN_AREA_PX,
+    YELLOW_DASH_PRESENT_FRAMES, YELLOW_DASH_ABSENT_FRAMES, DEBUG_VIZ_DASH_COUNTER,
+    CHECKER_ROI_TOP, CHECKER_ROI_BOT, CHECKER_BLACK_MAX_V,
+    CHECKER_DARK_RATIO_TH, CHECKER_YELLOW_RATIO_TH, CHECKER_CONFIRM_FRAMES,
+    DEBUG_VIZ_CHECKER_GATE,
+)
 
 RED = (0, 0, 255)
 YELLOW_COL = (0, 255, 255)
@@ -301,3 +308,190 @@ class HoughLaneDetector:
             cv2.imshow('hough_lane_result', debug_img)
             cv2.waitKey(1)
         return valid, offset, lookahead, lane_center, path, debug_img
+
+
+class YellowDashCounter:
+    """근거리 ROI에서 노란색 파선(끊긴 중앙선) 조각을 세는 카운터.
+
+    좌회전 진입 트리거 후보 — "신호등→좌회전 입구" 거리를 적분하는 대신, 실제로
+    지나간 노란 파선 개수를 센다(config.py "좌회전 진입 랜드마크 후보" 절 참고).
+    HSV 마스크(YELLOW_LOWER/UPPER — hough_lane.HoughLaneDetector._update_yellow_centers()와
+    동일 기준)로 근거리 밴드 안 노란 픽셀 존재 여부를 매 프레임 판단하고, '있음↔없음'
+    전이를 디바운스(연속 프레임 확정 — track_drive.py _update_lap()의
+    LAP_YAW_CONFIRM_FRAMES와 동일 패턴)한다.
+
+    [2026-08-21] 카운트 시점을 "보이기 시작하는 순간"(rising edge)에서 "다시 안 보이게
+    되는 순간"(falling edge)으로 변경(요청 반영) — 아직 눈에 보이기만 하고 지나치지
+    않은 파선까지 세면 안 되기 때문. 근거리 ROI 안에서 파선이 사라진다는 건 차량이
+    그만큼 전진해 실제로 지나쳤다는 뜻이라, falling edge가 "지나침"에 더 가깝다.
+
+    카운팅을 언제부터 시작할지(예: 노란 하프 출발선 검출 시점)는 이 클래스 책임이 아니다
+    — 호출부가 reset()을 호출한 시점부터 셀 뿐이다. 상태머신 연결(트리거 시점에 실제로
+    조향을 꺾는 것)은 아직 없음 — 우선 카운팅 자체가 실차 캡처에서 파선 하나하나를
+    잘 분리해 세는지부터 확인 필요.
+
+    트리거 조건("3개 지나치고 4번째가 다가오는 순간")은 count만으로는 못 만든다 — count는
+    "완전히 지나친 개수"라 4번째가 다가오는 중에는 아직 3이다. 호출부는 self.present(현재
+    파선이 보이는 중인가, 디바운스 확정값)를 같이 봐서 `count == TURN_DASH_TRIGGER_COUNT-1
+    and present`로 판단해야 한다(config.py TURN_DASH_TRIGGER_COUNT 주석 참고).
+    """
+
+    def __init__(self):
+        self.count = 0
+        self.present = False    # 디바운스로 확정된 현재 상태(파선이 보이는 중인가) — 호출부가 직접 읽는 공개 상태
+        self._present_run = 0    # raw 신호가 연속으로 "보임"이었던 프레임 수
+        self._absent_run = 0     # raw 신호가 연속으로 "안보임"이었던 프레임 수
+
+    def reset(self):
+        """카운팅 재시작 — 호출부가 '지금부터 세기 시작'하는 시점에 호출."""
+        self.count = 0
+        self.present = False
+        self._present_run = 0
+        self._absent_run = 0
+
+    def update(self, frame):
+        """frame(전방 카메라 원본 BGR) 1장 처리 → 갱신된 count 반환.
+
+        frame이 None이면 카운트를 건드리지 않고 현재 값만 반환(카메라 프레임 드롭 때문에
+        카운트가 흔들리지 않게 — perc_stopline()의 img_front None 가드와 동일 원칙)."""
+        if frame is None:
+            return self.count
+
+        h, w = frame.shape[:2]
+        y0 = int(h * YELLOW_DASH_ROI_TOP)
+        y1 = int(h * YELLOW_DASH_ROI_BOT)
+        roi = frame[y0:y1, 0:w]
+
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, YELLOW_LOWER, YELLOW_UPPER)
+        raw_present = int(np.count_nonzero(mask)) >= YELLOW_DASH_MIN_AREA_PX
+
+        if raw_present:
+            self._present_run += 1
+            self._absent_run = 0
+        else:
+            self._absent_run += 1
+            self._present_run = 0
+
+        if not self.present and self._present_run >= YELLOW_DASH_PRESENT_FRAMES:
+            self.present = True
+        elif self.present and self._absent_run >= YELLOW_DASH_ABSENT_FRAMES:
+            self.present = False
+            self.count += 1   # falling edge = 파선이 근거리 ROI를 벗어남 = 실제로 지나침
+
+        if DEBUG_VIZ_DASH_COUNTER:
+            self._draw_debug(roi, raw_present)
+
+        return self.count
+
+    def _draw_debug(self, roi, raw_present):
+        vis = roi.copy()
+        border = GREEN if self.present else (RED if raw_present else (120, 120, 120))
+        cv2.rectangle(vis, (1, 1), (vis.shape[1] - 2, vis.shape[0] - 2), border, 3)
+        cv2.putText(vis, f'count={self.count} present={self.present} raw={raw_present}',
+                    (6, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.imshow('yellow_dash_counter', vis)
+        cv2.waitKey(1)
+
+
+class CheckerBandGate:
+    """흑/노랑 체크무늬 밴드("하프 출발선") 통과 감지 — YellowDashCounter.reset() 호출
+    시점(카운팅 시작 트리거) 후보.
+
+    check_stopline()(perc_floor.py)과 같은 ROI+비율 임계값 방식이지만, 정지선(흰색
+    단일톤)과 달리 이 밴드는 "어두운 비율"과 "노란 비율"이 같은 ROI 안에 동시에 있어야
+    확정한다(config.py "체크무늬 게이트 밴드" 절 참고) — 그래야 맨 도로나 순수 노란
+    점선 중앙선과 안 헷갈린다. CHECKER_CONFIRM_FRAMES 연속 확정되면 딱 한 번만 True를
+    반환(rising edge, _update_lap()의 디바운스와 동일 패턴) — reset() 전까지 재무장 안
+    되므로, 밴드 위를 지나는 여러 프레임 동안 카운터가 여러 번 리셋되는 일은 없다.
+    """
+
+    def __init__(self):
+        self._confirm_run = 0
+        self._armed = True    # False가 되면(한 번 트리거된 후) reset() 전까지 다시 안 켜짐
+
+    def reset(self):
+        """다음 랩/재진입을 위해 재무장 — 호출부(상태머신)가 좌회전 시퀀스를 완전히
+        마친 뒤 호출."""
+        self._confirm_run = 0
+        self._armed = True
+
+    def update(self, frame):
+        """frame(전방 카메라 원본 BGR) 1장 처리 → 이번 프레임에 새로 확정됐으면 True."""
+        if frame is None or not self._armed:
+            return False
+
+        h, w = frame.shape[:2]
+        y0 = int(h * CHECKER_ROI_TOP)
+        y1 = int(h * CHECKER_ROI_BOT)
+        roi = frame[y0:y1, 0:w]
+
+        # [2026-08-21] "하프" 출발선 — 체커무늬가 도로 폭 전체가 아니라 우측 차로에만
+        # 있다(요청 반영, 실제 위치 확인됨). ROI 전체 폭 평균으로 비율을 재면 무늬 없는
+        # 좌측 절반이 희석시켜 임계값을 못 넘길 수 있어, 우측 절반만 잘라서 검사한다.
+        mid = roi.shape[1] // 2
+        right_half = roi[:, mid:]
+        dark_ratio, yellow_ratio = self._checker_ratios(right_half)
+        raw_present = (dark_ratio >= CHECKER_DARK_RATIO_TH
+                       and yellow_ratio >= CHECKER_YELLOW_RATIO_TH)
+
+        self._confirm_run = self._confirm_run + 1 if raw_present else 0
+        triggered = self._confirm_run >= CHECKER_CONFIRM_FRAMES
+        if triggered:
+            self._armed = False
+
+        if DEBUG_VIZ_CHECKER_GATE:
+            self._draw_debug(roi, mid, dark_ratio, yellow_ratio, raw_present, triggered)
+
+        return triggered
+
+    @staticmethod
+    def _checker_ratios(half_roi):
+        gray = cv2.cvtColor(half_roi, cv2.COLOR_BGR2GRAY)
+        dark_ratio = float(np.count_nonzero(gray < CHECKER_BLACK_MAX_V)) / gray.size
+
+        hsv = cv2.cvtColor(half_roi, cv2.COLOR_BGR2HSV)
+        yellow_mask = cv2.inRange(hsv, YELLOW_LOWER, YELLOW_UPPER)
+        yellow_ratio = float(np.count_nonzero(yellow_mask)) / yellow_mask.size
+
+        return dark_ratio, yellow_ratio
+
+    def _draw_debug(self, roi, mid, dark_ratio, yellow_ratio, raw_present, triggered):
+        """전체 ROI(좌+우)를 그대로 보여주되, 실제로 검사 대상인 우측 절반만 테두리+반투명
+        색으로 하이라이트하고 그 위에 체크(✓)/엑스(x) 표시를 얹는다 — 크롭된 절반만 보여주면
+        ROI가 실제 체커무늬 위치와 잘 맞는지 전체 맥락에서 확인하기 어렵다는 지적 반영."""
+        vis = roi.copy()
+        h, w = vis.shape[:2]
+        color = GREEN if raw_present else RED
+
+        overlay = vis.copy()
+        cv2.rectangle(overlay, (mid, 0), (w - 1, h - 1), color, -1)
+        cv2.addWeighted(overlay, 0.25, vis, 0.75, 0, vis)
+        cv2.rectangle(vis, (mid, 0), (w - 1, h - 1), color, 2)
+        cv2.line(vis, (mid, 0), (mid, h - 1), (255, 255, 255), 1)  # 좌/우 분할선 — 검사 안 하는 좌측과 경계 표시
+
+        mark_cx, mark_cy = mid + (w - mid) // 2, h // 2
+        self._draw_check_mark(vis, (mark_cx, mark_cy), raw_present)
+
+        cv2.putText(vis, f'dark={dark_ratio:.2f}(>={CHECKER_DARK_RATIO_TH}) '
+                          f'yel={yellow_ratio:.2f}(>={CHECKER_YELLOW_RATIO_TH})',
+                    (6, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(vis, f'confirm={self._confirm_run}/{CHECKER_CONFIRM_FRAMES} '
+                          f'armed={self._armed}',
+                    (6, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+        if triggered:
+            cv2.putText(vis, 'TRIGGERED', (6, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                        (0, 255, 255), 2, cv2.LINE_AA)
+        cv2.imshow('checker_band_gate', vis)
+        cv2.waitKey(1)
+
+    @staticmethod
+    def _draw_check_mark(img, center, ok, size=22, thickness=3):
+        cx, cy = center
+        color = GREEN if ok else RED
+        if ok:
+            cv2.line(img, (cx - size, cy), (cx - size // 3, cy + size), color, thickness, cv2.LINE_AA)
+            cv2.line(img, (cx - size // 3, cy + size), (cx + size, cy - size), color, thickness, cv2.LINE_AA)
+        else:
+            cv2.line(img, (cx - size, cy - size), (cx + size, cy + size), color, thickness, cv2.LINE_AA)
+            cv2.line(img, (cx - size, cy + size), (cx + size, cy - size), color, thickness, cv2.LINE_AA)
