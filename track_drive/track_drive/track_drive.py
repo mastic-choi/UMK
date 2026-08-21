@@ -359,7 +359,8 @@ class TrackDriverNode(Node):
         # 누적 기준점(_lap_t0 등)을 최초 1회만 리셋한다.
         self._departed = False
         self._lavacon_engaged  = False          # B1_LAVACON 진입 확정 latch (트리거 이후 잠깐 한쪽 클러스터가
-                                                 #   끊겨도 중간에 일반주행으로 안 튀도록 유지, lavacon_done으로 해제)
+                                                 #   끊겨도 중간에 일반주행으로 안 튀도록 유지, 근접 ROI 연속
+                                                 #   미검출(run_behavior_fsm() Phase.LAVACON 분기)로 해제)
         self.ctrl_angle = 0.0
         self.ctrl_speed = SPEED_STOP
         self._prev_angle_out = 0.0    # [5] 직전 발행 조향각(변화율 제한용)
@@ -2146,8 +2147,10 @@ class TrackDriverNode(Node):
         if self.phase == Phase.LAVACON:
             # [2026-08-20] 요청 반영 — B1은 지금 단계에서 진입/탈출 두 트리거만 쓴다.
             # 진입: 좌우 라이다 클러스터 동시검출(lavacon_trigger)로 self._lavacon_engaged를
-            # latch. 탈출: process_lavacon()이 매 틱 계산해두는 lavacon_done(우측 콘
-            # 연속 미검출)이 LAVACON_DONE_FRAMES만큼 유지되면 확정 — 이 판정 자체는
+            # latch. 탈출: [2026-08-21 버그수정, 아래 근접 ROI 재판정 참고] 처음엔
+            # process_lavacon()의 lavacon_done(넓은 ROI, CONE_LON_MAX=4.0m/±1.0m)을 그대로
+            # 옮겨 썼는데, 그 범위가 너무 넓어 실차에서 "한 번 진입하면 안 나가지는" 버그로
+            # 재현됨 — 지금은 push와 같은 근접 ROI(LAVACON_PUSH_*)로 재판정한다. 이 판정 자체는
             # 예전 _handle_lavacon() 안에 있던 것을 그대로 옮겨왔다(behavior_state가
             # B1_LAVACON이 될 일이 없어져 그 함수가 더 이상 안 불리므로, exit 판정을
             # 계속 돌리려면 여기로 옮겨야 한다). 진입~탈출 사이엔 실제 B1 회피 조향
@@ -2161,7 +2164,20 @@ class TrackDriverNode(Node):
             if self.lavacon_trigger:
                 self._lavacon_engaged = True
             if self._lavacon_engaged:
-                if self.lavacon_done:
+                # [2026-08-21, 실차 재현 버그수정] 원래는 self.lavacon_done(process_lavacon()의
+                # 넓은 ROI 기준, CONE_LON_MAX=4.0m/CONE_LAT_LIMIT=±1.0m)을 썼는데, 이 ROI가
+                # 너무 넓어서 실차에서 "한 번 라바콘 state에 들어가면 절대 안 나간다"는
+                # 증상으로 재현됨(사용자 실측) — 그 넓은 범위 안엔 거의 항상 벽/커브 연석/
+                # 다음 구간 장애물(B2=콘 1개) 중 하나가 걸려서 has_left/has_right가 계속
+                # True로 남아 lavacon_done이 사실상 영원히 False였다. §3.6에서 AuTURBO 실측
+                # 기반으로 새로 좁혀둔 근접 전용 push ROI(LAVACON_PUSH_*, 전방 0.1~0.5m,
+                # ±0.5m)로 대신 판정한다 — 이 ROI 안에 좌/우 어느 쪽도 콘이 없으면 "지금 당장
+                # 근처에 콘이 없다"는 뜻이라 훨씬 신뢰할 수 있다(AuTURBO도 진입/조향/탈출을
+                # 전부 이 좁은 근접 ROI 하나로 통일해서 판정함, README §3.6 참고).
+                near_left, near_right = nearest_cone_lateral(
+                    self.lidar_ranges, LAVACON_PUSH_LON_MIN, LAVACON_PUSH_LON_MAX,
+                    LAVACON_PUSH_LAT_LIMIT)
+                if near_left is None and near_right is None:
                     self._lavacon_empty_cnt += 1
                     if self._lavacon_empty_cnt >= LAVACON_DONE_FRAMES:
                         self._lavacon_empty_cnt = 0

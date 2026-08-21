@@ -2277,6 +2277,35 @@ push를 켜는 게이트가 있었는데, 실차에서 라이다 클러스터는
 우리 차량으로 실차 검증된 적은 없다 — 원시거리 vs 횡방향 성분 차이(위 참고)도 있어 실차에서
 콘을 스치거나 반대로 과민 반응하면 재조정 필요.
 
+### 3.7 [중대 버그] 한 번 라바콘 state에 들어가면 절대 안 나가던 문제 — 탈출 판정 ROI가 너무 넓었음 (2026-08-21)
+
+**증상(사용자 실차 재현):** `_lavacon_engaged`가 한 번 True가 되면 이후 계속 True로 남아
+Phase.LAVACON을 못 벗어난다 — 실제로는 라바콘 구간을 다 지났는데도 계속 라바콘 state로 잡혀있음.
+
+**원인:** `run_behavior_fsm()`의 탈출 판정이 `process_lavacon()`이 계산하는
+`self.lavacon_done`을 썼는데, 그 판정은 `perc_lavacon.py`의 `CONE_LON_MAX=4.0m`/
+`CONE_LAT_LIMIT=±1.0m`라는 **아주 넓은 ROI** 안에 좌/우 어느 쪽이든 점이 하나라도 있으면
+`False`(아직 구간 안)로 본다(2026-08-03 도입, "우측에 틈 하나만 있어도 조기종료로 오판하는
+문제" 대응 — README 원본 커밋 메시지 참고). 문제는 이 ROI가 너무 넓어서, 실제 라바콘
+구간을 완전히 벗어난 뒤에도 전방 4m/좌우 1m 안에 벽·연석·다음 구간 장애물(B2=라바콘 1개)
+중 하나가 거의 항상 걸린다 — `has_left`/`has_right`가 사실상 영원히 `True`로 남아
+`lavacon_done`이 절대 `True`가 되지 못했다.
+
+**수정:** `run_behavior_fsm()`의 탈출 판정을 `self.lavacon_done` 대신 §3.6에서 AuTURBO
+실측으로 좁혀둔 근접 전용 push ROI(`nearest_cone_lateral()` + `LAVACON_PUSH_LON/LAT_LIMIT`,
+전방 0.1~0.5m/±0.5m)로 교체 — 이 좁은 ROI 안에 좌/우 어느 쪽도 없으면 "지금 당장 근처에
+콘이 없다"로 보고 `LAVACON_DONE_FRAMES` 디바운스를 시작한다. AuTURBO 팀도 진입/조향/탈출을
+전부 이 좁은 근접 ROI 하나로 통일해서 판정했다(§3.6 참고) — 굳이 넓은 별도 ROI를 하나 더
+쓸 이유가 없었던 셈. `process_lavacon()`/`self.lavacon_done` 자체(및 그 넓은 ROI)는 디버그
+로그·박스 스택 시각화용으로는 그대로 남겨뒀다 — 실제 탈출 판정에서만 빠졌다.
+
+**알려진 한계:** 근접 ROI(전방 0.1~0.5m)가 좁아, 라바콘 간격(`BOX_LON_WIDTH=0.4m` 기준)이
+넓게 벌어지는 구간에서는 콘 사이를 지나는 짧은 순간 좌/우 모두 미검출되는 프레임이 실제
+구간 안에서도 발생할 수 있다 — `LAVACON_DONE_FRAMES`(40프레임 디바운스)가 이를 흡수할
+것으로 보이나, §3.6에서 같이 추가한 구간 내 속도 캡(`SPEED_LAVACON`)이 이 디바운스가
+버틸 시간을 벌어주는 전제가 깔려 있다. 실차 미검증 — 조기 탈출이 재현되면
+`LAVACON_DONE_FRAMES`를 늘리거나 `LAVACON_PUSH_LON_MAX`를 살짝 늘리는 쪽으로 대응할 것.
+
 ---
 
 ## 4. 사물회피 (B2_OBSTACLE, 고정장애물)
