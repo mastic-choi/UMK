@@ -1241,22 +1241,16 @@ DEBUG_VIZ_OBSTACLE_CUT = True   # [2026-08-20] 실차 검증 시작과 함께 �
 # #############################################################
 # 6. 미션 State / 실차 테스트 범위 제한
 # #############################################################
-# [2026-08-21, 임시] 방해차량 회피(B3, obstacle_cut_type='vehicle') 단독 실차 검증 —
-#   S0_SIGNAL 신호대기를 건너뛰고 S1_LANE_FOLLOW로 바로 출발, ENABLE_OBSTACLE_CUT(현재
-#   B2/B3의 실제 회피 메커니즘 — 위 run_behavior_fsm() Phase.OBSTACLE_ZONE 분기, da 근접
-#   컷)/ENABLE_BEHAVIOR/TEST_DISABLE_B2_B3=False를 모두 켜서 트랙의 라바콘(B2)→방해차량
-#   (B3) 구간을 정상 순서로 통과시키며 B3 회피만 집중 관찰한다. YOLO_CONE_ENABLE도 같이
-#   켠다 — perc_obstacle_cut_trigger()가 콘/차량 카메라 이중확인으로 obstacle_cut_type을
-#   'fixed'/'vehicle'로 가르는데, 콘 YOLO가 꺼져 있으면 B2가 카메라 폴백(라이다 단독)으로
-#   흐려 "트랙 순서상 B2 먼저"라는 전제(_b2_passed 가드, 위 Phase.OBSTACLE_ZONE 분기 참고)가
-#   약해진다. 검증 끝나면 아래 원래 값(START_STATE=S0_SIGNAL, ENABLE_OBSTACLE_CUT 이전
-#   기본값은 사용자 확인 필요, ENABLE_BEHAVIOR=True 유지, TEST_DISABLE_B2_B3=False 유지,
-#   TEST_FORCE_BEHAVIOR=False)으로 되돌릴 것.
+# [2026-08-21] B3 단독 검증용 임시 override(START_STATE=S1_LANE_FOLLOW 직행,
+#   TEST_FORCE_BEHAVIOR=True) 걷어내고 원래 값으로 복귀 — 이제 S0_SIGNAL(출발선 신호등,
+#   빨강 대기 → 초록/직진 확정 → 출발)부터 실제로 거치는 정상 플로우를 검증한다.
+#   _behavior_enabled는 강제 켜지 않고 원래대로 S0_SIGNAL "직진" 확정 시(track_drive.py
+#   commit_dir == 'straight' 분기, 위 주석 §참고)에만 True가 된다.
 # [2026-08-20, signal-whiteboard-autocrop 브랜치 병합] START_STATE는 원래 S0_WAIT_GREEN
 #   이었으나, 그 상태와 S2_INTERSECTION이 S0_SIGNAL 하나로 통합됐다(위 MissionState enum
 #   주석 참고, 출발선/교차로 재진입 모두 같은 SignalDetector.detect_s2() 재사용) — 값은
 #   그대로 "맨 처음 신호등 판독" 지점이라 의미상 동일하다.
-START_STATE     = MissionState.S1_LANE_FOLLOW
+START_STATE     = MissionState.S0_SIGNAL
 ENABLE_BEHAVIOR = True  # S1에서 라바콘/장애물/추월 Behavior를 켤지 여부(최상위 스위치)
 
 # ── 실차 테스트 범위 제한 ──
@@ -1270,12 +1264,13 @@ TEST_DISABLE_B2_B3 = False
 #         이중으로 걸어 B2/B3가 어떤 경로로도 안 켜지게 한다(안전판).
 #   False: 원래대로 SAFETY_DIST/OVERTAKE_TRIGGER 트리거 검사해서 B2/B3 정상 발동 —
 #         이번 B3 검증이 보고 싶은 게 바로 이 발동이라 False.
-TEST_FORCE_BEHAVIOR = True
+TEST_FORCE_BEHAVIOR = False
 #   True: _behavior_enabled를 시작부터 강제 True로 켜서, START_STATE=S1_LANE_FOLLOW로
 #         S0/S2를 건너뛴 채로도 B1→B2→B3가 정상 발동한다(그렇지 않으면 _behavior_enabled가
 #         S2 교차로 직진 확정 시에만 True가 되는데 그 경로 자체를 안 타므로 계속 False로
 #         남아 Behavior가 영원히 안 켜짐).
-#   False: 원래대로 S2 교차로 직진 신호를 받아야만 Behavior가 켜짐.
+#   False: 원래대로 S0_SIGNAL 직진 신호 확정 시에만 Behavior가 켜짐 — [2026-08-21]
+#         START_STATE=S0_SIGNAL로 되돌리면서 이 자연스러운 경로를 그대로 검증하도록 False로.
 
 # [2026-08-11] B2(정지 장애물) Hybrid A* 대안(USE_HYBRID_ASTAR_FOR_B2) 삭제.
 #   대신 _da_avoidance_failed() 게이트 + TargetPassing(실측 기반 하드코딩)로 대체
@@ -1365,7 +1360,8 @@ STABLE_JUMP_MAX = 15   # 이 이상(px) 차이나면 "같은 흐름"이 아닌 �
 PATH_EMA_ALPHA = 0.25   # 새 프레임에 줄 가중치(작을수록 더 부드럽고, 더 느리게 반응)
 
 # ── 라바콘/장애물/방해차량/신호등 트리거 ──
-LAVACON_DONE_FRAMES = 80      # 우측콘 미검출이 연속 N프레임(20Hz→약 4초) 쌓이면 Phase 전환(디바운스)
+LAVACON_DONE_FRAMES = 40      # [2026-08-21, 요청 반영] 80(≈4초)→40 — 좌우 콘 미검출이 연속
+                               #   N프레임(20Hz→약 2초) 쌓이면 Phase 전환(디바운스)
 LAVACON_TRIGGER_FRAMES = 5    # (YOLO 콘 검출 AND 좌우 라이다 클러스터 동시검출)이 연속 N프레임
                                #   쌓이면 B1_LAVACON 진입 확정. [2026-08-07] 카메라(YOLO)+라이다
                                #   이중확인으로 강화 — 값 자체는 기존 그대로 유지.

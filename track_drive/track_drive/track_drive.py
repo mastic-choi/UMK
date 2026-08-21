@@ -330,13 +330,11 @@ class TrackDriverNode(Node):
         # ── 판단/제어 상태 ──
         self.mission_state  = START_STATE
         self.behavior_state = BehaviorState.B0_NORMAL
-        # [2026-08-21, 임시] B2/B3(고정장애물/방해차량) 단독 검증 — Phase.LAVACON(B1 진입 대기,
-        # 실제 회피는 없는 placeholder라 건너뛰어도 손해 없음)을 건너뛰고 시작부터 바로
-        # Phase.OBSTACLE_ZONE으로 진입한다. _b2_passed/_b3_passed는 기본값 False 그대로 둔다 —
-        # _active_yolo_stage()가 Phase.OBSTACLE_ZONE에서 "_b2_passed가 아니면 콘, 이면 차량"
-        # 스테이지를 고르므로(위 참고, README §5.5로 B2 먼저 순서로 재복귀) 둘 다 False인
-        # 기본 상태론 콘 모델이 먼저 물린다.
-        self.phase          = Phase.OBSTACLE_ZONE
+        # [2026-08-21] B1(라바콘) 재검증 — YOLO 콘 검출이 B2 단독 테스트(위 임시 override,
+        # 2026-08-21 오전) 중 3회 실행 중 1회만 검출되는 등 불안정한 게 확인돼(README §4.3
+        # 한계 참고), B2/B3 단독 진입 override를 걷어내고 원래대로 Phase.LAVACON(B1 진입
+        # 대기)부터 시작한다.
+        self.phase          = Phase.LAVACON
         # [2026-08-15] Phase.OBSTACLE_ZONE 통합(da_based_b2b3_proposal.md B안) —
         # B2/B3 각각 최소 한 번 완료됐는지 추적. 둘 다 True가 돼야 Phase.DONE으로
         # 넘어간다(_mark_behavior_passed() 참고).
