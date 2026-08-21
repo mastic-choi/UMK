@@ -1211,29 +1211,6 @@ DL_DEBUG_HISTORY_LEN = 90
 DEBUG_VIZ_HOUGH_LANE = False  # 차선 — 대안 백엔드('hough') 디버그 창 (perception/hough_lane.py)
 DEBUG_VIZ_LANE       = False  # 차선 — 대안 백엔드('classic_cv') 디버그 창 (perception/lane_util.py)
 DEBUG_VIZ_STOPLINE   = False  # 정지선 디버그 창, 백엔드 무관 항상 동작 (perception/perc_floor.py)
-# [2026-08-13] 신호등(S0/S2) 디버그 강화 — ROI 좌표/HoughCircles 원(후보 전체+선택된 4개)/
-#   현재 인식 상태(정지·직진·좌회전·미검출)를 창 하나에 다 보여주도록 확장
-#   (perception/traffic_signal.py detect_s2()). 요청에 따라 기본 True로 켜둠 — 다른 항목과
-#   달리(위 2026-08-11 라바콘 테스트 메모 참고) 이 스위치는 독립적으로 True 유지할 것.
-# [2026-08-19] "YOLO 단독" 결과(yolo_signal_state.py, DEBUG_VIZ_YOLO_SIGNAL_STATE)와 창을
-#   헷갈리지 않게 역할을 분리 — 이 플래그는 최종 결과 창(track_drive.py
-#   _debug_viz_signal_status(), "YOLO+HSV_신호등" — 배경판 위치는 YOLO_SIGNAL_ENABLE에 따라
-#   YOLO 또는 HSV자동크롭, 점등 색상 판정은 항상 HSV/circle 기반)만 켠다. 후보 탐색 과정
-#   전체(signal4_roi/signal4_board_search)를 보고 싶으면 DEBUG_VIZ_SIGNAL_DETAIL을 따로 켤 것.
-# [2026-08-20] SIGNAL_USE_YOLO_STATE_FOR_DECISION=True로 판단 소스를 YOLO 단독으로 바꾸면서
-#   (아래 참고) 이 "YOLO+HSV" 창은 더 이상 실제 주행 판단과 무관해져 끄고, 대신
-#   DEBUG_VIZ_YOLO_SIGNAL_STATE를 켜서 실제 판단에 쓰는 YOLO 단독 결과 창을 보여준다.
-#   Hough/HSV 경로로 되돌리면(SIGNAL_USE_YOLO_STATE_FOR_DECISION=False) 이 두 값도 같이
-#   원래대로(True/False) 되돌릴 것 — 아니면 판단에 안 쓰는 창만 보이게 된다.
-DEBUG_VIZ_SIGNAL     = False   # 신호등 "YOLO+HSV" 결과 창 (track_drive.py _debug_viz_signal_status()) — YOLO 단독 판단 중엔 꺼둠
-DEBUG_VIZ_SIGNAL_DETAIL = False  # 신호등 후보탐색 과정 디버그 창 2개(signal4_roi/signal4_board_search) — 평소엔 꺼서 창 수를 줄임 (perception/traffic_signal.py)
-# DEBUG_LOG_SIGNAL: 신호등 전용 상세 진단 로그. 전역 DEBUG_LOG(0.5초 주기 요약 [SIG] 한 줄)와는
-#   별개로, 이 플래그가 켜지면 S0/S2 상태에서 매 프레임 "왜 못 잡았는지"(원 개수 부족/배치 불량/
-#   밝기 대비 부족 등) 원인을 자세히 찍는다 — DEBUG_LOG를 꺼도 이것만 켜서 신호등만 디버깅 가능.
-#   [2026-08-20] SIGNAL_USE_YOLO_STATE_FOR_DECISION=True일 땐 detect_s2() 자체를 안 돌리므로
-#   (perc_signal() 참고) 이 로그도 안 찍힌다 — Hough 경로로 되돌렸을 때만 의미 있음.
-#   (track_drive.py perc_signal())
-DEBUG_LOG_SIGNAL     = True
 DEBUG_VIZ_YOLO_CONE  = True   # [2026-08-21, 요청 반영] 다시 켬 — 단 콘 원시검출 창
                                # ('yolo_cone_result')은 이제 표시 직전에 아주 작게(160x120)
                                # 축소해서 띄운다(yolo_cone.py show_debug_windows() 참고,
@@ -1242,12 +1219,10 @@ DEBUG_VIZ_YOLO_CONE  = True   # [2026-08-21, 요청 반영] 다시 켬 — 단 �
                                # 쓰는 vis 프레임도 같이 만든다(yolo_cone.py _worker() 참고,
                                # yolo_vehicle.py DEBUG_VIZ_YOLO_VEHICLE과 동일 관례) — 그쪽은
                                # 축소 없이 원래 크기 그대로.
-# [2026-08-20] 배경판+색상상태 YOLO 동시 테스트 끝나서 다시 False로 되돌림(요청 반영,
-#   디버그창 전체 끄기).
-DEBUG_VIZ_YOLO_SIGNAL = False  # 신호등 배경판 YOLO 검출 박스 디버그 창 (perception/yolo_signal.py)
-# [2026-08-20] SIGNAL_USE_YOLO_STATE_FOR_DECISION=True로 이 모델이 실제 주행 판단 소스가 되면서
-#   True로 켬(요청 반영) — 실차에서 지금 뭘 보고 판단 중인지 눈으로 확인하기 위함.
-DEBUG_VIZ_YOLO_SIGNAL_STATE = True  # 신호등 색상상태 YOLO 검출 박스 디버그 창 (perception/yolo_signal_state.py, 창 이름 'YOLO_신호등')
+# [2026-08-21] 신호등 위치+색상 판정을 YOLO 단독(yolo_signal_state.py) 하나로 정리하면서
+#   (README §1.18) 이게 유일한 신호등 결과 창이 됐다 — 실차에서 지금 뭘 보고 판단 중인지
+#   눈으로 확인하기 위함.
+DEBUG_VIZ_YOLO_SIGNAL_STATE = True  # 신호등 위치+색상상태 YOLO 검출 박스 디버그 창 (perception/yolo_signal_state.py, 창 이름 'YOLO_신호등')
 # [2026-08-15] avoid-hold(§2.32) 전용 상태창 — 지금 유예가 걸려있는지/왜 걸렸는지/방향
 #   힌트/조기해제 진행상황을 한곳에 모아 보여주고, 실측 안 된 파라미터 값도 항상 같이
 #   띄워서 "이 숫자 아직 지어낸 값"이라는 걸 상기시킨다(track_drive.py
@@ -1460,7 +1435,7 @@ LAVACON_LINE_TRACK_MAX_JUMP_M   = 0.6   # 직전 박스 같은 라인 점과의 
 #   [2026-08-11] smooth-imu-yaw-rate 브랜치(0c0d88b)에서 수동 포팅.
 # [2026-08-20] ENABLE_BEHAVIOR=False(라바콘/장애물/추월 Behavior 전체 비활성, 순수
 #   차선주행만 사용) 상태인데도 perc_yolo_cone()이 매 프레임 백그라운드에서 계속 돌고
-#   있어서(track_drive.py perceive_all()) 요청 반영으로 끈다 — YOLO_SIGNAL_ENABLE과
+#   있어서(track_drive.py perceive_all()) 요청 반영으로 끈다 — ENABLE_OBSTACLE_CUT과
 #   동일 패턴으로, False면 track_drive.py가 YoloConeDetector 자체를 생성하지 않는다
 #   (self.yolo_cone_detector=None, perc_yolo_cone()이 None 체크로 조용히 스킵).
 #   라바콘(B1) 실차 테스트를 다시 시작하면 True로 되돌릴 것.
@@ -1508,18 +1483,14 @@ YOLO_VEHICLE_MODEL_PATH = None     # None이면 yolo_ros/target_vehicle_best.onn
                                     # nms 내장 export로 교체)으로 갱신.
 DEBUG_VIZ_YOLO_VEHICLE = True      # [2026-08-20] 실차 검증 시작과 함께 켬 — 카메라가 실제로 target_vehicle을 보는지 원시 박스로 확인용
 
-# ── 신호등 색상상태 YOLO (perception/yolo_signal_state.py, YOLOv8n ONNX) ──
+# ── 신호등 위치+색상상태 YOLO (perception/yolo_signal_state.py, YOLOv8n ONNX) ──
 #   [2026-08-19] datasets/signal_state/(라벨링 워크플로는 그쪽 README 참고)로 파인튜닝한
-#   신호등 색상상태(빨강/직진초록/좌회전초록) 검출기 — 바로 아래 "신호등 배경판 위치 탐지"
-#   (YOLO_SIGNAL_*, perception/yolo_signal.py)와는 별개 모델/별개 목적이다: 그쪽은 배경판
-#   "위치"만 찾아 기존 HSV 자동크롭을 대체하는 하이브리드고, 이쪽은 배경판 위치와 무관하게
-#   "지금 어떤 색이 켜져 있는지" 자체를 단일 스테이지로 직접 예측한다. 이름이 겹치지 않게
-#   전부 YOLO_SIGNAL_STATE_* 접두어를 쓴다.
-#   [2026-08-20] 요청 반영으로 perc_signal()의 실제 주행 판단(FSM 전환) 소스를 이걸로
-#   바꿨다 — 아래 SIGNAL_USE_YOLO_STATE_FOR_DECISION 참고. 실차에서 정확도가 기존
-#   Hough+HSV/YOLO 하이브리드보다 못하면 이 플래그 하나만 False로 되돌리면 즉시 기존
-#   경로(traffic_signal.py detect_s2())로 복귀한다(§"da 블롭 선택" 항목과 같은 이유 —
-#   전환은 항상 플래그 하나로 되돌릴 수 있게 유지).
+#   신호등 색상상태(빨강/직진초록/좌회전초록) 검출기 — "지금 어떤 색이 켜져 있는지"를
+#   단일 스테이지로 직접 예측한다(배경판 위치 탐지와 색상 판정이 한 모델).
+#   [2026-08-21] 이전까지 있던 HSV/Hough Circle 기반 검출(traffic_signal.py/frst.py/
+#   yolo_signal.py — 흰 배경판을 먼저 찾고 원 4개의 밝기로 색을 판정하던 방식)과
+#   "YOLO 단독 vs YOLO+HSV 하이브리드" 판단 소스 스위치(SIGNAL_USE_YOLO_STATE_FOR_DECISION)를
+#   전부 삭제했다(README §1.18) — 이제 신호등 인식은 이 YOLO 모델 하나뿐이다.
 YOLO_SIGNAL_STATE_INPUT_SIZE = 640     # signal_state_best_n.onnx export 시 imgsz와 반드시 일치시킬 것
 YOLO_SIGNAL_STATE_CONF_THRESHOLD = 0.5 # 이 신뢰도 이상인 검출만 인정(모델이 nms=True로 export돼 좌표 디코딩은 불필요) — 실차 미검증 기본값, cone과 동일하게 잡아둠
 # [2026-08-20 §2.59] target_vehicle과 같은 문제(ultralytics nms=True가 CoreML 전용이라
@@ -1528,16 +1499,6 @@ YOLO_SIGNAL_STATE_CONF_THRESHOLD = 0.5 # 이 신뢰도 이상인 검출만 인�
 # 이 파일의 파싱 코드는 원래부터 그 형식 전제라 변경 없음).
 YOLO_SIGNAL_STATE_MODEL_PATH = None    # None이면 yolo_ros/signal_state_best_n.onnx(형제 디렉터리)를 자동으로 찾음(perception/yolo_signal_state.py 참고)
 YOLO_SIGNAL_STATE_CLASS_NAMES = ('red', 'green_straight', 'green_left')  # class id(0/1/2) 순서 — datasets/signal_state/classes.txt와 반드시 일치시킬 것
-# [2026-08-20] perc_signal() 판단 소스 스위치(요청 반영, 실차 미검증) — True면 이 YOLO
-#   단독 모델(배경판 위치+색상상태를 한 스테이지로 동시 예측)을 실제 주행 판단(FSM)에
-#   쓴다. track_drive.py perc_signal()이 매 프레임 이 값을 보고 분기한다:
-#     True  → self.signal_red/straight/left_on_yolo(perc_yolo_signal_state() 결과)를 그대로 씀,
-#             traffic_signal.py detect_s2()(Hough Circle, "YOLO+HSV" 하이브리드)는 아예 안 돌림.
-#     False → 기존과 동일하게 detect_s2()만 씀(배경판 위치는 YOLO_SIGNAL_ENABLE에 따라
-#             YOLO 또는 HSV자동크롭, 점등 색상 판정은 항상 HSV/circle 기반).
-#   self.yolo_signal_state_detector가 None이면(모델 파일 없음 등 초기화 실패) 이 값과
-#   무관하게 항상 False 경로로 안전 폴백한다(perc_signal() 참고).
-SIGNAL_USE_YOLO_STATE_FOR_DECISION = True
 
 SAFETY_DIST      = 5.0        # B2(고정장애물) 발동 거리(m)
 OVERTAKE_TRIGGER = 6.5        # B3(방해차량) 발동 거리(m)
@@ -1588,237 +1549,6 @@ ASTAR_VEHICLE_MARGIN_M = 0.05  # 설계값(미검증) — 실측 풋프린트에
 USE_HYBRID_ASTAR_FOR_B3 = False
 ASTAR_B3_REPLAN_TICKS = 4       # 20Hz 기준 0.2s — 이 주기마다 최소 한 번은 전체 재탐색
 ASTAR_B3_FAIL_GRACE_TICKS = 3   # 탐색 실패가 이 틱 연속되면 TargetPassing으로 폴백
-
-# ── 신호등(S0/S2 공용 4구, perception/traffic_signal.py) ──
-# [2026-08-13] 실차 랩 캡처(lap_001/frame_000055.png, 640x480)에서 신호등이 실제로 찍힌
-#   프레임을 찾아 재튜닝. 기존 값(T,B=0.08,0.28 / L,R=0.04,0.78 / R=15~25)은 이 프레임에서
-#   신호등을 아예 못 찾았다(circle_count=0) — ROI 자체가 신호등 실제 위치(native px 기준
-#   대략 x=194~291, y=81~89)와 안 맞았던 것으로 보인다. 아래 값은 그 프레임에서
-#   HoughCircles가 4개를 안정적으로 찾고 shape_ok()까지 통과하는 걸 확인한 값.
-#   ROI를 실측 박스에 딱 맞추지 않고 일부러 여유 있게(러프하게) 잡았다 — 정지 위치/각도가
-#   매번 픽셀 단위로 똑같지 않을 것이므로. 다만 얼마나 넉넉하게 잡을지는 트레이드오프였다:
-#     - 타이트(185x72px): frame_000055 성공, 무작위 25프레임 오탐 0/25
-#     - 러프(320x144px): frame_000055 성공하지만(pick_best_4가 노이즈 속에서도 골라냄),
-#       무작위 40프레임 중 4개가 우연히 shape_ok를 통과하는 오탐 발생(4/40, 약 10%) —
-#       ROI가 넓을수록 원이 더 많이 잡히고 pick_best_4()가 "적당히 나란한 4개"를 실제
-#       신호등이 아닌 조합에서도 찾아버릴 수 있다.
-#     - 지금 값(262x110px, 중간): frame_000055 성공, 무작위 40프레임 오탐 1/40 — 이 정도가
-#       "너무 타이트하지도, 오탐이 늘지도 않는" 절충점으로 판단.
-#   주의: 프레임 한 장 기준이라 다른 거리/각도(S0 vs S2)에서는 또 안 맞을 수 있다 —
-#   실차에서 DEBUG_VIZ_SIGNAL/DEBUG_LOG_SIGNAL 켜고 재확인 필요.
-SIG4_ROI_T, SIG4_ROI_B = 0.07, 0.30
-SIG4_ROI_L, SIG4_ROI_R = 0.18, 0.50  # R을 0.58→0.50으로 축소: 그 우측 벽 패널 이음새가 원으로 오검출되던 걸 제외(2026-08-13)
-SIG4_MIN_RADIUS, SIG4_MAX_RADIUS = 9, 26
-# [2026-08-18, §1.7] Hough Circle 민감도. param1=Canny 상단 임계값(엣지), param2=원 판정
-# 누적투표 임계값(낮을수록 느슨 → 더 많이/더 쉽게 원으로 인정). 원래 find_circles() 안에
-# 하드코딩돼 있던 걸 재현율 튜닝용으로 config.py로 옮김.
-# [시도 후 폐기] §1.4~§1.6의 3중 안전장치(등간격검사+Hue밴드/균질성+aspect)가 하류에서
-# 오탐을 걸러줄 테니 이 값을 낮춰도 예전만큼 위험하지 않을 거라는 가설로 20→15 테스트했다.
-# lap_001 20~89 재검증 결과 성공이 5→34로 늘었지만 signal_offline_check.py --save-viz로
-# 확인해보니 새로 잡힌 프레임(27/74/84 등) 전부 천장 조명 텍스처가 만든 가짜 원이었다 — 게다가
-# 원래 잘 잡히던 frame_056/057까지 원이 너무 많이 잡혀(circle_count=13>10, too noisy) 오히려
-# 실패로 바뀌었다. **가설이 틀렸음**: §1.4~§1.6 필터는 "보드 블롭/원 배치" 단위로 작동해서,
-# 같은(진짜) 크롭 안에서 천장조명이 만드는 노이즈 원과 진짜 램프 원을 구분하지 못한다 —
-# 그 필터들이 막는 건 "완전히 다른 물체를 board로 잘못 고르는 것"이지 "진짜 board 안에서
-# Hough가 과민해지는 것"이 아니었다. 20으로 되돌림.
-SIG4_HOUGH_PARAM1, SIG4_HOUGH_PARAM2 = 40, 20
-# [2026-08-18, §1.8, 시도 후 폐기] Hough 입력 전 언샤프 마스킹(unsharp mask) —
-# blur - amount*GaussianBlur(blur, sigma) 형태의 표준 언샤프 마스킹으로 모션블러를 완화해
-# 재현율을 올려보려던 시도(§1.7의 param2 완화가 실패한 뒤 대안으로 시도). lap_001 20~89
-# 재검증 결과 성공 5→14로 늘었지만, `--save-viz`로 새 성공 프레임(65/73/76/81/85/34/60/62/63)을
-# 확인하니 전부 §1.7과 동일한 천장 조명 텍스처 오탐이었다 — 심지어 §1.3에서 등간격검사로 이미
-# 막아뒀던 frame_062까지 다시 통과해버렸다(샤프닝이 그 조명 텍스처의 엣지를 더 뚜렷하게 만들어
-# Hough가 더 쉽게 원으로 오인식). 게다가 frame_053은 오히려 회귀(원 형태가 미세하게 달라져
-# no_valid_4subset)했다. **§1.7과 같은 결론**: 진짜 신호(모션블러로 흐려짐)와 조명 텍스처
-# 노이즈를 이미지 선명도만으로는 못 가른다 — 선명하게 만들면 노이즈도 같이 선명해진다.
-# 기본값 비활성화로 되돌림. 코드/스위치 자체는 A/B 실험용으로 남겨둠(SIG4_CIRCLE_ENGINE과
-# 같은 관례).
-SIG4_UNSHARP_ENABLE = False
-SIG4_UNSHARP_AMOUNT = 1.0
-SIG4_UNSHARP_SIGMA  = 3.0
-SIG4_BRIGHT_MARGIN  = 15
-SIG4_MAX_CANDIDATES = 10  # 원이 이보다 많이 잡히면 조합 탐색 없이 바로 실패 처리(ROI 자체가 노이즈로 판단)
-# [2026-08-18] 등간격 검사 — 실제 4구 신호등은 4개 램프가 물리적으로 동일 간격이므로, 인접
-# 원 사이 간격(x축, 좌→우 3구간) 3개가 서로 크게 다르면 진짜 신호등이 아닐 가능성이 높다.
-# 기존 shape_ok()는 "각 간격이 최소값(SIG4_MIN_DIST) 이상"만 봤지 "간격끼리 비슷한지"는
-# 안 봐서, 다른 물체(천장조명/차량 후미등 등)가 하나 섞여도 개별 간격 조건만 맞으면 통과하는
-# 구멍이 있었다 — lap_001 실측(간격 최대/최소 비율)으로 확인: 정탐(frame_53/55/56/57)은
-# 1.13~1.64인데, 이미 알고 있던 오염/오탐(frame_52/62, Hough+박스 기준)은 2.22~2.64로
-# 뚜렷이 갈렸다. 그 경계에서 여유를 두고 아래 값으로 확정(가장 나쁜 정탐 1.64 < 이 값 <
-# 가장 좋은 오탐 2.22).
-SIG4_GAP_UNIFORMITY_MAX_RATIO = 2.0
-
-# [2026-08-18, §1.9, 시도 후 폐기] 원(circle) 단위 채도(S) 상한 — RAW(사용자 제공, 신호등
-# rig가 카메라 바로 앞에서 설치되는 근접 캡처, lap_001보다 모션블러 훨씬 적음) 실측으로 발견.
-# RAW에서 천장 조명 오탐 원(56개 표본, S 17~96)과 진짜 램프 원(24개 표본, 대부분 S 2~34)을
-# 비교해 40으로 설정해봤는데, **같은 검사를 lap_001의 진짜 램프 원에 적용하니 오히려 진짜를
-# 다 걸러버렸다** — lap_001은 조명/거리/카메라가 달라 진짜 램프 원의 채도가 최대 64까지
-# 올라간다(frame_52:최대36 53:최대64 55:최대53 56:최대55). lap_001 20~89 재검증 결과 성공이
-# 5→1로 급락(52만 남고 53/55/56/57 전부 실패)해서 즉시 폐기. **교훈: 채도 절대값은 캡처마다
-# (조명/노출/거리) 크게 달라져서 한 데이터셋에서 뽑은 임계값이 다른 데이터셋에 그대로 안
-# 옮겨간다** — §1.7/§1.8(모션블러)과는 다른 이유지만 결론은 비슷하다: 이 원 단위 채도 하나로는
-# "이 크롭 고유의 색 특성"과 "진짜 vs 가짜"를 구분 못 한다. None(비활성화)으로 되돌림 — 코드/
-# 스위치는 남겨둠(다른 실험용 스위치와 같은 관례). 시도해볼 만한 다음 방향: 절대 채도값 대신
-# "같은 크롭 안 다른 원들 대비 상대적으로 채도가 튀는 원만" 배제하는 상대적 기준.
-SIG4_CIRCLE_SAT_MAX = None
-
-# [2026-08-18, §1.10] 고정폴백(SIG4_ROI_*) 크롭 안에서 배경판 후보 마스크(_board_candidates()와
-# 동일 기준)의 가장 큰 연결 블롭이 크롭 면적에서 차지하는 비율 상한. §1.9까지 원(circle) 단위
-# 특징(위치/채도/엣지)은 전부 lap_001↔RAW(사용자 제공, 신호등 rig 근접 캡처) 사이에서 안
-# 옮겨갔지만, 이 "블롭 점유율"은 두 데이터셋 모두에서 진짜와 안 겹쳤다:
-#   진짜(lap_001 frame_057/958, 고정폴백으로 실제 신호등이 잡힌 경우) — 7.5%, 12.2%
-#   가짜(RAW frame_018/033/050/070/085/100/108/111, 고정폴백이 전부 천장 형광등을 찍은 경우)
-#     — 13.2%~38.5%, 8건 전부 진짜의 최댓값(12.2%)보다 큼
-# 그 사이(12.2%~13.2%)에 여유를 조금 더 두고 15%로 설정. 고정폴백은 원래 auto 후보와 달리
-# _board_candidates()의 마스크/컨투어 검사를 전혀 안 거치고 무조건 시도됐는데
-# (detail: perception/traffic_signal.py detect_s2()), 이제 이 검사를 통과해야만 안전망으로
-# 쓰인다 — 통과 못 하면(예: 천장이 크롭 대부분을 채운 경우) 안전망 자체를 포기하고 그 프레임은
-# 정직하게 실패 처리한다(회피가 아니라 "모른다"를 택하는 쪽).
-SIG4_FALLBACK_MAX_BOARD_FRAC = 0.15
-
-# ── 신호등 자동 크롭(흰 배경판 탐색) — [2026-08-18, lap_001 랩 캡처로 실측/재튜닝] ──
-#   위 SIG4_ROI_*는 실차 랩 캡처 한 장(frame_000055) 기준 고정 크롭이라 정지 위치/거리가
-#   달라지면 다시 안 맞을 수 있다는 한계가 있었다(위 주석 참고). 실물 신호등 사진(2026-08-18
-#   공유)을 보면 이 rig는 상용 신호등(어두운 박스)과 반대로 "흰 배경판 + 검은 테두리 원통
-#   램프 4개" 구조라, 어두운 영역이 아니라 밝은(흰) 사각형을 먼저 찾는 쪽이 이 rig 생김새에
-#   맞는다.
-#   [1차 시도, 폐기] 그레이스케일 밝기 하나(예: V>=120)만으로 후보를 찾으면 lap_001에서
-#   후보가 거의 항상 0개였다 — 신호등이 카메라 바로 위 천장 거치대에 달려있고 이 구간 전부
-#   모션블러가 심해, 배경판(V~160)과 천장 형광등(블러로 번져 최대 255)이 하나의 거대한
-#   연결성분(실측 87518px)으로 뭉개졌기 때문. 밝기 구간을 90~230 사이 여러 조합으로 좁혀도
-#   6~9만px대 단일 블롭으로 그대로 뭉쳤다.
-#   [2차 시도, 채택] 채도(S)를 낮게 제한하는 HSV 밴드로 바꾸니 분리가 됐다 — 배경판은
-#   무채색에 가까운 회백색(S 낮음)인 반면 천장 형광등 주변 번짐은 실측상 채도가 더 들쭉날쭉
-#   해서, `S<=30 & V=[120,220]`(+MORPH_OPEN으로 가느다란 형광등 반사 줄무늬 제거)로 두면
-#   병합 블롭 크기가 다시 병합되지 않는 수준(최대 5000px대)까지 줄었다. 이 조합으로 lap_001
-#   frame_000052/053(기존 고정 크롭으로는 원이 4개 안 잡혀 실패하던 프레임)까지 자동후보로
-#   추가 인식 성공을 확인 — 단, frame_000062는 천장 조명만 있는 영역을 오검출로 잘못
-#   골라 원 4개 패턴검사까지 우연히 통과한 사례가 1건 나왔다(6번 성공 중 1번, ~17%). 실제
-#   주행에서는 `SIG_CONFIRM_FRAMES`(3연속 확정, track_drive.py perc_signal()) 디바운스가
-#   이런 단발 오탐을 걸러줄 것으로 기대하지만 아직 실차/연속프레임으로 확인은 안 했다.
-#   재현율보다 정밀도 쪽으로 촘촘하게(S/면적 범위를 좁게) 잡은 이유이기도 하다 — 더 넓히면
-#   더 많은 프레임을 잡겠지만 오탐도 같이 늘어난다(느슨한 조합으로는 손이 카메라를 가린
-#   frame_000020도 "성공"으로 잘못 판정되는 걸 확인함).
-#   진짜 신호등인지는 결국 아래 find_circles/shape_ok/pick_best_4(그대로 재사용)가 "원 4개가
-#   정말 나란히 있는가"로 최종 판정한다 — 색상만으로 확정하지 않는 게 이 설계의 핵심. 후보가
-#   전부 실패하면 위 SIG4_ROI_*(고정 크롭)로 마지막에 한 번 더 시도해 항상 안전망이 있다
-#   (perception/traffic_signal.py detect_s2()).
-SIG4_AUTOCROP_ENABLE = True    # False면 기존 SIG4_ROI_* 고정 크롭만 사용(도입 전 동작으로 복귀)
-SIG4_SEARCH_ROI_T, SIG4_SEARCH_ROI_B = 0.0, 0.50  # 후보 탐색 범위(세로 비율) — 바닥 차선/라바콘 배제
-SIG4_SEARCH_ROI_L, SIG4_SEARCH_ROI_R = 0.0, 1.00  # 후보 탐색 범위(가로 비율) — 전체 폭
-SIG4_BOARD_SAT_MAX = 30    # 이 채도(S) 이하만 "무채색(흰 배경판)" 후보로 포함 — 실측 재튜닝
-SIG4_BOARD_V_MIN, SIG4_BOARD_V_MAX = 120, 220  # 명도(V) 밴드 — 하한으로 어두운 배경 배제,
-    #   상한으로 완전히 blown-out된 천장 형광등 중심부를 배제(실측 재튜닝)
-# [2026-08-18] Hue(H) 밴드 추가 — 그동안 S/V만 쓰고 H는 0~179(무제한)였다. lap_001에서
-# _board_candidates()가 고른 후보 블롭의 픽셀별 Hue 히스토그램을 실측해보니(offline 분석,
-# signal_offline_check.py로 재현 가능) 진짜 배경판 픽셀(frame_052 채택 후보/frame_055 채택
-# 후보 둘 다)은 H가 80~110대에 뚜렷하게 몰려 있는 반면, 예전에 오탐이었던 frame_062의 큰
-# 병합 블롭(§1.1 표의 "자동후보로 성공(오탐)" 케이스, 지금은 등간격검사로 걸러짐)은 H가
-# 0~10/30~70/160~170까지 훨씬 넓게 퍼져 있었다 — 배경판은 무채색 단일 광원(형광등)이 만든
-# 좁은 카메라 화이트밸런스 편향 하나로 수렴하는데, 오염된 블롭은 서로 다른 색의 사물(바닥
-# 반사, 다른 조명 등)이 섞여 색상이 들쭉날쭉하다는 뜻으로 해석. 정상 프레임(052/055)에서는
-# H<20/H>160 픽셀이 각각 1% 미만이라 이 범위를 배제해도 손실이 거의 없다 — 여유를 두고
-# 20~160으로 설정. 단일 원인 픽셀 임계값으로 병합을 완전히 못 끊는다는 건 이미 §S/V 튜닝과
-# CLAUDE.md의 "da 병합은 임계값 하나로 안 풀린다" 기록과 같은 맥락이라, 이 값 하나로 frame_052
-# 잔여 오염(§1.3, 등간격검사로도 못 잡음)까지 해결될 거라 기대하진 않음 — 재검증 필요.
-SIG4_BOARD_HUE_MIN, SIG4_BOARD_HUE_MAX = 20, 160
-# [2026-08-18, 시도 후 폐기] 히스토그램 코어(80~110대, chosen 후보들 평균±3표준편차 근사)에
-# 맞춰 40~140까지 좁혀봤다 — lap_001 20~89 재검증 결과 총 성공은 5→6으로 늘었지만, 새로 잡힌
-# frame_035가 signal_offline_check.py --save-viz로 크롭을 직접 확인해보니 신호등이 아니라
-# 벽/장비 모서리를 잘못 크롭한 명백한 오탐(STATE:RED로 오판)이었다 — 범위를 좁히면서 마스크가
-# 다르게 쪼개져 우연히 엉뚱한 벽 영역이 원 4개 패턴검사까지 통과해버린 경우. "총 성공 개수가
-# 늘었다"는 지표만으론 안전을 보장 못 한다는 교훈 — 반드시 각 신규 성공 프레임을 시각 확인해야
-# 함. 20~160으로 되돌림.
-# [2026-08-18 2차] 블롭(컨투어) 단위 Hue 표준편차 상한 — "블롭 안 색상이 얼마나 균질한가"로
-# 오염을 거른다. 위 SIG4_BOARD_MAX_AREA_PX 3500 축소 시도(바로 아래 주석)가 면적/위치로는
-# 오염 여부를 못 갈랐던 것과 대조적으로, lap_001 chosen 후보의 Hue 표준편차(픽셀 단위, 컨투어
-# 내부 mask 통과 픽셀만 대상)는 뚜렷이 갈렸다:
-#   정상(전부 실제로 채택돼 판정에 쓰인 배경판) — frame_052:16.9  frame_053:17.2
-#     frame_055:16.5  frame_056:19.8  (최댓값 19.8)
-#   오염(예전 오탐 frame_062, 이제는 Hue 밴드로 블롭이 둘로 쪼개진 뒤에도) — 25.5, 30.1
-#     (최솟값 25.5)
-# 19.8과 25.5 사이에 여유를 두고 22.0으로 설정. signal_offline_check.py로 재현 가능
-# (_board_candidates() 후보 블롭 픽셀에 대해 hsv[...,0].std() 계산).
-SIG4_BOARD_HUE_STD_MAX = 22.0
-SIG4_BOARD_MIN_AREA_PX = 800     # 후보 사각형 최소 면적(px, 탐색범위 해상도 기준) — 노이즈 제거
-SIG4_BOARD_MAX_AREA_PX = 15000   # 후보 사각형 최대 면적(px) — 실측 재튜닝(60000→15000, 병합 방지)
-    # [2026-08-18, 시도 후 폐기] frame_052/053 잔여 오염(§1.4) 대응으로 3500까지 좁혀봤다 —
-    #   Hue 밴드 적용 후 frame_052 chosen 후보 area=3844, frame_053 chosen 후보 area=3702라
-    #   3500이면 둘 다 걸러질 걸로 기대했지만, signal_offline_check.py로 lap_001 20~89 재검증한
-    #   결과 두 프레임 다 다음 후보/고정폴백까지 전부 실패로 악화됐다(대체할 더 작고 깨끗한 후보가
-    #   애초에 없었음) — 게다가 진짜 깨끗한 frame_056의 chosen 후보 area가 4673으로 52/53의
-    #   "오염된" 후보보다 오히려 더 커서, 상한을 좁히면 56도 같이 걸려 자동크롭을 잃었다(고정폴백이
-    #   있어 검출 자체는 유지됨). 즉 **이 데이터셋에서는 면적 크기가 오염 여부와 상관관계가
-    #   없다** — 70프레임 성공 합계가 5(52,53,55,56,57)→3(55,56,57)으로 순손실만 나서 15000으로
-    #   되돌림. bbox y좌표(탐색범위 상단에 닿는지)도 확인해봤지만 52/53의 오염 후보(y=78/80)와
-    #   56의 깨끗한 후보(y=0)가 뒤바뀐 패턴이라 이것도 판별 기준이 못 된다 — 다음 시도는 면적/
-    #   위치 같은 기하 정보보다 §1.4에서 다룬 색상(Hue) 쪽을 더 정교화하는 방향이 유망해 보임.
-SIG4_BOARD_MIN_ASPECT  = 2.0     # 후보 가로/세로 비율 하한(가로로 넓은 사각형만) — 실측 재튜닝
-# [2026-08-18, §1.6] lap_001 전체(2262프레임) 오탐 스윕 중 frame_1540~1542에서 사람이 문가에
-# 서있는 모습이 3프레임 연속 LEFT로 확정(`SIG_CONFIRM_FRAMES`=3 디바운스 통과)되는 걸 발견 —
-# 그 chosen 후보의 raw aspect가 1.39~1.45로, 기존 하한 1.3을 가까스로 통과하고 있었다. 반면
-# 이 시점까지 확인된 모든 진짜 배경판 chosen 후보(52:2.58 53:2.97 55:2.30 56:2.12)는 전부
-# 2.12 이상 — 그 사이(1.45와 2.12)에 여유를 두고 2.0으로 올렸다. 처음엔 "프레임 간 위치가
-# 안정적인가"로 걸러보려 했으나 실측해보니 정반대였다(진짜는 차량이 다가가며 원근이 바뀌어
-# 프레임당 30px+ 이동하는데, 가만히 서있는 사람 오탐은 3px 미만으로 더 안정적이었음) — 그래서
-# 프레임 간 비교 대신 이 "한 프레임만 봐도 되는" 형태 조건으로 전환.
-SIG4_BOARD_MAX_ASPECT  = 6.0     # 후보 가로/세로 비율 상한
-SIG4_BOARD_MAX_CANDIDATES = 6    # 이 개수까지만 원 패턴검사를 시도(면적 작은 순 — 보드에 더
-    #   타이트하게 맞는 후보부터, 연산량 상한)
-SIG4_BOARD_CROP_MARGIN = 0.35    # 후보 박스에 이 비율만큼 여유를 더해 크롭(원이 경계에 안 걸리게)
-
-# ── 신호등 배경판 위치 탐지 — YOLO 하이브리드 (perception/yolo_signal.py) ──
-# [2026-08-19] 위 SIG4_BOARD_*(HSV 임계값 기반 자동크롭)가 반복적으로 오탐/미탐을 겪는 자리
-# (천장 형광등/벽 TV가 배경판처럼 잡힘, §1.4~§1.10대 시행착오)를 YOLO 객체탐지로 대체하려는
-# 하이브리드 시도. 점등 색상 판정(find_circles/shape_ok/pick_best_4)은 그대로 두고, "배경판이
-# 어디 있는지"만 이걸로 찾는다 — yolo_signal_detection_plan.md 참고.
-# ★주의★ yolo_ros/signal_board_best_n.onnx는 datasets/yolo_signal_pilot(긍정 8+부정 7=15장,
-# 스모크테스트 전용, 조명/배경 다양성 없음) 기준 학습본이면 기본값은 False로 둘 것. 실데이터
-# (다른 세션 여러 번)로 재학습한 모델로 교체 전까지 켜면 이 파일럿 환경에만 과적합된 채로
-# 실차에 올라간다 — 지금 yolo_ros/에 있는 파일이 파일럿용인지 본학습용인지 확인 후 켤 것.
-# [2026-08-19] 위 경고(파일럿 15장 학습본이면 끄기)에도 불구하고 "YOLO+HSV_신호등" 디버그
-# 창에서 실제 YOLO 배경판탐지가 반영된 결과를 보려고 테스트용으로 켬 — 실전 주행/최종
-# 판단에 이 결과를 쓰기 전에는 재학습된 모델로 교체 여부를 다시 확인할 것.
-# [2026-08-20] 배경판+색상상태 YOLO 동시 테스트를 위해서도 켠 상태 유지 — 위 경고대로 지금
-#   yolo_ros/의 signal_board_best_n.onnx가 파일럿(스모크테스트)용인지 본학습본인지 확인 후
-#   사용할 것.
-YOLO_SIGNAL_ENABLE = True
-YOLO_SIGNAL_INPUT_SIZE = 640     # export 시 imgsz와 반드시 일치시킬 것 (train_pilot.md 참고)
-YOLO_SIGNAL_CONF_THRESHOLD = 0.5 # 이 신뢰도 이상인 검출만 board 후보로 인정
-YOLO_SIGNAL_MODEL_PATH = None    # None이면 yolo_ros/signal_board_best_n.onnx(형제 디렉터리) 자동탐색
-YOLO_SIGNAL_MAX_CANDIDATES = 3   # 신뢰도 상위 몇 개까지 detect_s2()의 board 후보로 넘길지
-YOLO_SIGNAL_CROP_MARGIN = 0.35   # bbox에 이 비율만큼 여유를 더해 크롭(SIG4_BOARD_CROP_MARGIN과
-                                  #   동일한 이유 — 원이 bbox 경계에 안 걸리게)
-
-# ── 신호등 원 탐색 엔진 — Hough Circle vs FRST(Fast Radial Symmetry Transform) ──
-#   [2026-08-18] 위 SIG4_BOARD_*(흰 배경판 후보 크롭) 자체는 그대로 두고, 그 크롭 "안에서"
-#   4개 원을 찾는 엔진만 교체할 수 있게 A/B 스위치로 만들었다(이 저장소 관례 —
-#   LANE_DETECTOR_BACKEND/DL_LL_ALGO와 동일 패턴). FRST(Loy & Zelinsky 2002 — 그래디언트
-#   방향이 점 주위로 얼마나 방사대칭인지에 투표하는 방식, 뚜렷한 엣지가 없어도 반응함)가
-#   Hough보다 나은 사례를 실측으로 확인했다(frame_000052 — Hough는 크롭 안에서 천장조명과
-#   진짜 램프가 섞인 4개 조합을 통과시켰는데 FRST는 섞임 없이 정확했음).
-#
-#   **다만 아직 기본값은 'hough'다 — 왜 FRST를 기본으로 못 올렸는지:** 처음엔 후보 크롭마다
-#   FRST를 매번 새로 돌렸는데, find_peaks() 임계값(SIG4_FRST_REL_THRESHOLD)이 "그 크롭 자체의
-#   최댓값" 대비 상대값이라 크롭이 작을수록 진짜 램프가 없어도 통과하는 버그가 있었다
-#   (lap_001 70프레임 중 44개가 "성공"으로 나옴, 대부분 오탐 — 실측으로 발견). "탐색범위
-#   전체에서 한 번만 계산 후 박스별로 필터링"하도록 고쳐서(find_circles_frst()/
-#   _frst_band_peaks() 참고) 버그 자체는 해결됐지만, 고친 뒤 재측정하니 이번엔 반대로
-#   **재현율이 확 떨어졌다**(70프레임 중 성공 4개뿐) — 게다가 그 4개 중에서도 육안 확인
-#   결과 진짜 신호등인 건 1개(frame_000055)뿐이고 나머지 3개(047/048/071)는 여전히 천장
-#   조명·차량 후미등이 4자리 중 한 자리에 섞여 들어간 부분오탐이었다. 즉 같은 데이터
-#   기준으로 Hough+박스 조합(정탐 4개: 053/055/056/057, 오염 1개, 오탐 1개)이 지금의
-#   FRST+박스보다 여전히 실측상 더 나아서, 기본값은 'hough'로 유지한다.
-#   FRST 구현/버그수정 자체는 남겨둔다 — 반지름 스텝/임계값 재튜닝이나(둘 다 초벌 추정치)
-#   §"결합 아이디어"에서 논의된 "두 엔진 교차검증(둘 다 동의할 때만 확정)" 같은 다른 결합
-#   방식엔 여전히 쓸모가 있을 수 있다.
-SIG4_CIRCLE_ENGINE = 'hough'   # 'hough'(기본, 실측상 더 정확) 또는 'frst' — find_circles*()
-SIG4_FRST_RADIUS_STEP  = 4    # SIG4_MIN_RADIUS~MAX_RADIUS 사이 이 간격으로 스케일(반지름) 샘플링
-SIG4_FRST_ALPHA        = 2.0  # 방사대칭 엄격도(원 논문 기본값) — 클수록 더 "완벽히 대칭"인 점만 남음
-SIG4_FRST_STD_FACTOR   = 0.25 # 결과 평활화용 가우시안 블러의 표준편차 배율(원 논문 기본값)
-SIG4_FRST_REL_THRESHOLD = 0.45  # 이 프레임 최댓값 대비 이 비율 이상인 피크만 후보로 채택(실측 재튜닝
-    #   — 0.15처럼 낮으면 후보가 항상 상한(SIG4_MAX_CANDIDATES)까지 꽉 차서 노이즈까지 다 들어옴)
-SIG4_FRST_PEAK_MIN_DIST = 15  # 피크 간 최소 픽셀거리(NMS) — 이보다 가까운 피크는 더 강한 것만 남김
 
 # ── 정지선(perception/perc_floor.py check_stopline(), 백엔드 무관 항상 사용) ──
 STOPLINE_WHITE_LOW = 180        # 그레이스케일 흰색 임계

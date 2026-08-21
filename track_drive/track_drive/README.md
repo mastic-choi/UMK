@@ -1157,6 +1157,51 @@ OR 차량 YOLO 중 어느 쪽이 봤는가"로 정하도록 바꿨는데, 이 ga
 막 True가 되는 순간 콘→차량으로 전환되는데, 그 직전 틱까지의 "콘이 보임" 잔상이 한두
 틱 안에 차량 검출값으로 안 덮이는 구간이 있을 수 있다.
 
+### 1.18 HSV/Hough Circle 기반 신호등 인식 삭제 — YOLO 단독(`yolo_signal_state.py`)만 남김 (2026-08-21)
+
+**배경:** §1.16에서 실제 주행 판단 소스는 이미 YOLO 단독 모델로 전환됐지만
+(`SIGNAL_USE_YOLO_STATE_FOR_DECISION=True`), 옛 HSV/Hough Circle 경로
+(`perception/traffic_signal.py`의 `SignalDetector.detect_s2()`, `perception/frst.py`의
+FRST 원 탐색 엔진)와 배경판 위치 전용 YOLO 하이브리드(`perception/yolo_signal.py`)는
+"플래그 하나로 언제든 되돌릴 수 있게" 코드로 남아 있었다. 요청으로 이 폴백 경로 자체를
+완전히 삭제하고, 신호등 인식을 YOLO 단독 하나로 정리했다.
+
+**삭제:**
+- `perception/traffic_signal.py`(`SignalDetector`, HSV 자동크롭 `_board_candidates()`/
+  Hough Circle `find_circles()`/배치검사 `shape_ok()`/`pick_best_4()` 전부 포함, §1.1~§1.15의
+  튜닝 이력이 담겨있던 파일)
+- `perception/frst.py`(FRST 원 탐색 엔진, §1.2)
+- `perception/yolo_signal.py`(배경판 위치 전용 YOLO 하이브리드, §1.16 이전 경로)
+- `signal_offline_check.py`(위 `SignalDetector.detect_s2()`를 랩 캡처로 오프라인 재검증하던
+  도구, §1.4 — 대상 코드가 없어져 같이 삭제)
+
+**config.py:** `SIG4_*`(약 30개, ROI/Hough 파라미터/HSV 배경판 임계값/FRST 파라미터),
+`YOLO_SIGNAL_ENABLE`/`YOLO_SIGNAL_INPUT_SIZE`/`YOLO_SIGNAL_CONF_THRESHOLD`/
+`YOLO_SIGNAL_MODEL_PATH`/`YOLO_SIGNAL_MAX_CANDIDATES`/`YOLO_SIGNAL_CROP_MARGIN`(배경판 위치
+전용 YOLO), `SIGNAL_USE_YOLO_STATE_FOR_DECISION`(판단 소스 스위치 — 이제 스위치가 아니라
+유일한 경로라 삭제), `DEBUG_VIZ_SIGNAL`/`DEBUG_VIZ_SIGNAL_DETAIL`/`DEBUG_LOG_SIGNAL`(HSV/Hough
+경로 전용 디버그 창·로그), `DEBUG_VIZ_YOLO_SIGNAL`(배경판 위치 YOLO 디버그 창)을 전부
+제거했다. `YOLO_SIGNAL_STATE_*`(위치+색상 동시 예측 YOLO 설정)와
+`DEBUG_VIZ_YOLO_SIGNAL_STATE`만 남는다.
+
+**track_drive.py:**
+- `self.signal_detector`/`self.yolo_signal_detector` 필드와 그 초기화 블록 삭제.
+  `self.yolo_signal_state_detector`만 남는다 — 초기화 실패 시(모델 파일 없음 등) 더 이상
+  안전 폴백이 없으므로, 신호등을 계속 "미검출"로만 보고한다(§1.16까지 있던 "폴백" 서술은
+  이제 유효하지 않음).
+- `self.signal_red/straight/left_on_yolo`(비교용 중간 변수) 삭제 — `perc_yolo_signal_state()`가
+  `self.signal_red/straight/left_on`을 직접 채운다.
+- `perc_signal()`은 이제 `detect_s2()` 호출 분기 없이, `perc_yolo_signal_state()`가 채워둔
+  값을 `SIG_CONFIRM_FRAMES` 디바운스만 적용해 확정값으로 승격시키는 역할만 한다.
+- `_debug_viz_signal_status()`("YOLO+HSV_신호등" 창)와 `_log_signal_debug()`(호출부가 이미
+  없어 죽어있던 코드였음) 삭제. `_print_debug()`의 `[SIG]` 요약 줄에서 `SignalDetector`
+  내부 필드(`s2_roi_px`/`s2_circle_count`/`s2_brightness`)를 찍던 부분도 같이 제거했다 —
+  신호등 상태는 `DEBUG_VIZ_YOLO_SIGNAL_STATE`(`YOLO_신호등` 창)로만 확인할 것.
+
+**알려진 한계:** 이 YOLO 모델이 커버 못 하는 조건(학습 데이터에 없는 조명/각도 등)에서
+신호등을 놓쳐도 되돌아갈 HSV/Hough 경로가 더 이상 없다 — §1.16의 "실차 미검증" 한계가
+그대로 유효하며, 이제는 유일한 경로이므로 실차 검증의 우선순위가 더 높다.
+
 ---
 
 ## 2. 라인트래킹 (차선주행, S1)

@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #=============================================
-# yolo_signal_state.py — YOLOv8n(ONNX Runtime) 기반 신호등 색상상태 검출.
+# yolo_signal_state.py — YOLOv8n(ONNX Runtime) 기반 신호등 위치+색상상태 검출.
 #
-# perception/yolo_signal.py("신호등 배경판 위치 탐지" 하이브리드, YOLO_SIGNAL_* config)와는
-# 별개 모델/별개 목적이다 — 그쪽은 배경판 "위치"만 찾아 기존 HSV 자동크롭(_board_candidates())
-# 대신 traffic_signal.py에 넘겨주고, 점등 색상 판정 자체는 여전히 classical CV
-# (circle_brightness/shape_ok/pick_best_4)가 한다. 이 모듈은 배경판 위치와 무관하게
-# "지금 어떤 색이 켜져 있는지" 자체를 단일 스테이지 YOLO로 직접 예측한다. 이름이 겹치지
-# 않게 클래스/설정 전부 *State* 접두어를 쓴다(YOLO_SIGNAL_STATE_*, config.py 참고).
+# [2026-08-21] 신호등 인식의 유일한 경로다 — 배경판 "위치"를 먼저 찾고 원 4개의 밝기로
+# 색을 판정하던 이전 HSV/Hough Circle 경로(traffic_signal.py/frst.py)와 배경판 위치
+# 전용 YOLO(yolo_signal.py)는 전부 삭제했다(README §1.18). 이 모듈은 "지금 어떤 색이
+# 켜져 있는지"를 단일 스테이지 YOLO로 직접 예측한다.
 #
 # signal_state_best_n.pt(yolo_ros/, YOLOv8n 파인튜닝, 클래스: {0: 'red',
 # 1: 'green_straight', 2: 'green_left'} — datasets/signal_state/classes.txt와 순서 동일)를
@@ -17,12 +15,9 @@
 # nms=True export라 output0=(1,N,6)=[x1,y1,x2,y2,conf,cls]에 이미 NMS가 적용돼 있어,
 # 여기서는 클래스별로 신뢰도 임계값을 넘는 것 중 최댓값만 고르면 된다.
 #
-# traffic_signal.py의 SignalDetector.detect_s2()(Hough Circle 방식)와 반환 시그니처를
-# (red_on, straight_on, left_on)로 맞췄다. track_drive.py는 이 결과를 self.signal_*_on_yolo에
-# 저장한다 — [2026-08-20] config.py SIGNAL_USE_YOLO_STATE_FOR_DECISION=True(요청 반영)면
-# perc_signal()이 이 값을 그대로 실제 주행 판단(FSM 전환) 소스로 쓴다(detect_s2()는 그 경우
-# 아예 안 돌림). False로 되돌리면 기존처럼 detect_s2() 결과만 쓰고 이 모듈 결과는
-# self.signal_*_on_yolo에만 남아 비교용으로 쓰인다(track_drive.py perc_signal() 참고).
+# track_drive.py는 detect()의 반환값(red_on, straight_on, left_on)을 self.signal_red/
+# straight/left_on에 그대로 저장하고, perc_signal()이 SIG_CONFIRM_FRAMES 연속 유지로
+# 디바운스만 적용한다(track_drive.py perc_signal()/perc_yolo_signal_state() 참고).
 #
 # dl_lane.py/yolo_cone.py와 동일하게 추론을 별도 데몬 스레드에서 자기 페이스로 돌리고,
 # detect()는 논블로킹으로 최신 결과를 반환한다. cv2.imshow()는 메인 스레드에서만 호출해야
@@ -252,10 +247,8 @@ class YoloSignalStateDetector:
 
     def detect(self, frame):
         """논블로킹: 최신 프레임을 추론 큐에 올리고, 지금까지 계산된 최신 결과를 즉시 반환.
-        출력 : (red_on, straight_on, left_on) — traffic_signal.SignalDetector.detect_s2()와
-          동일한 우선순위(좌회전 > 직진 > 빨강)로 배타 처리한다(§ config.py
-          red_lit/straight_lit/left_lit 주석과 동일한 이유 — 동시에 여러 클래스가 잡히는
-          오검출을 대비)."""
+        출력 : (red_on, straight_on, left_on) — 좌회전 > 직진 > 빨강 우선순위로 배타
+          처리한다(동시에 여러 클래스가 잡히는 오검출 대비)."""
         if frame is not None:
             with self._lock:
                 self._latest_frame = frame

@@ -40,10 +40,8 @@ from .perception.hough_lane import HoughLaneDetector
 from .perception.perc_floor import check_stopline, LaneDetector as ClassicLaneDetector
 from .perception.lane_util import CameraProcessor, SlideWindow
 from .perception.dl_lane import DLLaneDetector
-from .perception.traffic_signal import SignalDetector
 from .perception.yolo_cone import YoloConeDetector
 from .perception.yolo_vehicle import YoloVehicleDetector
-from .perception.yolo_signal import YoloSignalDetector
 from .perception.yolo_signal_state import YoloSignalStateDetector
 from .controller.obstacle_avoidance import ObstacleAvoidance, AvoidPhase
 # vehicle_overtake.py 의 구 VehicleOvertake 는 더 이상 쓰지 않는다.
@@ -141,16 +139,10 @@ class TrackDriverNode(Node):
         self._sig_straight_cnt = 0   # signal_straight_on 연속 유지 프레임 수
         self._sig_left_cnt     = 0   # signal_left_on 연속 유지 프레임 수
         # [2026-08-20] S1→S0_SIGNAL 진입 트리거를 정지선에서 "신호등 보드 자체가 인식되는
-        # 시점"으로 교체 — perc_signal()이 이제 S1_LANE_FOLLOW 중에도 detect_s2()를 돌려,
-        # 색상과 무관하게 4구 보드 자체가 잡혔는지(SignalDetector.s2_chosen_idx>=0)만 본다.
+        # 시점"으로 교체 — perc_signal()이 이제 S1_LANE_FOLLOW 중에도 YOLO 신호등 검출기를
+        # 돌려, 색상과 무관하게 색상 클래스 중 하나라도 검출됐는지(board_seen)만 본다.
         self.signal_board_confirmed = False
         self._sig_board_cnt = 0      # 보드 인식(색상 무관) 연속 유지 프레임 수
-        # [2026-08-19] YOLO 신호등 색상상태 검출(perception/yolo_signal.py) 비교용 — 위
-        # signal_*_on(Hough Circle)과 나란히 보기만 하고 아직 FSM 판단에는 안 씀(YOLO_SIGNAL_*
-        # config.py 주석 참고).
-        self.signal_red_on_yolo      = False
-        self.signal_straight_on_yolo = False
-        self.signal_left_on_yolo     = False
         self.stopline = False            # 굵은 가로 흰선(정지선/지름길 끝 단서, S3 진출·바퀴카운트용)
         self._signal_reentry_cooldown_t = 0.0  # 이 시각까지 신호등 보드 재감지(S0_SIGNAL 재진입) 무시
         self._last_stopline_t = 0.0      # [10] 정지선을 마지막으로 본 시각(교차로 근처 기동 금지용)
@@ -296,7 +288,7 @@ class TrackDriverNode(Node):
         # 초기화가 실패하면 _build_lane_detector()의 dl→hough 폴백과 달리 대체 백엔드가
         # 없으므로(카메라 이중확인 자체가 선택사항), None으로 두고 perc_lavacon_trigger()가
         # "카메라 확인 불가 시 라이다 단독 판정으로 폴백"하도록 한다 — 원인은 에러 로그로 남긴다.
-        # [2026-08-20] YOLO_SIGNAL_ENABLE과 동일 패턴으로 YOLO_CONE_ENABLE 게이트 추가(요청
+        # [2026-08-20] ENABLE_OBSTACLE_CUT과 동일 패턴으로 YOLO_CONE_ENABLE 게이트 추가(요청
         # 반영) — ENABLE_BEHAVIOR=False로 라바콘 자체를 안 쓰는 지금, 이 검출기가 매 프레임
         # 백그라운드에서 계속 도는 게 순전한 오버헤드라 꺼둔다(config.py YOLO_CONE_ENABLE
         # 주석 참고). perc_yolo_cone()은 self.yolo_cone_detector=None일 때 조용히 스킵한다.
@@ -313,7 +305,7 @@ class TrackDriverNode(Node):
         # [2026-08-20] da 근접 컷(ENABLE_OBSTACLE_CUT) 전용 YOLO 차량 검출기 — 이 저장소의
         # 다른 YOLO 검출기와 동일 패턴(초기화 실패 시 None, 라이다 단독 판정으로 폴백).
         # ENABLE_OBSTACLE_CUT=False(기본값)면 초기화 자체를 건너뛴다 — 이미 dl_lane/
-        # yolo_cone/yolo_signal 세 개가 돌고 있는 상황에서 안 쓰는 4번째 추론 스레드를
+        # yolo_cone/yolo_signal_state 세 개가 돌고 있는 상황에서 안 쓰는 4번째 추론 스레드를
         # 굳이 띄워 자원경합을 더할 이유가 없다(꺼져있을 땐 정말로 아무 영향 없게).
         self.yolo_vehicle_cut_detector = None
         if ENABLE_OBSTACLE_CUT:
@@ -324,31 +316,15 @@ class TrackDriverNode(Node):
                     f'YOLO 차량(근접컷) 검출기 초기화 실패, 근접 컷 트리거는 라이다 단독 판정으로 폴백합니다: {e}'
                 )
 
-        # [2026-08-19, 파일럿] 신호등 배경판 위치 탐지용 YOLO — YOLO_SIGNAL_ENABLE=False가
-        # 기본값이라(datasets/yolo_signal_pilot 스모크테스트 데이터뿐, 실데이터 재학습 전)
-        # 평소엔 이 블록이 아예 안 돈다. 켜져 있는데 모델 파일이 없으면 위 콘 검출기와 동일한
-        # 패턴으로 None 폴백 — SignalDetector가 yolo_detector=None이면 기존 HSV 자동크롭으로
-        # 자동 복귀하므로(traffic_signal.py 참고) 안전하다.
-        self.yolo_signal_detector = None
-        if YOLO_SIGNAL_ENABLE:
-            try:
-                self.yolo_signal_detector = YoloSignalDetector(logger=self.get_logger())
-            except Exception as e:
-                self.get_logger().error(
-                    f'YOLO 신호등 검출기 초기화 실패, 배경판 탐색은 기존 HSV 자동크롭으로 폴백합니다: {e}'
-                )
-                self.yolo_signal_detector = None
-        self.signal_detector = SignalDetector(yolo_detector=self.yolo_signal_detector)  # 신호등(3구/4구) 인식기
-
-        # 신호등 색상상태 YOLO 검출기(위 배경판 위치 탐지용과는 별개 모델/역할 —
-        # perception/yolo_signal_state.py 헤더 주석 참고). [2026-08-20] SIGNAL_USE_YOLO_STATE_
-        # FOR_DECISION=True(config.py)면 이 검출기 결과가 perc_signal()의 실제 주행 판단 소스가
-        # 된다 — 초기화 실패 시 폴백 없이 None으로 두면 perc_signal()이 그 경우 자동으로 기존
-        # Hough Circle 경로로 안전 폴백한다(SIGNAL_USE_YOLO_STATE_FOR_DECISION 값과 무관하게).
+        # [2026-08-21] 신호등 인식은 이 YOLO 단독 모델(위치+색상상태를 한 스테이지로 동시
+        # 예측) 하나뿐이다 — 예전에 있던 HSV/Hough Circle 기반 검출(traffic_signal.py/
+        # frst.py) 및 배경판 위치 전용 YOLO(yolo_signal.py)는 삭제했다(README §1.18). 초기화
+        # 실패 시(모델 파일 없음 등) 폴백 없이 None으로 두면 perc_signal()이 신호등을 계속
+        # "미검출"로만 보고한다 — 다른 YOLO 검출기와 달리 이 모델이 없으면 대체 경로가 없다.
         try:
             self.yolo_signal_state_detector = YoloSignalStateDetector(logger=self.get_logger())
         except Exception as e:
-            self.get_logger().error(f'YOLO 신호등 색상상태 검출기 초기화 실패, 기존 Hough Circle 경로로 폴백합니다: {e}')
+            self.get_logger().error(f'YOLO 신호등 검출기 초기화 실패, 신호등을 인식할 수 없습니다: {e}')
             self.yolo_signal_state_detector = None
 
         # ── 판단/제어 상태 ──
@@ -628,13 +604,13 @@ class TrackDriverNode(Node):
                                  #   DL 백엔드로 넘긴다(set_avoid_hold()와 동일한 1틱 지연 허용, 아래 참고)
         yolo_stage = self._active_yolo_stage()
 
-        # [2026-08-20] perc_signal()이 SIGNAL_USE_YOLO_STATE_FOR_DECISION=True일 때 이 결과
-        #   (self.signal_*_on_yolo)를 판단 소스로 그대로 쓰므로, 같은 틱의 최신값을 넘겨주려면
-        #   perc_signal()보다 먼저 돌아야 한다(1틱 지연을 추가로 만들지 않기 위함).
+        # [2026-08-21] perc_signal()이 이 결과(self.signal_red/straight/left_on)를 그대로
+        #   디바운스(확정) 처리하므로, 같은 틱의 최신값을 넘겨주려면 perc_signal()보다 먼저
+        #   돌아야 한다(1틱 지연을 추가로 만들지 않기 위함).
         if yolo_stage == 'signal':
-            self.perc_yolo_signal_state() # 비전 (YOLO, 신호등 색상상태 단독 예측)
+            self.perc_yolo_signal_state() # 비전 (YOLO, 신호등 위치+색상상태 동시 예측)
         else:
-            self.signal_red_on_yolo = self.signal_straight_on_yolo = self.signal_left_on_yolo = False
+            self.signal_red_on = self.signal_straight_on = self.signal_left_on = False
         self.perc_signal()      # 비전
         self.perc_obstacle()    # 라이다
         self._update_avoid_hold()  # 라이다(위 obstacle_front/dist 기반) — perc_obstacle() 직후여야 함
@@ -689,22 +665,18 @@ class TrackDriverNode(Node):
         # [2026-08-20] 여기서 별도 창으로 안 띄운다 — _debug_viz_obstacle_cut()이
         # get_latest_debug_frame()으로 이 프레임을 가져다 라이다 ROI 패널과 한 창에 합쳐 그린다.
 
-    # [2-4b] 신호등 색상상태 YOLO
-    #   입력 self.img_front → 출력 self.signal_*_on_yolo
+    # [2-4b] 신호등 위치+색상상태 YOLO
+    #   입력 self.img_front → 출력 self.signal_red/straight/left_on
     #   yolo_signal_state.py가 별도 스레드에서 자기 페이스로 추론하므로 여기선 논블로킹으로
-    #   최신 결과만 받아온다(perc_yolo_cone()과 동일한 패턴). perc_signal()과 달리 상태 무관하게
-    #   (S3/S4 포함) 항상 돌린다 — 실차 영상 전체 구간에서 이 모델이 얼마나 오탐하는지도
-    #   같이 보고 싶어서(정상 주행 중 신호등 아닌 걸 신호로 잘못 잡는지 확인 목적).
-    #   [2026-08-20] SIGNAL_USE_YOLO_STATE_FOR_DECISION=True(config.py, 요청 반영)면 여기서
-    #   갱신하는 self.signal_*_on_yolo가 perc_signal()의 실제 주행 판단 소스로 그대로 쓰인다 —
-    #   perceive_all()에서 이 함수가 perc_signal()보다 먼저 돌도록 순서를 맞춰뒀다.
+    #   최신 결과만 받아온다(perc_yolo_cone()과 동일한 패턴). perceive_all()이 _active_yolo_stage()
+    #   로 'signal' 단계일 때만 이 함수를 호출한다 — perc_signal()보다 먼저 돌도록 순서를 맞춰뒀다.
     def perc_yolo_signal_state(self):
         if self.yolo_signal_state_detector is None:
-            self.signal_red_on_yolo = self.signal_straight_on_yolo = self.signal_left_on_yolo = False
+            self.signal_red_on = self.signal_straight_on = self.signal_left_on = False
             return
         if self.img_front is None:
             return
-        self.signal_red_on_yolo, self.signal_straight_on_yolo, self.signal_left_on_yolo = \
+        self.signal_red_on, self.signal_straight_on, self.signal_left_on = \
             self.yolo_signal_state_detector.detect(self.img_front)
         self.yolo_signal_state_detector.show_debug_windows()  # 메인 스레드에서만 호출(yolo_signal_state.py 주석 참고)
 
@@ -839,52 +811,34 @@ class TrackDriverNode(Node):
     #   출력 signal_red/straight/left_on (S0_SIGNAL 공용 — 출발/교차로 겸용)
     #   주의 4구는 직진·좌회전 모두 초록 → 점등 '위치'로 구분
     def perc_signal(self):
-        """신호등 판별 — traffic_signal.py의 SignalDetector.detect_s2()(4구 Hough Circle)에 위임.
-          대회 규정 변경으로 출발과 교차로가 동일한 4구 신호등을 재사용하고, [2026-08-20]부터는
-          그 둘을 아예 하나의 state(MissionState.S0_SIGNAL)로 합쳤다 — 이 함수는 매번 같은 의미로
-          판독한다: signal_straight_confirmed(초록만 점등) = 직진(출발 시점엔 "출발"과 동의어),
+        """신호등 판별 — perc_yolo_signal_state()가 같은 틱에 먼저 갱신해둔
+          self.signal_red/straight/left_on(YOLO 단독, 위치+색상 동시 예측)을 디바운스만
+          적용해 확정값으로 승격시킨다. 대회 규정 변경으로 출발과 교차로가 동일한 4구
+          신호등을 재사용하고, [2026-08-20]부터는 그 둘을 아예 하나의
+          state(MissionState.S0_SIGNAL)로 합쳤다 — 이 함수는 매번 같은 의미로 판독한다:
+          signal_straight_confirmed(초록만 점등) = 직진(출발 시점엔 "출발"과 동의어),
           signal_left_confirmed(초록+빨강 동시) = 좌회전(지름길, 출발 지점에선 사실상 안 뜸).
-        detect_s2()는 원 4개가 정확히 안 잡히면(초과분은 pick_best_4()로 어느 정도 흡수하지만,
-        미달은 흡수 불가) 그 프레임은 인식 실패로 순간값이 False가 될 수 있다. 여기서
-        SIG_CONFIRM_FRAMES 연속 유지를 확인해 confirmed로 승격시켜, 단발성 오검출/오검출실패가
-        바로 FSM 전환(출발/좌회전)으로 새는 걸 막는다(라바콘/차량 트리거와 동일한 패턴).
-        DEBUG_LOG_SIGNAL=True면(기본값) 매 프레임 _log_signal_debug()로 실패 원인+힌트를 찍는다
-        — DEBUG_VIZ_SIGNAL(창)과 별개 스위치라 터미널 로그만 원하면 이것만 켜도 됨.
+        YOLO 검출이 그 프레임에 실패하면(신뢰도 미달/각도 등) signal_*_on이 False가 될 수
+        있다. 여기서 SIG_CONFIRM_FRAMES 연속 유지를 확인해 confirmed로 승격시켜, 단발성
+        오검출/미검출이 바로 FSM 전환(출발/좌회전)으로 새는 걸 막는다(라바콘/차량 트리거와
+        동일한 패턴).
 
-        [2026-08-20] S1_LANE_FOLLOW 중에도 detect_s2()를 돌리도록 확장(요청 반영) — 예전엔
+        [2026-08-20] S1_LANE_FOLLOW 중에도 신호등 검출을 돌리도록 확장(요청 반영) — 예전엔
         S0_SIGNAL 진입 후에야 신호등을 "보기" 시작해서, 그 진입 자체는 정지선(바닥 흰선)
         검출이 트리거였다. 그런데 "정지선을 밟아야 신호를 읽기 시작한다"는 신호등 자체를
         인식하는 것과는 다른 신호원이라, 정지선 인식이 어긋나면(치우침/블러 등) 신호등이
         이미 빨간불인데도 계속 차선주행 속도로 접근하는 상황이 가능했다. 이제 S1 중에도
         보드 인식 자체(색상 무관)를 매 프레임 확인해 _s1_lane_follow()가 이걸로 S0_SIGNAL
         진입을 트리거한다 — 정지선은 더 이상 이 전환에 관여하지 않는다(다른 용도—
-        _shortcut_end()/_update_lap()/교차로 근처 기동 금지—는 그대로 유지).
-
-        [2026-08-20] 판단 소스 스위치(config.py SIGNAL_USE_YOLO_STATE_FOR_DECISION, 요청 반영)
-        — True고 YOLO 색상상태 검출기가 살아있으면 perc_yolo_signal_state()가 같은 틱에 먼저
-        갱신해둔 self.signal_*_on_yolo(단일 스테이지 YOLO, 위치+색상 동시 예측)를 그대로 쓰고
-        detect_s2()(Hough Circle, "YOLO+HSV" 하이브리드) 자체를 아예 안 돌린다. False거나
-        검출기가 None이면(모델 파일 없음 등) 기존과 동일하게 detect_s2()만 쓴다."""
+        _shortcut_end()/_update_lap()/교차로 근처 기동 금지—는 그대로 유지)."""
         if self.img_front is None:
             return
         if self.mission_state not in (MissionState.S1_LANE_FOLLOW, MissionState.S0_SIGNAL):
             return
 
-        use_yolo_state = SIGNAL_USE_YOLO_STATE_FOR_DECISION and self.yolo_signal_state_detector is not None
-        if use_yolo_state:
-            self.signal_red_on      = self.signal_red_on_yolo
-            self.signal_straight_on = self.signal_straight_on_yolo
-            self.signal_left_on     = self.signal_left_on_yolo
-            # "보드 자체가 보이는가"에 대응하는 신호가 따로 없다(단일 스테이지라 배경판
-            # bbox를 안 줌) — 색상 클래스 중 하나라도 검출됐으면 보드가 보인다고 간주한다.
-            board_seen = self.signal_red_on or self.signal_straight_on or self.signal_left_on
-        else:
-            self.signal_red_on, self.signal_straight_on, self.signal_left_on = \
-                self.signal_detector.detect_s2(self.img_front)
-            if self.yolo_signal_detector is not None:
-                self.yolo_signal_detector.show_debug_windows()  # 메인 스레드 전용(yolo_signal.py 주석 참고)
-            # S0_SIGNAL 진입 트리거용 — 색상은 아직 안 보고 "보드 자체가 잡혔는가"만 본다.
-            board_seen = self.signal_detector.s2_chosen_idx >= 0
+        # "보드 자체가 보이는가"에 대응하는 신호가 따로 없다(단일 스테이지 모델이라 배경판
+        # bbox를 안 줌) — 색상 클래스 중 하나라도 검출됐으면 보드가 보인다고 간주한다.
+        board_seen = self.signal_red_on or self.signal_straight_on or self.signal_left_on
 
         if self.mission_state == MissionState.S1_LANE_FOLLOW:
             self._sig_board_cnt = self._sig_board_cnt + 1 if board_seen else 0
@@ -3024,70 +2978,6 @@ class TrackDriverNode(Node):
         cv2.imshow('obstacle_cut_debug', canvas)
         cv2.waitKey(1)
 
-    # [DEBUG_VIZ_SIGNAL, 신규 2026-08-18] 신호등 "YOLO+HSV" 결과 창 — traffic_signal.py의
-    # signal4_roi/signal4_board_search(DEBUG_VIZ_SIGNAL_DETAIL, 후보탐색 과정 전체를 보여주는
-    # 상세 창, 평소엔 꺼둠)와 달리, 이 창은 전체 카메라 원본 위에 "지금 어디를 보고 있는지"
-    # (박스, 초록=이번 프레임 성공/빨강=실패)와 "그래서 결론이 뭔지"(순간값 + SIG_CONFIRM_FRAMES
-    # 디바운스를 통과한 확정값)를 한 창에서 같이 보여준다.
-    # [2026-08-19] "YOLO 단독" 결과 창(yolo_signal_state.py, yolo_signal_state_result)과 헷갈리지
-    # 않게 역할을 분리했다 — 이 창은 배경판 위치를 YOLO_SIGNAL_ENABLE에 따라 YOLO 또는 HSV
-    # 자동크롭으로 찾고, 점등 색상 판정은 항상 HSV/circle 기반(circle_brightness 등)인 하이브리드
-    # 결과만 보여준다. YOLO 단독 색상상태 예측과 직접 비교하고 싶으면 두 창을 나란히 띄워 볼 것.
-    # [2026-08-20] perc_signal()이 이제 S1_LANE_FOLLOW 중에도 detect_s2()를 돌리므로(S0_SIGNAL
-    # 진입 트리거를 정지선 대신 "보드 인식"으로 바꾼 것과 연동) control_loop()에서도 S1/S0
-    # 둘 다에서 호출한다. S1 중엔 색상 확정 카운터(_sig_straight_cnt/_sig_left_cnt)가 아직
-    # 안 돌므로(perc_signal() 참고) 그 대신 보드 인식 카운터(_sig_board_cnt)를 보여준다.
-    def _debug_viz_signal_status(self):
-        if self.img_front is None:
-            return
-        sd = self.signal_detector
-        vis = self.img_front.copy()
-
-        t, b, l, r = sd.s2_roi_px
-        ok = not sd.s2_reject_reason
-        box_color = (0, 200, 0) if ok else (0, 0, 220)
-        cv2.rectangle(vis, (l, t), (r, b), box_color, 2, cv2.LINE_AA)
-
-        board_src_kr = 'YOLO' if YOLO_SIGNAL_ENABLE else 'HSV자동크롭'
-
-        if self.mission_state == MissionState.S1_LANE_FOLLOW:
-            confirm_color = (0, 200, 0) if self.signal_board_confirmed else (0, 140, 255)
-            lines = [
-                (f'{self.mission_state.name}  [배경판:{board_src_kr}] — S0_SIGNAL 진입 대기 중',
-                 (10, 8), (255, 255, 255), 18, f'{self.mission_state.name}  [board:{board_src_kr}]'),
-                (f'이번 프레임 보드 인식: {"O" if ok else "X"}', (10, 40),
-                 (255, 255, 255) if ok else (0, 0, 220), 20, f'Board seen this frame: {"YES" if ok else "NO"}'),
-                (f'확정: {"보드 확정(곧 정지)" if self.signal_board_confirmed else "대기 중"} '
-                 f'({self._sig_board_cnt}/{SIG_CONFIRM_FRAMES})',
-                 (10, 72), confirm_color, 18, f'Confirmed: board={self.signal_board_confirmed}'),
-            ]
-        else:
-            state_kr = ('좌회전' if self.signal_left_on else
-                        '직진'   if self.signal_straight_on else
-                        '정지(빨강)' if self.signal_red_on else '미검출')
-            confirmed = self.signal_left_confirmed or self.signal_straight_confirmed
-            confirm_kr = ('좌회전 확정' if self.signal_left_confirmed else
-                           '직진 확정'   if self.signal_straight_confirmed else '대기 중')
-            confirm_color = (0, 200, 0) if confirmed else (0, 140, 255)
-            lines = [
-                (f'{self.mission_state.name}  [배경판:{board_src_kr}+색상:HSV]', (10, 8), (255, 255, 255), 18,
-                 f'{self.mission_state.name}  [board:{board_src_kr}+color:HSV]'),
-                (f'이번 프레임: {state_kr}', (10, 40), (255, 255, 255) if ok else (0, 0, 220), 20,
-                 f'This frame: {state_kr}'),
-                (f'확정: {confirm_kr} (직진 {self._sig_straight_cnt}/{SIG_CONFIRM_FRAMES}  '
-                 f'좌회전 {self._sig_left_cnt}/{SIG_CONFIRM_FRAMES})',
-                 (10, 72), confirm_color, 18, f'Confirmed: {confirm_kr}'),
-            ]
-        if not ok:
-            lines.append((f'실패 사유: {sd.s2_reject_reason}', (10, 100), (0, 0, 220), 16,
-                           f'Fail: {sd.s2_reject_reason}'))
-
-        put_text_kr_multi(vis, lines)
-        cv2.rectangle(vis, (0, 0), (vis.shape[1] - 1, vis.shape[0] - 1), box_color, 3)
-
-        cv2.imshow('YOLO+HSV_신호등', vis)
-        cv2.waitKey(1)
-
     def _lane_pid(self, offset, deadzone=LANE_DEADZONE):
         """차선 중앙편차(offset)를 PID 제어로 조향각(angle)으로 변환한다."""
         if abs(offset) < deadzone:
@@ -3528,8 +3418,6 @@ class TrackDriverNode(Node):
             self._debug_viz_avoid_hold()
         if DEBUG_VIZ_OBSTACLE_CUT:
             self._debug_viz_obstacle_cut()
-        if DEBUG_VIZ_SIGNAL and self.mission_state in (MissionState.S1_LANE_FOLLOW, MissionState.S0_SIGNAL):
-            self._debug_viz_signal_status()
 
         if ENABLE_BEHAVIOR and self.mission_state == MissionState.S1_LANE_FOLLOW and self._behavior_enabled:
             self.run_behavior_fsm()         #    Behavior 상태 결정
@@ -3598,15 +3486,6 @@ class TrackDriverNode(Node):
         masked_pts, masked_min = self._lavacon_mask_dbg
         masked_min_s = f'{masked_min:.2f}m' if masked_min >= 0 else 'N/A'
 
-        sig_line = ''
-        if self.mission_state == MissionState.S0_SIGNAL:
-            sd = self.signal_detector
-            reason = sd.s2_reject_reason or 'OK'
-            sig_line = (
-                f'\n  [SIG] roi={sd.s2_roi_px} circles={sd.s2_circle_count} '
-                f'reason={reason} bright={sd.s2_brightness}'
-            )
-
         sig_flags = (f'R{int(self.signal_red_on)}L{int(self.signal_left_on)}S{int(self.signal_straight_on)} '
                      f'confirmS{int(self.signal_straight_confirmed)}({self._sig_straight_cnt}/{SIG_CONFIRM_FRAMES})'
                      f'L{int(self.signal_left_confirmed)}({self._sig_left_cnt}/{SIG_CONFIRM_FRAMES})')
@@ -3635,52 +3514,7 @@ class TrackDriverNode(Node):
             f'trigV={self._vehicle_trigger_cnt}/{VEHICLE_TRIGGER_FRAMES}\n'
             f'  [LAVA-ROI] L pts={lava_lp} run={lava_lrun}(need>=2) '
             f'R pts={lava_rp} run={lava_rrun}(need>=2) '
-            f'masked_raw_pts={masked_pts} masked_min={masked_min_s}'
-            f'{sig_line}')
-
-    def _log_signal_debug(self):
-        """DEBUG_LOG_SIGNAL 전용 상세 로그. 전역 DEBUG_LOG의 [SIG] 요약 줄(0.5초 주기, roi/circles/
-        reason/bright만 나열)과 달리, 신호등이 "왜" 안 잡히는지 단계별 원인 + 대응 힌트를 붙여서
-        찍는다 — DEBUG_LOG를 꺼둔 채로 신호등만 디버깅하고 싶을 때 이것만 켜면 됨.
-        perc_signal()에서 S1_LANE_FOLLOW/S0_SIGNAL 상태일 때만 호출된다(그 외 상태는
-        detect_s2() 자체를 안 돌림, [2026-08-20] S1 확장 — perc_signal() 참고).
-        0.2초 스로틀(대략 4~5프레임당 1번, 20Hz 기준) — 매 프레임 찍으면 터미널이 너무 빨리
-        흘러가서 오히려 못 읽는다."""
-        sd = self.signal_detector
-        reason = sd.s2_reject_reason or 'OK'
-
-        if reason == 'no_circles':
-            hint = 'ROI 안에 원이 아예 안 잡힘 → 신호등이 ROI 밖이거나 노출/대비 문제 (SIG4_ROI_*)'
-        elif 'too noisy' in reason:
-            hint = '원이 너무 많이 잡힘(MAX_CANDIDATES 초과) → 반사광 등 잡음, ROI를 좁히는 것 고려'
-        elif '(<4)' in reason:
-            hint = '원이 4개 미만 → 가림/블러 또는 반지름 범위 밖 (SIG4_MIN/MAX_RADIUS)'
-        elif 'vert_spread' in reason:
-            hint = '찾은 4개가 세로로 너무 퍼짐 → 오검출이 섞였거나 카메라 각도 틀어짐 의심'
-        elif 'horiz_spread' in reason:
-            hint = '찾은 4개가 가로로 너무 퍼짐 → 오검출이 섞임 의심'
-        elif 'gap[' in reason:
-            hint = '인접한 두 원 사이 간격이 너무 좁음 → 반사광 등이 신호등 원 사이에 끼어듦'
-        elif 'no_valid_4subset' in reason:
-            hint = '원 5개 이상 중 배치조건을 만족하는 4개 조합이 없음 → 오검출 비율이 높음'
-        else:
-            hint = '배치검사 통과 — 아래 bright/lit이 실제 밝기 대비 판정 결과(정상 동작)'
-
-        state_kr = ('좌회전' if self.signal_left_on else
-                    '직진'   if self.signal_straight_on else
-                    '정지(빨강)' if self.signal_red_on else '미검출')
-
-        self.get_logger().info(
-            f'[SIG-DEBUG] {self.mission_state.name} state={state_kr}\n'
-            f'  roi(px)=(t={sd.s2_roi_px[0]},b={sd.s2_roi_px[1]},l={sd.s2_roi_px[2]},r={sd.s2_roi_px[3]}) '
-            f'radius={SIG4_MIN_RADIUS}~{SIG4_MAX_RADIUS}px circles_found={sd.s2_circle_count}\n'
-            f'  reason={reason}\n'
-            f'  → {hint}\n'
-            f'  bright(빨강,노랑,좌회전,직진)={sd.s2_brightness} margin={SIG4_BRIGHT_MARGIN} '
-            f'lit={[int(v) for v in sd.s2_lit]}\n'
-            f'  confirm: 직진={self._sig_straight_cnt}/{SIG_CONFIRM_FRAMES} '
-            f'좌회전={self._sig_left_cnt}/{SIG_CONFIRM_FRAMES}',
-            throttle_duration_sec=0.2)
+            f'masked_raw_pts={masked_pts} masked_min={masked_min_s}')
 
 
 # #############################################################
