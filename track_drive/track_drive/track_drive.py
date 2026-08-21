@@ -263,6 +263,10 @@ class TrackDriverNode(Node):
         self._obstacle_cut_lidar_side = None   # 'L'/'R'/None(lidar_near 아니었으면)
         self._obstacle_cut_yolo_side  = None   # 'L'/'R'/None(YOLO 미검출)
         self._obstacle_cut_side_veto  = False  # True면 이번 틱 좌우 불일치로 vehicle_seen 취소됨
+        # [2026-08-21] 진입을 확정지은 그 순간의 장애물 좌/우('L'/'R') — _update_obstacle_cut_hold()의
+        # 새 진입 분기에서 self._obstacle_cut_y 부호로 한 번 캡처해두고, 활성 유지 중엔 안 바뀐다.
+        # _obstacle_cut_roi_clear()가 해제 판정 시 이 쪽만 본다(요청 반영 — 아래 해당 함수 주석 참고).
+        self._obstacle_cut_trigger_side = None  # 'L'/'R'/None(아직 한 번도 진입 안 함)
         # [2026-08-21] obstacle_cut_active 진입 순간 PP_LOOKAHEAD_CURVATURE_GAIN을
         # PP_CURVATURE_BOOST_GAIN으로 잠깐 올려두는 타이머 — 이 시각까지는 부스트 유지
         # (_update_obstacle_cut_hold()가 진입 엣지에서 세팅, _lane_steer()가 매틱 소비).
@@ -1372,6 +1376,11 @@ class TrackDriverNode(Node):
                 self._obstacle_cut_hold_sec_min = (
                     OBSTACLE_CUT_HOLD_SEC_MIN_FIXED if self.obstacle_cut_type == 'fixed'
                     else OBSTACLE_CUT_HOLD_SEC_MIN)
+                # [2026-08-21, 요청 반영] 진입을 확정지은 이번 틱의 self._obstacle_cut_y
+                # 부호로 트리거 쪽을 캡처 — 해제 판정(_obstacle_cut_roi_clear())이 이 쪽만
+                # 보고 반대쪽 라이다 상황과 무관하게 판단하게 한다.
+                self._obstacle_cut_trigger_side = (
+                    'L' if self._obstacle_cut_y is not None and self._obstacle_cut_y > 0.0 else 'R')
             self._obstacle_cut_until_t = now + self._obstacle_cut_hold_sec_min
             self._obstacle_cut_release_cnt = 0
         else:
@@ -1398,7 +1407,12 @@ class TrackDriverNode(Node):
     def _obstacle_cut_roi_clear(self):
         """perc_obstacle_cut_trigger()와 동일한 전용 ROI(OBSTACLE_CUT_RELEASE_DIST_M로
         약간 넓힌 히스테리시스 거리)에 아무 점도 안 잡히는지 — 해제 판단 전용이라
-        obstacle_cut_trigger 계산과 별개로 다시 라이다를 훑는다(가벼운 연산)."""
+        obstacle_cut_trigger 계산과 별개로 다시 라이다를 훑는다(가벼운 연산).
+
+        [2026-08-21, 요청 반영] 좌우 대칭(|y|<Y_HALF_M) 전체가 아니라, 진입을 확정지었던
+        그 순간의 쪽(self._obstacle_cut_trigger_side, 'L'/'R')만 본다 — 반대쪽에 뭐가
+        잡히든 안 잡히든 해제 판정과 무관하게, "그때 트리거됐던 라이다"가 사라졌는지로만
+        판단한다. side가 아직 None(진입 이력 없음)이면 이전처럼 양쪽 다 본다(안전 폴백)."""
         BODY_LO, BODY_HI = 215, 305
         ranges = np.array(self.lidar_ranges, dtype=np.float32)
         ranges[~np.isfinite(ranges)] = 0.0
@@ -1411,8 +1425,14 @@ class TrackDriverNode(Node):
         r = ranges[:m]
         x = r * np.cos(deg)
         y = r * np.sin(deg)
-        roi_mask = ((r > 0.0) & (x > 0.0) & (x < OBSTACLE_CUT_RELEASE_DIST_M)
-                    & (np.abs(y) < OBSTACLE_CUT_TRIGGER_Y_HALF_M))
+        side = self._obstacle_cut_trigger_side
+        if side == 'L':
+            side_mask = (y > 0.0) & (y < OBSTACLE_CUT_TRIGGER_Y_HALF_M)
+        elif side == 'R':
+            side_mask = (y < 0.0) & (y > -OBSTACLE_CUT_TRIGGER_Y_HALF_M)
+        else:
+            side_mask = np.abs(y) < OBSTACLE_CUT_TRIGGER_Y_HALF_M
+        roi_mask = (r > 0.0) & (x > 0.0) & (x < OBSTACLE_CUT_RELEASE_DIST_M) & side_mask
         return not bool(np.any(roi_mask))
 
     # [2-4b] 라바콘 좌우 클러스터 검출 + YOLO 카메라 이중확인 → B1_LAVACON 진입 트리거

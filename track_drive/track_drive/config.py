@@ -1409,8 +1409,8 @@ LAVACON_PUSH_SAFETY_MARGIN_M = 0.26
 #   가까운 범위만 본다. "지금 당장 스칠 위험이 있는 콘"만 반응해야 하므로, 멀리 있는
 #   콘까지 보면 아직 위협도 아닌데 미리 밀거나(오조향) 다음 콘으로 넘어가면서 push가
 #   들쭉날쭉 튈 위험이 있다. 실측 아님 — 실차에서 튜닝 필요.
-LAVACON_PUSH_LON_MIN     = 0.2   # 차체 바로 앞 반사 배제(perc_lavacon.py LON_MIN과 동일 이유)
-LAVACON_PUSH_LON_MAX     = 1.5   # 이 거리보다 먼 콘은 아직 안 민다
+LAVACON_PUSH_LON_MIN     = 0.1   # 차체 바로 앞 반사 배제(perc_lavacon.py LON_MIN과 동일 이유)
+LAVACON_PUSH_LON_MAX     = 0.5   # 이 거리보다 먼 콘은 아직 안 민다
 LAVACON_PUSH_LAT_LIMIT   = 1.0   # 횡방향 탐색 한계 — CONE_LAT_LIMIT(perc_lavacon.py)와 동일값으로 시작
 
 # [2026-08-19] 박스 안 후보점의 좌/우 배정을 y부호(차량 헤딩 기준 고정 중앙선, y>0=좌/
