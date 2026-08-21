@@ -223,9 +223,21 @@ CORNER_IMU_MIN_SCALE = 0.5  # IMU가 "회전 거의 없음"을 보고해도 비�
 #   불필요 — 대신 VESC가 죽어있으면 _speed_mps_fallback()이 명령속도(TURN_SPEED류)를
 #   METERS_PER_SPEED_UNIT으로 환산해 폴백하므로(_commit_speed_mps()와 동일 철학) 거리
 #   적분 자체가 멈춰 무한 회전하는 상황은 없다.
-TURN_ANGLE     = -60.0   # [진입] S2 교차로 → S3 지름길 좌회전 조향각(위 "-a") — 실차 튜닝 필요
+#   [2026-08-21] TURN_ANGLE/TURN_DIST_M(진입쪽만, 진출은 그대로 둠)을 "완전 오픈루프로
+#   90도 다 돈다"에서 "짧게 살짝 꺾어주기만 하고 나머지는 비전에 맡긴다"로 실험 변경(요청
+#   반영). _do_left_turn()이 next_state=S3_SHORTCUT로 완료 전환하면 바로 다음 프레임부터
+#   _s3_shortcut()이 lane_valid 조건에서 _lane_drive()를 호출하므로(기존 코드, 별도 수정
+#   불필요) 짧은 넛지 이후 자연스럽게 비전 폐루프로 넘어간다 — 목적은 순수 데드레커닝
+#   구간(바퀴슬립·배터리전압강하로 드리프트되는)을 최소화하는 것.
+#   ★주의★ 이 조합(TURN_SPEED=15, dt=0.05s@20Hz)에서는 틱당 이동거리가
+#   TURN_SPEED*METERS_PER_SPEED_UNIT*0.05 ≈ 6.4cm로 TURN_DIST_M=0.05(5cm)보다 커서,
+#   거리적분이 사실상 1틱 온오프 펄스와 다르지 않다(대화로 사전 인지된 한계, 산포/해상도
+#   문제는 실차로 직접 확인 예정) — 필요시 TURN_SPEED를 낮춰 해상도를 확보할 것.
+#   신호확정 후 정지위치 산포(S0_SIGNAL 진입 시점 접근속도에 따라 달라짐)도 그대로 남아있어
+#   5cm 목표 자체가 그 산포보다 작을 수 있음 — 실차 반응 보고 판단.
+TURN_ANGLE     = -30.0   # [진입] S2 교차로 → S3 지름길 좌회전 조향각 — 넛지 실험값(실차 미검증)
 TURN_SPEED     = 15.0    # [진입] 좌회전 속도
-TURN_DIST_M    = 1.0     # [진입] TURN_ANGLE을 유지할 이동거리(m) — 실차 미검증 초기값
+TURN_DIST_M    = 0.05    # [진입] TURN_ANGLE을 유지할 이동거리(m) — 넛지 실험값(실차 미검증), 위 주의 참고
 TURN_EXIT_ANGLE   = -60.0   # [진출] S3 지름길 → S1 차선주행 좌회전 조향각 — 실차 튜닝 필요
 TURN_EXIT_SPEED   = 15.0    # [진출] 좌회전 속도
 TURN_EXIT_DIST_M  = 1.0     # [진출] TURN_EXIT_ANGLE을 유지할 이동거리(m) — 실차 미검증 초기값
