@@ -2387,6 +2387,43 @@ _b3_passed` 둘 다 필요)은 순서와 무관해 그대로. `_b2_passed`/`_b3_
 때만 안전 — 트랙 순서가 실제로 바뀌었는지, 혹은 상황(예: 코스 구성 변경)에 따라 다시 바뀔 수
 있는지 실차에서 재확인할 것.
 
+### 5.5 트랙 순서 게이트 재반전 — "B3 먼저"에서 다시 "B2(고정장애물) 먼저"로, 단계 표시창 추가 (2026-08-22)
+
+**배경:** §5.4에서 "B3(방해차량) → B2(고정장애물)"로 뒤집었던 게 실제 대회 트랙 순서와
+맞지 않는다는 요청으로, 원래 순서(§5.2) "B1(라바콘) → B2(고정장애물) → B3(방해차량)"로
+되돌렸다 — §5.4를 대체하는 게 아니라 그 반전을 다시 반전시킨 것(§5.2와 동일 코드로 복귀).
+
+**수정한 곳:** §5.4가 건드렸던 지점을 전부 원복.
+- `run_behavior_fsm()`의 `Phase.OBSTACLE_ZONE` 분기: `'fixed' and self._b3_passed → 'B2'`를
+  `'vehicle' and self._b2_passed → 'B3'`(그 외엔 `'B2'`)로 되돌림.
+- `_active_yolo_stage()`: `Phase.OBSTACLE_ZONE`에서 `'vehicle' if not self._b3_passed else
+  'cone'`을 `'cone' if not self._b2_passed else 'vehicle'`로 되돌림 — B2가 지나기 전까진
+  콘 YOLO만 돌고, B2가 끝난 뒤에야 차량 YOLO로 전환된다.
+- `__init__`의 `self._b2_passed`/`self._b3_passed` 초기화 주변 주석, `_debug_viz_obstacle_cut()`
+  주석도 원래 순서에 맞춰 갱신.
+
+**함께 추가:** "지금 B1/B2/B3 중 어느 단계고 뭘 기다리는지"가 그동안 `_print_debug()`의
+터미널 `[{mission_state}|{behavior_state}|{phase}]` 요약 줄로만 나와서 실시간 상황 대응 중
+알아보기 어렵다는 요청으로, `obstacle_cut_debug` 창 상단에 상태 줄을 추가했다
+(`_current_stage_label()`, track_drive.py). `run_behavior_fsm()`과 정확히 같은 판단 순서를
+따라가며 표시 문구는 다음과 같다:
+- `Phase.LAVACON`: "B1 라바콘 — 진행 중(탈출 대기)" / "대기 중(좌우 동시검출 트리거 대기)"
+- `Phase.OBSTACLE_ZONE`: `_b2_passed`가 False면 "B2 고정장애물", 아니면 "B3 방해차량" —
+  뒤에 "감지됨(회피/통과 중)"(`_obscut_zone_tag`가 그 태그와 일치) 또는 "대기 중" 표시
+- `Phase.DONE`: "B1/B2/B3 모두 통과 — 다음 교차로 대기"
+- `S0_SIGNAL`/`S3_SHORTCUT`/`S4_FINISH`: 각 상태 이름을 그대로 표시(Behavior 진행과 무관)
+
+색상은 초록=감지/진행 중, 주황=대기 중, 회색=해당 없음/종료로 통일해 다른 디버그 창
+(예: `signal4_roi`, `avoid_hold_debug`)과 관례를 맞췄다.
+
+**영향받지 않는 것:** §5.4와 동일 — `_mark_behavior_passed()`/Phase.DONE 전환 조건, `RESET_
+PHASE_EACH_LAP` 리셋 경로.
+
+**알려진 한계 (실차 미검증):** 다시 "B2가 B3보다 항상 먼저 나온다"는 전제로 돌아간 것이라
+§5.2의 한계가 그대로 적용된다 — 실제 트랙에서 예외적으로 순서가 섞이면 오분류 위험. 단계
+표시창(`obstacle_cut_debug`)은 `DEBUG_VIZ_OBSTACLE_CUT=True`일 때만 보이므로, 꺼둔 상태라면
+여전히 터미널 로그로만 확인 가능.
+
 ---
 
 ## 6. 실측값 기록 (캘리브레이션)

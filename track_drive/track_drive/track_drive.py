@@ -333,17 +333,17 @@ class TrackDriverNode(Node):
         # [2026-08-21, 임시] B2/B3(고정장애물/방해차량) 단독 검증 — Phase.LAVACON(B1 진입 대기,
         # 실제 회피는 없는 placeholder라 건너뛰어도 손해 없음)을 건너뛰고 시작부터 바로
         # Phase.OBSTACLE_ZONE으로 진입한다. _b2_passed/_b3_passed는 기본값 False 그대로 둔다 —
-        # _active_yolo_stage()가 Phase.OBSTACLE_ZONE에서 "_b3_passed가 아니면 차량, 이면 콘"
-        # 스테이지를 고르므로(위 참고, 2026-08-21 요청 반영으로 B3 먼저 순서로 뒤집힘) 둘 다
-        # False인 기본 상태론 차량 모델이 먼저 물린다.
+        # _active_yolo_stage()가 Phase.OBSTACLE_ZONE에서 "_b2_passed가 아니면 콘, 이면 차량"
+        # 스테이지를 고르므로(위 참고, README §5.5로 B2 먼저 순서로 재복귀) 둘 다 False인
+        # 기본 상태론 콘 모델이 먼저 물린다.
         self.phase          = Phase.OBSTACLE_ZONE
         # [2026-08-15] Phase.OBSTACLE_ZONE 통합(da_based_b2b3_proposal.md B안) —
         # B2/B3 각각 최소 한 번 완료됐는지 추적. 둘 다 True가 돼야 Phase.DONE으로
         # 넘어간다(_mark_behavior_passed() 참고).
-        # [2026-08-20] 대회 트랙은 고정장애물(B2)이 항상 이동장애물(B3)보다 먼저
-        # 나오는 게 확정된 순서라고 봤었으나(§5.2), [2026-08-21, 요청 반영] 순서가
-        # "이동장애물(B3) → 고정장애물(B2)"로 뒤집혔다 — run_behavior_fsm()에서 B2 트리거를
-        # self._b3_passed가 True일 때만 받아들이도록 순서를 강제한다(아래 참고, §5.4).
+        # [2026-08-20] 대회 트랙은 고정장애물(B2)이 항상 이동장애물(B3)보다 먼저 나오는 게
+        # 확정된 순서다(§5.2) — §5.4에서 잠깐 반대로 뒤집었다가(요청 반영), [2026-08-22]
+        # 요청으로 다시 "B2 먼저"로 되돌렸다(README §5.5). run_behavior_fsm()에서 B3 트리거를
+        # self._b2_passed가 True일 때만 받아들이도록 순서를 강제한다(아래 참고).
         self._b2_passed = False
         self._b3_passed = False
         # [2026-08-20] 요청 반영 — B2/B3 실제 처리를 da 근접 컷(obstacle_cut_active) 기반으로
@@ -576,12 +576,12 @@ class TrackDriverNode(Node):
     #   같다(스레드/세션은 살아있지만 GPU/CPU 추론 자체는 안 돎).
     #
     #   매핑: S0_SIGNAL(신호등 판단 대기) → 신호등. S1_LANE_FOLLOW 중 Phase.LAVACON(B1
-    #   진입 대기) → 콘. Phase.OBSTACLE_ZONE 중 B3(방해차량) 아직 안 지났으면 → 차량,
-    #   지났으면(B2 고정장애물=콘 1개 대기) → 콘. Phase.DONE(다음 교차로 신호등 대기) → 신호등.
+    #   진입 대기) → 콘. Phase.OBSTACLE_ZONE 중 B2(고정장애물) 아직 안 지났으면 → 콘,
+    #   지났으면(B3 방해차량 대기) → 차량. Phase.DONE(다음 교차로 신호등 대기) → 신호등.
     #   S3_SHORTCUT/S4_FINISH는 카메라 YOLO 자체가 불필요해 전부 끈다.
-    #   [2026-08-21, 요청 반영] 트랙 순서를 "B3(방해차량) → B2(고정장애물)"로 뒤집었다 —
-    #   §5.2/§5.4가 강제하던 "B2 먼저" 게이트를 반대로 바꾼 것과 짝을 맞춘 것(아래
-    #   Phase.OBSTACLE_ZONE 분기, run_behavior_fsm() 참고).
+    #   [2026-08-22, 요청 반영] §5.4에서 "B3(방해차량) → B2(고정장애물)"로 뒤집었던 트랙
+    #   순서를 다시 원래 순서 "B1(라바콘) → B2(고정장애물) → B3(방해차량)"로 되돌렸다
+    #   (README §5.5) — 아래 Phase.OBSTACLE_ZONE 분기, run_behavior_fsm() 참고.
     #
     #   [2026-08-20] §1.16은 신호등 YOLO를 "S3/S4 포함 항상 켜서 오탐률을 전체 구간에서
     #   로그로 본다"는 의도로 상시 가동시켰는데, 이번 요청으로 그 부분을 뒤집는다 —
@@ -595,7 +595,7 @@ class TrackDriverNode(Node):
             if self.phase == Phase.LAVACON:
                 return 'cone'
             if self.phase == Phase.OBSTACLE_ZONE:
-                return 'vehicle' if not self._b3_passed else 'cone'
+                return 'cone' if not self._b2_passed else 'vehicle'
             return 'signal'  # Phase.DONE — 다음 교차로 신호등 보드 대기
         return None  # S3_SHORTCUT/S4_FINISH — 카메라 YOLO 불필요
 
@@ -2195,15 +2195,14 @@ class TrackDriverNode(Node):
             # 나중을 위해 보존, 아래 함수 docstring 참고).
             if self.obstacle_cut_active and self._obscut_zone_tag is None:
                 # obstacle_cut_type: perc_obstacle_cut_trigger()가 YOLO 콘/차량 이중확인으로
-                # 매 틱 갱신해두는 값을 트리거 활성화 순간 스냅샷 — 'fixed'(라바콘=B2) 아니면
-                # 'vehicle'(방해차량=B3). [2026-08-21, 요청 반영] 트랙 순서가 "B3 → B2"로
-                # 뒤집혔다(§5.4, 기존 §5.2 "B2 먼저" 게이트의 반대) — _b3_passed가 아직
-                # False면 타입이 fixed로 잡혀도 B3로 취급한다 — 초반 오분류로 B2를 먼저
-                # 통과 처리해버리는 사고를 원천 차단.
-                if self.obstacle_cut_type == 'fixed' and self._b3_passed:
-                    self._obscut_zone_tag = 'B2'
-                else:
+                # 매 틱 갱신해두는 값을 트리거 활성화 순간 스냅샷 — 'fixed'(고정장애물=B2) 아니면
+                # 'vehicle'(방해차량=B3). 트랙 순서는 "B2 먼저"(§5.2, §5.4에서 잠깐 반대로
+                # 뒤집혔다가 §5.5로 원복) — _b2_passed가 아직 False면 타입이 vehicle로 잡혀도
+                # B2로 취급한다 — 초반 오분류로 B3를 먼저 통과 처리해버리는 사고를 원천 차단.
+                if self.obstacle_cut_type == 'vehicle' and self._b2_passed:
                     self._obscut_zone_tag = 'B3'
+                else:
+                    self._obscut_zone_tag = 'B2'
 
             if self._obscut_zone_tag is not None and not self.obstacle_cut_active:
                 self._mark_behavior_passed(self._obscut_zone_tag)
@@ -2845,6 +2844,42 @@ class TrackDriverNode(Node):
     # 오가며 봐야 했다 — 카메라 박스와 라이다 ROI 안 점을 나란히 놓고 바로 대조할 수 있게
     # 한 창으로 합침(요청 반영). yolo_vehicle.py는 이제 전용 창을 안 띄우고
     # get_latest_debug_frame()으로 프레임만 넘긴다(해당 함수 주석 참고).
+    # [2026-08-22, 요청 반영] "지금 B1/B2/B3 중 어느 단계고 뭘 기다리는지"를 터미널 로그
+    # (_print_debug()의 [{mission_state}|{behavior_state}|{phase}] 요약 줄, 상황 대응 중
+    # 알아보기 힘들다는 요청)가 아니라 _debug_viz_obstacle_cut() 창 상단에 한글 한 줄로
+    # 보여주기 위한 헬퍼 — (한글, BGR색, 영문) 튜플을 반환한다. run_behavior_fsm()의
+    # Phase.LAVACON/OBSTACLE_ZONE 분기와 정확히 같은 판단 순서(B1→B2→B3)를 그대로 따라간다.
+    def _current_stage_label(self):
+        ms = self.mission_state
+        if ms == MissionState.S0_SIGNAL:
+            return '신호등 판독 대기', (0, 200, 255), 'S0_SIGNAL: waiting for light'
+        if ms == MissionState.S3_SHORTCUT:
+            return '지름길(S3) 주행 중', (0, 200, 255), 'S3_SHORTCUT'
+        if ms == MissionState.S4_FINISH:
+            return '주행 종료', (150, 150, 150), 'S4_FINISH'
+
+        if self.phase == Phase.LAVACON:
+            engaged = self._lavacon_engaged
+            state_kr = '진행 중(탈출 대기)' if engaged else '대기 중(좌우 동시검출 트리거 대기)'
+            state_en = 'engaged' if engaged else 'waiting for entry trigger'
+            color = (0, 200, 0) if engaged else (0, 140, 255)
+            return f'B1 라바콘 — {state_kr}', color, f'B1 LAVACON — {state_en}'
+
+        if self.phase == Phase.OBSTACLE_ZONE:
+            if not self._b2_passed:
+                tag, label_kr, label_en = 'B2', 'B2 고정장애물', 'B2 FIXED OBSTACLE'
+            elif not self._b3_passed:
+                tag, label_kr, label_en = 'B3', 'B3 방해차량', 'B3 VEHICLE'
+            else:
+                return 'OBSTACLE_ZONE 종료 처리 중', (150, 150, 150), 'OBSTACLE_ZONE finishing'
+            active = self._obscut_zone_tag == tag
+            state_kr = '감지됨(회피/통과 중)' if active else '대기 중(감지 안 됨)'
+            state_en = 'detected' if active else 'waiting'
+            color = (0, 200, 0) if active else (0, 140, 255)
+            return f'{label_kr} — {state_kr}', color, f'{label_en} — {state_en}'
+
+        return 'B1/B2/B3 모두 통과 — 다음 교차로 대기', (0, 200, 0), 'ALL PASSED — waiting for next intersection'
+
     def _debug_viz_obstacle_cut(self):
         now = time.time()
         remaining = max(0.0, self._obstacle_cut_until_t - now)
@@ -2856,8 +2891,11 @@ class TrackDriverNode(Node):
         # [2026-08-21] B2(고정장애물=콘)/B3(방해차량) 공용 창 — obstacle_cut 메커니즘 자체가
         # 라이다 ROI/트리거/유지타이머까지 완전히 공유라(perc_obstacle_cut_trigger() 참고)
         # 창 대부분은 손 안 대고, 카메라 패널/검출값 텍스트만 지금 활성 스테이지
-        # (_active_yolo_stage(), Phase.OBSTACLE_ZONE에서 _b3_passed 기준 'vehicle'/'cone')에
+        # (_active_yolo_stage(), Phase.OBSTACLE_ZONE에서 _b2_passed 기준 'cone'/'vehicle')에
         # 맞춰 콘 검출기 ↔ 차량 검출기를 동적으로 바꿔 보여준다.
+        # [2026-08-22, 요청 반영] 상단 헤드라인에 "지금 B1/B2/B3 중 어느 단계고 뭘 기다리는지"
+        # 를 한 줄로 보여준다 — 예전엔 이 정보가 _print_debug()의 터미널 [SIG] 요약 줄로만
+        # 나와서 실시간으로 알아보기 어렵다는 요청 반영(_current_stage_label() 참고).
         cam_stage = self._active_yolo_stage()
         if cam_stage == 'vehicle':
             cam_detector, cam_label = self.yolo_vehicle_cut_detector, 'YOLO VEHICLE CAM'
@@ -2870,19 +2908,21 @@ class TrackDriverNode(Node):
 
         # --- 상단 카메라(YOLO)/라이다 BEV 패널 레이아웃 -------------------------------
         CAM_W, CAM_H = 300, 220
-        cam_x0, cam_y0 = 10, 34
+        cam_x0, cam_y0 = 10, 58   # [2026-08-22] 아래 stage 줄 추가로 34→58(+24px)
         PANEL_W, PANEL_H = 240, CAM_H
         panel_x0, panel_y0 = cam_x0 + CAM_W + 20, cam_y0
         text_y0 = cam_y0 + CAM_H + 16
 
         canvas = np.full((text_y0 + 186, panel_x0 + PANEL_W + 10, 3), 30, dtype=np.uint8)
 
+        stage_kr, stage_color, stage_en = self._current_stage_label()
         headline = [
             (f'OBSTACLE-CUT: {"활성" if self.obstacle_cut_active else "대기"}  '
              f'(남은 {remaining:.2f}s / floor={self._obstacle_cut_hold_sec_min:.2f}s)',
              (10, 8), active_color, 17,
              f'OBSTACLE-CUT: {"ACTIVE" if self.obstacle_cut_active else "idle"} '
              f'({remaining:.2f}s left / floor={self._obstacle_cut_hold_sec_min:.2f}s)'),
+            (f'단계: {stage_kr}', (10, 30), stage_color, 17, f'STAGE: {stage_en}'),
         ]
         lines = [
             (f'직전 해제 사유: {self.obstacle_cut_release_reason or "(아직 없음)"}   '
