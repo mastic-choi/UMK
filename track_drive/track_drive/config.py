@@ -101,6 +101,10 @@ SPEED_NORMAL  = 15.0   # [2026-08-17g] 10.0 → 15.0(요청 반영, 증속). 이
                         #   것이라 15도 측정 범위 밖 외삽 — 실제 m/s·제동거리·코너 반응이 그 선형식대로
                         #   나올지 실차 재검증 필요.
 SPEED_LAVACON = 2.5    # 라바콘 구간 속도
+# [2026-08-21] 이 상수는 원래 죽은 코드(_handle_lavacon(), README §3.4)에서만 쓰였는데,
+#   §3.6에서 `_lane_drive()`의 push 안전판 활성 구간(`_lavacon_engaged`) 속도 캡으로
+#   재사용하기 시작함 — ROI를 AuTURBO 실측값(전방 0.1~0.5m)으로 좁히면서, 그 팀처럼
+#   저속 전제가 있어야 반응시간이 확보되기 때문(위 LAVACON_PUSH_LON/LAT 주석 참고).
 SPEED_STOP    = 0.0
 # [2026-08-06] 코너 감속(_lane_drive())의 목표속도 하한 — 원래 SPEED_NORMAL*0.15(=1.2, 두 곳에
 #   하드코딩)로 잡혀 있었는데, config.py "6. 단위환산" 절의 실측 근거(정속 회귀선의 절편이
@@ -1403,15 +1407,30 @@ LAVACON_STEER_MODE_DA_PUSH = True
 #   (실측값 없음, perc_lavacon_trigger()의 CLUSTER_MAX_GAP=0.35는 "콘 지름 근사"라 참고는
 #   되나 라이다 스프레드가 섞인 값이라 그대로 쓰지 않음) — 실차에서 콘을 스치면 이 값을
 #   올릴 것.
-LAVACON_PUSH_SAFETY_MARGIN_M = 0.26
+# [2026-08-21] 0.26 → 0.5(요청 반영) — 2023 KMU AuTURBO rookie 팀 코드
+#   (RubberconController.py, README §1.16/`_imu_corner_confirm_scale()` 주석에서 이미
+#   참고해온 그 팀)의 라바콘 회피 실측값을 참고. 그 팀은 라이다 ROI 안에서 검출된 점까지의
+#   원시거리(range)가 0.5m가 되도록 미는 P제어를 썼다(`error = 0.5 - range`) — 우리와
+#   완전히 같은 하드웨어(라이다/모터 등)로 완전히 같은 라바콘 배치의 실제 대회 트랙에서
+#   검증된 값이라, 우리 0.26m보다 이 0.5m을 신뢰할 근거가 더 크다고 판단(사용자 요청).
+#   단, 그 팀은 원시거리(r=√(x²+y²)) 기준이고 우리는 횡방향(y)만 보므로 완전히 같은
+#   물리량은 아니다 — ROI 자체가 좁아(아래 LON/LAT) 오차범위 안이라고 보고 그대로 채택.
+LAVACON_PUSH_SAFETY_MARGIN_M = 0.5
 
 # [2026-08-19] push 신호 전용 ROI — 박스 스택의 CONE_LON_MAX(4.0m, 구간 전체) 대신 훨씬
 #   가까운 범위만 본다. "지금 당장 스칠 위험이 있는 콘"만 반응해야 하므로, 멀리 있는
 #   콘까지 보면 아직 위협도 아닌데 미리 밀거나(오조향) 다음 콘으로 넘어가면서 push가
 #   들쭉날쭉 튈 위험이 있다. 실측 아님 — 실차에서 튜닝 필요.
-LAVACON_PUSH_LON_MIN     = 0.2   # 차체 바로 앞 반사 배제(perc_lavacon.py LON_MIN과 동일 이유)
-LAVACON_PUSH_LON_MAX     = 1.5   # 이 거리보다 먼 콘은 아직 안 민다
-LAVACON_PUSH_LAT_LIMIT   = 1.0   # 횡방향 탐색 한계 — CONE_LAT_LIMIT(perc_lavacon.py)와 동일값으로 시작
+# [2026-08-21] 0.2~1.5m/±1.0m → 0.1~0.5m/±0.5m(요청 반영) — 위 안전마진과 같은 이유로
+#   2023 KMU AuTURBO rookie 팀의 실측 ROI(전방 0.1~0.5m, 좌우 ±0.5m)를 그대로 채택.
+#   "멀리서 미리 반응"이 아니라 "거의 붙어서야 반응"하는 근접 전용 방식으로 바뀌는데,
+#   그 팀은 이 좁은 ROI 구간에서 속도를 고정 저속(SPEED_LAVACON, 아래)으로 깔아서
+#   반응할 시간을 확보했다 — 이 ROI 축소는 반드시 `_lavacon_engaged` 중 속도 캡
+#   적용(_lane_drive() 참고)과 같이 가야 한다. 단독으로 ROI만 좁히면 정속 주행 중엔
+#   반응시간이 부족해질 위험이 있음(README §3.6 참고).
+LAVACON_PUSH_LON_MIN     = 0.1   # 차체 바로 앞 반사 배제(perc_lavacon.py LON_MIN과 동일 이유)
+LAVACON_PUSH_LON_MAX     = 0.5   # 이 거리보다 먼 콘은 아직 안 민다
+LAVACON_PUSH_LAT_LIMIT   = 0.5   # 횡방향 탐색 한계
 
 # [2026-08-19] 박스 안 후보점의 좌/우 배정을 y부호(차량 헤딩 기준 고정 중앙선, y>0=좌/
 #   y<0=우) 대신 직전 박스의 같은 라인과의 최근접 연속성으로 할지 여부

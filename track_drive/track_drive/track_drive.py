@@ -2337,6 +2337,17 @@ class TrackDriverNode(Node):
         # 구조가 아니다.
         if self.obstacle_cut_active:
             target_speed = min(target_speed, SPEED_OBSTACLE_CUT)
+        # [2026-08-21] 라바콘 push 안전판(§3.5/§3.6, _lavacon_steer_da_push()) 활성 구간
+        # 속도 캡 — 2023 KMU AuTURBO rookie 팀 실측을 참고해 push ROI를 근접 전용(전방
+        # 0.1~0.5m)으로 좁히면서(config.py LAVACON_PUSH_LON/LAT 주석 참고) 같이 추가했다.
+        # 그 팀은 이 좁은 ROI 구간 내내 속도를 고정 저속으로 깔아서 반응시간을 확보했는데,
+        # 여기서도 같은 이유로 self._lavacon_engaged(진입 트리거 확정 latch) 동안 전체를
+        # SPEED_LAVACON으로 캡한다 — obstacle_cut_active와 달리 "push가 실제로 걸리는
+        # 순간"만 캡하지 않는 이유는, ROI가 좁아 콘이 그 안에 들어오는 순간엔 이미
+        # 늦을 수 있어서(코너 안쪽 등) 구간 전체를 미리 저속으로 두는 쪽이 안전하기
+        # 때문이다.
+        if self._lavacon_engaged:
+            target_speed = min(target_speed, SPEED_LAVACON)
         # [2026-08-18] avoid-hold 적용4(SPEED_AVOID_HOLD_BLOCKED 안전판) 삭제 — 실차 테스트에서
         # "속도 5 고정" 증상의 실제 원인으로 확인됨(README §2.43). TEST_DISABLE_B2_B3=True라
         # 실제 회피 기동(옆차선 이동)은 꺼져있는데 이 캡만 무관하게 계속 걸려서, 트리거를
