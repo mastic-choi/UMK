@@ -2256,8 +2256,21 @@ class TrackDriverNode(Node):
         return max(CORNER_IMU_MIN_SCALE, min(1.0, abs(imu_kappa) / CORNER_IMU_CONFIRM_KAPPA_PX))
 
     def _lane_drive(self):
-        """S1/S3 공통 차선 조향+감속 로직. ctrl_angle·ctrl_speed·_prev_speed·_corner_hold 갱신."""
-        self.ctrl_angle = self._lane_steer()
+        """S1/S3 공통 차선 조향+감속 로직. ctrl_angle·ctrl_speed·_prev_speed·_corner_hold 갱신.
+
+        [2026-08-21] §3.4가 남긴 "알려진 한계"(라바콘 구간을 회피조향 없이 일반 차선 PID로만
+        지나가서, 콘이 차선 폭 안쪽까지 침범하면 충돌 위험) 대응 — `self._lavacon_engaged`
+        (perc_lavacon_trigger()의 라이다 AND YOLO 이중확인으로 이미 확정된 "지금 라바콘
+        구간 안" latch, run_behavior_fsm()의 Phase.LAVACON 분기가 계속 관리)가 True인 동안만
+        `_lavacon_steer_da_push()`(da 경로 + 콘 침범 시 옆으로 밀기)로 바꿔 쓴다.
+        `behavior_state`는 여전히 B0_NORMAL로 유지되므로(§3.4 결정 유지, B2/B3 단독 검증에
+        영향 없음) 이건 `_handle_lavacon()`을 되살리는 게 아니라, 상시로 도는 안전 보정
+        하나를 여기 얹는 것뿐이다(§4.3 da 근접 컷이 behavior_state와 무관하게 상시로 도는
+        것과 같은 패턴)."""
+        if self._lavacon_engaged:
+            self.ctrl_angle = self._lavacon_steer_da_push()
+        else:
+            self.ctrl_angle = self._lane_steer()
 
         # [2026-08-06, 2026-08-10 복원] 코너 감속 판단은 "지금 순간 조향각이 얼마나 큰가"가
         # 아니라 "최근 한동안 같은 방향으로 얼마나 꺾여 있었는가"를 봐야 한다. pure_pursuit은
@@ -3134,10 +3147,18 @@ class TrackDriverNode(Node):
     #   봐도(박스 스택이 실차에서 계속 시달린 문제) 바로 동작한다. da 단독으로도 라바콘
     #   구간을 그럭저럭 지나간다는 게 실차로 이미 확인됨(사용자, 2026-08-19).
     def _lavacon_steer_da_push(self):
-        """push는 self.cone_detected_yolo(그 프레임에 카메라로도 콘이 실제 보일 때)로만
-        켠다 — perc_lavacon_trigger()가 진입 판정에 라이다 단독 대신 YOLO AND 라이다를
-        쓰는 것과 같은 이유(라이다 단독 클러스터는 벽 모서리 등에서 오검출 여지가 있음).
-        YOLO가 콘을 못 볼 때는 push=0으로 da 경로를 그대로 따른다(안전 기본값).
+        """[2026-08-19, 최초 도입] push는 원래 self.cone_detected_yolo(그 프레임에 카메라로도
+        콘이 실제 보일 때)로만 켰다 — perc_lavacon_trigger()가 진입 판정에 라이다 단독 대신
+        YOLO AND 라이다를 쓰는 것과 같은 이유(라이다 단독 클러스터는 벽 모서리 등에서 오검출
+        여지가 있음).
+
+        [2026-08-21, 요청 반영] 그 매 프레임 카메라 재확인 게이트를 뺐다 — 실차에서 라이다
+        클러스터는 선명하게 잡히는데도 YOLO가 그 프레임에 콘을 놓쳐(카메라 각도/거리/조도 등)
+        push 자체가 안 걸리는 문제가 있었다(사용자 실측). 이 함수는 이제 `_lane_drive()`에서
+        `self._lavacon_engaged`가 True일 때만 불린다 — 그 latch 자체가 이미
+        perc_lavacon_trigger()의 라이다 AND YOLO 이중확인을 거쳐 확정된 것이므로("지금
+        라바콘 구간 안"이라는 전제가 이미 보장됨), 매 프레임 카메라 재확인 없이 라이다
+        근접만으로 push를 켜도 진입 오검출 문제와는 별개다(진입 자체는 여전히 이중확인 그대로).
 
         push_m 부호: nearest_cone_lateral()의 y는 좌측+ — 좌측 콘이 안전마진을 침범하면
         그만큼 우측(+px)으로, 우측 콘이 침범하면 그만큼 좌측(-px)으로 민다. 두 콘이 동시에
@@ -3148,17 +3169,15 @@ class TrackDriverNode(Node):
         Pure Pursuit이 해석해 실제로 옆으로 붙는 조향이 나온다. vehicle_x도 같이 밀면
         상대위치가 그대로라 아무 효과가 없다.
         """
-        push_px = 0.0
-        if self.cone_detected_yolo:
-            left_y, right_y = nearest_cone_lateral(
-                self.lidar_ranges, LAVACON_PUSH_LON_MIN, LAVACON_PUSH_LON_MAX,
-                LAVACON_PUSH_LAT_LIMIT)
-            push_m = 0.0
-            if left_y is not None and left_y < LAVACON_PUSH_SAFETY_MARGIN_M:
-                push_m += LAVACON_PUSH_SAFETY_MARGIN_M - left_y        # 좌측 콘 침범 → 우측(+)으로
-            if right_y is not None and -right_y < LAVACON_PUSH_SAFETY_MARGIN_M:
-                push_m -= LAVACON_PUSH_SAFETY_MARGIN_M - (-right_y)    # 우측 콘 침범 → 좌측(-)으로
-            push_px = push_m * DL_PIXELS_PER_METER
+        left_y, right_y = nearest_cone_lateral(
+            self.lidar_ranges, LAVACON_PUSH_LON_MIN, LAVACON_PUSH_LON_MAX,
+            LAVACON_PUSH_LAT_LIMIT)
+        push_m = 0.0
+        if left_y is not None and left_y < LAVACON_PUSH_SAFETY_MARGIN_M:
+            push_m += LAVACON_PUSH_SAFETY_MARGIN_M - left_y        # 좌측 콘 침범 → 우측(+)으로
+        if right_y is not None and -right_y < LAVACON_PUSH_SAFETY_MARGIN_M:
+            push_m -= LAVACON_PUSH_SAFETY_MARGIN_M - (-right_y)    # 우측 콘 침범 → 좌측(-)으로
+        push_px = push_m * DL_PIXELS_PER_METER
 
         shifted_path = [(x + push_px, y) for x, y in self.lane_path]
 
