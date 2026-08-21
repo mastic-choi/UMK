@@ -1296,16 +1296,17 @@ DEBUG_VIZ_OBSTACLE_CUT = True   # [2026-08-20] 실차 검증 시작과 함께 �
 # #############################################################
 # 6. 미션 State / 실차 테스트 범위 제한
 # #############################################################
-# [2026-08-21] B3 단독 검증용 임시 override(START_STATE=S1_LANE_FOLLOW 직행,
-#   TEST_FORCE_BEHAVIOR=True) 걷어내고 원래 값으로 복귀 — 이제 S0_SIGNAL(출발선 신호등,
-#   빨강 대기 → 초록/직진 확정 → 출발)부터 실제로 거치는 정상 플로우를 검증한다.
-#   _behavior_enabled는 강제 켜지 않고 원래대로 S0_SIGNAL "직진" 확정 시(track_drive.py
-#   commit_dir == 'straight' 분기, 위 주석 §참고)에만 True가 된다.
+# [2026-08-21] 라바콘(B1) 단독 검증용 임시 override — S0_SIGNAL(신호등 대기→직진확정)을
+#   건너뛰고 곧장 S1_LANE_FOLLOW로 시작한다. self.phase 기본값이 이미 Phase.LAVACON(위
+#   MissionState/Phase enum 근처 track_drive.py __init__ 참고)이라 별도 변경 불필요 —
+#   S1 진입 즉시 B1 진입 트리거(perc_lavacon_trigger()) 판정이 바로 돈다. 검증 끝나면
+#   START_STATE=S0_SIGNAL / TEST_FORCE_BEHAVIOR=False로 되돌릴 것(바로 아래 B3 단독
+#   검증 때도 같은 패턴을 썼다가 원복한 이력 있음).
 # [2026-08-20, signal-whiteboard-autocrop 브랜치 병합] START_STATE는 원래 S0_WAIT_GREEN
 #   이었으나, 그 상태와 S2_INTERSECTION이 S0_SIGNAL 하나로 통합됐다(위 MissionState enum
 #   주석 참고, 출발선/교차로 재진입 모두 같은 SignalDetector.detect_s2() 재사용) — 값은
 #   그대로 "맨 처음 신호등 판독" 지점이라 의미상 동일하다.
-START_STATE     = MissionState.S0_SIGNAL
+START_STATE     = MissionState.S1_LANE_FOLLOW
 ENABLE_BEHAVIOR = True  # S1에서 라바콘/장애물/추월 Behavior를 켤지 여부(최상위 스위치)
 
 # ── 실차 테스트 범위 제한 ──
@@ -1319,13 +1320,14 @@ TEST_DISABLE_B2_B3 = False
 #         이중으로 걸어 B2/B3가 어떤 경로로도 안 켜지게 한다(안전판).
 #   False: 원래대로 SAFETY_DIST/OVERTAKE_TRIGGER 트리거 검사해서 B2/B3 정상 발동 —
 #         이번 B3 검증이 보고 싶은 게 바로 이 발동이라 False.
-TEST_FORCE_BEHAVIOR = False
+TEST_FORCE_BEHAVIOR = True
 #   True: _behavior_enabled를 시작부터 강제 True로 켜서, START_STATE=S1_LANE_FOLLOW로
 #         S0/S2를 건너뛴 채로도 B1→B2→B3가 정상 발동한다(그렇지 않으면 _behavior_enabled가
-#         S2 교차로 직진 확정 시에만 True가 되는데 그 경로 자체를 안 타므로 계속 False로
-#         남아 Behavior가 영원히 안 켜짐).
-#   False: 원래대로 S0_SIGNAL 직진 신호 확정 시에만 Behavior가 켜짐 — [2026-08-21]
-#         START_STATE=S0_SIGNAL로 되돌리면서 이 자연스러운 경로를 그대로 검증하도록 False로.
+#         S0_SIGNAL 직진 확정 시에만 True가 되는데 그 경로 자체를 안 타므로 계속 False로
+#         남아 Behavior가 영원히 안 켜짐). [2026-08-21] 라바콘(B1) 단독 검증을 위해 켬 —
+#         위 START_STATE=S1_LANE_FOLLOW와 항상 짝으로 같이 바꿀 것.
+#   False: 원래대로 S0_SIGNAL 직진 신호 확정 시에만 Behavior가 켜짐 — 정상 플로우
+#         (신호등부터 실제로 거침) 검증 때는 START_STATE=S0_SIGNAL과 함께 False로 되돌릴 것.
 
 # [2026-08-11] B2(정지 장애물) Hybrid A* 대안(USE_HYBRID_ASTAR_FOR_B2) 삭제.
 #   대신 _da_avoidance_failed() 게이트 + TargetPassing(실측 기반 하드코딩)로 대체
