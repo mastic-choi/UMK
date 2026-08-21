@@ -3478,6 +3478,30 @@ class TrackDriverNode(Node):
     # #########################################################
     # [6] 유틸/디버그
     # #########################################################
+    # [2026-08-22, 요청 반영] _print_debug() 맨 앞 [mission|behavior|phase] 요약 줄의 가운데
+    # 칸이 실제로는 거의 항상 "B0_NORMAL"로 고정돼 있어(§5.5 위 주석 — 실제 회피는
+    # behavior_state가 아니라 obstacle_cut_active가 담당, run_behavior_fsm() 참고) 그 자리만
+    # 보고는 지금 B1/B2/B3 중 어디에 있는지 알 수 없었다. self.behavior_state 자체를 바꾸면
+    # apply_behavior_override()가 옛 TargetPassing 핸들러(_handle_lavacon()/
+    # _handle_fixed_obstacle()/_handle_overtake())를 다시 불러버려 실제 주행이 깨지므로
+    # (그래서 run_behavior_fsm()이 항상 B0_NORMAL로 고정해둔 것), 이 태그는 표시 전용이고
+    # self.behavior_state는 건드리지 않는다 — run_behavior_fsm()과 동일한 판단 순서
+    # (B1→B2→B3)를 그대로 따라간다. 뒤에 '+'가 붙으면 그 단계가 지금 실제로 감지/진행
+    # 중이라는 뜻(대기 중이면 안 붙음) — obstacle_cut_debug 창의 _current_stage_label()과
+    # 같은 근거(_lavacon_engaged/_b2_passed/_b3_passed/_obscut_zone_tag)를 쓴다.
+    def _behavior_progress_tag(self):
+        if self.mission_state != MissionState.S1_LANE_FOLLOW:
+            return self.behavior_state.name
+        if self.phase == Phase.LAVACON:
+            return 'B1_LAVACON' + ('+' if self._lavacon_engaged else '')
+        if self.phase == Phase.OBSTACLE_ZONE:
+            pending = 'B2' if not self._b2_passed else ('B3' if not self._b3_passed else None)
+            if pending is None:
+                return 'B0_NORMAL'
+            name = 'B2_OBSTACLE' if pending == 'B2' else 'B3_VEHICLE'
+            return name + ('+' if self._obscut_zone_tag == pending else '')
+        return 'B0_NORMAL'  # Phase.DONE — B1/B2/B3 모두 통과, 다음 교차로 대기
+
     def _print_debug(self):
         """0.5초마다 여러 줄로 상태 덤프. 별도 터미널(rqt/topic echo) 없이 이 로그만으로
         센서 원시상태(카메라 살아있는지·신호색·라이다 포인트수)부터 트리거 카운터까지 확인 가능하게 함.
@@ -3537,8 +3561,10 @@ class TrackDriverNode(Node):
         cut_desc = (f'{"ON" if self.obstacle_cut_active else "off"}'
                     f'({self.obstacle_cut_type})' if self.obstacle_cut_type != 'none'
                     else ("ON" if self.obstacle_cut_active else "off"))
+        # [2026-08-22, 요청 반영] 가운데 칸을 self.behavior_state.name(거의 항상 B0_NORMAL)
+        # 대신 _behavior_progress_tag()로 바꿔 B1→B2→B3 진행이 이 한 줄에서 바로 보이게 함.
         self.get_logger().info(
-            f'[{self.mission_state.name}|{self.behavior_state.name}|{self.phase.name}] '
+            f'[{self.mission_state.name}|{self._behavior_progress_tag()}|{self.phase.name}] '
             f'ang={self.ctrl_angle:+.1f} spd={self.ctrl_speed:.1f} cut={cut_desc}\n'
             f'  [LAP] {self.lap}/{TOTAL_LAPS} 바퀴 '
             f'누적={math.degrees(self._yaw_accum):+.0f}도/{math.degrees(LAP_YAW_FULL):.0f} '

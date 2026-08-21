@@ -2404,17 +2404,26 @@ _b3_passed` 둘 다 필요)은 순서와 무관해 그대로. `_b2_passed`/`_b3_
 
 **함께 추가:** "지금 B1/B2/B3 중 어느 단계고 뭘 기다리는지"가 그동안 `_print_debug()`의
 터미널 `[{mission_state}|{behavior_state}|{phase}]` 요약 줄로만 나와서 실시간 상황 대응 중
-알아보기 어렵다는 요청으로, `obstacle_cut_debug` 창 상단에 상태 줄을 추가했다
-(`_current_stage_label()`, track_drive.py). `run_behavior_fsm()`과 정확히 같은 판단 순서를
-따라가며 표시 문구는 다음과 같다:
-- `Phase.LAVACON`: "B1 라바콘 — 진행 중(탈출 대기)" / "대기 중(좌우 동시검출 트리거 대기)"
-- `Phase.OBSTACLE_ZONE`: `_b2_passed`가 False면 "B2 고정장애물", 아니면 "B3 방해차량" —
-  뒤에 "감지됨(회피/통과 중)"(`_obscut_zone_tag`가 그 태그와 일치) 또는 "대기 중" 표시
-- `Phase.DONE`: "B1/B2/B3 모두 통과 — 다음 교차로 대기"
-- `S0_SIGNAL`/`S3_SHORTCUT`/`S4_FINISH`: 각 상태 이름을 그대로 표시(Behavior 진행과 무관)
-
-색상은 초록=감지/진행 중, 주황=대기 중, 회색=해당 없음/종료로 통일해 다른 디버그 창
-(예: `signal4_roi`, `avoid_hold_debug`)과 관례를 맞췄다.
+알아보기 어렵다는 요청으로 두 곳에 표시를 추가했다:
+- `obstacle_cut_debug` 창 상단 상태 줄(`_current_stage_label()`, track_drive.py) — 한글
+  설명형: `Phase.LAVACON`은 "B1 라바콘 — 진행 중(탈출 대기)"/"대기 중(좌우 동시검출 트리거
+  대기)", `Phase.OBSTACLE_ZONE`은 `_b2_passed`가 False면 "B2 고정장애물", 아니면 "B3
+  방해차량" 뒤에 "감지됨(회피/통과 중)"(`_obscut_zone_tag`가 그 태그와 일치)/"대기 중",
+  `Phase.DONE`은 "B1/B2/B3 모두 통과 — 다음 교차로 대기". 색상은 초록=감지/진행 중,
+  주황=대기 중, 회색=해당 없음/종료로 다른 디버그 창(`signal4_roi`, `avoid_hold_debug`)과
+  관례를 맞췄다.
+- [2026-08-22 추가 수정] 사용자가 실제로 원한 자리는 이 창이 아니라 터미널 `_print_debug()`
+  요약 줄의 가운데 칸(`[mission|behavior|phase]`)이었다 — 그 칸은 `self.behavior_state.name`
+  을 그대로 찍는데, `run_behavior_fsm()`이 실제 회피를 `obstacle_cut_active`로 넘기면서
+  이 필드는 거의 항상 `B0_NORMAL`로 고정돼 있어(위 "배경" 참고) 그것만 봐선 진행 단계를
+  알 수 없었다. `self.behavior_state` 자체를 B1/B2/B3로 바꾸면
+  `apply_behavior_override()`가 옛 `_handle_lavacon()`/`_handle_fixed_obstacle()`/
+  `_handle_overtake()`(TargetPassing 기반, 지금은 안 쓰는 실제 조향 핸들러)를 다시 불러버려
+  주행이 깨지므로, 표시 전용 헬퍼 `_behavior_progress_tag()`를 새로 만들어 그 칸에서만
+  `self.behavior_state.name` 대신 이걸 쓰게 했다(`self.behavior_state` 자체는 그대로 항상
+  `B0_NORMAL`). `_current_stage_label()`과 같은 근거(`_lavacon_engaged`/`_b2_passed`/
+  `_b3_passed`/`_obscut_zone_tag`)로 `B1_LAVACON`/`B2_OBSTACLE`/`B3_VEHICLE`/`B0_NORMAL`을
+  반환하고, 그 단계가 지금 실제로 감지/진행 중이면 `+`를 붙인다(예: `B2_OBSTACLE+`).
 
 **영향받지 않는 것:** §5.4와 동일 — `_mark_behavior_passed()`/Phase.DONE 전환 조건, `RESET_
 PHASE_EACH_LAP` 리셋 경로.
