@@ -1296,7 +1296,8 @@ DEBUG_WIN_POS_OBSTACLE_CUT  = (0, 650)
 #   겹치지 않는지 다시 확인할 것.
 DEBUG_WIN_POS_YOLO_SIGNAL_STATE = (0, 0)      # 'YOLO_신호등' 창 (perception/yolo_signal_state.py), 640x480
 DEBUG_WIN_POS_CHECKER_PILLAR    = (650, 0)    # 'checker_pillar_bev' 창 (track_drive.py), 500x500
-DEBUG_WIN_POS_LEFT_TURN         = (0, 650)    # 'left_turn_debug' 창 (track_drive.py), 480x436
+DEBUG_WIN_POS_LEFT_TURN         = (0, 650)    # 'left_turn_debug' 창 (track_drive.py), 480x336
+                                               # ([2026-08-23] 카메라/라이다 패널 축소로 436→336)
 
 # [2026-08-11] 라바콘 실차 테스트 중엔 라이다 창만 보고 싶다는 요청으로, 아래 DEBUG_VIZ_LIDAR만
 #   켜고 나머지는 전부 잠시 끔. 다른 디버그창이 다시 필요하면(예: 차선 인식 디버깅) 개별적으로
