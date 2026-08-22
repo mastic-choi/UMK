@@ -1290,6 +1290,13 @@ DEBUG_PERIOD = 0.5     # 위 로그 주기(s)
 DEBUG_WIN_POS_DL_LANE       = (0, 0)
 DEBUG_WIN_POS_LAVACON       = (650, 0)
 DEBUG_WIN_POS_OBSTACLE_CUT  = (0, 650)
+# [2026-08-23] 위 3개(DL_LANE/LAVACON/OBSTACLE_CUT)가 지금 다 꺼져 있고 대신 아래 3개
+#   (YOLO_신호등/checker_pillar_bev/left_turn_debug)만 켜져 있어서, 같은 그리드 좌표를
+#   그대로 재사용해도 안 겹친다 — 위 3개를 동시에 다시 켤 일이 생기면 이 좌표들이 서로
+#   겹치지 않는지 다시 확인할 것.
+DEBUG_WIN_POS_YOLO_SIGNAL_STATE = (0, 0)      # 'YOLO_신호등' 창 (perception/yolo_signal_state.py), 640x480
+DEBUG_WIN_POS_CHECKER_PILLAR    = (650, 0)    # 'checker_pillar_bev' 창 (track_drive.py), 500x500
+DEBUG_WIN_POS_LEFT_TURN         = (0, 650)    # 'left_turn_debug' 창 (track_drive.py), 480x436
 
 # [2026-08-11] 라바콘 실차 테스트 중엔 라이다 창만 보고 싶다는 요청으로, 아래 DEBUG_VIZ_LIDAR만
 #   켜고 나머지는 전부 잠시 끔. 다른 디버그창이 다시 필요하면(예: 차선 인식 디버깅) 개별적으로
@@ -1404,11 +1411,12 @@ DEBUG_VIZ_AVOID_HOLD = False
 # [2026-08-20] da 근접 컷(obstacle-cut, ENABLE_OBSTACLE_CUT 주석 참고) 전용 상태창 —
 #   라이다 raw/YOLO raw/AND확정/유지타이머 잔여시간/해제카운터를 avoid_hold_debug와
 #   같은 구조로 한곳에 모아 보여준다(track_drive.py _debug_viz_obstacle_cut()).
-DEBUG_VIZ_OBSTACLE_CUT = True    # [2026-08-22i] 요청 반영으로 껐다가, [2026-08-22m] 회피(da 근접 컷)
-#   검출범위 확인용으로 다시 켬 — 이 창의 "LIDAR TRIGGER ROI" BEV 패널이 라이다 검출범위
-#   (OBSTACLE_CUT_TRIGGER_X_MAX_M x Y_HALF_M 박스)를 보여주는 창이다. dl_lane 창의 경로선
-#   색 구분(draw_path(), lane_util.py)과 같이 켜서 "라이다가 왜 지금 잡았는지"와 "그래서
-#   경로가 실제로 밀렸는지"를 두 창에서 나란히 확인한다.
+DEBUG_VIZ_OBSTACLE_CUT = False    # [2026-08-22i] 요청 반영으로 껐다가, [2026-08-22m] 회피(da 근접 컷)
+#   검출범위 확인용으로 다시 켰다가, [2026-08-23] 요청 반영으로 다시 끔 — 이 창의 "LIDAR
+#   TRIGGER ROI" BEV 패널이 라이다 검출범위(OBSTACLE_CUT_TRIGGER_X_MAX_M x Y_HALF_M 박스)를
+#   보여주는 창이다. dl_lane 창의 경로선 색 구분(draw_path(), lane_util.py)과 같이 켜서
+#   "라이다가 왜 지금 잡았는지"와 "그래서 경로가 실제로 밀렸는지"를 두 창에서 나란히
+#   확인하려던 용도였는데, dl_lane도 지금 꺼져있어 필요 없어졌다. 필요하면 다시 True로.
 
 
 # #############################################################

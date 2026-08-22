@@ -1978,6 +1978,10 @@ class TrackDriverNode(Node):
         self._checker_pillar_bev_img = bev  # left_turn_debug 통합창(_debug_viz_left_turn())이 재사용
 
         if DEBUG_VIZ_CHECKER_PILLAR:
+            if 'checker_pillar_bev' not in self._dbg_windows_positioned:
+                cv2.namedWindow('checker_pillar_bev', cv2.WINDOW_AUTOSIZE)
+                cv2.moveWindow('checker_pillar_bev', *DEBUG_WIN_POS_CHECKER_PILLAR)
+                self._dbg_windows_positioned.add('checker_pillar_bev')
             cv2.imshow('checker_pillar_bev', bev)
             cv2.waitKey(1)
 
@@ -3368,6 +3372,10 @@ class TrackDriverNode(Node):
         cv2.line(cam_row, (half_w, 0), (half_w, HALF_H - 1), (80, 80, 80), 1)
 
         combined = np.vstack([canvas, cam_row])
+        if 'left_turn_debug' not in self._dbg_windows_positioned:
+            cv2.namedWindow('left_turn_debug', cv2.WINDOW_AUTOSIZE)
+            cv2.moveWindow('left_turn_debug', *DEBUG_WIN_POS_LEFT_TURN)
+            self._dbg_windows_positioned.add('left_turn_debug')
         cv2.imshow('left_turn_debug', combined)
         cv2.waitKey(1)
 

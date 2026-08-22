@@ -41,6 +41,7 @@ else:
 from ..config import (
     YOLO_SIGNAL_STATE_INPUT_SIZE, YOLO_SIGNAL_STATE_CONF_THRESHOLD, YOLO_SIGNAL_STATE_MODEL_PATH,
     YOLO_SIGNAL_STATE_CLASS_NAMES, DEBUG_VIZ_YOLO_SIGNAL_STATE, FPS_LOG_PERIOD_SEC,
+    DEBUG_WIN_POS_YOLO_SIGNAL_STATE,
 )
 
 
@@ -184,6 +185,10 @@ class YoloSignalStateDetector:
         self._latest_state = {name: (False, 0.0) for name in YOLO_SIGNAL_STATE_CLASS_NAMES}
         self._latest_detections = []
         self._latest_debug = None                    # 시각화용 vis 프레임
+        # [2026-08-23] 'YOLO_신호등' 창을 처음 띄울 때만 cv2.moveWindow로 위치를 잡기 위한
+        #   1회성 가드(DEBUG_WIN_POS_YOLO_SIGNAL_STATE 참고, track_drive.py/dl_lane.py의
+        #   같은 패턴과 동일 이유).
+        self._dbg_win_positioned = False
         self._stopped = False
         self._last_fps_log_t = time.time()
         self._logged_infer_error = False  # [2026-08-20] 추론 예외를 매 프레임 로그하면 로그창이
@@ -268,6 +273,10 @@ class YoloSignalStateDetector:
             vis = self._latest_debug
         if vis is None:
             return
+        if not self._dbg_win_positioned:
+            cv2.namedWindow('YOLO_신호등', cv2.WINDOW_AUTOSIZE)
+            cv2.moveWindow('YOLO_신호등', *DEBUG_WIN_POS_YOLO_SIGNAL_STATE)
+            self._dbg_win_positioned = True
         cv2.imshow('YOLO_신호등', vis)
         cv2.waitKey(1)
 
