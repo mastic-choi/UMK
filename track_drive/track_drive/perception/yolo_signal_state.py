@@ -278,10 +278,14 @@ class YoloSignalStateDetector:
             cv2.moveWindow('YOLO_신호등', *DEBUG_WIN_POS_YOLO_SIGNAL_STATE)
             self._dbg_win_positioned = True
         # [2026-08-23, 요청 반영: "카메라욜로랑 검출라이다는 크기 완전 작게"] 원본
-        # 640x480(YOLO_SIGNAL_STATE_INPUT_SIZE 기반 프레임)을 화면 표시용으로만 축소 —
-        # 검출/판단에 쓰이는 vis 자체는 그대로 두고 imshow 직전에만 리사이즈한다
-        # (yolo_cone_result 창 "아주 작게" 튜닝과 동일 관례, 160x120).
-        small_vis = cv2.resize(vis, (160, 120), interpolation=cv2.INTER_AREA)
+        # 640x480(YOLO_SIGNAL_STATE_INPUT_SIZE 기반 프레임)을 화면 표시용으로만 리사이즈 —
+        # 검출/판단에 쓰이는 vis 자체는 그대로 두고 imshow 직전에만 리사이즈한다.
+        # [2026-08-23d, 요청 반영] 160x120은 좌회전/직진 판단 검증 중 박스가 너무 작아 안
+        # 보인다는 재요청으로 600x450(4:3 비율 유지)으로 다시 키움 — DEBUG_WIN_POS_YOLO_
+        # SIGNAL_STATE=(0,0)에서 이 크기로 떠도 오른쪽 checker_pillar_bev(650,0 시작)와는
+        # 50px 여유가 있고, 아래쪽 left_turn_debug(0,650 시작)와도 겹치지 않는다
+        # (config.py DEBUG_WIN_POS_YOLO_SIGNAL_STATE 주석 참고).
+        small_vis = cv2.resize(vis, (600, 450), interpolation=cv2.INTER_AREA)
         cv2.imshow('YOLO_신호등', small_vis)
         cv2.waitKey(1)
 

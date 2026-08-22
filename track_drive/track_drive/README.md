@@ -1442,6 +1442,150 @@ EMA 클러스터링 오검출, avoid-hold 유예 오작동)는 눈으로 못 본
 
 ---
 
+### 1.19h `TEST_SIGNAL_LOOP` — "주행 중 신호등 만남" 반복 격리 테스트 모드 신설 (2026-08-23)
+
+**배경:** §1.19g 직후, "직진 신호를 몇 번을 확정받아도 B1이 절대 안 켜진다"는 증상이
+그 사이(8/22~23) 잠깐 걸어뒀던 "B3 통과 후 신호등 대기" 단독 검증용 override
+(`START_STATE=S1_LANE_FOLLOW` + `Phase.DONE`/`_b2_passed`=`_b3_passed`=`True`)가 원복 안
+된 채 남아있던 게 원인으로 진단됨 — `Phase.DONE`이면 `run_behavior_fsm()`이
+`Phase.LAVACON` 분기 자체에 안 들어가 라바콘 트리거 검사를 아예 안 하기 때문. 일단
+`START_STATE=S0_SIGNAL`/`Phase.LAVACON`/`False`/`False` 정상 플로우로 원복했다가,
+바로 이어서 "주행 중 신호등 만났을 때 좌회전/직진 판단"을 실차에서 **반복** 테스트하고
+싶다는 요청이 들어와 — 매번 결승선까지 실제로 완주해야 다음 시도를 할 수 있으면 비효율
+적이므로, 같은 모양의 override를 다시 걸되 이번엔 반복 루프가 되게 전용 스위치
+(`TEST_SIGNAL_LOOP`)로 감쌌다.
+
+**수정:** `config.py`
+- `TEST_SIGNAL_LOOP`(신규, `True`) — "6. 미션 State" 절에 `TEST_FORCE_BEHAVIOR` 옆에 추가.
+- `START_STATE = MissionState.S1_LANE_FOLLOW`로 다시 변경.
+
+`track_drive.py`
+- `__init__`: `self.phase = Phase.DONE`, `_b2_passed = _b3_passed = True`로 다시 변경
+  (§1.19g 이전, 8/23 초반 override와 동일한 값 — "B1/B2/B3 이미 통과, 다음 교차로
+  신호등 대기" 상태로 바로 시작).
+- `_s1_lane_follow()` 직진 확정(`signal_straight_confirmed`) 분기: `TEST_SIGNAL_LOOP`가
+  켜져 있으면 그 자리에서 바로 `phase=Phase.LAVACON`, `_b2_passed`/`_b3_passed`/
+  `_lavacon_engaged`/`_lavacon_empty_cnt`/`_lavacon_trigger_cnt`를 리셋 — 정상 레이스라면
+  이 리셋은 결승선을 통과해야(`_update_lap()`) 일어나지만, 신호 판단만 테스트할 땐 결승선
+  까지 안 가고 바로 B1이 다음 순서로 대기하게 만든다.
+- `_do_checker_ramp_turn()` 좌회전 램프 완료 분기: `TEST_SIGNAL_LOOP`가 켜져 있고
+  `phase==Phase.DONE`(=이 좌회전이 신호 판단 테스트 대기 상태에서 시작된 것)이면
+  `_signal_yolo_off=False`로 되돌려 신호등 YOLO를 재개 — "좌회전 발행 후 다시 아까
+  대기 상태로 복귀"해서 다음 시도를 바로 이어갈 수 있게. `phase`가 `LAVACON`/
+  `OBSTACLE_ZONE`(=실제 레이스 중 좌회전)이면 이 리셋을 안 해 정상 동작(다음 바퀴
+  리셋 전까지 신호등 YOLO 꺼둠, §1.19g)을 그대로 지킨다.
+- 직진 쪽은 되돌아가는 게 아니라 B1로 전진하는 흐름이라(위 참고) `_signal_yolo_off`를
+  따로 안 풀어도 된다 — 다음 신호는 애초에 그 다음 바퀴에나 나온다.
+
+**알려진 한계:** 실차 미검증. `TEST_SIGNAL_LOOP=True`인 채로 실제 3바퀴 레이스를 뛰면
+신호 확정 시점에 phase가 조기 리셋되어 버리므로, **검증이 끝나면 반드시**
+`TEST_SIGNAL_LOOP=False` + `START_STATE=S0_SIGNAL` + `track_drive.py __init__`의
+`phase=Phase.LAVACON`/`_b2_passed=_b3_passed=False`로 같이 되돌릴 것(8/23 안에 이
+override가 벌써 두 번째로 원복 대상이 됐다는 점을 특히 유의 — 다음에도 검증 끝나면
+바로 되돌릴 것).
+
+---
+
+### 1.19i 신호 확정 후 YOLO 끄는 시점에 `SIGNAL_YOLO_OFF_HOLD_FRAMES` 유예 추가 (2026-08-23)
+
+**배경:** §1.19h 테스트 모드로 좌회전을 실차에서 확인하던 중 "`YOLO_신호등` 디버그창엔
+좌회전이 분명히 찍혔는데 확정 표시가 안 된다"는 보고 — 원인은 검출 실패가 아니라
+타이밍이었다. 좌회전 확정은 같은 틱에 곧장 `MissionState.S0_SIGNAL`로 전환되고,
+`_change_state()`가 `S0_SIGNAL` 진입 처리에서 `signal_left_confirmed`/`signal_left_on`/
+`_sig_left_cnt`를 그 자리에서 즉시 0/`False`로 리셋한다(S0_SIGNAL이 새로 판독을 시작하기
+위한 정상 동작). 그런데 §1.19g에서 넣은 "확정되면 즉시 `_signal_yolo_off=True`" 로직이
+같은 틱에 걸리면서, 그 다음 틱부터 `_active_yolo_stage()`가 YOLO 자체를 꺼버려 — 결과적으로
+확정된 순간 딱 1프레임만 반짝 보이고 검출/확정 표시가 통째로 사라져 육안·디버그창으로
+확인할 틈이 없었다.
+
+**수정:** `track_drive.py`
+- `__init__`에 `self._signal_off_hold_cnt = None` 신규 — `_change_state()`가 안 건드리는
+  별도 필드라 S0_SIGNAL 진입 리셋에 영향받지 않는다.
+- `perc_signal()`: 확정되는 순간 바로 `_signal_yolo_off=True`를 세우는 대신, 확정되면
+  `_signal_off_hold_cnt`를 0부터 세기 시작해 `SIGNAL_YOLO_OFF_HOLD_FRAMES`(신규,
+  `config.py`, 기본 10=20Hz 기준 0.5초)에 도달해야 그때 끈다.
+- `_update_lap()`(매 바퀴 리셋)와 `_do_checker_ramp_turn()`(TEST_SIGNAL_LOOP 좌회전 루프
+  복귀) 두 곳의 기존 `_signal_yolo_off=False` 리셋 옆에 `_signal_off_hold_cnt=None`도
+  같이 추가 — 안 하면 두 번째 신호부터는 유예 없이 바로 꺼진다.
+
+`config.py`
+- `SIGNAL_YOLO_OFF_HOLD_FRAMES = 10` 신규.
+- `SIG_CONFIRM_FRAMES`(§1.19g에서 1로 낮췄던 값) 주석 갱신 — 그 증상의 진짜 원인이
+  검출 불안정이 아니라 이 즉시-끔 타이밍이었다는 게 재확인됐으니, 유예가 생긴 지금은
+  다시 3 근처로 올려도 될 가능성이 있다고 기록(값 자체는 이 시점엔 아직 1 유지, §1.19j
+  에서 실제로 3으로 원복함).
+
+**알려진 한계:** 실차 미검증. FSM 상태전환(좌회전이면 `S0_SIGNAL` 진입, 직진이면
+`_behavior_enabled` 재활성화)은 확정되는 그 틱에 이미 끝나므로 이 유예는 FSM 반응
+속도와 무관 — 순수하게 "YOLO를 몇 프레임 더 돌려 디버그창에서 확인 가능하게" 하는
+것뿐이다. `SIGNAL_YOLO_OFF_HOLD_FRAMES`를 늘리면 그만큼 확정 후에도 불필요한 추론이
+더 오래 돈다.
+
+---
+
+### 1.19j §1.19i 유예를 넣었는데도 좌회전이 `left_turn_debug`엔 안 찍힘 — 진짜 원인은 `SIG_CONFIRM_FRAMES=1`의 단발 오검출 (2026-08-23)
+
+**배경:** §1.19i 수정 후에도 "`YOLO_신호등` 창엔 좌회전이 확실히 떴는데
+`left_turn_debug`(확정 L/S 줄)엔 전혀 안 찍힌다"는 재보고 — 유예 프레임 문제가 아니라
+아예 처음부터 신호등 YOLO 자체가 안 불리고 있었던 것으로 재진단. 경로: TEST_SIGNAL_LOOP
+모드로 좌회전 테스트 전에(또는 같은 세션에서) 신호판이 "green_left"로 완전히 안정되기
+전 과도 상태에서 `green_straight`로 잠깐 오검출되는 프레임이 하나라도 섞이면,
+`SIG_CONFIRM_FRAMES=1`이라 그 한 프레임만으로 즉시 `signal_straight_confirmed`가
+확정된다. `_s1_lane_follow()`의 `TEST_SIGNAL_LOOP` 직진 분기(§1.19h)가 그 순간
+`self.phase`를 곧장 `Phase.LAVACON`으로 돌려버리고, 그 뒤로는 `_active_yolo_stage()`가
+`Phase.LAVACON`이면 `'cone'`만 리턴하므로 신호등 YOLO(`perc_yolo_signal_state()`) 자체가
+더 이상 호출되지 않는다 — `signal_left_on`은 영원히 `False`로 고정. 이 시점 이후로
+아무리 진짜 좌회전 화살표를 보여줘도 FSM은 그걸 보지도 못한다. 그런데 `YOLO_신호등`
+디버그창은 (오검출 전) 마지막으로 성공했던 추론 프레임이 그대로 얼어붙어 있는 것뿐이라
+(백그라운드 워커가 새 프레임을 못 받으면 유휴 상태로 대기, `yolo_signal_state.py`
+`_worker()` 참고) — 사용자 눈엔 "지금도 검출되고 있다"로 보이는 착시였다.
+
+**수정:** `config.py`
+- `SIG_CONFIRM_FRAMES` 1 → 3 원복 — §1.19i의 유예(`SIGNAL_YOLO_OFF_HOLD_FRAMES`)로
+  "확정 직후 바로 꺼져서 안 보인다"는 원래 문제는 이미 해결됐으므로, 단발 오검출에
+  취약한 N=1을 유지할 이유가 없어졌다.
+
+`track_drive.py`
+- `_debug_viz_left_turn()`에 `phase=... 활성 YOLO=...` 줄 신규 추가 — `_active_yolo_stage()`
+  결과가 `'signal'`이 아니면 빨간 계열 색 + "← 신호등 YOLO 꺼짐, 위 확정 안 뜸" 문구로
+  바로 원인이 드러나게 했다. 이제 `YOLO_신호등` 창과 `left_turn_debug`가 서로 다른
+  걸 보여줘도 이 줄만 보면 "신호등 YOLO가 지금 이 틱에 실제로 도는지"를 바로 구분할 수
+  있다.
+
+**알려진 한계:** 실차 미검증. `TEST_SIGNAL_LOOP` 모드 자체가 가진 구조적 약점은 여전함 —
+`phase`가 한 번 `Phase.DONE`을 벗어나면(직진 오검출 포함) 그 세션 안에서 되돌아올 방법이
+없다(실제 B1/B2/B3를 다 통과하거나 노드 재시작만 가능). 지금 노드가 떠 있는 상태에서
+이미 이 오검출을 겪었다면 `phase`가 `Phase.LAVACON`/`OBSTACLE_ZONE`에 멈춰있을 수 있으니,
+좌회전을 다시 테스트하기 전에 위 새 디버그 줄로 `phase=DONE`인지 먼저 확인하거나 노드를
+재시작할 것.
+
+---
+
+### 1.19k `YOLO_SIGNAL_STATE_CONF_THRESHOLD` 0.8→0.5 원복 + `SIG_CONFIRM_FRAMES` 1→3 재상향 (2026-08-23, 사용자 지시)
+
+**배경:** §1.19j의 "직진 오검출 1프레임 → phase 조기 이탈" 문제가 실차에서 계속
+재현됨 — 사용자가 "`green_left`가 잘 안 잡히고 죄다 `green_straight`로 읽힌다"고
+관찰. 원인으로 두 가지가 겹쳐있던 것으로 판단됨: (1) `YOLO_SIGNAL_STATE_CONF_THRESHOLD`가
+그 전날 0.5→0.8로 올라가 있어서, `green_left`(화살표라 판형이 작고 인식이 상대적으로
+까다로움)가 유독 그 문턱을 못 넘어 잘 안 잡히고 `green_straight`/`red`만 쉽게 통과하는
+쪽으로 편향, (2) `SIG_CONFIRM_FRAMES=1`이라 그렇게 통과한 단발 오검출이 디바운스 없이
+그 즉시 확정으로 승격. 둘이 겹쳐서 "좌회전을 보여줘도 그 전에 잠깐 스친 직진 오검출이
+먼저 확정돼버리고, `TEST_SIGNAL_LOOP` 특성상 그 뒤로는 신호등 YOLO 자체가 멈춰버리는"
+현상으로 나타남.
+
+**수정:** `config.py`
+- `YOLO_SIGNAL_STATE_CONF_THRESHOLD` 0.8 → 0.5 원복.
+- `SIG_CONFIRM_FRAMES` 1 → 3 재상향.
+- 방어선을 "신뢰도 문턱을 높여서 거르기"가 아니라 "문턱은 낮춰서 잘 잡되, 여러 프레임
+  연속으로 확인해서 거르기" 쪽으로 재배치 — 이번엔 사용자가 직접 지시한 값이니
+  다음에 임의로 다시 바꾸지 말 것(§SIG_CONFIRM_FRAMES 주석 참고, 이전에 확인 없이
+  바꿨다가 문제가 됐음).
+
+**알려진 한계:** 실차 미검증. `green_left`의 실제 평균 신뢰도가 몇인지는 아직 실측
+안 됨 — `YOLO_신호등` 창의 박스 위 conf 숫자로 확인 후 필요하면 임계값을 더 조정할 것.
+
+---
+
 ## 2. 라인트래킹 (차선주행, S1)
 
 **수정할 곳:** `START_STATE=S1_LANE_FOLLOW`, `TEST_FORCE_BEHAVIOR=False`.

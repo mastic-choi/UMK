@@ -159,6 +159,13 @@ class TrackDriverNode(Node):
         # 불필요한 추론이 계속 돌던 비대칭을 없앴다. _active_yolo_stage() S0_SIGNAL/Phase.DONE
         # 분기 참고, RESET_PHASE_EACH_LAP에서 다음 바퀴 시작 시 해제.
         self._signal_yolo_off = False
+        # [2026-08-23, 요청 반영] "확정되자마자 바로 꺼서 디버그창에서 검출된 걸 확인할
+        # 새도 없다"는 보고로, 확정 순간 바로 끄지 않고 SIGNAL_YOLO_OFF_HOLD_FRAMES만큼
+        # 더 돈 뒤에 끄도록 유예를 둔다. None=아직 확정 안 됨(카운트 시작 전), 확정되는
+        # 순간 0부터 세기 시작 — perc_signal() 참고. mission_state가 S0_SIGNAL로 바뀌면서
+        # _change_state()가 signal_left_confirmed 등을 곧바로 리셋해버려도(좌회전 확정
+        # 시 같은 틱에 전환됨) 이 카운터 자체는 안 건드리므로 유예가 끊기지 않는다.
+        self._signal_off_hold_cnt = None
         # [2026-08-22] S1→S0_SIGNAL 진입 트리거를 "보드 인식(색상 무관)" → "색상 확정
         # (signal_straight/left_confirmed)"으로 교체(요청 반영) — 예전엔 보드만 보여도
         # 곧장 S0_SIGNAL로 넘어가 그 안에서 다시 멈춰 서서 색상을 판독했다(그 사이 속도가
@@ -370,13 +377,13 @@ class TrackDriverNode(Node):
         # ── 판단/제어 상태 ──
         self.mission_state  = START_STATE
         self.behavior_state = BehaviorState.B0_NORMAL
-        # [2026-08-23] "B3 통과 후 다음 교차로 신호등 대기" 단독 검증용으로 잠깐
-        # Phase.DONE + _b2_passed/_b3_passed=True로 걸어뒀던 override를 원복했다(요청
-        # 반영, B1이 신호 확정과 무관하게 절대 안 켜지는 문제로 진단됨 — Phase.DONE이면
-        # run_behavior_fsm()이 Phase.LAVACON 분기 자체에 안 들어가 라바콘 트리거 검사를
-        # 아예 안 하고 매 틱 B0_NORMAL로 고정하기 때문). START_STATE도 config.py에서
-        # S0_SIGNAL로 같이 되돌림 — 정상 플로우(출발선 신호등 대기부터 실제로 거침) 검증.
-        self.phase          = Phase.LAVACON
+        # [2026-08-23] "B3 통과 후 다음 교차로 신호등 대기" 단독 검증용 override를 다시
+        # 건다(요청 반영, TEST_SIGNAL_LOOP와 짝 — config.py "6. 미션 State" 절 참고) —
+        # 신호등 판단(직진/좌회전)만 실차에서 반복 테스트하려는 목적이라, B1/B2/B3를
+        # 전부 "이미 통과한 것"으로 놓고 곧장 다음 교차로 신호등 대기 상태로 시작한다.
+        # 검증 끝나면 Phase.LAVACON/False/False로 되돌리고 config.py TEST_SIGNAL_LOOP도
+        # False로 같이 되돌릴 것(9c4371e 좌회전 단독 검증 때와 같은 패턴).
+        self.phase          = Phase.DONE
         # [2026-08-15] Phase.OBSTACLE_ZONE 통합(da_based_b2b3_proposal.md B안) —
         # B2/B3 각각 최소 한 번 완료됐는지 추적. 둘 다 True가 돼야 Phase.DONE으로
         # 넘어간다(_mark_behavior_passed() 참고).
@@ -384,8 +391,10 @@ class TrackDriverNode(Node):
         # 확정된 순서다(§5.2) — §5.4에서 잠깐 반대로 뒤집었다가(요청 반영), [2026-08-22]
         # 요청으로 다시 "B2 먼저"로 되돌렸다(README §5.5). run_behavior_fsm()에서 B3 트리거를
         # self._b2_passed가 True일 때만 받아들이도록 순서를 강제한다(아래 참고).
-        self._b2_passed = False
-        self._b3_passed = False
+        # [2026-08-23] 위 Phase.DONE 시작과 짝 — Phase.DONE 진입 조건(_mark_behavior_passed())
+        # 이 원래 요구하는 값(둘 다 True)을 시작부터 맞춰둔다.
+        self._b2_passed = True
+        self._b3_passed = True
         # [2026-08-20] 요청 반영 — B2/B3 실제 처리를 da 근접 컷(obstacle_cut_active) 기반으로
         # 바꾸면서 추가. obstacle_cut_active 진입 순간 'B2'/'B3' 중 하나를 latch해뒀다가,
         # obstacle_cut_active가 다시 꺼지는 순간(탈출) 그 태그로 _mark_behavior_passed()를
@@ -393,7 +402,8 @@ class TrackDriverNode(Node):
         # 동일한 진입~탈출 latch 패턴.
         self._obscut_zone_tag = None
         self._behavior_enabled = TEST_FORCE_BEHAVIOR  # 원래 S0_SIGNAL "직진" 확정 시에만 True
-                                                       #   (TEST_FORCE_BEHAVIOR=False, START_STATE=S0_SIGNAL 정상 플로우 — 그 확정 경로를 타야 켜짐)
+                                                       #   (TEST_FORCE_BEHAVIOR=False — Phase.DONE 시작이라 강제 ON 불필요,
+                                                       #    직진 신호 확정 분기가 그때 가서 직접 켠다)
         # [2026-08-20] S0_SIGNAL 통합(S0_WAIT_GREEN+S2_INTERSECTION → 하나)으로 같은 state를
         # 출발 때와 매 바퀴 교차로에서 반복 재진입하게 됐다 — "이번이 진짜 첫 출발인지"는
         # prev_state 비교로 더 이상 구분이 안 되므로(둘 다 같은 state) 이 플래그로 직접
@@ -639,6 +649,12 @@ class TrackDriverNode(Node):
     #   다시 전체 구간에서 보고 싶으면 이 함수가 'signal' 아닌 다른 stage일 때도
     #   perc_yolo_signal_state()를 호출하도록 되돌리면 된다.
     def _active_yolo_stage(self):
+        if TEST_FORCE_SIGNAL_YOLO:
+            # [2026-08-23, 요청 반영] "욜로 안 끊기게, 검출만 테스트" 전용 — mission_state/
+            # phase/_signal_yolo_off 등 FSM 상태와 완전히 무관하게 신호등 YOLO를 항상 켠다.
+            # TEST_SIGNAL_LOOP의 phase 조기 이탈이나 확정 후 hold-off 로직(perc_signal())에
+            # 전혀 영향받지 않으므로, 순수하게 YOLO_신호등 창의 검출 정확도만 보고 싶을 때 켤 것.
+            return 'signal'
         if self.mission_state == MissionState.S0_SIGNAL:
             # [2026-08-23] 좌회전 확정 뒤 커밋구간/게이트 램프(_s2_commit_dist/
             # _checker_ramp_dist)를 도는 동안은 색상이 이미 확정된 뒤라 더 볼 필요가 없다
@@ -918,15 +934,32 @@ class TrackDriverNode(Node):
         self._sig_left_cnt     = self._sig_left_cnt + 1 if self.signal_left_on else 0
         self.signal_straight_confirmed = self._sig_straight_cnt >= SIG_CONFIRM_FRAMES
         self.signal_left_confirmed     = self._sig_left_cnt >= SIG_CONFIRM_FRAMES
-        # [2026-08-23] 직진/좌회전 둘 중 하나라도 확정되는 즉시 신호등 YOLO 추론을 끈다 —
+        # [2026-08-23] 직진/좌회전 둘 중 하나라도 확정되면 신호등 YOLO 추론을 끈다 —
         # 색상이 이미 확정된 이상 더 볼 필요가 없다(다음 바퀴 리셋까지, _update_lap()
         # RESET_PHASE_EACH_LAP 분기 참고). 예전엔 직진 확정 분기(_s1_lane_follow())에서만
         # 개별적으로 껐는데, 좌회전 확정 뒤 S0_SIGNAL 커밋구간에서는 _active_yolo_stage()가
         # S0_SIGNAL이면 이 플래그와 무관하게 무조건 'signal'을 켜고 있어 좌회전 쪽만
         # 추론이 안 꺼지는 비대칭이 있었다 — 여기 한 곳에서 양쪽 다 같은 순간(확정되는 틱)에
         # 끄도록 합쳤다(_active_yolo_stage() S0_SIGNAL 분기도 같이 수정).
-        if self.signal_straight_confirmed or self.signal_left_confirmed:
-            self._signal_yolo_off = True
+        # [2026-08-23b, 요청 반영] "YOLO_신호등 창에 좌회전이 분명히 찍혔는데도 확정
+        # 표시가 바로 사라져서 확인이 안 된다"는 보고 — 좌회전 확정은 같은 틱에 곧장
+        # S0_SIGNAL로 전환되고 _change_state()가 signal_left_confirmed/signal_left_on/
+        # _sig_left_cnt를 그 자리에서 즉시 리셋해버리는데(S0_SIGNAL 진입 시 새로 판독
+        # 시작하려는 의도, 그 자체는 정상), 곧이어 이 조건이 True→False로 바로 꺼져
+        # YOLO도 다음 틱부터 바로 멈춰버려 육안/디버그창으로 확인할 틈이 없었다. 그래서
+        # 확정되는 즉시 끄지 않고, 확정된 틱부터 SIGNAL_YOLO_OFF_HOLD_FRAMES만큼 더 돈
+        # 뒤에 끄도록 유예를 둔다 — _signal_off_hold_cnt는 _change_state()가 안 건드리는
+        # 별도 필드라 위 리셋과 무관하게 계속 유지된다. FSM의 실제 상태전환(좌회전이면
+        # S0_SIGNAL 진입, 직진이면 Behavior 재활성화)은 이 유예와 무관하게 확정되는 그
+        # 틱에 이미 끝나 있으므로, 이 유예는 순수하게 "YOLO를 몇 프레임 더 돌려서 눈으로
+        # 확인 가능하게" 하는 것뿐 — FSM 반응 속도에는 영향 없다.
+        if (self.signal_straight_confirmed or self.signal_left_confirmed) \
+                and self._signal_off_hold_cnt is None:
+            self._signal_off_hold_cnt = 0
+        if self._signal_off_hold_cnt is not None:
+            self._signal_off_hold_cnt += 1
+            if self._signal_off_hold_cnt >= SIGNAL_YOLO_OFF_HOLD_FRAMES:
+                self._signal_yolo_off = True
 
     # [2026-08-13] mask(불리언 배열)에서 True인 인덱스들 중 가장 긴 "연속(인접 인덱스)"
     # 구간의 길이를 구한다. 전방 장애물 그룹핑(perc_obstacle()의 fidx/groups, np.split을
@@ -2145,6 +2178,7 @@ class TrackDriverNode(Node):
             self.vehicle_controller.reset()
             self.behavior_state = BehaviorState.B0_NORMAL
             self._signal_yolo_off = False  # [2026-08-23] 새 바퀴 시작 — 다음 교차로 신호등 YOLO 재개
+            self._signal_off_hold_cnt = None  # [2026-08-23b] 유예 카운터도 같이 리셋(perc_signal() 참고)
             self._b2_passed = False   # [2026-08-15] Phase.OBSTACLE_ZONE 통합 — 완료 추적도 매 바퀴 리셋
             self._b3_passed = False
             self._obscut_zone_tag = None  # [2026-08-20] da 근접 컷 기반 B2/B3 latch도 매 바퀴 리셋
@@ -2243,6 +2277,18 @@ class TrackDriverNode(Node):
             # (_signal_yolo_off는 이제 perc_signal()이 확정되는 순간 바로 세팅한다.)
             self._behavior_enabled = True
             self._signal_reentry_cooldown_t = time.time() + SIGNAL_REENTRY_COOLDOWN
+            if TEST_SIGNAL_LOOP:
+                # [2026-08-23, 요청 반영] 격리 테스트 전용 — 정상 레이스에선 이 phase
+                # 리셋을 _update_lap()(결승선 통과)이 담당하고 신호 확정 시점엔 아직
+                # 안 건드리는 게 맞지만(신호 지점~결승선 사이 구간이 남아있어서), 신호
+                # 판단만 반복 테스트할 땐 결승선까지 안 가고 바로 다음 순서(B1)를 봐야
+                # 하므로 여기서 직접 리셋한다.
+                self.phase = Phase.LAVACON
+                self._b2_passed = False
+                self._b3_passed = False
+                self._lavacon_engaged = False
+                self._lavacon_empty_cnt = 0
+                self._lavacon_trigger_cnt = 0
 
     # ── S0_SIGNAL: 4구 신호등 판단 — 출발선/교차로 공용 (정지 후 신호로 경로 판단) ──
     def _s0_signal(self):
@@ -2334,6 +2380,14 @@ class TrackDriverNode(Node):
             # state 없이 곧장 일반 차선주행으로 복귀하고, B1→B2→B3 Behavior를 다시 연다.
             self._behavior_enabled = True
             self._signal_reentry_cooldown_t = time.time() + SIGNAL_REENTRY_COOLDOWN
+            if TEST_SIGNAL_LOOP and self.phase == Phase.DONE:
+                # [2026-08-23, 요청 반영] 격리 테스트 전용 — phase가 그대로 Phase.DONE이면
+                # (=이 좌회전이 신호 판단 테스트 대기 상태에서 시작된 것) "아까 상태"로
+                # 되돌아가는 것이므로, 다음 테스트를 위해 신호등 YOLO를 다시 켠다. 정상
+                # 레이스에선 이 리셋을 _update_lap()(결승선 통과)만 담당해야 하므로
+                # phase==LAVACON/OBSTACLE_ZONE(=실제 레이스 중 좌회전)일 땐 안 건드린다.
+                self._signal_yolo_off = False
+                self._signal_off_hold_cnt = None  # [2026-08-23b] 유예 카운터도 같이 리셋
             self._change_state(MissionState.S1_LANE_FOLLOW)
 
     def _yaw_delta(self, start):
@@ -3353,6 +3407,19 @@ class TrackDriverNode(Node):
                   f'S={int(self.signal_straight_on)} confirmL={int(self.signal_left_confirmed)} '
                   f'confirmS={int(self.signal_straight_confirmed)}')
 
+        # [2026-08-23c, 요청 반영] "YOLO_신호등 창엔 분명히 찍히는데 여기(확정 L/S)엔 안
+        # 뜬다"는 혼란의 실제 원인은 대부분 _active_yolo_stage()가 이 틱에 'signal'을
+        # 아예 리턴 안 해서(phase가 Phase.LAVACON/OBSTACLE_ZONE으로 넘어가 있으면
+        # perc_yolo_signal_state() 자체가 안 불림) — 그럴 땐 YOLO_신호등 창은 마지막으로
+        # 성공했던 추론 결과가 그대로 얼어붙어 있는 것뿐이다(백그라운드 워커가 새 프레임을
+        # 못 받아 유휴 상태, yolo_signal_state.py _worker() 참고). 한눈에 구분되게
+        # phase/현재 활성 YOLO 스테이지를 별도 줄로 보여준다.
+        yolo_stage = self._active_yolo_stage()
+        stage_col = (0, 200, 0) if yolo_stage == 'signal' else (0, 120, 220)
+        stage_txt = (f'phase={self.phase.name}  활성 YOLO={yolo_stage!r}'
+                     + ('' if yolo_stage == 'signal' else '  ← 신호등 YOLO 꺼짐, 위 확정 안 뜸'))
+        stage_en = f'phase={self.phase.name} active_yolo_stage={yolo_stage!r}'
+
         put_text_kr_multi(canvas, [
             ('좌회전 진입 램프 통합 상태', (10, 8), (255, 255, 255), 18, 'LEFT TURN ENTRY STATUS'),
             (run_txt, (10, 40), run_col, 16, run_en),
@@ -3360,6 +3427,7 @@ class TrackDriverNode(Node):
             (angle_txt, (10, 96), (0, 255, 255) if running else (200, 200, 200), 15, angle_en),
             (lidar_txt, (10, 126), lidar_col, 15, lidar_en),
             (sig_txt, (10, 156), sig_col, 14, sig_en),
+            (stage_txt, (10, 182), stage_col, 14, stage_en),
         ])
 
         border_col = (0, 200, 0) if running else (80, 80, 80)
