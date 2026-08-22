@@ -389,8 +389,8 @@ class TrackDriverNode(Node):
         self._prev_angle_out = 0.0    # [5] 직전 발행 조향각(변화율 제한용)
         self._pid_prev_error = 0.0
         self._pid_integral   = 0.0
-        self._s2_commit_dist = None   # S2 신호 확정 후 물리적 분기 커밋 구간 누적 이동거리(m, None=미진입)
-        self._s2_commit_dir  = None   # 커밋 구간에서 진행 중인 방향 ('straight'/'left')
+        self._s2_commit_dist = None   # 좌회전 커밋 구간(체크무늬 게이트까지) 누적 이동거리(m, None=미진입)
+        self._s2_commit_dir  = None   # [2026-08-22h] 직진은 커밋 구간 자체가 없어져 이제 'left'만 들어온다
         self._prev_speed     = 0.0    # 가속 속도제한용(직전 출력 속도)
         self._corner_hold    = 0.0    # 코너 활성도(감쇠 peak-hold)
         self._corner_signal  = 0.0    # 코너 감속 판단용 조향각 signed EMA(부호 유지, _lane_drive() 참고)
@@ -2121,13 +2121,16 @@ class TrackDriverNode(Node):
             전환해 그 안에서 멈춰 서서 색상을 판독하던 방식을 없앴다(요청 반영 — 그 정지
             구간 동안 속도가 0으로 굳는 문제). 이제 색상이 실제로 확정
             (signal_straight/left_confirmed, perc_signal() 참고)될 때까지 이 함수(S1
-            차선주행)를 그대로 유지하고, 확정되는 순간 정지 없이 곧장 S0_SIGNAL로 넘어가며
-            커밋 구간(_s2_commit_dist, 직진 유지)을 같은 틱에 바로 시작한다 — 아래
-            _change_state() 직후 _s2_commit_dist를 세팅하는 순서 참고(먼저 세팅하면
-            _change_state()가 S0_SIGNAL 진입 처리에서 그 값을 다시 None으로 지운다).
-            좌회전(지름길)이면 이 커밋 구간이 라이다 체크무늬 게이트 검출
-            (checker_pillar_trigger)로 끝나고 그 자리에서 좌회전을 시작한다
-            (_s0_signal() 'left' 분기 참고) — 정지 이벤트 자체가 없다.
+            차선주행)를 그대로 유지한다.
+            좌회전(지름길) 확정이면 정지 없이 곧장 S0_SIGNAL로 넘어가 커밋 구간
+            (_s2_commit_dist)을 같은 틱에 바로 시작한다 — 아래 _change_state() 직후
+            _s2_commit_dist를 세팅하는 순서 참고(먼저 세팅하면 _change_state()가
+            S0_SIGNAL 진입 처리에서 그 값을 다시 None으로 지운다). 이 커밋 구간은 라이다
+            체크무늬 게이트 검출(checker_pillar_trigger)로 끝나고 그 자리에서 좌회전을
+            시작한다(_s0_signal() 참고) — 정지 이벤트 자체가 없다.
+            [2026-08-22h] 직진 확정이면(요청 반영) 커밋 구간/상태전환 자체가 없다 — 신호가
+            이미 "직진"이라고 확정했으니 물리적 분기까지 저속으로 기다릴 이유가 없고, 그냥
+            S1을 유지한 채 Behavior만 재활성화해 다음 바퀴(라바콘부터)를 바로 준비한다.
         """
         # Behavior가 조향을 전담하는 구간에서는 Mission의 차선 PID를 건너뛴다.
         # [2026-08-20] 요청 반영 — 라바콘 구간은 지금 진입/탈출 트리거만 판정하고(아래
@@ -2154,9 +2157,9 @@ class TrackDriverNode(Node):
             self._s2_commit_dist = 0.0   # _change_state()가 진입 처리에서 None으로 리셋한 뒤 다시 세팅
             self._s2_commit_dir  = 'left'
         elif self.signal_straight_confirmed:
-            self._change_state(MissionState.S0_SIGNAL)
-            self._s2_commit_dist = 0.0
-            self._s2_commit_dir  = 'straight'
+            # [2026-08-22h] 요청 반영 — 커밋 구간 없이 곧장 다음 바퀴 준비만 하고 S1 유지.
+            self._behavior_enabled = True
+            self._signal_reentry_cooldown_t = time.time() + SIGNAL_REENTRY_COOLDOWN
 
     # ── S0_SIGNAL: 4구 신호등 판단 — 출발선/교차로 공용 (정지 후 신호로 경로 판단) ──
     def _s0_signal(self):
@@ -2165,91 +2168,51 @@ class TrackDriverNode(Node):
         (S2_INTERSECTION)로 나뉘어 있던 걸 하나로 합쳤다 — 둘 다 로직이 완전히 같았기 때문
         (정지 → 4구 신호 판독 → 직진/좌회전 확정).
 
-        [2026-08-22] 트랙 중앙 분기점 재진입은 이제 _s1_lane_follow()가 색상 확정
-        (signal_straight/left_confirmed)을 직접 보고 나서야 이 state로 넘어오면서
-        _s2_commit_dist를 같은 틱에 미리 세팅해둔다 — 그래서 재진입 시엔 아래 "1. 진입 즉시
-        정지" 분기(신호 미확정=정지)에 도달하지 않고 곧장 커밋 구간(2번)으로 들어간다.
-        이 정지 분기가 실제로 쓰이는 건 START_STATE=S0_SIGNAL로 노드가 맨 처음 시작하는
-        출발선 경우뿐이다 — 그때는 아직 아무 신호도 안 봤으니 진짜로 "정지 후 판독"이
-        필요하다(대회 규정상 심판이 신호를 초록으로 바꾸기 전까지 출발 자체가 금지).
-          1. 진입 즉시 정지 (기본값 STOP, 명시적 신호만 출발/재출발) — 출발선 전용, 위 참고
-          2. 직진 초록(signal_straight_confirmed) → 커밋 구간(S2_COMMIT_DIST_M) 거쳐 S1 복귀
-             + Behavior 활성화(라바콘부터 진행 — README §대회 규정 요약대로 출발 직후에도 매번 켠다)
-             좌회전 신호(signal_left_confirmed) → 커밋 구간 거쳐 좌회전 후 S3(지름길, 3바퀴 중
-             2·3바퀴째에 한 번만 등장)
+        [2026-08-22h] 요청 반영 — 직진 확정(signal_straight_confirmed)은 이제 이 state
+        자체에 들어오지 않는다(_s1_lane_follow() 참고: 확정되는 순간 S1을 유지한 채
+        Behavior만 재활성화하고 끝). 그래서 이 state에 진입하는 경로는 좌회전(지름길)
+        확정 하나뿐이다 — 아래 "1. 진입 즉시 정지" 분기도 좌회전 신호만 본다. 그 분기가
+        실제로 쓰이는 건 START_STATE=S0_SIGNAL로 노드가 맨 처음 시작하는 출발선 경우뿐
+        이다(대회 규정상 심판이 신호를 초록으로 바꾸기 전까지 출발 자체가 금지 — 출발선
+        신호가 직진이면 곧장 S1로 넘어가고 이 state에 남지 않는다).
+          1. 진입 즉시 정지 (기본값 STOP, 좌회전 신호만 커밋 구간 시작) — 출발선 전용, 위 참고
+          2. 좌회전 신호(signal_left_confirmed) → 커밋 구간(_s2_commit_dist) 거쳐 좌회전
+             후 S1 복귀(3바퀴 중 2·3바퀴째에 한 번만 등장). 커밋 구간 동안은 S1과 동일한
+             차선주행(_lane_drive())을 유지하고, checker_pillar_trigger(체크무늬 게이트
+             라이다 기둥쌍 검출)로 커밋 종료를 판정한다 — 거리 기반이 아니라 물리적
+             트리거라 신호 확정 지점과 실제 분기 사이에 커브가 있어도 안전하다.
           3. 좌회전 진행 중이면 신호와 무관하게 완료 우선
-          4. 커밋 구간(_s2_commit_dist), 'straight'만: 신호와 무관하게 직진만 유지 — 신호가
-             보이는 지점과 실제 도로가 갈라지는 물리적 분기 지점이 떨어져 있고(config.py
-             S2_COMMIT_DIST_M 주석 참고), 그 사이에 _lane_drive()(비전)를 켜면 분기가
-             보이기 시작하는 순간 da가 반대쪽 갈래로 끌려간다(실측 재현됨, 교차로 기준). 신호로
-             이미 확정된 방향이므로 이 구간은 비전을 아예 참조하지 않는다. 커밋 구간 종료
-             판정은 시간이 아니라 VESC 실측(v_mps) 적분 거리로 한다 — 대회 주행 때 APPROACH_SPEED
-             근방 실속도가 튜닝 시점과 달라져도 물리적 분기 지점과 안 어긋나게(config.py
-             S2_COMMIT_DIST_M 주석 참고). 출발 시점에는 이 분기 자체가 없지만 같은 코드경로를
-             타므로 출발 직후에도 짧게(≈S2_COMMIT_DIST_M=1m) 이 구간을 거친다 — 출발선은 직선이라
-             문제는 없을 것으로 보이나 실차 미검증.
-          5. 커밋 구간, 'left'만: [2026-08-22f] 위 4번과 달리 비전을 끄지 않고 _lane_drive()로
-             S1과 동일하게 차선주행을 유지한다(요청 반영) — 좌회전은 애초에 거리(4번의
-             S2_COMMIT_DIST_M)가 아니라 checker_pillar_trigger(체크무늬 게이트 라이다 기둥쌍
-             검출)로 커밋 종료를 판정하므로, 4번이 비전을 끄는 근거("거리 기반 종료 판정이
-             da 쏠림에 흔들리면 안 된다")가 애초에 적용되지 않는다. 트리거 검출 전까지 계속
-             angle=0 직진만 강제하면 신호 확정 지점과 실제 분기 사이에 커브가 있을 때 차선을
-             벗어날 위험이 있다는 실차 우려로 바꿨다 — _do_checker_ramp_turn() 참고.
         """
         if self._checker_ramp_dist is not None:
             self._do_checker_ramp_turn()
             return
 
         if self._s2_commit_dist is not None:
-            if self._s2_commit_dir == 'left':
-                # [2026-08-22f] 커밋 구간 동안 직진 강제(angle=0, APPROACH_SPEED) 대신 S1과
-                # 동일한 차선주행(_lane_drive())을 그대로 유지하도록 변경(요청 반영) — 아래
-                # 'straight' 분기가 여전히 비전을 끄는 이유(신호가 보이는 지점과 물리적 분기가
-                # 떨어져 있어 da가 반대 갈래로 끌려감, S2_COMMIT_DIST_M 주석 참고)는 애초에
-                # "거리 기반으로 커밋을 끝낸다"는 전제와 묶여 있었는데, 좌회전은 이미
-                # checker_pillar_trigger(물리적 라이다 검출)로 커밋 종료 시점을 잡아 그 전제와
-                # 무관하다 — 트리거가 뜨기 전까지 계속 뻣뻣하게 직진만 하면, 신호 확정 지점과
-                # 실제 트랙 사이에 커브가 있을 때 차선을 벗어날 위험이 있다는 실차 우려로 이
-                # 구간 전체를 비전 주행으로 바꿨다. 트리거가 뜨는 순간부터는 기존과 동일하게
-                # _begin_checker_ramp_turn()이 조향을 넘겨받는다. 실차 미검증.
-                self._lane_drive()
-                self._s2_commit_dist += self._speed_mps_fallback(self.ctrl_speed) * 0.05  # 20Hz 제어주기(control_loop) 가정
+            self._lane_drive()
+            self._s2_commit_dist += self._speed_mps_fallback(self.ctrl_speed) * 0.05  # 20Hz 제어주기(control_loop) 가정
 
-                # [2026-08-21] 커밋 종료 트리거를 거리(S2_COMMIT_DIST_M) 대신 체크무늬 게이트
-                # 라이다 기둥쌍 검출로 대체(요청 반영, config.py "체크무늬 게이트 라이다
-                # 기둥쌍 검출" 절 참고) — 신호확정 후 정지위치 산포에 안 흔들리는 물리적
-                # 트리거. CHECKER_PILLAR_TIMEOUT_DIST_M 넘도록 기둥쌍이 안 잡히면(라이다
-                # 죽음/오검출) 기존 거리기반 방식으로 강제 폴백해 무한 직진을 막는다.
-                timed_out = self._s2_commit_dist >= CHECKER_PILLAR_TIMEOUT_DIST_M
-                if self.checker_pillar_trigger or timed_out:
-                    if timed_out and not self.checker_pillar_trigger:
-                        self.get_logger().warn(
-                            f'체크무늬 게이트 기둥쌍 미검출(거리 {self._s2_commit_dist:.2f}m) '
-                            '— 타임아웃으로 좌회전 램프 강제 시작')
-                    self._s2_commit_dist = None
-                    self._s2_commit_dir  = None
-                    self._begin_checker_ramp_turn()
-                return
-
-            self.ctrl_angle = 0.0
-            self.ctrl_speed = APPROACH_SPEED
-            self._s2_commit_dist += self._speed_mps_fallback(APPROACH_SPEED) * 0.05  # 20Hz 제어주기(control_loop) 가정
-
-            if self._s2_commit_dist >= S2_COMMIT_DIST_M:
-                commit_dir = self._s2_commit_dir
+            # [2026-08-21] 커밋 종료 트리거는 거리가 아니라 체크무늬 게이트 라이다 기둥쌍
+            # 검출(config.py "체크무늬 게이트 라이다 기둥쌍 검출" 절 참고) — 신호확정 후
+            # 정지위치 산포에 안 흔들리는 물리적 트리거. CHECKER_PILLAR_TIMEOUT_DIST_M
+            # 넘도록 기둥쌍이 안 잡히면(라이다 죽음/오검출) 거리기반으로 강제 폴백해 무한
+            # 직진을 막는다.
+            timed_out = self._s2_commit_dist >= CHECKER_PILLAR_TIMEOUT_DIST_M
+            if self.checker_pillar_trigger or timed_out:
+                if timed_out and not self.checker_pillar_trigger:
+                    self.get_logger().warn(
+                        f'체크무늬 게이트 기둥쌍 미검출(거리 {self._s2_commit_dist:.2f}m) '
+                        '— 타임아웃으로 좌회전 램프 강제 시작')
                 self._s2_commit_dist = None
                 self._s2_commit_dir  = None
-                # commit_dir == 'straight'만 여기 남는다('left'는 위에서 이미 처리하고 return)
-                self._behavior_enabled = True
-                self._signal_reentry_cooldown_t = time.time() + SIGNAL_REENTRY_COOLDOWN
-                self._change_state(MissionState.S1_LANE_FOLLOW)
+                self._begin_checker_ramp_turn()
             return
 
         self.ctrl_angle, self.ctrl_speed = 0.0, SPEED_STOP
 
         if self.signal_straight_confirmed:
-            self._s2_commit_dist = 0.0
-            self._s2_commit_dir  = 'straight'
+            self._behavior_enabled = True
+            self._signal_reentry_cooldown_t = time.time() + SIGNAL_REENTRY_COOLDOWN
+            self._change_state(MissionState.S1_LANE_FOLLOW)
         elif self.signal_left_confirmed:
             self._s2_commit_dist = 0.0
             self._s2_commit_dir  = 'left'
