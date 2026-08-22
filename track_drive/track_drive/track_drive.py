@@ -35,7 +35,9 @@ from sensor_msgs.msg import Image, LaserScan, Imu
 from std_msgs.msg import Float32MultiArray, Float32
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy, HistoryPolicy
 from cv_bridge import CvBridge
-from .perception.perc_lavacon import process_lavacon, CONE_LON_MAX as LAVACON_PATH_LON_MAX
+from .perception.perc_lavacon import (
+    process_lavacon, process_lavacon_camera, CONE_LON_MAX as LAVACON_PATH_LON_MAX,
+)
 from .perception.hough_lane import HoughLaneDetector
 from .perception.perc_floor import check_stopline, LaneDetector as ClassicLaneDetector
 from .perception.lane_util import CameraProcessor, SlideWindow
@@ -227,6 +229,9 @@ class TrackDriverNode(Node):
         self.lavacon_done   = False
         self.lavacon_path   = []     # _lane_steer()에 그대로 태우는 px 스케일 경로(perc_lavacon() 참고)
         self._lavacon_path_m = []    # 위와 같은 경로의 원본(라이다 미터 좌표) — DEBUG_VIZ_LAVACON 시각화용
+        self._lavacon_cam_path_m = []  # [2026-08-22] YOLO 카메라 BEV 기준 경로(process_lavacon_camera())
+                                        # — 조향 반영 실험용, 현재는 DEBUG_VIZ_LAVACON 창에 겹쳐 그려
+                                        # 라이다 경로와 오차를 비교하는 용도로만 씀(perc_yolo_cone() 참고)
         self._lavacon_empty_cnt = 0   # 우측콘 연속 미검출 프레임 수(Phase 전환 디바운스)
         self.lavacon_left_detected  = False  # 좌측 라이다 클러스터 검출 여부(B1 진입 트리거용)
         self.lavacon_right_detected = False  # 우측 라이다 클러스터 검출 여부(B1 진입 트리거용)
@@ -546,6 +551,13 @@ class TrackDriverNode(Node):
             return
         self.cone_detected_yolo = self.yolo_cone_detector.detect(self.img_front)
         self.yolo_cone_detector.show_debug_windows()  # 메인 스레드에서만 호출(yolo_cone.py 주석 참고)
+
+        # [2026-08-22] 조향 반영 실험용 카메라 BEV 경로 — 아직 조향엔 안 태우고
+        # DEBUG_VIZ_LAVACON 창에서 라이다 경로와 겹쳐보는 용도로만 쓰므로, 그 플래그가
+        # 꺼져 있으면 계산 자체를 스킵한다(불필요한 CPU 사용 방지).
+        if DEBUG_VIZ_LAVACON:
+            detections = self.yolo_cone_detector.get_detections()
+            self._lavacon_cam_path_m = process_lavacon_camera(detections)
 
     # [2-4b] 신호등 색상상태 YOLO (비교용, 아직 주행 판단에는 미연결)
     #   입력 self.img_front → 출력 self.signal_*_on_yolo
@@ -1254,6 +1266,21 @@ class TrackDriverNode(Node):
                 cv2.circle(bev, to_px(wx, wy), 5, (0, 255, 255), -1)
                 cv2.circle(bev, to_px(wx, wy), 5, (0, 0, 0), 1)
 
+        # [2026-08-22] YOLO 카메라 BEV 경로(process_lavacon_camera()) — 파란색으로 겹쳐
+        # 그려서 라이다 경로(노란색)와 실차에서 얼마나 어긋나는지 눈으로 비교한다. 아직
+        # 조향엔 안 태움(perc_yolo_cone() 주석 참고) — 이 오버레이가 실차에서 라이다
+        # 경로와 충분히 가깝게 나와야 다음 단계(폴백/융합)로 넘어갈 근거가 된다.
+        cam_path_m = self._lavacon_cam_path_m
+        if cam_path_m:
+            prev_px = (EX, EY)
+            for wx, wy in cam_path_m:
+                cur_px = to_px(wx, wy)
+                cv2.line(bev, prev_px, cur_px, (255, 120, 0), 2)
+                prev_px = cur_px
+            for wx, wy in cam_path_m:
+                cv2.circle(bev, to_px(wx, wy), 4, (255, 120, 0), -1)
+                cv2.circle(bev, to_px(wx, wy), 4, (0, 0, 0), 1)
+
         cv2.circle(bev, (EX, EY), 6, (255, 220, 0), -1)
         cv2.line(bev, (EX, EY), (EX, EY - 18), (255, 220, 0), 2)
 
@@ -1272,10 +1299,12 @@ class TrackDriverNode(Node):
         masked_min_s = f'{masked_min:.2f}m' if masked_min >= 0 else 'N/A'
         cv2.putText(bev, f'masked(magenta) pts={masked_pts} min={masked_min_s}',
                     (8, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1, cv2.LINE_AA)
-        cv2.putText(bev, f'yellow=lavacon_path(L/R cone-cluster midpoint, n={len(path_m)})',
+        cv2.putText(bev, f'yellow=lavacon_path(lidar, n={len(path_m)})',
                     (8, 132), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(bev, f'orange=cam_path(YOLO BEV, experimental, n={len(cam_path_m)})',
+                    (8, 154), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 120, 0), 1, cv2.LINE_AA)
         cv2.putText(bev, 'red=vehicle heading ref line (nearest-neighbor pairing axis)',
-                    (8, 154), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1, cv2.LINE_AA)
+                    (8, 176), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1, cv2.LINE_AA)
         cv2.imshow('lavacon_bev', bev)
         cv2.waitKey(1)
 

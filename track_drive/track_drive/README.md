@@ -1617,8 +1617,8 @@ ROI에 벽/다른 물체 점이 같이 잡혀도 실제로 트리거 판단에 �
 **[2026-08-11] 조향이 라인주행과 완전히 동일한 Pure Pursuit/파라미터를 공유**하도록 변경
 (`_lane_steer(path=self.lavacon_path)`) — 예전 전용 P게인(`LAVACON_KP`) 방식 폐기.
 
-**디버그:** `DEBUG_VIZ_LAVACON` → `lavacon_bev` 창(트리거 ROI+조향 경로), `DEBUG_VIZ_YOLO_CONE` → 콘 검출
-박스.
+**디버그:** `DEBUG_VIZ_LAVACON` → `lavacon_bev` 창(트리거 ROI+조향 경로 노란색+YOLO 카메라 BEV 경로
+주황색 오버레이, §3.3), `DEBUG_VIZ_YOLO_CONE` → 콘 검출 박스.
 
 ### 3.1 경로생성 방식 교체 — 보로노이 → 좌우 콘 클러스터 중앙 페어링 (2026-08-19)
 `perc_lavacon.py`의 `process_lavacon()`이 콘 점군 전체로 `scipy.spatial.Voronoi`를 계산해 그 정점을
@@ -1649,6 +1649,42 @@ ONNX 모델이 TensorRT 빌드에 실패하면(당시 `cone_best_n.onnx`, `TRT-1
 옮기는 근본 대응은 아직 안 함(다른 모델/provider에서 재발 가능).
 
 **알려진 한계:** `LAVACON_DONE_FRAMES=80`/`YOLO_CONE_CONF_THRESHOLD=0.5` 등 실차 미검증 초기값.
+
+### 3.3 YOLO 콘 검출 좌/우 위치를 조향에 반영하는 실험 — 1단계: 카메라 BEV 경로 시각화만 (2026-08-22)
+지금까지 `yolo_cone.py`는 콘 검출 여부(bool)만 썼다 — 박스 좌표는 계산해도 640x640 모델
+입력 스케일 그대로 버렸다(원본 640x480과 종횡비가 달라 그대로 쓰면 좌표가 뒤틀림). 이번
+변경은 좌/우 위치를 실제로 조향에 쓰기 위한 1단계로, "픽셀→실측 미터 환산을 어떻게
+맞추나"부터 풀었다:
+
+- **새 캘리브레이션은 안 함.** `dl_lane.py`가 이미 실측해 둔 BEV 호모그래피
+  (`DL_BEV_SRC_PX_RAW` 4점 + `DL_PIXELS_PER_METER=200px/m`, §6.3)를 그대로 재사용한다 —
+  같은 카메라(`img_front`, 640x480)를 보므로 콘 전용으로 새로 잴 이유가 없다.
+  (`perc_lavacon.py`에 `_CONE_BEV_M0`로 독립 재계산 — `dl_lane.py`의 `_dl_M0`는
+  leading-underscore라 import 대신 `measure_lidar_camera_offset.py`와 같은 패턴으로 재계산.)
+- `yolo_cone.py`의 `YoloConeEngine.infer()`가 이제 detections를 원본 640x480 절대 픽셀
+  스케일로 되돌려 반환(`scale_x`/`scale_y`로 x/y 각각 다른 배율 보정). `YoloConeDetector`에
+  `get_detections()` 신설(기존 `detect()`는 bool 반환 그대로 유지, 호출부 변경 없음).
+- `perc_lavacon.py`에 `process_lavacon_camera(detections)` 신설 — 각 콘 박스의 바닥
+  접지점(하단 중앙, 콘은 세워진 물체라 박스 위쪽일수록 지면에서 멀어짐)을 BEV로 미터
+  좌표화 → 라이다와 동일한 부호 규약(x=전방+, y=좌측+)으로 맞춤 → 좌/우 분리 →
+  `_pair_nearest()`(§3.2, 라이다 경로와 동일 함수) 재사용해 중앙 경로 생성. YOLO는 콘 하나당
+  박스 하나가 바로 나와서 라이다처럼 여러 빔을 하나로 뭉치는 클러스터링 단계가 필요 없다.
+- `track_drive.py`: `perc_yolo_cone()`이 `DEBUG_VIZ_LAVACON`일 때만(불필요한 CPU 방지)
+  `self._lavacon_cam_path_m`을 계산하고, `_draw_lavacon_bev()`가 이걸 주황색으로 기존
+  라이다 경로(노란색) 위에 겹쳐 그린다. **조향에는 아직 연결 안 함** — 라이다 경로가
+  비었을 때(한쪽 콘 미검출) 폴백으로 쓸지, 상시 가중 융합할지는 이 오버레이로 실차에서
+  오차 크기를 먼저 확인한 뒤 정하기로 함.
+
+**알려진 한계/미검증:**
+- `_CONE_BEV_M0`(즉 `DL_BEV_SRC_PX_RAW`)는 원래 근거리(~1m 이내) 차선 4점으로 캘리브레이션된
+  것이라, 콘은 `CONE_LON_MAX=4m`까지 보므로 원거리로 갈수록(화면 위쪽) 원근 외삽 오차가
+  커질 수 있다 — 실차 캡처로 라이다 경로와의 편차를 확인하기 전까지는 신뢰도 미지수.
+- 라이다-카메라 원점 오프셋(`LIDAR_TO_CAM_DX_M`/`DY_M`, `measure_lidar_camera_offset.py`
+  참고)이 아직 실측되지 않아, 두 경로를 같은 원점으로 정렬한 "융합"은 아직 못 한다 —
+  지금은 서로 독립된 경로로 겹쳐만 본다.
+- 콘 바닥 접지점을 박스 하단 중앙으로 근사하는데, YOLO 박스가 콘을 살짝 크게/작게 잡으면
+  접지점 y좌표가 밀려 forward_m 오차로 직결된다 — 오검출 박스 하나가 경로 전체를 흔들
+  위험(현재는 시각화 전용이라 조향엔 영향 없음).
 
 ---
 

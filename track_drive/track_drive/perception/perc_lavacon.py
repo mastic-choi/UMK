@@ -47,12 +47,21 @@
 # =============================================================
 import math
 import numpy as np
+import cv2
 
 # [2026-08-07] LIDAR_ANGLE_OFFSET_DEG를 이 파일에 별도 상수로 하드코딩해뒀던 게
 #   config.py와 값이 어긋날 수 있는 위험이었다(위 "2026-06-19 구 규약" 버그가 정확히
 #   이 종류의 비동기화로 생겼었음) — config.py를 단일 소스로 삼아 여기서도 그대로
 #   가져다 쓰도록 고쳤다. 값 자체(80.0)는 바뀌지 않았다.
 from ..config import LIDAR_ANGLE_OFFSET_DEG
+
+# [2026-08-22] process_lavacon_camera() 용 — dl_lane.py가 이미 실측 캘리브레이션해둔
+#   BEV 호모그래피(DL_BEV_SRC_PX_RAW 4점, DL_PIXELS_PER_METER=200px/m)를 그대로
+#   재사용한다. 같은 카메라(img_front, 640x480)를 보는 것이므로 콘 검출용으로 새로
+#   캘리브레이션할 필요는 없다 — 다만 이 4점은 원래 "근거리(~1m 이내) 차선"용으로 찍은
+#   것이라, 콘처럼 최대 CONE_LON_MAX(4m)까지 원거리 외삽하면 원근 왜곡 오차가 커질 수
+#   있다(미검증, 아래 process_lavacon_camera() 주석 참고).
+from ..config import DL_BEV_SRC_PX_RAW, DL_ROI_Y0, DL_PIXELS_PER_METER
 
 # ─────────────────────────────────────────────
 # 튜닝 상수 (track_drive.py 의 실측 ROI 값과 일치시킴)
@@ -73,6 +82,85 @@ OFFSET_GAIN      = 1.0          # y평균 → offset 스케일 계수 (제어팀
 #   순번이 아니라 실제 유클리드 거리로 짝을 찾으므로 그 위험은 사실상 사라졌다 — 그래도
 #   너무 크게 잡으면 관련 없는 먼 콘까지 억지로 짝지어질 수 있어 기존 값(6)을 그대로 유지.
 MAX_GATES        = 6
+
+# ─────────────────────────────────────────────
+# 카메라 BEV 호모그래피 (process_lavacon_camera() 전용)
+# ─────────────────────────────────────────────
+# dl_lane.py의 _dl_M0(perception/dl_lane.py)과 완전히 동일한 정의를 여기서 독립적으로
+# 다시 계산한다 — dl_lane.py의 _dl_M0는 leading underscore(모듈 내부용) 심볼이라 import
+# 대신 재계산 쪽을 택했다(measure_lidar_camera_offset.py가 이미 쓰는 것과 같은 패턴).
+# 값의 단일 소스는 여전히 config.py(DL_BEV_SRC_PX_RAW 등)이므로 dl_lane.py쪽 캘리브레이션이
+# 갱신되면 이 파일도 자동으로 같이 갱신된다.
+_CONE_BEV_SRC_PX = DL_BEV_SRC_PX_RAW - np.float32([0, DL_ROI_Y0])
+_CONE_BEV_BLOCK_W = 0.8 * DL_PIXELS_PER_METER   # 실측 폭 0.8m (README §6.3)
+_CONE_BEV_BLOCK_H = 1.0 * DL_PIXELS_PER_METER   # 실측 길이 1.0m (근거리~1m 지점, README §6.3)
+_CONE_BEV_DST_PX = np.float32([
+    [0, 0], [_CONE_BEV_BLOCK_W, 0], [_CONE_BEV_BLOCK_W, _CONE_BEV_BLOCK_H], [0, _CONE_BEV_BLOCK_H],
+])
+_CONE_BEV_M0 = cv2.getPerspectiveTransform(_CONE_BEV_SRC_PX, _CONE_BEV_DST_PX)
+
+
+def _yolo_box_to_cam_xy(x1, y1, x2, y2):
+    """YOLO 콘 박스(원본 640x480 프레임 절대 픽셀) -> 차량 기준 (forward_m, lateral_m).
+
+    바닥 접지점(박스 하단 중앙, ((x1+x2)/2, y2))을 지면과 닿는 점으로 근사해 BEV
+    호모그래피에 통과시킨다 — 호모그래피는 "지면 평면 위의 점"에서만 원근 왜곡이 정확히
+    풀리므로, 박스 상단이나 중심이 아니라 반드시 바닥변을 써야 한다(콘은 세워진 물체라
+    박스 위쪽일수록 지면에서 멀어짐).
+
+    ★주의★ _CONE_BEV_M0는 근거리(~1m 이내) 차선 4점으로 캘리브레이션됐다 — 콘은
+    CONE_LON_MAX(4m)까지 보므로, 캘리브레이션 구간 밖으로 갈수록(화면 위쪽일수록)
+    원근 외삽 오차가 커질 수 있다. 실차로 라이다 경로(process_lavacon())와 겹쳐서
+    오차 크기를 확인하기 전까지는 참고용으로만 쓸 것(perc_lavacon_trigger()의
+    DEBUG_VIZ_LAVACON 창에서 두 경로를 겹쳐 비교).
+    """
+    cx = (x1 + x2) / 2.0
+    pt = np.float32([[[cx, y2 - DL_ROI_Y0]]])
+    xb, yb = cv2.perspectiveTransform(pt, _CONE_BEV_M0)[0, 0]
+    forward_m = (_CONE_BEV_BLOCK_H - yb) / DL_PIXELS_PER_METER
+    lateral_m = (xb - _CONE_BEV_BLOCK_W / 2.0) / DL_PIXELS_PER_METER
+    return float(forward_m), float(lateral_m)
+
+
+def process_lavacon_camera(detections):
+    """YOLO 콘 박스 리스트 -> 카메라 BEV 기준 중앙 경로 (라이다 process_lavacon()의
+    카메라 버전, [2026-08-22] 조향 반영 실험용 — 현재는 디버그 시각화 전용으로만 연결돼
+    있음, track_drive.py _draw_lavacon_bev() 참고).
+
+    입력 : detections — [(x1,y1,x2,y2,conf), ...], yolo_cone.py가 이미 원본
+           640x480 프레임 절대 픽셀 스케일로 되돌려 내보낸 것.
+    출력 : path_cam_m — [(x, y), ...], 라이다와 동일한 좌표 약속(x=전방+, y=좌측+),
+           전방거리(x) 오름차순. 좌/우 어느 한쪽이라도 안 보이면 빈 리스트
+           (process_lavacon()과 동일한 폴백 규약).
+
+    라이다와 픽셀 원점이 다르다(LIDAR_TO_CAM_DX_M/DY_M 미실측, measure_lidar_camera_offset.py
+    참고) — 그래서 이 경로를 라이다 경로와 같은 좌표계로 "융합"하지 않고 독립된 경로로
+    다룬다. YOLO는 콘 하나당 박스 하나가 이미 나오므로(라이다처럼 여러 빔이 한 콘에
+    흩어져 잡히는 문제가 없음) _cluster_cone_side() 같은 클러스터링은 필요 없고,
+    바로 좌/우로 나눠 _pair_nearest()만 재사용한다.
+    """
+    if not detections:
+        return []
+
+    cam_x, cam_y = [], []
+    for x1, y1, x2, y2, _conf in detections:
+        fwd_m, lat_m = _yolo_box_to_cam_xy(x1, y1, x2, y2)
+        cam_x.append(fwd_m)
+        cam_y.append(-lat_m)   # lateral_m: +가 이미지 우측 -> 라이다 규약(y=좌측+)으로 부호 반전
+
+    cam_x = np.array(cam_x, dtype=np.float32)
+    cam_y = np.array(cam_y, dtype=np.float32)
+
+    left_mask = cam_y > 0.0
+    right_mask = cam_y < 0.0
+    left_cx, left_cy = cam_x[left_mask], cam_y[left_mask]
+    right_cx, right_cy = cam_x[right_mask], cam_y[right_mask]
+
+    if len(left_cx) == 0 or len(right_cx) == 0:
+        return []
+
+    mid_x, mid_y = _pair_nearest(left_cx, left_cy, right_cx, right_cy, MAX_GATES)
+    return list(zip(mid_x.tolist(), mid_y.tolist()))
 
 
 def _pair_nearest(left_cx, left_cy, right_cx, right_cy, max_gates):

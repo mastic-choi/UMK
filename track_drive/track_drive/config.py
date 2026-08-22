@@ -1391,6 +1391,11 @@ LAVACON_TRIGGER_FRAMES = 5    # (YOLO 콘 검출 AND 좌우 라이다 클러스�
 YOLO_CONE_INPUT_SIZE = 640     # cone_best_n.onnx export 시 imgsz와 반드시 일치시킬 것
 YOLO_CONE_CONF_THRESHOLD = 0.5 # 이 신뢰도 이상인 검출만 인정(모델이 nms=True로 export돼 좌표 디코딩은 불필요)
 YOLO_CONE_MODEL_PATH = None    # None이면 yolo_ros/cone_best_n.onnx(형제 디렉터리)를 자동으로 찾음(perception/yolo_cone.py 참고)
+# [2026-08-22] 조향 반영 실험 — YOLO 콘 박스를 dl_lane.py와 동일한 BEV 호모그래피(위
+#   DL_BEV_SRC_PX_RAW/DL_PIXELS_PER_METER)로 미터 좌표화해 라이다 경로와 겹쳐보는
+#   perc_lavacon.process_lavacon_camera() 추가. 새 상수 없음(기존 DL_BEV_* 재사용) —
+#   현재는 DEBUG_VIZ_LAVACON 창에 시각화만 되고 조향에는 아직 안 태움
+#   (README §3.3, track_drive.py perc_yolo_cone()/_draw_lavacon_bev() 참고).
 
 # ── 신호등 색상상태 YOLO (perception/yolo_signal_state.py, YOLOv8n ONNX) ──
 #   [2026-08-19] datasets/signal_state/(라벨링 워크플로는 그쪽 README 참고)로 파인튜닝한

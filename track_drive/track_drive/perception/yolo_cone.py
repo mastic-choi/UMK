@@ -10,9 +10,12 @@
 # (1,N,6)=[x1,y1,x2,y2,conf,cls])을 신뢰도 임계값으로 거르기만 하면 된다(직접
 # NMS/좌표 디코딩 불필요).
 #
-# perc_lavacon_trigger()의 진입 조건("YOLO 콘 검출 AND 라이다 클러스터 검출")에서
-# 화면에 콘이 있는지 없는지 이진값만 필요하므로, 좌표를 원본 프레임 스케일로
-# 되돌리는 등의 후처리는 하지 않는다(신뢰도만 보면 됨).
+# perc_lavacon_trigger()의 진입 조건("YOLO 콘 검출 AND 라이다 클러스터 검출")에서는
+# 화면에 콘이 있는지 없는지 이진값만 필요하지만, [2026-08-22] 조향 반영 실험(카메라
+# BEV로 콘 좌/우 위치 추정, perc_lavacon.py process_lavacon_camera() 참고)을 위해
+# detections를 원본 프레임(640x480) 절대 픽셀 스케일로 되돌려서 내보낸다 — letterbox
+# 없는 단순 리사이즈라 모델 입력(640x640)과 원본이 종횡비가 다르므로, x/y를 각각
+# 다른 배율로 되돌려야 한다(scale_x = 원본W/640, scale_y = 원본H/640).
 #
 # dl_lane.py와 동일하게 추론을 별도 데몬 스레드에서 자기 페이스로 돌리고,
 # detect()는 논블로킹으로 최신 결과를 반환한다. cv2.imshow()는 메인 스레드에서만
@@ -151,10 +154,10 @@ class YoloConeEngine:
     def infer(self, bgr_frame):
         """입력 : 임의 크기(H,W) BGR 프레임
         출력 : (cone_detected, detections) — detections는 [(x1,y1,x2,y2,conf), ...]
-               (640x640 입력 스케일 좌표, 640 letterbox 없이 단순 리사이즈라 원본
-               프레임과 종횡비가 다르면 좌표가 뒤틀릴 수 있음 — 지금은 "검출 여부"만
-               쓰므로 원본 스케일로 되돌리지 않는다. 나중에 좌/우 위치까지 쓰게 되면
-               반드시 리스케일 로직을 추가할 것).
+               ★원본 프레임(bgr_frame) 절대 픽셀 스케일★로 되돌린 좌표. 모델 입력은
+               640x640(letterbox 없는 단순 리사이즈)이라 원본과 종횡비가 다르면 x/y가
+               서로 다른 배율로 눌려있다 — scale_x=원본W/640, scale_y=원본H/640을 각각
+               곱해 되돌린다(가로/세로 한 배율로 뭉뚱그리면 안 됨).
         모델이 nms=True로 export돼 output0에 이미 NMS 적용된 [x1,y1,x2,y2,conf,cls]가
         나온다 — 여기서는 conf 임계값 필터링만 한다(클래스는 cone 하나뿐이라 필터 불필요).
         """
@@ -164,12 +167,16 @@ class YoloConeEngine:
         dt = time.perf_counter() - t0
         self._latency_ema = dt if self._latency_ema is None else 0.8 * self._latency_ema + 0.2 * dt
 
+        scale_x = bgr_frame.shape[1] / YOLO_CONE_INPUT_SIZE
+        scale_y = bgr_frame.shape[0] / YOLO_CONE_INPUT_SIZE
+
         # outputs shape: (1, N, 6) — N은 이번 프레임 검출 수(패딩된 0행 포함 가능)
         dets = outputs[0]
         detections = []
         for x1, y1, x2, y2, conf, _cls in dets:
             if conf >= YOLO_CONE_CONF_THRESHOLD:
-                detections.append((float(x1), float(y1), float(x2), float(y2), float(conf)))
+                detections.append((float(x1) * scale_x, float(y1) * scale_y,
+                                    float(x2) * scale_x, float(y2) * scale_y, float(conf)))
 
         return (len(detections) > 0), detections
 
@@ -217,12 +224,12 @@ class YoloConeDetector:
                 if DEBUG_VIZ_YOLO_CONE:
                     # 그리기만 여기서(스레드 세이프하지 않은 imshow/waitKey는 절대 호출 안 함
                     # — dl_lane.py DLSlideWindow.visualize() 주석과 동일한 이유).
-                    scale_x = frame.shape[1] / YOLO_CONE_INPUT_SIZE
-                    scale_y = frame.shape[0] / YOLO_CONE_INPUT_SIZE
+                    # detections는 이미 engine.infer()에서 원본 프레임 스케일로 되돌려져
+                    # 나오므로(위 infer() 주석 참고) 여기서 다시 스케일링하지 않는다.
                     vis = frame.copy()
                     for x1, y1, x2, y2, conf in detections:
-                        p1 = (int(x1 * scale_x), int(y1 * scale_y))
-                        p2 = (int(x2 * scale_x), int(y2 * scale_y))
+                        p1 = (int(x1), int(y1))
+                        p2 = (int(x2), int(y2))
                         cv2.rectangle(vis, p1, p2, (0, 255, 0), 2)
                         cv2.putText(vis, f'cone {conf:.2f}', (p1[0], max(0, p1[1] - 6)),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
@@ -250,6 +257,15 @@ class YoloConeDetector:
         with self._lock:
             cone_detected, _detections = self._latest_result
         return cone_detected
+
+    def get_detections(self):
+        """[2026-08-22] 조향 반영 실험용 — detect()와 달리 새 프레임을 큐에 올리지 않고
+        (detect()가 이미 매 틱 올리고 있으므로 중복 불필요), 최신 검출 박스 리스트만
+        읽어온다. 출력 : [(x1,y1,x2,y2,conf), ...], 원본 프레임(640x480) 절대 픽셀
+        스케일(engine.infer() 참고)."""
+        with self._lock:
+            _cone_detected, detections = self._latest_result
+        return detections
 
     def show_debug_windows(self):
         """★ 반드시 메인 스레드에서만 호출할 것 ★ (dl_lane.py와 동일한 이유)."""
