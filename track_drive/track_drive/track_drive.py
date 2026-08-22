@@ -1982,7 +1982,12 @@ class TrackDriverNode(Node):
                 cv2.namedWindow('checker_pillar_bev', cv2.WINDOW_AUTOSIZE)
                 cv2.moveWindow('checker_pillar_bev', *DEBUG_WIN_POS_CHECKER_PILLAR)
                 self._dbg_windows_positioned.add('checker_pillar_bev')
-            cv2.imshow('checker_pillar_bev', bev)
+            # [2026-08-23, 요청 반영: "카메라욜로랑 검출라이다는 크기 완전 작게"] 원본
+            # 500x500(self._checker_pillar_bev_img, left_turn_debug 통합창도 재사용)은
+            # 그대로 두고, 이 독립 창에 띄울 때만 표시용으로 축소한다(정사각형이라 종횡비
+            # 유지 위해 160x160 — 카메라 창 YOLO_신호등의 160x120과 같은 크기 관례).
+            small_bev = cv2.resize(bev, (160, 160), interpolation=cv2.INTER_AREA)
+            cv2.imshow('checker_pillar_bev', small_bev)
             cv2.waitKey(1)
 
     # [2-4e] 체크무늬 게이트 통과 후 완만한 조향 램프 (_s0_signal() 'left' 커밋 종료 후 사용)
@@ -3346,36 +3351,34 @@ class TrackDriverNode(Node):
         # 종횡비가 서로 달라 자연 크기로는 나란히 맞추기 어려우므로, obstacle_cut_debug
         # 카메라 패널과 동일 관례(종횡비 무시 단순 리사이즈 — "표시 전용, 좌표 왜곡은 이
         # 창의 목적에 영향 없음")로 각각을 고정 박스에 맞춘다.
-        # [2026-08-23, 요청 반영: "카메라욜로랑 검출라이다는 크기 완전 작게"] 원래
-        # half_w×HALF_H(240x220)였던 두 패널을 SMALL_W×SMALL_H(160x120, yolo_cone_result
-        # 창 §2026-08-21 "아주 작게" 튜닝 때와 동일 크기 관례)로 축소 — 상태 텍스트 패널
-        # 폭(panel_w=480)은 그대로 유지해야 위 canvas와 np.vstack이 맞으므로, 축소된 두
-        # 패널을 hstack한 뒤 남는 오른쪽 여백은 검은 패딩으로 채운다.
-        SMALL_W, SMALL_H = 160, 120
+        # [2026-08-23] 이 안의 두 패널을 잠깐 축소했다가(요청 오해) 원복 — "카메라욜로랑
+        # 검출라이다 크기 줄여줘"는 이 통합창 안의 패널이 아니라 독립 창인 'YOLO_신호등'
+        # (perception/yolo_signal_state.py)과 'checker_pillar_bev'(DEBUG_VIZ_CHECKER_PILLAR
+        # 단독 창) 얘기였다 — 그쪽에서 축소 처리.
+        half_w = panel_w // 2
+        HALF_H = 220
 
         if self.img_front is not None:
-            cam_panel = cv2.resize(self.img_front, (SMALL_W, SMALL_H), interpolation=cv2.INTER_AREA)
+            cam_panel = cv2.resize(self.img_front, (half_w, HALF_H), interpolation=cv2.INTER_AREA)
         else:
-            cam_panel = np.full((SMALL_H, SMALL_W, 3), 30, dtype=np.uint8)
-            cv2.putText(cam_panel, 'no frame', (5, SMALL_H // 2),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (110, 110, 110), 1, cv2.LINE_AA)
-        cv2.putText(cam_panel, 'FRONT CAM', (4, 14),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 255), 1, cv2.LINE_AA)
+            cam_panel = np.full((HALF_H, half_w, 3), 30, dtype=np.uint8)
+            cv2.putText(cam_panel, 'no frame yet', (10, HALF_H // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (110, 110, 110), 1, cv2.LINE_AA)
+        cv2.putText(cam_panel, 'FRONT CAM', (8, 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
 
         if self._checker_pillar_bev_img is not None:
-            bev_panel = cv2.resize(self._checker_pillar_bev_img, (SMALL_W, SMALL_H),
+            bev_panel = cv2.resize(self._checker_pillar_bev_img, (panel_w - half_w, HALF_H),
                                     interpolation=cv2.INTER_AREA)
         else:
-            bev_panel = np.full((SMALL_H, SMALL_W, 3), 30, dtype=np.uint8)
-            cv2.putText(bev_panel, 'no frame', (5, SMALL_H // 2),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (110, 110, 110), 1, cv2.LINE_AA)
-        cv2.putText(bev_panel, 'LIDAR BEV', (4, 14),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 255), 1, cv2.LINE_AA)
+            bev_panel = np.full((HALF_H, panel_w - half_w, 3), 30, dtype=np.uint8)
+            cv2.putText(bev_panel, 'no frame yet', (10, HALF_H // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (110, 110, 110), 1, cv2.LINE_AA)
+        cv2.putText(bev_panel, 'LIDAR BEV', (8, 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
 
-        cam_row_small = np.hstack([cam_panel, bev_panel])
-        cv2.line(cam_row_small, (SMALL_W, 0), (SMALL_W, SMALL_H - 1), (80, 80, 80), 1)
-        cam_row = np.full((SMALL_H, panel_w, 3), 30, dtype=np.uint8)
-        cam_row[:, :SMALL_W * 2] = cam_row_small
+        cam_row = np.hstack([cam_panel, bev_panel])
+        cv2.line(cam_row, (half_w, 0), (half_w, HALF_H - 1), (80, 80, 80), 1)
 
         combined = np.vstack([canvas, cam_row])
         if 'left_turn_debug' not in self._dbg_windows_positioned:
