@@ -1316,8 +1316,10 @@ DEBUG_VIZ_LIDAR    = False   # 라이다 BEV 장애물 감지 디버그 창 (tra
 #   것 — 위 DEBUG_VIZ_LIDAR 주석 참고). 처음엔 DEBUG_VIZ_LIDAR(B2/B3 전용)와 같이 켰다가,
 #   지금은 라바콘 검출 확인이 목적이라 위 DEBUG_VIZ_LIDAR를 다시 False로 끄고 이 창만 남김
 #   (요청 반영).
-DEBUG_VIZ_LAVACON  = True   # 라바콘 트리거 ROI + push ROI(지금 실제 조향에 쓰이는 좌우 최근접
+DEBUG_VIZ_LAVACON  = False  # 라바콘 트리거 ROI + push ROI(지금 실제 조향에 쓰이는 좌우 최근접
                              #   콘 검출) 통합 BEV 디버그 창 (track_drive.py _draw_lavacon_bev())
+                             # [2026-08-23] 요청 반영으로 끔 — B3 통과 후 신호등 대기+좌회전
+                             #   진입 검증 중이라 B1(라바콘)은 이번 검증 범위 밖.
 # [2026-08-22k] DEBUG_VIZ_LAVACON_SHOW_PATH 삭제(요청 반영) — 박스 스택 페어링 조향
 #   (_handle_lavacon()의 폴백 분기, 2026-08-20부터 이미 안 불림)이 쓰던 노란 경로선(path_m)
 #   시각화를 _draw_lavacon_bev()에서 지우면서 이 스위치가 아무것도 안 하게 됐다.
@@ -1333,7 +1335,9 @@ DEBUG_VIZ_IMU      = False  # IMU(/imu) 연동 상태 + 현재 yaw값 디버그 
                              # [2026-08-22] 요청 반영으로 끔 — 아래 "차선인식/좌회전 통합
                              #   창만 남기고 나머지 다 끄기" 일괄 정리, 필요하면 다시 True로.
 
-DEBUG_VIZ_DL_LANE    = True  # 차선 — 기본 백엔드('dl') 디버그 창 (perception/dl_lane.py)
+DEBUG_VIZ_DL_LANE    = False  # 차선 — 기본 백엔드('dl') 디버그 창 (perception/dl_lane.py)
+                               # [2026-08-23] 요청 반영으로 끔 — 신호등/da/좌회전 4개 창만
+                               #   켜두기 위해 나머지와 함께 정리.
 # [2026-08-10] offset 스파크라인이 몇 프레임을 보여줄지 — [2026-08-11] 원래 별도
 #   'dl_lane_params' 창 하단에 붙었으나, 그 창의 파라미터 텍스트 목록(대부분 config
 #   고정값)을 지우면서 스파크라인만 'dl_lane' 창 맨 아래로 옮겼다(DEBUG_VIZ_DL_LANE
@@ -1358,7 +1362,9 @@ DEBUG_VIZ_DASH_COUNTER = False   # 노란 파선 카운터 디버그 창 (percep
 #   [2026-08-22i] 요청 반영으로 끔 — 이 창의 핵심 정보(라이다 감지 트리거 여부)는 아래
 #   DEBUG_VIZ_LEFT_TURN 통합 창에도 요약으로 들어간다. 좌우 점 하나하나의 원시 BEV
 #   좌표까지 봐야 할 때만 다시 True로.
-DEBUG_VIZ_CHECKER_PILLAR = False   # 체크무늬 게이트 라이다 기둥쌍 검출 BEV 디버그 창 (track_drive.py)
+# [2026-08-23] 요청 반영으로 다시 켬 — 좌회전 검출박스가 찍힌 원시 라이다 BEV를 따로
+#   보고 싶다는 요청.
+DEBUG_VIZ_CHECKER_PILLAR = True   # 체크무늬 게이트 라이다 기둥쌍 검출 BEV 디버그 창 (track_drive.py)
 # [2026-08-22i] 좌회전(체크무늬 게이트 진입) 전용 통합 디버그 창 — 실행중/실행끝/발행각도/
 #   라이다감지 4가지를 한 창에 모아 보여준다(요청 반영: "좌회전 관련 ... 합친 디버그창 하나").
 #   기존에 이 정보들이 obstacle_cut_debug(§_current_stage_label())/checker_pillar_bev/
@@ -1372,7 +1378,9 @@ DEBUG_VIZ_CHECKER_PILLAR = False   # 체크무늬 게이트 라이다 기둥쌍 
 #   (self.img_front)도 이어붙였다. [2026-08-22l] 요청 반영("카메라 영상부분을 옆으로
 #   붙여줘")으로 카메라/BEV를 세로가 아닌 좌우 나란히 배치로 변경 — 최종 레이아웃:
 #   상태 텍스트(위) / FRONT CAM·LIDAR BEV 좌우 나란히(아래).
-DEBUG_VIZ_LEFT_TURN = False   # 좌회전 실행중/실행끝/발행각도/라이다감지+카메라+BEV 통합 디버그 창 (track_drive.py)
+DEBUG_VIZ_LEFT_TURN = True   # 좌회전 실행중/실행끝/발행각도/라이다감지+카메라+BEV 통합 디버그 창 (track_drive.py)
+                              # [2026-08-23] 요청 반영으로 다시 켬 — 좌회전 조향각(발행각도)
+                              #   진행 상황 확인용.
 DEBUG_VIZ_YOLO_CONE  = False   # 콘 원시검출 창('yolo_cone_result', yolo_cone.py
                                # show_debug_windows()) + obstacle_cut_debug 창의 콘 카메라
                                # 패널(cam_stage=='cone'일 때)용 vis 프레임(yolo_cone.py
