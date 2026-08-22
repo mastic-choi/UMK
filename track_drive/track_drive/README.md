@@ -1204,6 +1204,115 @@ FRST 원 탐색 엔진)와 배경판 위치 전용 YOLO 하이브리드(`percept
 
 ---
 
+### 1.19 체크무늬 게이트 라이다 기둥쌍 트리거(`perc_checker_pillar()`) 재조정 — ROI 전방 이동 + 근접노이즈 배제 + 검출조건 완화 (2026-08-22)
+
+**배경:** §2.55~2.60(고정장애물/방해차량) 튜닝과 별개로, `perc_checker_pillar()`
+(좌회전 진입 랜드마크 — 신호등 게이트 좌우 기둥쌍을 라이다로 직접 재는 트리거,
+`config.py` "좌회전 진입 랜드마크" 절 참고)는 `S0_SIGNAL` 'left' 커밋 중에만 쓰이는데,
+기둥쌍이 트리거 ROI 안에서 잘 안 잡힌다는 실차 보고로 재조정했다(요청 반영, 전부 실차
+미검증 — 다음 실차 테스트에서 `checker_pillar_bev` 창으로 확인 필요).
+
+**수정 (모두 `config.py` "좌회전 진입 랜드마크" 절):**
+- `CHECKER_PILLAR_LON_MIN/MAX`: 폭(0.7m) 유지한 채 전방으로 0.25m 이동
+  (`-0.4~0.3m` → `-0.15~0.55m`).
+- `CHECKER_PILLAR_MIN_RANGE_M`(신규, 0.1m): `perc_checker_pillar()`의 ROI 조건에
+  `r > CHECKER_PILLAR_MIN_RANGE_M`을 추가해 이 거리 이내로 찍힌 포인트(자기반사/노이즈로
+  추정)를 무시.
+- `CHECKER_PILLAR_CLUSTER_MIN_PTS`: 2 → 1. 좌/우 각각 연속 2포인트를 못 채우면 그
+  사이드째 "미검출"로 빠지던 문제 대응 — 1포인트만 찍혀도 그 사이드는 검출된 것으로 완화.
+- `lat_ok` 판정(`perc_checker_pillar()`): 대칭 허용오차(`|lat_dist - TARGET| <=
+  TOLERANCE`) → 하한만 있는 비교(`lat_dist >= CHECKER_PILLAR_LAT_TARGET_M`)로 변경.
+  사이드당 1포인트만으로 잡은 좌표는 덜 안정적이라, 상한까지 좁게 걸면 실제 기둥쌍인데도
+  근소하게 밀려나 놓칠 위험이 더 크다고 판단해 상한을 없앴다. 더 이상 안 쓰이는
+  `CHECKER_PILLAR_LAT_TOLERANCE_M`은 삭제(`_draw_checker_pillar_bev()` 표시 문구도
+  `target=X+-Y` → `target>=X`로 갱신).
+
+**알려진 한계:** `CHECKER_PILLAR_CLUSTER_MIN_PTS=1`+`lat_ok` 상한 제거는 오탐(엉뚱한
+장애물 쌍을 게이트로 오인) 위험을 늘리는 방향의 완화다 — `CHECKER_PILLAR_LAT_MAX=1.0`이
+그나마 좌우 거리를 물리적으로 2.0m 밑으로 막아주지만, 실차에서 오탐이 늘면 이번에 낮춘
+값들을 다시 올리는 쪽으로 재조정할 것.
+
+**[2026-08-22c 추가]** `CHECKER_PILLAR_LAT_TARGET_M`(위 `lat_ok`의 하한 기준)을 실측
+기둥 간격 0.98m → 0.5m로 추가 하향(요청 반영, 실차 미검증) — 위 "알려진 한계"의 오탐
+위험이 이만큼 더 커진 상태이므로, 실차에서 무관한 라이다 클러스터쌍을 게이트로 오인하지
+않는지 우선 확인할 것.
+
+**[2026-08-22d 추가]** 좌회전 중 속도가 계속 `SPEED_NORMAL`과 같은 15로 발행된다는 실차
+보고 — 원인은 실제 진입 좌회전 램프(`_do_checker_ramp_turn()`)가 `ctrl_speed`로
+`TURN_SPEED`를 그대로 쓰는데 그 값이 15.0이었던 것(진출 좌회전 `_do_left_turn()`의
+`TURN_EXIT_SPEED`도 마찬가지로 15.0). 둘 다 12.0으로 낮췄다(요청 반영, `config.py`
+"좌회전 공통" 절, 실차 재검증 필요).
+
+**[2026-08-22e 추가]** `CHECKER_PILLAR_MIN_RANGE_M`(위 극근접 무시 필터)이 0.1m로는
+실차에서 효과가 안 보인다는 보고로 0.3m로 상향(요청 반영, 실차 미검증) — 원인은
+미확정(실제 반사가 0.1~0.3m 대에서 잡히는 것일 수도 있음). ★주의★ 이 필터는
+`checker_pillar_bev` 창의 점 색상(회색=ROI 밖/무시, 초록·주황=검출됨)에만 영향을
+준다 — 무시된 점도 화면에는 여전히 회색 점으로 그려지므로(`_draw_checker_pillar_bev()`가
+`r>0`인 점을 전부 그림), "점이 안 사라진다"는 관찰만으로는 필터가 안 먹혔다고 단정할 수
+없다. 회색인지 색이 들어왔는지로 판단할 것 — 그래도 여전히 안 걸러지면 코드 경로 자체를
+재확인할 것. 같은 세션에 `checker_pillar_bev`에 이 데드존을 빨간 원으로 시각화하는 것도
+추가했다(`_draw_checker_pillar_bev()`).
+
+**[2026-08-22f 추가]** 좌회전 커밋 구간(`_s0_signal()` 'left' 분기)이 `checker_pillar_trigger`가
+뜨기 전까지 `angle=0, speed=APPROACH_SPEED`로 뻣뻣하게 직진만 하던 것을, S1과 동일한
+`_lane_drive()` 차선주행으로 바꿨다(요청 반영, 실차 미검증) — "커밋 구간엔 비전을 끈다"는
+'straight' 분기의 설계 근거(신호 확정 지점≠물리적 분기 지점, da 쏠림 위험, §1.12 주석)는
+애초에 "거리(S2_COMMIT_DIST_M) 기반으로 커밋을 끝낸다"는 전제와 묶여 있었는데, 좌회전은
+이미 §1.19에서 거리 대신 `checker_pillar_trigger`(라이다 실측)로 커밋 종료를 판정하도록
+바뀌어 있어 그 전제가 적용되지 않는다 — 신호 확정 지점과 실제 좌회전 분기 사이에 커브가
+있으면 뻣뻣한 직진이 오히려 트랙 이탈 위험이라는 우려로 변경. 트리거가 뜨는 순간부터는
+기존과 동일하게 `_begin_checker_ramp_turn()`이 조향을 넘겨받는다. `_s0_signal()` 독스트링
+4/5번 항목도 같이 갱신.
+
+### 1.19b `MissionState.S3_SHORTCUT` 삭제 — 좌회전 진입 램프 완료 후 곧장 S1_LANE_FOLLOW로 복귀 (2026-08-22)
+
+**배경:** S3_SHORTCUT은 원래 "지름길은 신호등 없는 별도 구간이라 직진 유지 + 끝에서
+정지선 검출로 탈출 좌회전을 스크립트로 실행해야 한다"는 전제로 만들어진 전용 state였다.
+실차 트랙을 다시 확인한 결과, 지름길도 물리적으로는 그냥 트랙의 일반 구간이고 — B3
+방해차량 회피를 마친 뒤 다음 교차로 신호등을 기다리며 차선주행하는 상태(Phase.DONE,
+`_active_yolo_stage()`의 `Phase.DONE` 분기 참고)와 동일하다는 판단(요청 반영) — 별도
+탈출 스크립트가 있어야 한다는 전제 자체가 더 이상 유효하지 않다.
+
+**수정:**
+- `_do_checker_ramp_turn()`(§1.19 도입) 램프 완료 시 전환할 state를
+  `MissionState.S3_SHORTCUT` → `MissionState.S1_LANE_FOLLOW`로 변경. 'straight' 커밋
+  완료(`_s0_signal()`)와 동일하게 `self._behavior_enabled = True`도 같이 세팅해 B1→B2→B3
+  Behavior를 다시 연다(이미 `Phase.DONE`이면 `run_behavior_fsm()`이 그대로 무시하므로
+  안전).
+- `_s3_shortcut()`/`_shortcut_end()`/`_begin_left_turn()`/`_do_left_turn()` 전부 삭제 —
+  전부 S3_SHORTCUT 전용이었고(`_do_left_turn()`의 S3 진입 분기는 §1.19에서 이미 죽어있던
+  코드, 진출 분기가 이번에 마지막 호출부를 잃음), `MissionState.S3_SHORTCUT` enum 값도
+  같이 삭제(값 3은 재사용 안 함).
+- `config.py`: `TURN_ANGLE`/`TURN_DIST_M`/`TURN_EXIT_ANGLE`/`TURN_EXIT_SPEED`/
+  `TURN_EXIT_DIST_M`/`APPROACH_EXIT_SPEED`/`APPROACH_EXIT_TIME`/`SHORTCUT_MIN_T`/
+  `SHORTCUT_MAX_T`/`SHORTCUT_VISION_CUTOFF_T` 삭제(전부 위 삭제된 함수들 전용).
+  `TURN_SPEED`는 `_do_checker_ramp_turn()`이 계속 쓰므로 유지.
+- `track_drive.py`: `self._turn_dist`/`self._exit_approach_t0`/`self._shortcut_t0`/
+  `self._shortcut_ref_yaw` 필드, `run_mission_fsm()` 디스패치 테이블의 S3 항목,
+  `_change_state()`의 S3 진입 초기화 블록, `_current_stage_label()`/`_active_yolo_stage()`/
+  `_debug_viz_vesc()`의 S3 관련 분기·주석 삭제.
+
+**알려진 한계:** 지름길 끝(본선 합류부)에 실제로 신호등이 있고 정상적으로 인식된다는
+전제가 이 변경의 핵심이다 — 만약 그 지점에 신호등이 없거나 인식이 잘 안 되면(§1.19b
+이전 설계가 애초에 그 문제를 피하려고 정지선+시간 기반 대안을 썼던 이유), 지름길을
+빠져나온 뒤 차선주행이 아무 전환 없이 계속 이어지기만 하고 다음 교차로 판단으로 못
+넘어갈 수 있다 — 실차에서 지름길 통과 후 정상적으로 다음 신호등을 인식/판단하는지
+반드시 확인할 것.
+
+### 1.19c `DEBUG_VIZ_YOLO_SIGNAL_STATE` 끄기 + `obstacle_cut_debug` 창에 좌회전 진입 램프 상태 표시 (2026-08-22)
+
+**수정:**
+- `config.py`: `DEBUG_VIZ_YOLO_SIGNAL_STATE`(신호등 위치+색상 YOLO 검출창, `YOLO_신호등`)
+  `True → False`(요청 반영) — 필요하면 다시 켤 것.
+- `track_drive.py` `_current_stage_label()`(`obstacle_cut_debug` 창 상단 헤드라인 헬퍼,
+  §2.56/2026-08-22 도입): `self._checker_ramp_dist is not None`(체크무늬 게이트 라이다
+  임계값을 넘어 `_do_checker_ramp_turn()`의 -10°→-30° 조향 램프로 넘어간 상태)일 때
+  `좌회전 진입 중 (게이트 통과, 조향 X.X°, d/D m)`을 최우선으로 보여주도록 분기 추가(요청
+  반영) — `mission_state`는 램프가 끝날 때까지 계속 `S0_SIGNAL`이라, 원래 있던
+  `S0_SIGNAL` 분기("신호등 판독 대기")보다 먼저 걸러야 실제로 좌회전 중임이 창에 드러난다.
+
+---
+
 ## 2. 라인트래킹 (차선주행, S1)
 
 **수정할 곳:** `START_STATE=S1_LANE_FOLLOW`, `TEST_FORCE_BEHAVIOR=False`.

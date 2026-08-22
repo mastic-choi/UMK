@@ -138,12 +138,14 @@ class TrackDriverNode(Node):
         self.signal_left_confirmed     = False
         self._sig_straight_cnt = 0   # signal_straight_on 연속 유지 프레임 수
         self._sig_left_cnt     = 0   # signal_left_on 연속 유지 프레임 수
-        # [2026-08-20] S1→S0_SIGNAL 진입 트리거를 정지선에서 "신호등 보드 자체가 인식되는
-        # 시점"으로 교체 — perc_signal()이 이제 S1_LANE_FOLLOW 중에도 YOLO 신호등 검출기를
-        # 돌려, 색상과 무관하게 색상 클래스 중 하나라도 검출됐는지(board_seen)만 본다.
-        self.signal_board_confirmed = False
-        self._sig_board_cnt = 0      # 보드 인식(색상 무관) 연속 유지 프레임 수
-        self.stopline = False            # 굵은 가로 흰선(정지선/지름길 끝 단서, S3 진출·바퀴카운트용)
+        # [2026-08-22] S1→S0_SIGNAL 진입 트리거를 "보드 인식(색상 무관)" → "색상 확정
+        # (signal_straight/left_confirmed)"으로 교체(요청 반영) — 예전엔 보드만 보여도
+        # 곧장 S0_SIGNAL로 넘어가 그 안에서 다시 멈춰 서서 색상을 판독했다(그 사이 속도가
+        # 0으로 굳음). 이제 색상이 실제로 확정될 때까지 S1 차선주행을 그대로 유지하고,
+        # 확정되는 순간 정지 없이 곧장 커밋 구간으로 들어간다 — perc_signal()/
+        # _s1_lane_follow() 참고. 이에 따라 보드 인식 전용 트리거(signal_board_confirmed)는
+        # 더 이상 쓰지 않는다.
+        self.stopline = False            # 굵은 가로 흰선(정지선 단서, 바퀴카운트용)
         self._signal_reentry_cooldown_t = 0.0  # 이 시각까지 신호등 보드 재감지(S0_SIGNAL 재진입) 무시
         self._last_stopline_t = 0.0      # [10] 정지선을 마지막으로 본 시각(교차로 근처 기동 금지용)
         # [2-3 장애물(전방/측면)]
@@ -242,7 +244,7 @@ class TrackDriverNode(Node):
         self.checker_pillar_trigger        = False  # (좌우 검출 AND 간격이 실측값과 일치)가 디바운스 프레임수만큼 유지되면 True
         self._checker_pillar_trigger_cnt   = 0      # 디바운스 카운터
         self._checker_pillar_dbg = (0, 0, 0, 0, 0.0)  # 디버그용 (좌pts, 좌run, 우pts, 우run, 횡방향거리)
-        self._checker_ramp_dist = None  # None=램프 비활성, 아니면 트리거 이후 누적 이동거리(m) — _do_left_turn()의 _turn_dist와 동일 패턴
+        self._checker_ramp_dist = None  # None=램프 비활성, 아니면 트리거 이후 누적 이동거리(m) — _s2_commit_dist와 동일한 VESC 거리적분 패턴
         # [2-6 방해차량 트리거]
         self.vehicle_trigger       = False   # 라이다 디바운스 통과 → B3 진입 트리거
         self._vehicle_trigger_cnt  = 0       # 동시검출 연속 프레임 수(디바운스 카운터)
@@ -387,12 +389,8 @@ class TrackDriverNode(Node):
         self._prev_angle_out = 0.0    # [5] 직전 발행 조향각(변화율 제한용)
         self._pid_prev_error = 0.0
         self._pid_integral   = 0.0
-        self._turn_dist      = None   # 좌회전 진행 중 누적 이동거리(m, None=미회전) — [2026-08-20] IMU yaw 대신 거리 기반
         self._s2_commit_dist = None   # S2 신호 확정 후 물리적 분기 커밋 구간 누적 이동거리(m, None=미진입)
         self._s2_commit_dir  = None   # 커밋 구간에서 진행 중인 방향 ('straight'/'left')
-        self._exit_approach_t0 = None # [진출] S3 탈출 정지선 감지 후 감속 시작 시각
-        self._shortcut_t0    = None   # 지름길 진입 시각(끝감지 타이밍용)
-        self._shortcut_ref_yaw = None # S3 진입 1초 후 기록한 기준 yaw (탈출 좌회전 전 보정용)
         self._prev_speed     = 0.0    # 가속 속도제한용(직전 출력 속도)
         self._corner_hold    = 0.0    # 코너 활성도(감쇠 peak-hold)
         self._corner_signal  = 0.0    # 코너 감속 판단용 조향각 signed EMA(부호 유지, _lane_drive() 참고)
@@ -551,7 +549,7 @@ class TrackDriverNode(Node):
         # 구독하도록 이미 전환되어 있음(ros1_bridge가 커스텀 XycarMotor 타입을 못 넘기는 문제 우회).
         clipped_angle = float(np.clip(angle, -ANGLE_MAX, ANGLE_MAX))
         # [5] 변화율 제한: 크기(clip)만으로는 한 주기에 0도→-60도 같은 계단 명령이 그대로 나간다
-        #     (_do_left_turn 의 즉시 대입, B0→B1 전환, Stanley 출력 교체 등에서 실제로 발생).
+        #     (_begin_checker_ramp_turn() 진입 시 즉시 대입, B0→B1 전환, Stanley 출력 교체 등에서 실제로 발생).
         #     서보 기계부하와 제어 오실레이션을 동시에 줄인다.
         clipped_angle = float(np.clip(clipped_angle,
                                       self._prev_angle_out - ANGLE_RATE_MAX,
@@ -598,7 +596,7 @@ class TrackDriverNode(Node):
     #   매핑: S0_SIGNAL(신호등 판단 대기) → 신호등. S1_LANE_FOLLOW 중 Phase.LAVACON(B1
     #   진입 대기) → 콘. Phase.OBSTACLE_ZONE 중 B2(고정장애물) 아직 안 지났으면 → 콘,
     #   지났으면(B3 방해차량 대기) → 차량. Phase.DONE(다음 교차로 신호등 대기) → 신호등.
-    #   S3_SHORTCUT/S4_FINISH는 카메라 YOLO 자체가 불필요해 전부 끈다.
+    #   S4_FINISH는 카메라 YOLO 자체가 불필요해 전부 끈다.
     #   [2026-08-22, 요청 반영] §5.4에서 "B3(방해차량) → B2(고정장애물)"로 뒤집었던 트랙
     #   순서를 다시 원래 순서 "B1(라바콘) → B2(고정장애물) → B3(방해차량)"로 되돌렸다
     #   (README §5.5) — 아래 Phase.OBSTACLE_ZONE 분기, run_behavior_fsm() 참고.
@@ -617,7 +615,7 @@ class TrackDriverNode(Node):
             if self.phase == Phase.OBSTACLE_ZONE:
                 return 'cone' if not self._b2_passed else 'vehicle'
             return 'signal'  # Phase.DONE — 다음 교차로 신호등 보드 대기
-        return None  # S3_SHORTCUT/S4_FINISH — 카메라 YOLO 불필요
+        return None  # S4_FINISH — 카메라 YOLO 불필요
 
     def perceive_all(self):
         self.perc_lane()        # 비전 — set_obstacle()가 여기서 "직전 틱"의 obstacle_cut_active를
@@ -848,27 +846,25 @@ class TrackDriverNode(Node):
         S0_SIGNAL 진입 후에야 신호등을 "보기" 시작해서, 그 진입 자체는 정지선(바닥 흰선)
         검출이 트리거였다. 그런데 "정지선을 밟아야 신호를 읽기 시작한다"는 신호등 자체를
         인식하는 것과는 다른 신호원이라, 정지선 인식이 어긋나면(치우침/블러 등) 신호등이
-        이미 빨간불인데도 계속 차선주행 속도로 접근하는 상황이 가능했다. 이제 S1 중에도
-        보드 인식 자체(색상 무관)를 매 프레임 확인해 _s1_lane_follow()가 이걸로 S0_SIGNAL
-        진입을 트리거한다 — 정지선은 더 이상 이 전환에 관여하지 않는다(다른 용도—
-        _shortcut_end()/_update_lap()/교차로 근처 기동 금지—는 그대로 유지)."""
+        이미 빨간불인데도 계속 차선주행 속도로 접근하는 상황이 가능했다. 정지선은 더 이상
+        이 전환에 관여하지 않는다(다른 용도— _update_lap()/교차로 근처 기동 금지—는
+        그대로 유지).
+
+        [2026-08-22] "보드 인식(색상 무관) → S0_SIGNAL 진입 → 그 안에서 색상 확정"이던
+        2단계 트리거를 없앴다(요청 반영, S0_SIGNAL 진입 시 속도가 0으로 굳는 문제) —
+        S1_LANE_FOLLOW/S0_SIGNAL 구분 없이 매 프레임 직진/좌회전 색상 확정
+        (signal_straight/left_confirmed)을 갱신하고, _s1_lane_follow()가 이 확정값을
+        직접 보고 커밋 구간 진입을 트리거한다. 색상 확정 전까지는 S1 차선주행이 멈추지
+        않는다."""
         if self.img_front is None:
             return
         if self.mission_state not in (MissionState.S1_LANE_FOLLOW, MissionState.S0_SIGNAL):
             return
 
-        # "보드 자체가 보이는가"에 대응하는 신호가 따로 없다(단일 스테이지 모델이라 배경판
-        # bbox를 안 줌) — 색상 클래스 중 하나라도 검출됐으면 보드가 보인다고 간주한다.
-        board_seen = self.signal_red_on or self.signal_straight_on or self.signal_left_on
-
-        if self.mission_state == MissionState.S1_LANE_FOLLOW:
-            self._sig_board_cnt = self._sig_board_cnt + 1 if board_seen else 0
-            self.signal_board_confirmed = self._sig_board_cnt >= SIG_CONFIRM_FRAMES
-        else:  # S0_SIGNAL — 직진/좌회전 색상 확정
-            self._sig_straight_cnt = self._sig_straight_cnt + 1 if self.signal_straight_on else 0
-            self._sig_left_cnt     = self._sig_left_cnt + 1 if self.signal_left_on else 0
-            self.signal_straight_confirmed = self._sig_straight_cnt >= SIG_CONFIRM_FRAMES
-            self.signal_left_confirmed     = self._sig_left_cnt >= SIG_CONFIRM_FRAMES
+        self._sig_straight_cnt = self._sig_straight_cnt + 1 if self.signal_straight_on else 0
+        self._sig_left_cnt     = self._sig_left_cnt + 1 if self.signal_left_on else 0
+        self.signal_straight_confirmed = self._sig_straight_cnt >= SIG_CONFIRM_FRAMES
+        self.signal_left_confirmed     = self._sig_left_cnt >= SIG_CONFIRM_FRAMES
 
     # [2026-08-13] mask(불리언 배열)에서 True인 인덱스들 중 가장 긴 "연속(인접 인덱스)"
     # 구간의 길이를 구한다. 전방 장애물 그룹핑(perc_obstacle()의 fidx/groups, np.split을
@@ -1800,8 +1796,9 @@ class TrackDriverNode(Node):
     #   입력 self.lidar_ranges → 출력 checker_pillar_left/right_detected, checker_pillar_trigger
     #   perc_lavacon_trigger()와 완전히 동일한 패턴(극좌표→직교좌표, 종방향 ROI, 좌/우
     #   클러스터 탐지)이지만, 좌우 클러스터 간 횡방향 거리가 실측 기둥 간격
-    #   (CHECKER_PILLAR_LAT_TARGET_M)과 일치해야만 확정한다는 조건이 추가됐다 — config.py
-    #   "체크무늬 게이트 라이다 기둥쌍 검출" 절 참고.
+    #   (CHECKER_PILLAR_LAT_TARGET_M) 이상이어야만 확정한다는 조건이 추가됐다 — config.py
+    #   "체크무늬 게이트 라이다 기둥쌍 검출" 절 참고. [2026-08-22b] 검출조건 완화 이력은
+    #   README §1.19 참고.
     def perc_checker_pillar(self):
         if self.lidar_ranges is None:
             self.checker_pillar_left_detected  = False
@@ -1826,7 +1823,7 @@ class TrackDriverNode(Node):
         r = ranges[:m]
         x = r * np.cos(deg)          # 전방(+앞)
         y = r * np.sin(deg)          # 횡방향(+좌/-우)
-        roi = (r > 0.0) & (x > CHECKER_PILLAR_LON_MIN) & (x < CHECKER_PILLAR_LON_MAX) \
+        roi = (r > CHECKER_PILLAR_MIN_RANGE_M) & (x > CHECKER_PILLAR_LON_MIN) & (x < CHECKER_PILLAR_LON_MAX) \
               & (np.abs(y) < CHECKER_PILLAR_LAT_MAX)
 
         def _cluster_center(side_mask):
@@ -1856,12 +1853,80 @@ class TrackDriverNode(Node):
             self.checker_pillar_lat_dist_m = 0.0
         self._checker_pillar_dbg = (left_pts, left_run, right_pts, right_run, self.checker_pillar_lat_dist_m)
 
-        lat_ok = abs(self.checker_pillar_lat_dist_m - CHECKER_PILLAR_LAT_TARGET_M) <= CHECKER_PILLAR_LAT_TOLERANCE_M
+        lat_ok = self.checker_pillar_lat_dist_m >= CHECKER_PILLAR_LAT_TARGET_M
         if self.checker_pillar_left_detected and self.checker_pillar_right_detected and lat_ok:
             self._checker_pillar_trigger_cnt += 1
         else:
             self._checker_pillar_trigger_cnt = 0
         self.checker_pillar_trigger = self._checker_pillar_trigger_cnt >= CHECKER_PILLAR_CONFIRM_FRAMES
+
+        if DEBUG_VIZ_CHECKER_PILLAR:
+            self._draw_checker_pillar_bev(r, x, y, roi, lat_ok,
+                                           left_pts, left_run, right_pts, right_run)
+
+    # [2-4d''] [DEBUG_VIZ_CHECKER_PILLAR] 체크무늬 게이트 라이다 기둥쌍 검출 BEV 시각화
+    #   _draw_lavacon_bev()와 동일 스타일(1/2/3m 거리원, 청록 ROI 박스, 좌=초록/우=주황 점).
+    #   좌우 기둥쌍 사이 실측 횡방향 거리(checker_pillar_lat_dist_m)가 실측 기준값
+    #   (CHECKER_PILLAR_LAT_TARGET_M±TOLERANCE)과 맞는지가 이 게이트만의 추가 확정 조건이라
+    #   화면에 그 비교값도 같이 표시한다.
+    def _draw_checker_pillar_bev(self, r, x, y, roi, lat_ok,
+                                  left_pts, left_run, right_pts, right_run):
+        PPM = 80
+        W, H = 500, 500
+        ORIGIN_EX, ORIGIN_EY = 250, 460
+        bev = np.zeros((H, W, 3), dtype=np.uint8)
+
+        for d in (1, 2, 3):
+            cv2.circle(bev, (ORIGIN_EX, ORIGIN_EY), d * PPM, (50, 50, 50), 1)
+            cv2.putText(bev, f'{d}m', (ORIGIN_EX + 4, ORIGIN_EY - d * PPM + 12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (80, 80, 80), 1)
+
+        def to_px(wx, wy): return (int(ORIGIN_EX - wy * PPM), int(ORIGIN_EY - wx * PPM))
+
+        cv2.rectangle(bev, to_px(CHECKER_PILLAR_LON_MIN, CHECKER_PILLAR_LAT_MAX),
+                      to_px(CHECKER_PILLAR_LON_MAX, -CHECKER_PILLAR_LAT_MAX), (0, 220, 220), 1)
+
+        # [2026-08-22e] 극근접 무시 데드존(CHECKER_PILLAR_MIN_RANGE_M) 시각화 — 이 원
+        # 안쪽 점은 roi 계산에서 이미 제외되지만(위 perc_checker_pillar() 참고), 화면에는
+        # 여전히 회색 점으로 그려지므로(무시=미검출이지 미표시가 아님) 필터가 실제로
+        # 걸리는 범위를 빨간 원으로 눈에 보이게 표시해 "왜 안 사라지지" 오해를 줄인다.
+        cv2.circle(bev, (ORIGIN_EX, ORIGIN_EY), int(CHECKER_PILLAR_MIN_RANGE_M * PPM), (0, 0, 255), 1)
+        cv2.putText(bev, f'ignore<{CHECKER_PILLAR_MIN_RANGE_M:.2f}m',
+                    (ORIGIN_EX + 4, ORIGIN_EY - int(CHECKER_PILLAR_MIN_RANGE_M * PPM) - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1, cv2.LINE_AA)
+
+        left_mask, right_mask = roi & (y > 0.0), roi & (y < 0.0)
+        for i in range(len(r)):
+            if r[i] <= 0.0:
+                continue
+            sx, sy = int(ORIGIN_EX - y[i] * PPM), int(ORIGIN_EY - x[i] * PPM)
+            if not (0 <= sx < W and 0 <= sy < H):
+                continue
+            if left_mask[i]:    col = (0, 255, 0)
+            elif right_mask[i]: col = (0, 140, 255)
+            else:                col = (60, 60, 60)
+            cv2.circle(bev, (sx, sy), 3, col, -1)
+
+        cv2.circle(bev, (ORIGIN_EX, ORIGIN_EY), 6, (255, 220, 0), -1)
+        cv2.line(bev, (ORIGIN_EX, ORIGIN_EY), (ORIGIN_EX, ORIGIN_EY - 18), (255, 220, 0), 2)
+
+        l_col = (0, 255, 0)   if self.checker_pillar_left_detected  else (0, 0, 255)
+        r_col = (0, 140, 255) if self.checker_pillar_right_detected else (0, 0, 255)
+        cv2.putText(bev, f'L pts={left_pts} run={left_run}', (8, 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, l_col, 1, cv2.LINE_AA)
+        cv2.putText(bev, f'R pts={right_pts} run={right_run}', (8, 44),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, r_col, 1, cv2.LINE_AA)
+        dist_col = (0, 255, 0) if lat_ok else (0, 0, 255)
+        cv2.putText(bev, f'lat_dist={self.checker_pillar_lat_dist_m:.2f}m '
+                          f'(target>={CHECKER_PILLAR_LAT_TARGET_M:.2f})',
+                    (8, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.42, dist_col, 1, cv2.LINE_AA)
+        trig_col = (0, 255, 0) if self.checker_pillar_trigger else (200, 200, 200)
+        cv2.putText(bev, f'trigger={self.checker_pillar_trigger} '
+                          f'cnt={self._checker_pillar_trigger_cnt}/{CHECKER_PILLAR_CONFIRM_FRAMES}',
+                    (8, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.45, trig_col, 1, cv2.LINE_AA)
+
+        cv2.imshow('checker_pillar_bev', bev)
+        cv2.waitKey(1)
 
     # [2-4e] 체크무늬 게이트 통과 후 완만한 조향 램프 (_s0_signal() 'left' 커밋 종료 후 사용)
     #   checker_pillar_trigger가 뜬 시점에 호출부(_begin_checker_ramp_turn())가
@@ -2002,7 +2067,6 @@ class TrackDriverNode(Node):
         {
             MissionState.S0_SIGNAL      : self._s0_signal,
             MissionState.S1_LANE_FOLLOW : self._s1_lane_follow,
-            MissionState.S3_SHORTCUT    : self._s3_shortcut,
             MissionState.S4_FINISH      : self._s4_finish,
         }[self.mission_state]()
 
@@ -2036,9 +2100,6 @@ class TrackDriverNode(Node):
             # [2026-08-20] S0_SIGNAL 통합 이후 이 state는 출발 때 1번 + 매 바퀴 교차로에서
             # 반복 진입하므로, prev_state만으로는 "진짜 첫 출발"을 구분할 수 없다(항상
             # S0_SIGNAL이라 같음) — self._departed로 직접 추적한다.
-            # 다음 접근에서 신호등 보드를 새로 인식할 수 있도록 리셋(재진입마다 항상).
-            self._sig_board_cnt = 0
-            self.signal_board_confirmed = False
             if not self._departed:
                 self._departed = True
                 # 신호등 오검출 억제 + 바퀴 기준점 리셋은 진짜 출발 시점에만 필요 —
@@ -2047,10 +2108,6 @@ class TrackDriverNode(Node):
                 self._lap_t0 = time.time()
                 self._yaw_accum = 0.0
                 self._prev_yaw_accum_ref = self.imu_yaw
-        # S3 진입 시 탈출 감속 플래그 + 기준 yaw 초기화
-        if new_state == MissionState.S3_SHORTCUT:
-            self._exit_approach_t0 = None
-            self._shortcut_ref_yaw = None
 
     # ── S1: 차선인식 주행 (라바콘·고정장애물·추월 Behavior를 이 상태 안에서 처리) ──
     def _s1_lane_follow(self):
@@ -2060,15 +2117,17 @@ class TrackDriverNode(Node):
             그때마다 _behavior_enabled=True로 Behavior(B1→B2→B3)가 바로 활성화된다
             (README §대회 규정 요약: 라바콘 등은 출발 직후부터 시작). Behavior가 조향/속도를
             전담하는 구간에서는 여기서 PID를 돌리지 않는다(적분 오염 방지) — 아래 조기 return.
-          - [2026-08-20] 정지선이 아니라 "신호등 보드가 인식되는 시점"(signal_board_confirmed,
-            perc_signal() 참고)에 서행 구간 없이 곧장 S0_SIGNAL(교차로 재진입)로 전환한다
-            (요청 반영). 정지선(바닥 흰선) 검출은 신호등 자체를 보는 것과는 다른 신호원이라,
-            정지선 인식이 어긋나면 신호등이 이미 빨간불인데도 계속 차선주행 속도로 접근하는
-            상황이 가능했다 — 신호등 보드 자체를 트리거로 쓰면 그 간극이 없다. 실제 정지는
-            S0_SIGNAL 진입 후 그 상태의 매 프레임 기본 동작(_s0_signal(): 신호 미확정=
-            사실상 빨간불이면 속도 0)이 대신한다 — 신호가 이미 확정돼 있었다면(직전 바퀴의
-            잔상 등) 정지 없이 바로 커밋 구간으로 넘어갈 수도 있는데, _change_state()가
-            S0_SIGNAL 진입 시 signal_*_confirmed를 항상 리셋하므로 그런 오작동은 없다.
+          - [2026-08-22] "신호등 보드가 인식되는 시점"(색상 무관)에 곧장 S0_SIGNAL로
+            전환해 그 안에서 멈춰 서서 색상을 판독하던 방식을 없앴다(요청 반영 — 그 정지
+            구간 동안 속도가 0으로 굳는 문제). 이제 색상이 실제로 확정
+            (signal_straight/left_confirmed, perc_signal() 참고)될 때까지 이 함수(S1
+            차선주행)를 그대로 유지하고, 확정되는 순간 정지 없이 곧장 S0_SIGNAL로 넘어가며
+            커밋 구간(_s2_commit_dist, 직진 유지)을 같은 틱에 바로 시작한다 — 아래
+            _change_state() 직후 _s2_commit_dist를 세팅하는 순서 참고(먼저 세팅하면
+            _change_state()가 S0_SIGNAL 진입 처리에서 그 값을 다시 None으로 지운다).
+            좌회전(지름길)이면 이 커밋 구간이 라이다 체크무늬 게이트 검출
+            (checker_pillar_trigger)로 끝나고 그 자리에서 좌회전을 시작한다
+            (_s0_signal() 'left' 분기 참고) — 정지 이벤트 자체가 없다.
         """
         # Behavior가 조향을 전담하는 구간에서는 Mission의 차선 PID를 건너뛴다.
         # [2026-08-20] 요청 반영 — 라바콘 구간은 지금 진입/탈출 트리거만 판정하고(아래
@@ -2085,30 +2144,42 @@ class TrackDriverNode(Node):
             return
 
         self._lane_drive()
-        # TEST_DISABLE_INTERSECTION=True면 신호등 보드를 인식해도 아래 조건이 항상 False가 되어
+        # TEST_DISABLE_INTERSECTION=True면 색상이 확정돼도 아래 조건이 항상 False가 되어
         # S0_SIGNAL 재진입 자체가 원천 차단되고 계속 이 함수(_lane_drive)만 반복하며
         # 차선주행을 이어간다.
-        if (not TEST_DISABLE_INTERSECTION and self.signal_board_confirmed
-                and time.time() >= self._signal_reentry_cooldown_t):  # 보드 인식(쿨다운 지난 뒤만)
+        if TEST_DISABLE_INTERSECTION or time.time() < self._signal_reentry_cooldown_t:
+            return
+        if self.signal_left_confirmed:
             self._change_state(MissionState.S0_SIGNAL)
+            self._s2_commit_dist = 0.0   # _change_state()가 진입 처리에서 None으로 리셋한 뒤 다시 세팅
+            self._s2_commit_dir  = 'left'
+        elif self.signal_straight_confirmed:
+            self._change_state(MissionState.S0_SIGNAL)
+            self._s2_commit_dist = 0.0
+            self._s2_commit_dir  = 'straight'
 
     # ── S0_SIGNAL: 4구 신호등 판단 — 출발선/교차로 공용 (정지 후 신호로 경로 판단) ──
     def _s0_signal(self):
         """
         4구 신호등 앞에서 정지한 채 판독한다. [2026-08-20] 원래 출발(S0_WAIT_GREEN)과 교차로
         (S2_INTERSECTION)로 나뉘어 있던 걸 하나로 합쳤다 — 둘 다 로직이 완전히 같았기 때문
-        (정지 → 4구 신호 판독 → 직진/좌회전 확정). 이 state는 출발 직후 1번, 이후 매 바퀴
-        트랙 중앙 분기점에서 재진입한다. START_STATE=S0_SIGNAL이라 맨 처음 진입도 이 경로를
-        그대로 타므로, 출발이든 교차로 재진입이든 "신호 미확정=사실상 빨간불이면 정지"가
-        동일하게 적용된다(아래 1번, 별도 "정지" 이벤트/타이머 없이 매 프레임 기본값으로).
-          1. 진입 즉시 정지 (기본값 STOP, 명시적 신호만 출발/재출발)
+        (정지 → 4구 신호 판독 → 직진/좌회전 확정).
+
+        [2026-08-22] 트랙 중앙 분기점 재진입은 이제 _s1_lane_follow()가 색상 확정
+        (signal_straight/left_confirmed)을 직접 보고 나서야 이 state로 넘어오면서
+        _s2_commit_dist를 같은 틱에 미리 세팅해둔다 — 그래서 재진입 시엔 아래 "1. 진입 즉시
+        정지" 분기(신호 미확정=정지)에 도달하지 않고 곧장 커밋 구간(2번)으로 들어간다.
+        이 정지 분기가 실제로 쓰이는 건 START_STATE=S0_SIGNAL로 노드가 맨 처음 시작하는
+        출발선 경우뿐이다 — 그때는 아직 아무 신호도 안 봤으니 진짜로 "정지 후 판독"이
+        필요하다(대회 규정상 심판이 신호를 초록으로 바꾸기 전까지 출발 자체가 금지).
+          1. 진입 즉시 정지 (기본값 STOP, 명시적 신호만 출발/재출발) — 출발선 전용, 위 참고
           2. 직진 초록(signal_straight_confirmed) → 커밋 구간(S2_COMMIT_DIST_M) 거쳐 S1 복귀
              + Behavior 활성화(라바콘부터 진행 — README §대회 규정 요약대로 출발 직후에도 매번 켠다)
              좌회전 신호(signal_left_confirmed) → 커밋 구간 거쳐 좌회전 후 S3(지름길, 3바퀴 중
              2·3바퀴째에 한 번만 등장)
           3. 좌회전 진행 중이면 신호와 무관하게 완료 우선
-          4. 커밋 구간(_s2_commit_dist)에서는 신호와 무관하게 직진만 유지 — 신호가 보이는
-             지점과 실제 도로가 갈라지는 물리적 분기 지점이 떨어져 있고(config.py
+          4. 커밋 구간(_s2_commit_dist), 'straight'만: 신호와 무관하게 직진만 유지 — 신호가
+             보이는 지점과 실제 도로가 갈라지는 물리적 분기 지점이 떨어져 있고(config.py
              S2_COMMIT_DIST_M 주석 참고), 그 사이에 _lane_drive()(비전)를 켜면 분기가
              보이기 시작하는 순간 da가 반대쪽 갈래로 끌려간다(실측 재현됨, 교차로 기준). 신호로
              이미 확정된 방향이므로 이 구간은 비전을 아예 참조하지 않는다. 커밋 구간 종료
@@ -2117,22 +2188,33 @@ class TrackDriverNode(Node):
              S2_COMMIT_DIST_M 주석 참고). 출발 시점에는 이 분기 자체가 없지만 같은 코드경로를
              타므로 출발 직후에도 짧게(≈S2_COMMIT_DIST_M=1m) 이 구간을 거친다 — 출발선은 직선이라
              문제는 없을 것으로 보이나 실차 미검증.
+          5. 커밋 구간, 'left'만: [2026-08-22f] 위 4번과 달리 비전을 끄지 않고 _lane_drive()로
+             S1과 동일하게 차선주행을 유지한다(요청 반영) — 좌회전은 애초에 거리(4번의
+             S2_COMMIT_DIST_M)가 아니라 checker_pillar_trigger(체크무늬 게이트 라이다 기둥쌍
+             검출)로 커밋 종료를 판정하므로, 4번이 비전을 끄는 근거("거리 기반 종료 판정이
+             da 쏠림에 흔들리면 안 된다")가 애초에 적용되지 않는다. 트리거 검출 전까지 계속
+             angle=0 직진만 강제하면 신호 확정 지점과 실제 분기 사이에 커브가 있을 때 차선을
+             벗어날 위험이 있다는 실차 우려로 바꿨다 — _do_checker_ramp_turn() 참고.
         """
         if self._checker_ramp_dist is not None:
             self._do_checker_ramp_turn()
             return
 
-        # [2026-08-21] 진입 좌회전(S2→S3)의 _turn_dist 오픈루프 경로는 위 체크무늬 게이트
-        # 램프로 대체돼 더 이상 이 state에서 도달하지 않는다(_begin_left_turn()이 여기서
-        # 더는 호출 안 됨 — 아래 'left' 커밋 분기가 _begin_checker_ramp_turn()을 씀).
-        # _do_left_turn()/TURN_ANGLE류는 _s3_shortcut()의 진출(S3→S1) 좌회전에서 계속 쓰인다.
-
         if self._s2_commit_dist is not None:
-            self.ctrl_angle = 0.0
-            self.ctrl_speed = APPROACH_SPEED
-            self._s2_commit_dist += self._speed_mps_fallback(APPROACH_SPEED) * 0.05  # 20Hz 제어주기(control_loop) 가정
-
             if self._s2_commit_dir == 'left':
+                # [2026-08-22f] 커밋 구간 동안 직진 강제(angle=0, APPROACH_SPEED) 대신 S1과
+                # 동일한 차선주행(_lane_drive())을 그대로 유지하도록 변경(요청 반영) — 아래
+                # 'straight' 분기가 여전히 비전을 끄는 이유(신호가 보이는 지점과 물리적 분기가
+                # 떨어져 있어 da가 반대 갈래로 끌려감, S2_COMMIT_DIST_M 주석 참고)는 애초에
+                # "거리 기반으로 커밋을 끝낸다"는 전제와 묶여 있었는데, 좌회전은 이미
+                # checker_pillar_trigger(물리적 라이다 검출)로 커밋 종료 시점을 잡아 그 전제와
+                # 무관하다 — 트리거가 뜨기 전까지 계속 뻣뻣하게 직진만 하면, 신호 확정 지점과
+                # 실제 트랙 사이에 커브가 있을 때 차선을 벗어날 위험이 있다는 실차 우려로 이
+                # 구간 전체를 비전 주행으로 바꿨다. 트리거가 뜨는 순간부터는 기존과 동일하게
+                # _begin_checker_ramp_turn()이 조향을 넘겨받는다. 실차 미검증.
+                self._lane_drive()
+                self._s2_commit_dist += self._speed_mps_fallback(self.ctrl_speed) * 0.05  # 20Hz 제어주기(control_loop) 가정
+
                 # [2026-08-21] 커밋 종료 트리거를 거리(S2_COMMIT_DIST_M) 대신 체크무늬 게이트
                 # 라이다 기둥쌍 검출로 대체(요청 반영, config.py "체크무늬 게이트 라이다
                 # 기둥쌍 검출" 절 참고) — 신호확정 후 정지위치 산포에 안 흔들리는 물리적
@@ -2148,6 +2230,10 @@ class TrackDriverNode(Node):
                     self._s2_commit_dir  = None
                     self._begin_checker_ramp_turn()
                 return
+
+            self.ctrl_angle = 0.0
+            self.ctrl_speed = APPROACH_SPEED
+            self._s2_commit_dist += self._speed_mps_fallback(APPROACH_SPEED) * 0.05  # 20Hz 제어주기(control_loop) 가정
 
             if self._s2_commit_dist >= S2_COMMIT_DIST_M:
                 commit_dir = self._s2_commit_dir
@@ -2168,117 +2254,24 @@ class TrackDriverNode(Node):
             self._s2_commit_dist = 0.0
             self._s2_commit_dir  = 'left'
 
-    # ── S3: 지름길 — 직진(+차선소실 대비), 끝에서 좌회전 ──
-    def _s3_shortcut(self):
-        """
-        지름길 직진. 중간 차선소실 구간은 라이다로 딸 것이 없으므로 그냥 직진.
-        끝에 도달하면 신호없이 좌회전으로 S1(차선주행) 복귀 (Behavior는 켜지 않음).
-
-        지름길 출구(본선 합류부)는 신호등이 없어 정지선 검출로만 끝(_shortcut_end())을
-        판단하는데, 합류부는 도로가 서서히 넓어지는 형태라 정지선이 실제로 잡히기 전에
-        da 세그멘테이션이 합류 쪽으로 먼저 끌려가는 문제가 있다(ㅓ교차로와 동일한
-        실패모드, config.py SHORTCUT_VISION_CUTOFF_T 주석 참고). 그래서 정지선 검출을
-        기다리지 않고 SHORTCUT_VISION_CUTOFF_T가 지나면 미리 비전(_lane_drive())을 끄고
-        _shortcut_ref_yaw 기준 헤딩홀드로 직진을 유지한다 — 좌회전 스크립트는 아직
-        시작하지 않고, 정지선이 실제로 잡히거나 SHORTCUT_MAX_T에 도달해 _shortcut_end()가
-        확정된 뒤에야 진출 시퀀스(감속+좌회전)로 넘어간다.
-        """
-        if self._turn_dist is not None:
-            self._do_left_turn(next_state=MissionState.S1_LANE_FOLLOW)
-            return
-
-        if self._shortcut_t0 is None:
-            self._shortcut_t0 = time.time()
-
-        if self._shortcut_ref_yaw is None and (time.time() - self._shortcut_t0) >= 1.0:
-            self._shortcut_ref_yaw = self.imu_yaw
-            self.get_logger().info(f'[S3] 기준 yaw 기록: {math.degrees(self._shortcut_ref_yaw):.1f}°')
-
-        if self._shortcut_end():
-            if self._exit_approach_t0 is None:
-                self._exit_approach_t0 = time.time()
-            elapsed = time.time() - self._exit_approach_t0
-            if elapsed < APPROACH_EXIT_TIME:
-                if self._shortcut_ref_yaw is not None:
-                    yaw_err = self._yaw_delta(self._shortcut_ref_yaw)
-                    self.ctrl_angle = float(np.clip(-yaw_err * 100.0, -30.0, 30.0))
-                else:
-                    self.ctrl_angle = 0.0
-                self.ctrl_speed = APPROACH_EXIT_SPEED
-            else:
-                self._shortcut_t0 = None
-                self._exit_approach_t0 = None
-                self._begin_left_turn()
-            return
-
-        shortcut_elapsed = time.time() - self._shortcut_t0
-        if shortcut_elapsed >= SHORTCUT_VISION_CUTOFF_T and self._shortcut_ref_yaw is not None:
-            # 합류부 근접 구간 — 정지선이 아직 안 잡혔어도 비전을 더는 믿지 않고
-            # 헤딩홀드로 직진 유지(진출 시퀀스는 _shortcut_end() 확정 후에만 시작).
-            yaw_err = self._yaw_delta(self._shortcut_ref_yaw)
-            self.ctrl_angle = float(np.clip(-yaw_err * 100.0, -30.0, 30.0))
-            self.ctrl_speed = SPEED_NORMAL
-            return
-
-        if self.lane_valid:
-            self._lane_drive()
-        else:
-            self.ctrl_angle = 0.0
-            self.ctrl_speed = SPEED_NORMAL
-
-    def _shortcut_end(self):
-        """지름길 끝(탈출 좌회전 지점) 감지."""
-        if self._shortcut_t0 is None:
-            return False
-        elapsed = time.time() - self._shortcut_t0
-        if elapsed < SHORTCUT_MIN_T:
-            return False
-        return self.stopline or elapsed > SHORTCUT_MAX_T
-
     # ── S4: 종료 ──
     def _s4_finish(self):
         self.ctrl_angle, self.ctrl_speed = 0.0, SPEED_STOP
-
-
-
-    # ── 좌회전 공통 (실차 전환: 후진 없이 무난한 좌회전) ──
-    def _begin_left_turn(self):
-        self._turn_dist = 0.0   # 거리 적분 시작(0m부터 목표거리까지)
-        self.get_logger().info('좌회전 시작')
-
-    def _do_left_turn(self, next_state):
-        """무난한(후진 없는) 좌회전 후 next_state로 전환.
-
-        [2026-08-20] 종료 판정을 IMU yaw 실측 기반(closed-loop)에서 실측거리 기반으로
-        되돌렸다(요청 반영, config.py "좌회전 공통" 절 주석 참고). 고정 조향각(trn_ang)을
-        고정 이동거리(trn_dist)만큼 유지하다가 끝낸다 — S2_COMMIT_DIST_M(_s0_signal())과
-        동일한 적분 패턴(_speed_mps_fallback(), VESC 실측 + 명령속도 폴백)이라 IMU 없이도
-        VESC 장애 시 무한 회전 없이 항상 끝난다.
-
-        [2026-08-21] next_state==S3_SHORTCUT 분기(TURN_ANGLE류)는 진입 좌회전이 체크무늬
-        게이트 램프(_do_checker_ramp_turn())로 대체되며 현재 호출부가 없다 — 함수/분기는
-        되돌릴 경우를 대비해 남겨둠. next_state==S1_LANE_FOLLOW(진출, S3→S1)는 계속 사용."""
-        if next_state == MissionState.S3_SHORTCUT:
-            trn_ang, trn_spd, trn_dist = TURN_ANGLE, TURN_SPEED, TURN_DIST_M
-        else:
-            trn_ang, trn_spd, trn_dist = TURN_EXIT_ANGLE, TURN_EXIT_SPEED, TURN_EXIT_DIST_M
-
-        if self._turn_dist < trn_dist:
-            self.ctrl_angle = trn_ang
-            self.ctrl_speed = trn_spd
-            self._turn_dist += self._speed_mps_fallback(trn_spd) * 0.05  # 20Hz 제어주기(control_loop) 가정
-        else:
-            self.get_logger().info('좌회전 완료')
-            self._turn_dist = None
-            if next_state == MissionState.S1_LANE_FOLLOW:
-                self._signal_reentry_cooldown_t = time.time() + SIGNAL_REENTRY_COOLDOWN
-            self._change_state(next_state)
 
     # ── 진입 좌회전 — 체크무늬 게이트 라이다 기둥쌍 트리거 + 완만한 조향 램프 ──
     #   [2026-08-21] _begin_left_turn()/_do_left_turn(next_state=S3_SHORTCUT)을 대체(요청
     #   반영) — S2_COMMIT_DIST_M 거리기반 대신 perc_checker_pillar()의 라이다 기둥쌍
     #   검출로 커밋 종료를 판단하고(_s0_signal() 'left' 분기 참고), 고정각 즉시 진입 대신
     #   CHECKER_TURN_RAMP_START_ANGLE→END_ANGLE로 서서히 조향을 올린다.
+    #   [2026-08-22g] 램프 완료 후 전환할 곳을 MissionState.S3_SHORTCUT(지름길 전용 직진+
+    #   정지선 감지+탈출 좌회전 스크립트)에서 MissionState.S1_LANE_FOLLOW로 바꿨다(요청
+    #   반영) — 지름길 구간도 물리적으로는 그냥 트랙의 일부라 일반 차선주행과 다를 게
+    #   없고(끝에 신호등 없는 갈림길도 아니고, B3 방해차량 회피를 마친 뒤 다음 교차로
+    #   신호등을 기다리며 차선주행하는 상태와 동일), 별도 탈출 스크립트가 필요하다는 전제
+    #   자체가 더 이상 유효하지 않다는 판단(실차 트랙 재확인). S3_SHORTCUT
+    #   전용이던 _s3_shortcut()/_shortcut_end()/_begin_left_turn()/_do_left_turn()과
+    #   MissionState.S3_SHORTCUT enum 값 자체를 삭제했다(README §1.19b 참고) — 되돌릴
+    #   경우 git 이력에서 복원할 것.
     def _begin_checker_ramp_turn(self):
         self._checker_ramp_dist = 0.0
         self.get_logger().info('체크무늬 게이트 통과 — 좌회전 램프 시작')
@@ -2290,8 +2283,11 @@ class TrackDriverNode(Node):
         if done:
             self.get_logger().info('체크무늬 게이트 좌회전 램프 완료')
             self._checker_ramp_dist = None
+            # 'straight' 커밋 완료(_s0_signal())와 동일하게 처리 — 좌회전도 별도 지름길
+            # state 없이 곧장 일반 차선주행으로 복귀하고, B1→B2→B3 Behavior를 다시 연다.
+            self._behavior_enabled = True
             self._signal_reentry_cooldown_t = time.time() + SIGNAL_REENTRY_COOLDOWN
-            self._change_state(MissionState.S3_SHORTCUT)
+            self._change_state(MissionState.S1_LANE_FOLLOW)
 
     def _yaw_delta(self, start):
         """현재 yaw - start (−π~π wrap)"""
@@ -2598,15 +2594,16 @@ class TrackDriverNode(Node):
         return self._prev_speed
 
     def _speed_mps_fallback(self, cmd_speed):
-        """거리 적분(_s2_commit_dist/_turn_dist)에 쓸 현재 속도(m/s) 추정.
+        """거리 적분(_s2_commit_dist/_checker_ramp_dist)에 쓸 현재 속도(m/s) 추정.
         VESC 실측이 살아있으면(_vesc_live()) 그 값을 그대로 쓴다 — 대회 당일 실속도가
         얼마든 실제 이동거리 기준으로 맞는다. VESC가 죽어있을 때만 그 구간에서 명령
         중인 속도(cmd_speed, 모터단위)를 METERS_PER_SPEED_UNIT으로 환산해 폴백한다 —
         예전 시간 기반(S2_COMMIT_T)이 암묵적으로 가정하던 것과 동일한 근사치라 VESC
         장애 시에도 이전과 같은 동작으로 안전하게 열화되고, 거리 적분 자체가 멈춰
         무한정 그 구간에 머무는(예: 좌회전 조향을 계속 유지하는) 상황이 없다.
-        [2026-08-20] S2_COMMIT_DIST_M 전용이던 _commit_speed_mps()를 일반화 —
-        _do_left_turn()의 거리 기반 좌회전 종료 판정에도 동일 철학으로 재사용한다."""
+        [2026-08-20] S2_COMMIT_DIST_M 전용이던 _commit_speed_mps()를 일반화 — 체크무늬
+        게이트 램프(_checker_turn_ramp_angle())의 거리 기반 종료 판정에도 동일 철학으로
+        재사용한다."""
         if self._vesc_live():
             return abs(self.v_mps)
         return cmd_speed * METERS_PER_SPEED_UNIT
@@ -2809,21 +2806,12 @@ class TrackDriverNode(Node):
             ('토픽: /vesc_speed_erpm (std_msgs/Float32, vesc_speed_bridge.py 경유)',
              (10, 108), (180, 180, 180), 12, 'topic: /vesc_speed_erpm'),
         ]
-        # [2026-08-20] 좌회전(_do_left_turn())을 실측거리 기반으로 되돌리며, 진행상황
-        # 표시를 IMU 창(_debug_viz_imu(), 예전 yaw 기반)에서 여기로 옮겼다 — 이제 좌회전
-        # 진행 판정이 VESC 적분(_turn_dist)이라 이 창이 더 맞는 위치.
-        turn_active = self._turn_dist is not None
-        if turn_active:
-            trn_dist_target = (TURN_DIST_M if self.mission_state == MissionState.S0_SIGNAL
-                                else TURN_EXIT_DIST_M)
-            lines.append((
-                f'좌회전 중: {self._turn_dist:.2f}m / {trn_dist_target:.2f}m',
-                (10, 140), (0, 255, 255), 16,
-                f'TURNING: {self._turn_dist:.2f} / {trn_dist_target:.2f} m'))
-        elif self._checker_ramp_dist is not None:
-            # [2026-08-21] 체크무늬 게이트 램프(_do_checker_ramp_turn())도 같은 창에서
-            # 보이게 — _turn_dist가 아니라 _checker_ramp_dist를 쓰므로 위 turn_active만
-            # 보면 "진행 중 아님"으로 오인됨.
+        # [2026-08-20] 좌회전(_do_checker_ramp_turn())의 진행상황 표시를 IMU 창
+        # (_debug_viz_imu(), 예전 yaw 기반)에서 여기로 옮겼다 — 좌회전 진행 판정이 VESC
+        # 적분(_checker_ramp_dist)이라 이 창이 더 맞는 위치. [2026-08-22g] S3_SHORTCUT
+        # 진출 좌회전(_do_left_turn(), 옛 _turn_dist 기반)은 S3 자체를 삭제하며 같이
+        # 없어져 이제 진입 램프 하나만 표시한다.
+        if self._checker_ramp_dist is not None:
             lines.append((
                 f'체크무늬 램프 중: {self._checker_ramp_dist:.2f}m / {CHECKER_TURN_RAMP_DIST_M:.2f}m '
                 f'(angle={self.ctrl_angle:.1f}°)',
@@ -2840,10 +2828,9 @@ class TrackDriverNode(Node):
 
     # [DEBUG_VIZ_IMU] IMU(/imu) 연동이 실제로 살아있는지 + 지금 imu_yaw 값이 얼마인지를
     # 한눈에 보여주는 창(2026-08-18, _debug_viz_vesc()와 동일 패턴). [2026-08-20] 좌회전
-    # (_do_left_turn())을 실측거리 기반으로 되돌리며 좌회전 진행상황 표시는
-    # _debug_viz_vesc()로 옮겼다 — 이제 좌회전이 IMU를 참조하지 않는다. 이 창은 여전히
-    # _s3_shortcut()의 헤딩홀드(_shortcut_ref_yaw)가 IMU를 쓰므로 그 값 확인용으로 남긴다.
-    # control_loop()에서 매 주기 호출.
+    # 진행상황 표시는 _debug_viz_vesc()로 옮겼다 — 좌회전(체크무늬 게이트 램프) 자체는
+    # IMU를 참조하지 않는다. 이 창은 여전히 바퀴카운트(_update_lap()의 _yaw_accum) 등
+    # imu_yaw를 쓰는 다른 로직 확인용으로 남긴다. control_loop()에서 매 주기 호출.
     def _debug_viz_imu(self):
         now = time.time()
         if self._imu_t is None:
@@ -3042,12 +3029,23 @@ class TrackDriverNode(Node):
     # 알아보기 힘들다는 요청)가 아니라 _debug_viz_obstacle_cut() 창 상단에 한글 한 줄로
     # 보여주기 위한 헬퍼 — (한글, BGR색, 영문) 튜플을 반환한다. run_behavior_fsm()의
     # Phase.LAVACON/OBSTACLE_ZONE 분기와 정확히 같은 판단 순서(B1→B2→B3)를 그대로 따라간다.
+    # [2026-08-22h, 요청 반영] 좌회전 진입 램프 중(checker_pillar_trigger를 넘어
+    # _do_checker_ramp_turn()이 도는 구간)도 여기서 최우선으로 걸러 보여준다.
     def _current_stage_label(self):
+        # [2026-08-22h, 요청 반영] 체크무늬 게이트 라이다 임계값(checker_pillar_trigger)을
+        # 넘어 좌회전 진입 램프(_do_checker_ramp_turn(), -10°→-30° 조향)로 넘어간 순간도
+        # 이 창 헤드라인에서 바로 보이게 — mission_state는 그동안 계속 S0_SIGNAL이라(램프가
+        # 끝나야 S1_LANE_FOLLOW로 전환됨) 아래 S0_SIGNAL 분기보다 먼저 걸러야 한다.
+        if self._checker_ramp_dist is not None:
+            return (f'좌회전 진입 중 (게이트 통과, 조향 {self.ctrl_angle:.1f}°, '
+                     f'{self._checker_ramp_dist:.2f}/{CHECKER_TURN_RAMP_DIST_M:.2f}m)',
+                    (0, 200, 0),
+                    f'LEFT TURN ENTRY (angle={self.ctrl_angle:.1f} deg, '
+                    f'{self._checker_ramp_dist:.2f}/{CHECKER_TURN_RAMP_DIST_M:.2f} m)')
+
         ms = self.mission_state
         if ms == MissionState.S0_SIGNAL:
             return '신호등 판독 대기', (0, 200, 255), 'S0_SIGNAL: waiting for light'
-        if ms == MissionState.S3_SHORTCUT:
-            return '지름길(S3) 주행 중', (0, 200, 255), 'S3_SHORTCUT'
         if ms == MissionState.S4_FINISH:
             return '주행 종료', (150, 150, 150), 'S4_FINISH'
 

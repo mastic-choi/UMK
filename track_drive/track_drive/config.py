@@ -38,9 +38,15 @@ class MissionState(Enum):
     # 통합했다(track_drive.py _s0_signal() 참고, README §1). 이 state는 출발 직후 1회,
     # 이후 매 바퀴 트랙 중앙 분기점에서 재진입한다 — "이번이 진짜 첫 출발인지"는
     # track_drive.py의 self._departed 플래그로 별도 추적(값 자체엔 영향 없음).
+    # [2026-08-22g] S3_SHORTCUT(=3, 지름길 전용 직진+정지선감지+탈출좌회전 state) 삭제(요청
+    # 반영) — 지름길도 물리적으로는 트랙의 일반 구간이라 B3 방해차량 회피 후 다음 교차로
+    # 신호등을 기다리며 차선주행하는 상태와 동일하다는 판단(실차 트랙 재확인). 좌회전
+    # 진입 램프(_do_checker_ramp_turn())가 끝나면 이제 곧장 S1_LANE_FOLLOW로 돌아간다 —
+    # track_drive.py _s3_shortcut()/_shortcut_end()/_begin_left_turn()/_do_left_turn() 삭제
+    # 이력 참고(README §1.19b). 값 3은 재사용하지 않고 비워둔다(git 이력에 남은 죽은
+    # state와 값이 우연히 겹치지 않도록).
     S0_SIGNAL       = 0  # 4구 신호등 판단 (출발선/교차로 공용, 정지→직진·좌회전 확정)
     S1_LANE_FOLLOW  = 1  # 차선인식 주행 (라바콘·고정장애물·추월 Behavior를 이 상태 안에서 처리)
-    S3_SHORTCUT     = 3  # 지름길 (직진, 끝에서 좌회전)
     S4_FINISH       = 4  # 종료
 
 class BehaviorState(Enum):
@@ -211,24 +217,14 @@ CORNER_MIN_SPEED_SCALE = 0.35  # 반경이 0에 가까워져도 속도가 0으�
 CORNER_IMU_CONFIRM_KAPPA_PX = 1.0 / CORNER_MIN_RADIUS_PX  # = 0.004 — 이 이상 IMU curvature면 코너감속 100% 신뢰
 CORNER_IMU_MIN_SCALE = 0.5  # IMU가 "회전 거의 없음"을 보고해도 비전신호 기반 감속을 최소 이만큼은 남겨두는 하한
 
-# ── 좌회전 공통 (S2→S3 진입, S3→S1 진출) — 전부 실차 튜닝 필요한 임시값 ──
-#   [2026-08-20] 종료 판정을 IMU yaw 실측 기반(closed-loop)에서 다시 실측거리 기반으로
-#   변경(요청 반영). IMU closed-loop([2026-08-18] 도입분)는 "실제로 몇 도 돌았는가"를
-#   기준으로 삼아 배터리 전압 강하 등에 따른 요레이트 변동에 안 흔들린다는 장점이 있었지만,
-#   IMU yaw 부호 규약 자체가 pose_estimator.py 기준 실차 미검증이었고(§1.13 주석 참고),
-#   사용자가 실차 튜닝 편의상 "고정 조향각을 고정 거리만큼 유지"하는 단순한 open-loop
-#   방식을 선호함 — 목표거리(TURN_DIST_M/TURN_EXIT_DIST_M)만큼 VESC 실측(v_mps) 적분
-#   거리가 쌓이면 좌회전을 끝낸다(_do_left_turn() 참고, S2_COMMIT_DIST_M과 동일한 적분
-#   패턴). IMU를 아예 참조하지 않으므로 IMU 죽음에 대한 안전 타임아웃(TURN_FRAMES류)도
-#   불필요 — 대신 VESC가 죽어있으면 _speed_mps_fallback()이 명령속도(TURN_SPEED류)를
-#   METERS_PER_SPEED_UNIT으로 환산해 폴백하므로(_commit_speed_mps()와 동일 철학) 거리
-#   적분 자체가 멈춰 무한 회전하는 상황은 없다.
-TURN_ANGLE     = -60.0   # [진입] S2 교차로 → S3 지름길 좌회전 조향각(위 "-a") — 실차 튜닝 필요
-TURN_SPEED     = 15.0    # [진입] 좌회전 속도
-TURN_DIST_M    = 1.0     # [진입] TURN_ANGLE을 유지할 이동거리(m) — 실차 미검증 초기값
-TURN_EXIT_ANGLE   = -60.0   # [진출] S3 지름길 → S1 차선주행 좌회전 조향각 — 실차 튜닝 필요
-TURN_EXIT_SPEED   = 15.0    # [진출] 좌회전 속도
-TURN_EXIT_DIST_M  = 1.0     # [진출] TURN_EXIT_ANGLE을 유지할 이동거리(m) — 실차 미검증 초기값
+# ── 좌회전 공통 (S0_SIGNAL 'left' 커밋 → 체크무늬 게이트 램프 진입) ──
+#   [2026-08-22g] S3_SHORTCUT(지름길 전용 state) 삭제와 함께 진출(S3→S1) 좌회전 스크립트
+#   (TURN_ANGLE/TURN_DIST_M/TURN_EXIT_*, _do_left_turn())도 같이 삭제했다(요청 반영,
+#   config.py "미션 상태 Enum" 절 주석 참고) — 이제 좌회전은 진입(_do_checker_ramp_turn(),
+#   CHECKER_TURN_RAMP_* 절)만 있고, 끝나면 곧장 S1_LANE_FOLLOW로 돌아간다.
+TURN_SPEED     = 12.0    # [진입] 체크무늬 게이트 램프 좌회전 속도(_do_checker_ramp_turn()이 ctrl_speed로 그대로 씀)
+                          # [2026-08-22d] 15.0 → 12.0(요청 반영) — SPEED_NORMAL과 같은 15라
+                          # "좌회전 중에도 그냥 직진 속도로 발행된다"는 게 실차에서 확인됨.
 
 # ── 정지선 접근 감속 ──
 #   [2026-08-20] S1→S0 진입 쪽의 감속-후-전환(APPROACH_TIME 서행 구간)은 폐지 — 정지선을
@@ -236,9 +232,7 @@ TURN_EXIT_DIST_M  = 1.0     # [진출] TURN_EXIT_ANGLE을 유지할 이동거리
 #   빨간불이면 속도 0", _s0_signal() 기본 동작)이 정지를 대신한다(요청 반영: "정지"라는
 #   별도 이벤트/타이머 없이 신호 상태만으로 속도가 결정되게). APPROACH_SPEED는 신호 확정
 #   후 커밋 구간(S2_COMMIT_DIST_M)에서는 계속 쓰이므로 유지.
-APPROACH_SPEED      = 2.0  # [커밋 구간] 신호 확정 후 물리적 분기까지 직진 속도
-APPROACH_EXIT_SPEED = 2.0  # [진출] S3 탈출 정지선 감지 후 감속 속도
-APPROACH_EXIT_TIME  = 1.0  # [진출] 감속 유지 시간(s)
+APPROACH_SPEED      = 2.0  # [커밋 구간] 신호 확정('straight') 후 물리적 분기까지 직진 속도
 
 # ── S2 신호 확정 → 물리적 분기 커밋 구간 (실차 튜닝 필요) ──
 #   4구 신호등의 ㅓ교차로는 신호가 보이는 지점과 실제 도로가 갈라지는 지점(물리적
@@ -952,13 +946,33 @@ CHECKER_CONFIRM_FRAMES = 2      # 연속 이 프레임 이상 위 조건을 만�
 #   옆을 지나는 순간"을 잡으려는 추정치라 perc_lavacon_trigger()의 0.3~0.5m보다 더 넓게
 #   잡아뒀다(게이트 구조물이 콘보다 커서 감지 가능 구간도 더 길 것으로 추정) — 전부 실차
 #   미검증 초기값.
-CHECKER_PILLAR_LON_MIN = 0.1        # 트리거 ROI 전방 종방향 하한(m)
-CHECKER_PILLAR_LON_MAX = 0.8        # 트리거 ROI 전방 종방향 상한(m)
-CHECKER_PILLAR_LAT_MAX = 2.0        # 트리거 ROI 횡방향 한계(m) — perc_lavacon_trigger()와 동일
-CHECKER_PILLAR_CLUSTER_MIN_PTS = 2  # 클러스터 최소 연속 포인트 수 — perc_lavacon_trigger()와 동일
+#   [2026-08-22] 실차 확인 후 ROI 재조정(요청 반영) — 횡방향 한계를 2.0→1.0m로 좁히고,
+#   종방향 구간은 폭(0.7m)은 유지한 채 차량 쪽으로 0.5m 당김(0.1~0.8 → -0.4~0.3m).
+#   [2026-08-22b] 실차 재확인 후 재조정(요청 반영) — 종방향 구간을 폭(0.7m) 유지한 채
+#   전방으로 0.25m 밀어올림(-0.4~0.3 → -0.15~0.55m). 또한 라이다 자기반사/노이즈로
+#   추정되는 극근접(0.1m 이내) 포인트를 아예 무시하도록 CHECKER_PILLAR_MIN_RANGE_M 신설.
+#   [2026-08-22e] 0.1 → 0.3으로 상향(요청 반영) — 실차에서 0.1m로는 근접 노이즈가 여전히
+#   안 걸러지는 게 확인됨(원인 미확정 — 실제 반사 거리가 0.1~0.3m 대라는 뜻일 수도, 다른
+#   경로 문제일 수도 있음). 실차 미검증, 이번에도 안 걸러지면 코드 경로 자체를 재확인할 것.
+CHECKER_PILLAR_LON_MIN = -0.15      # 트리거 ROI 전방 종방향 하한(m)
+CHECKER_PILLAR_LON_MAX = 0.55       # 트리거 ROI 전방 종방향 상한(m)
+CHECKER_PILLAR_LAT_MAX = 1.0        # 트리거 ROI 횡방향 한계(m) — perc_lavacon_trigger()와 동일
+CHECKER_PILLAR_MIN_RANGE_M = 0.3    # 이 거리(m) 이내로 찍힌 포인트는 자기반사/노이즈로 보고 무시
+# [2026-08-22b] 좌회전 신호 확정 커밋 중에만 쓰이는 트리거라(perc_checker_pillar() 호출부
+# 주석 참고) 이 값을 낮추는 효과가 그 구간에만 국한된다 — 이전엔 한쪽이라도 연속
+# 2포인트(+거리편차 이내)를 못 채우면 그 사이드 자체가 "미검출"이라 기둥쌍이 잘 안 잡힌다는
+# 실차 보고(요청 반영) — 좌우 각 1포인트만 찍혀도 그 사이드는 검출된 것으로 완화.
+CHECKER_PILLAR_CLUSTER_MIN_PTS = 1  # 클러스터 최소 연속 포인트 수(좌우 각각 이 이상이면 그 사이드 검출)
 CHECKER_PILLAR_CLUSTER_MAX_GAP = 0.35  # 같은 클러스터로 볼 최대 거리편차(m) — 기둥 굵기 실측 후 재조정할 것(콘 지름 근사값 그대로 재사용 중)
-CHECKER_PILLAR_LAT_TARGET_M = 0.98  # 좌우 기둥 사이 실측 횡방향 간격(m) — 사용자 실측값
-CHECKER_PILLAR_LAT_TOLERANCE_M = 0.15  # 위 실측값과의 허용 오차(m) — 라이다 노이즈/기둥 굵기 감안 추정치, 실차 미검증
+CHECKER_PILLAR_LAT_TARGET_M = 0.5   # 좌우 기둥 사이 최소 횡방향 간격(m, lat_dist가 이 이상이면 통과)
+                                     # [2026-08-22c] 0.98(실측 기둥 간격) → 0.5로 하향(요청 반영) —
+                                     # 실차 미검증, 너무 낮추면 무관한 라이다 클러스터쌍(예: 라바콘,
+                                     # 다른 장애물)을 게이트로 오인할 위험이 커지니 checker_pillar_bev
+                                     # 오탐 여부를 확인할 것.
+# [2026-08-22b] 대칭 허용오차(± TOLERANCE) 대신 "간격이 이 값 이상이면 통과"로 완화(요청
+# 반영) — 위 CLUSTER_MIN_PTS 완화와 짝: 사이드당 1포인트만으로 잡은 위치는 좌표가 덜
+# 안정적이라, 상한까지 좁게 걸면 실제 기둥쌍인데도 근소하게 밀려나 놓칠 위험이 더 크다고
+# 판단(실차 미검증, perc_checker_pillar()의 lat_ok 참고).
 CHECKER_PILLAR_CONFIRM_FRAMES = 2   # 연속 이 프레임 이상 좌우+간격 조건을 만족해야 확정(디바운스)
 CHECKER_PILLAR_TIMEOUT_DIST_M = 2.0  # [안전장치] 커밋 시작 후 이 거리(m)까지 기둥쌍이 안 잡히면
                                       #   (라이다 죽음/오검출 등) _s0_signal()이 기존 S2_COMMIT_DIST_M
@@ -1312,6 +1326,12 @@ DEBUG_VIZ_STOPLINE   = False  # 정지선 디버그 창, 백엔드 무관 항상
 #   신뢰도 검증 전이라 기본 True — 확정되면 다른 항목처럼 False로 내릴 것.
 DEBUG_VIZ_CHECKER_GATE = True   # 체커무늬(하프 출발선) 게이트 디버그 창 (perception/hough_lane.py CheckerBandGate)
 DEBUG_VIZ_DASH_COUNTER = True   # 노란 파선 카운터 디버그 창 (perception/hough_lane.py YellowDashCounter)
+# [2026-08-22] 위 CHECKER_GATE(비전, hough_lane.py)와는 별개 — 이건 perc_checker_pillar()가
+#   쓰는 라이다 좌우 기둥쌍 검출(체크무늬 게이트 라이다 기둥쌍, checker_pillar_trigger) 전용
+#   BEV 디버그 창. 신호등 좌회전 확정 후 이 트리거가 실제 좌회전 시작 시점을 결정하는
+#   구조로 바뀌면서(요청 반영, track_drive.py _s1_lane_follow()/_s0_signal() 참고) 실차에서
+#   좌우 기둥쌍이 실제로 잡히는지 눈으로 바로 확인할 필요가 생겨 추가했다.
+DEBUG_VIZ_CHECKER_PILLAR = True   # 체크무늬 게이트 라이다 기둥쌍 검출 BEV 디버그 창 (track_drive.py)
 DEBUG_VIZ_YOLO_CONE  = True   # [2026-08-21, 요청 반영] 다시 켬 — 단 콘 원시검출 창
                                # ('yolo_cone_result')은 이제 표시 직전에 아주 작게(160x120)
                                # 축소해서 띄운다(yolo_cone.py show_debug_windows() 참고,
@@ -1323,7 +1343,8 @@ DEBUG_VIZ_YOLO_CONE  = True   # [2026-08-21, 요청 반영] 다시 켬 — 단 �
 # [2026-08-21] 신호등 위치+색상 판정을 YOLO 단독(yolo_signal_state.py) 하나로 정리하면서
 #   (README §1.18) 이게 유일한 신호등 결과 창이 됐다 — 실차에서 지금 뭘 보고 판단 중인지
 #   눈으로 확인하기 위함.
-DEBUG_VIZ_YOLO_SIGNAL_STATE = True  # 신호등 위치+색상상태 YOLO 검출 박스 디버그 창 (perception/yolo_signal_state.py, 창 이름 'YOLO_신호등')
+DEBUG_VIZ_YOLO_SIGNAL_STATE = False  # 신호등 위치+색상상태 YOLO 검출 박스 디버그 창 (perception/yolo_signal_state.py, 창 이름 'YOLO_신호등')
+                                      # [2026-08-22h] 요청 반영으로 끔 — 필요하면 다시 True로.
 # [2026-08-15] avoid-hold(§2.32) 전용 상태창 — 지금 유예가 걸려있는지/왜 걸렸는지/방향
 #   힌트/조기해제 진행상황을 한곳에 모아 보여주고, 실측 안 된 파라미터 값도 항상 같이
 #   띄워서 "이 숫자 아직 지어낸 값"이라는 걸 상기시킨다(track_drive.py
@@ -1658,18 +1679,9 @@ STOPLINE_WHITE_LOW = 180        # 그레이스케일 흰색 임계
 STOPLINE_WHITE_RATIO_TH = 0.06  # ROI 내 흰 픽셀 비율 임계 (실측: 1000/16500 ≈ 6%)
 
 # ── 정지선 접근/이탈 판정 (track_drive.py) ──
-SHORTCUT_MIN_T = 3.0     # 지름길 진입 후 끝감지 활성화까지 최소 주행시간(s, 오판 방지)
-SHORTCUT_MAX_T = 15.0    # 지름길 최대 주행시간(s, 끝 못 찾을 때 강제 탈출 백업)
-# 지름길 출구(본선 합류부)는 신호등이 없어 정지선 검출로만 끝을 판단하는데, 합류부는
-# 도로가 서서히 넓어지는 형태라 정지선이 실제로 잡히기 "전"에 da 세그멘테이션이 이미
-# 합류 쪽(실측: 우측)으로 넓어져 중심선이 끌려가는 문제가 있다(ㅓ교차로와 동일한
-# 실패모드, 트리거만 신호 대신 시간 기반). 그래서 정지선 검출을 기다리지 않고, 이
-# 시간이 지나면 미리 _lane_drive()(비전)를 끄고 _shortcut_ref_yaw 기준 헤딩홀드로
-# 전환한다(좌회전 스크립트는 아직 시작 안 함 — 정지선이 실제로 잡히거나 SHORTCUT_MAX_T에
-# 도달해야 _shortcut_end()가 확정되어 진출 시퀀스로 넘어간다). SHORTCUT_MIN_T보다 크고
-# SHORTCUT_MAX_T보다 충분히 작아야 하며, 실차에서 지름길 실제 통과시간을 재서 합류부
-# 도달 직전 시점으로 맞출 것 — 지금은 미실측 추정치.
-SHORTCUT_VISION_CUTOFF_T = 10.0
+# [2026-08-22g] SHORTCUT_MIN_T/MAX_T/VISION_CUTOFF_T 삭제 — S3_SHORTCUT state 자체가
+# 없어지며(config.py "미션 상태 Enum"/"좌회전 공통" 절 참고) 이 셋의 유일한 소비자였던
+# _s3_shortcut()/_shortcut_end()가 함께 삭제됐다.
 # [2026-08-20] 이름을 STOPLINE_COOLDOWN → SIGNAL_REENTRY_COOLDOWN으로 변경 — S0_SIGNAL
 #   재진입 트리거가 정지선에서 신호등 보드 인식(signal_board_confirmed)으로 바뀌면서
 #   (track_drive.py perc_signal()/_s1_lane_follow() 참고), 이 쿨다운도 "정지선 재감지"가
