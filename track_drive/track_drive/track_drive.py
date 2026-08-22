@@ -244,7 +244,9 @@ class TrackDriverNode(Node):
         self.checker_pillar_trigger        = False  # (좌우 검출 AND 간격이 실측값과 일치)가 디바운스 프레임수만큼 유지되면 True
         self._checker_pillar_trigger_cnt   = 0      # 디바운스 카운터
         self._checker_pillar_dbg = (0, 0, 0, 0, 0.0)  # 디버그용 (좌pts, 좌run, 우pts, 우run, 횡방향거리)
+        self._checker_pillar_bev_img = None  # 최근 라이다 BEV 프레임(_draw_checker_pillar_bev()가 채움) — left_turn_debug 통합창이 그대로 재사용
         self._checker_ramp_dist = None  # None=램프 비활성, 아니면 트리거 이후 누적 이동거리(m) — _s2_commit_dist와 동일한 VESC 거리적분 패턴
+        self._left_turn_last_done_t = None  # 좌회전 램프가 가장 최근에 "완료"된 time.time() — left_turn_debug 창의 "실행끝" 표시용(None=아직 한 번도 완료 안 됨)
         # [2-6 방해차량 트리거]
         self.vehicle_trigger       = False   # 라이다 디바운스 통과 → B3 진입 트리거
         self._vehicle_trigger_cnt  = 0       # 동시검출 연속 프레임 수(디바운스 카운터)
@@ -1860,7 +1862,11 @@ class TrackDriverNode(Node):
             self._checker_pillar_trigger_cnt = 0
         self.checker_pillar_trigger = self._checker_pillar_trigger_cnt >= CHECKER_PILLAR_CONFIRM_FRAMES
 
-        if DEBUG_VIZ_CHECKER_PILLAR:
+        # [2026-08-22j] DEBUG_VIZ_LEFT_TURN 통합창도 이 BEV 프레임을 그대로 넣어 보여주므로
+        # (_debug_viz_left_turn() 참고, 요청 반영: "좌회전 디버깅창에 라이다영상도 추가"),
+        # 독립 창 플래그(DEBUG_VIZ_CHECKER_PILLAR)가 꺼져 있어도 통합창이 켜져 있으면 계속
+        # BEV를 만들어 self._checker_pillar_bev_img에 채워둔다.
+        if DEBUG_VIZ_CHECKER_PILLAR or DEBUG_VIZ_LEFT_TURN:
             self._draw_checker_pillar_bev(r, x, y, roi, lat_ok,
                                            left_pts, left_run, right_pts, right_run)
 
@@ -1925,8 +1931,11 @@ class TrackDriverNode(Node):
                           f'cnt={self._checker_pillar_trigger_cnt}/{CHECKER_PILLAR_CONFIRM_FRAMES}',
                     (8, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.45, trig_col, 1, cv2.LINE_AA)
 
-        cv2.imshow('checker_pillar_bev', bev)
-        cv2.waitKey(1)
+        self._checker_pillar_bev_img = bev  # left_turn_debug 통합창(_debug_viz_left_turn())이 재사용
+
+        if DEBUG_VIZ_CHECKER_PILLAR:
+            cv2.imshow('checker_pillar_bev', bev)
+            cv2.waitKey(1)
 
     # [2-4e] 체크무늬 게이트 통과 후 완만한 조향 램프 (_s0_signal() 'left' 커밋 종료 후 사용)
     #   checker_pillar_trigger가 뜬 시점에 호출부(_begin_checker_ramp_turn())가
@@ -1936,13 +1945,17 @@ class TrackDriverNode(Node):
     #   기반 거리적분이라 VESC 죽음에도 안전(무한 램프 없음). 램프가 끝나면(None, angle=
     #   END_ANGLE) 튜플을 반환 — 호출부가 ramp_dist를 None으로 리셋하고 다음 로직(예:
     #   차선인식 복귀)으로 넘어가면 된다.
+    #   [2026-08-22] CHECKER_TURN_RAMP_CURVE='smoothstep'(3t²-2t³)이 기본값 — t=0(램프
+    #   시작)과 t=1(END_ANGLE 고정값으로 넘어가는 지점) 양쪽 다 기울기 0이라 조향이 저크
+    #   없이 부드러운 S자 곡선으로 붙는다. 'linear'는 단순 비례(요청의 "선형" 옵션, 튜닝
+    #   비교용으로 남겨둠).
     def _checker_turn_ramp_angle(self, cmd_speed):
         if self._checker_ramp_dist is None:
             return CHECKER_TURN_RAMP_START_ANGLE, False
 
         t = min(self._checker_ramp_dist / CHECKER_TURN_RAMP_DIST_M, 1.0)
-        if CHECKER_TURN_RAMP_CURVE == 'ease_in':
-            t = t * t   # 초반 완만, 후반 급격 — 2차 이즈인
+        if CHECKER_TURN_RAMP_CURVE == 'smoothstep':
+            t = t * t * (3.0 - 2.0 * t)   # 양끝 기울기 0인 S자 곡선 — 시작/종료 모두 저크 없음
         angle = CHECKER_TURN_RAMP_START_ANGLE + (CHECKER_TURN_RAMP_END_ANGLE - CHECKER_TURN_RAMP_START_ANGLE) * t
 
         done = self._checker_ramp_dist >= CHECKER_TURN_RAMP_DIST_M
@@ -2246,6 +2259,7 @@ class TrackDriverNode(Node):
         if done:
             self.get_logger().info('체크무늬 게이트 좌회전 램프 완료')
             self._checker_ramp_dist = None
+            self._left_turn_last_done_t = time.time()  # left_turn_debug 창 "실행끝" 표시용
             # 'straight' 커밋 완료(_s0_signal())와 동일하게 처리 — 좌회전도 별도 지름길
             # state 없이 곧장 일반 차선주행으로 복귀하고, B1→B2→B3 Behavior를 다시 연다.
             self._behavior_enabled = True
@@ -3172,6 +3186,113 @@ class TrackDriverNode(Node):
         cv2.imshow('obstacle_cut_debug', canvas)
         cv2.waitKey(1)
 
+    # [DEBUG_VIZ_LEFT_TURN] 좌회전(체크무늬 게이트 진입) 전용 통합 디버그 창.
+    #   [2026-08-22i, 요청 반영] "좌회전 관련 실행중/실행끝/발행각도/라이다감지 합친
+    #   디버그창 하나"로 신설 — 예전엔 이 네 가지가 obstacle_cut_debug(_current_stage_label()
+    #   헤드라인)/checker_pillar_bev(라이다 원시 BEV)에 흩어져 있었다. 같은 요청으로 이
+    #   창과 DEBUG_VIZ_DL_LANE(차선인식)만 남기고 나머지 DEBUG_VIZ_*는 다 껐다(config.py 참고).
+    #   [2026-08-22j/k/l, 요청 반영] 상태 텍스트 패널 아래에 전방 카메라(self.img_front)와
+    #   라이다 BEV(self._checker_pillar_bev_img)를 좌우로 나란히 붙여 한 창에서 텍스트+영상을
+    #   같이 본다.
+    def _debug_viz_left_turn(self):
+        running = self._checker_ramp_dist is not None
+        now = time.time()
+        since_done = (now - self._left_turn_last_done_t) if self._left_turn_last_done_t is not None else None
+
+        canvas = np.full((216, 480, 3), 30, dtype=np.uint8)
+
+        run_col = (0, 200, 0) if running else (110, 110, 110)
+        run_txt = f'실행중: {"예 (게이트 통과, 조향 램프 진행 중)" if running else "아니오"}'
+        run_en = f'RUNNING: {running}'
+
+        if since_done is None:
+            done_col, done_txt, done_en = (110, 110, 110), '실행끝: 아직 없음(한 번도 완료 안 됨)', 'FINISHED: never'
+        elif since_done < 3.0:
+            done_col, done_txt, done_en = (0, 255, 255), f'실행끝: 방금 완료 ({since_done:.1f}초 전)', f'FINISHED: {since_done:.1f}s ago'
+        else:
+            done_col, done_txt, done_en = (200, 200, 200), f'실행끝: 마지막 완료 {since_done:.1f}초 전', f'FINISHED: {since_done:.1f}s ago'
+
+        if running:
+            angle_txt = (f'발행각도: {self.ctrl_angle:.1f}°  '
+                         f'({CHECKER_TURN_RAMP_START_ANGLE:.0f}°→{CHECKER_TURN_RAMP_END_ANGLE:.0f}°, '
+                         f'{self._checker_ramp_dist:.2f}/{CHECKER_TURN_RAMP_DIST_M:.2f}m, '
+                         f'{CHECKER_TURN_RAMP_CURVE})')
+            angle_en = (f'ANGLE: {self.ctrl_angle:.1f} deg ({self._checker_ramp_dist:.2f}/'
+                        f'{CHECKER_TURN_RAMP_DIST_M:.2f}m, {CHECKER_TURN_RAMP_CURVE})')
+        else:
+            angle_txt = f'발행각도: {self.ctrl_angle:.1f}° (좌회전 램프 비활성 — 현재 전체 발행값)'
+            angle_en = f'ANGLE: {self.ctrl_angle:.1f} deg (ramp idle — current published value)'
+
+        lidar_col = (0, 200, 0) if self.checker_pillar_trigger else (110, 110, 110)
+        lidar_txt = (f'라이다감지: {self.checker_pillar_trigger}  '
+                     f'(디바운스 {self._checker_pillar_trigger_cnt}/{CHECKER_PILLAR_CONFIRM_FRAMES}, '
+                     f'좌{self.checker_pillar_left_detected} 우{self.checker_pillar_right_detected}, '
+                     f'간격 {self.checker_pillar_lat_dist_m:.2f}m)')
+        lidar_en = (f'LIDAR: trigger={self.checker_pillar_trigger} '
+                    f'cnt={self._checker_pillar_trigger_cnt}/{CHECKER_PILLAR_CONFIRM_FRAMES}')
+
+        # [2026-08-22m, 요청 반영: "욜로 신호등이 어떤 상태로 검출됐는지도 한줄 추가"]
+        # perc_yolo_signal_state()가 매 프레임 갱신하는 원시 점등 상태(signal_red/left/
+        # straight_on)와 perc_signal()이 SIG_CONFIRM_FRAMES 연속 유지로 승격시킨 확정값
+        # (signal_left/straight_confirmed)을 한 줄로 같이 보여준다 — _print_debug()의
+        # 터미널 [SIG] 로그(sig_flags)와 동일한 포맷.
+        sig_col = (0, 200, 0) if (self.signal_left_confirmed or self.signal_straight_confirmed) else (200, 200, 200)
+        sig_txt = (f'신호등(YOLO): R{int(self.signal_red_on)} L{int(self.signal_left_on)} '
+                   f'S{int(self.signal_straight_on)}  확정 L={int(self.signal_left_confirmed)}'
+                   f'({self._sig_left_cnt}/{SIG_CONFIRM_FRAMES}) '
+                   f'S={int(self.signal_straight_confirmed)}({self._sig_straight_cnt}/{SIG_CONFIRM_FRAMES})')
+        sig_en = (f'SIGNAL(YOLO): R={int(self.signal_red_on)} L={int(self.signal_left_on)} '
+                  f'S={int(self.signal_straight_on)} confirmL={int(self.signal_left_confirmed)} '
+                  f'confirmS={int(self.signal_straight_confirmed)}')
+
+        put_text_kr_multi(canvas, [
+            ('좌회전 진입 램프 통합 상태', (10, 8), (255, 255, 255), 18, 'LEFT TURN ENTRY STATUS'),
+            (run_txt, (10, 40), run_col, 16, run_en),
+            (done_txt, (10, 66), done_col, 16, done_en),
+            (angle_txt, (10, 96), (0, 255, 255) if running else (200, 200, 200), 15, angle_en),
+            (lidar_txt, (10, 126), lidar_col, 15, lidar_en),
+            (sig_txt, (10, 156), sig_col, 14, sig_en),
+        ])
+
+        border_col = (0, 200, 0) if running else (80, 80, 80)
+        cv2.rectangle(canvas, (0, 0), (canvas.shape[1] - 1, canvas.shape[0] - 1), border_col, 3)
+        panel_w = canvas.shape[1]
+
+        # [2026-08-22l, 요청 반영: "카메라 영상부분을 옆으로 붙여줘"] 전방 카메라
+        # (self.img_front)와 라이다 BEV(self._checker_pillar_bev_img)를 상태 패널 아래에
+        # 좌우로 나란히 붙인다 — 둘의 종횡비가 서로 달라 자연 크기로는 나란히 맞추기
+        # 어려우므로, obstacle_cut_debug 카메라 패널과 동일 관례(종횡비 무시 단순
+        # 리사이즈 — "표시 전용, 좌표 왜곡은 이 창의 목적에 영향 없음")로 각각을
+        # half_w × HALF_H 고정 박스에 맞춘다.
+        half_w = panel_w // 2
+        HALF_H = 220
+
+        if self.img_front is not None:
+            cam_panel = cv2.resize(self.img_front, (half_w, HALF_H), interpolation=cv2.INTER_AREA)
+        else:
+            cam_panel = np.full((HALF_H, half_w, 3), 30, dtype=np.uint8)
+            cv2.putText(cam_panel, 'no frame yet', (10, HALF_H // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (110, 110, 110), 1, cv2.LINE_AA)
+        cv2.putText(cam_panel, 'FRONT CAM', (8, 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+
+        if self._checker_pillar_bev_img is not None:
+            bev_panel = cv2.resize(self._checker_pillar_bev_img, (panel_w - half_w, HALF_H),
+                                    interpolation=cv2.INTER_AREA)
+        else:
+            bev_panel = np.full((HALF_H, panel_w - half_w, 3), 30, dtype=np.uint8)
+            cv2.putText(bev_panel, 'no frame yet', (10, HALF_H // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (110, 110, 110), 1, cv2.LINE_AA)
+        cv2.putText(bev_panel, 'LIDAR BEV', (8, 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+
+        cam_row = np.hstack([cam_panel, bev_panel])
+        cv2.line(cam_row, (half_w, 0), (half_w, HALF_H - 1), (80, 80, 80), 1)
+
+        combined = np.vstack([canvas, cam_row])
+        cv2.imshow('left_turn_debug', combined)
+        cv2.waitKey(1)
+
     def _lane_pid(self, offset, deadzone=LANE_DEADZONE):
         """차선 중앙편차(offset)를 PID 제어로 조향각(angle)으로 변환한다."""
         if abs(offset) < deadzone:
@@ -3631,6 +3752,11 @@ class TrackDriverNode(Node):
         self.pose_estimator.update(self.v_mps, math.radians(self.ctrl_angle), 0.05)
 
         self.drive(self.ctrl_angle, self.ctrl_speed)   # 4. 발행
+        if DEBUG_VIZ_LEFT_TURN:
+            # [2026-08-22i] "발행각도"가 이번 틱에 실제로 발행된 값이어야 하므로
+            # drive() 이후에 그린다(위 STEER/VESC/IMU/OBSTACLE_CUT 창들은 behavior
+            # override 이전 시점이라 이 창과 달리 최종 발행값과 어긋날 수 있음).
+            self._debug_viz_left_turn()
         if DEBUG_LOG:                                    # 5. 디버그
             self._print_debug()
 

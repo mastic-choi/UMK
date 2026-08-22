@@ -1344,6 +1344,67 @@ speed=2로 저속 직진하지 않는다. 좌회전(§1.19f) 경로는 이번 �
 같음) 적용 안 된다는 판단으로 지웠다 — 만약 실제 트랙에서 직진 신호 확정 지점 직후에도
 갈림길처럼 보이는 구간이 있다면 재검토 필요.
 
+### 1.19e 좌회전 진입 램프(`_checker_turn_ramp_angle()`) 거리 상향 + 곡선(smoothstep) 전환 (2026-08-22)
+
+**배경:** §1.19가 도입한 -10°→-30° 조향 램프(`CHECKER_TURN_RAMP_DIST_M`, 원래 0.5m)가
+`SPEED_NORMAL` 3→10 상향(README 별도 기록) 이후 실차에서 약 3프레임 만에 끝나버린다는
+보고 — 속도가 오른 만큼 같은 0.5m를 훨씬 빨리 주파해버린 것. 또한 `CHECKER_TURN_RAMP_CURVE`
+기본값이 `'linear'`였던 것을 곡선으로 바꿔달라는 요청(둘 다 요청 반영).
+
+**수정 (`config.py` "좌회전 진입 — 체크무늬 게이트 통과 후 완만한 조향 램프" 절):**
+- `CHECKER_TURN_RAMP_DIST_M`: 0.5 → 2.0. 시간(`time.time()`) 기반이 아니라 거리 기반을
+  그대로 유지한 이유 — 조향각과 거리의 관계가 실제 주행 궤적의 곡률(회전반경)을
+  결정하므로, 속도가 달라져도(예: 이번 SPEED_NORMAL 변경, 추후 재튜닝) 같은 거리 기준을
+  쓰면 게이트를 통과하는 물리적 곡선 모양이 그대로 유지된다 — 시간 기준이었다면 속도가
+  오를수록 궤적상 곡선 구간 자체가 늘어져 버려 속도 튜닝 때마다 궤적이 달라지는 부작용이
+  있었을 것.
+- `CHECKER_TURN_RAMP_CURVE` 기본값: `'linear'` → `'smoothstep'`(`_checker_turn_ramp_angle()`에
+  `t*t*(3-2t)` 추가). 기존 `'ease_in'`(t²)은 램프 시작(t=0)에서만 완만하고, 램프가 끝나
+  `CHECKER_TURN_RAMP_END_ANGLE` 고정값으로 넘어가는 지점(t=1)에서는 기울기가 0이 아니라
+  거기서 뚝 끊기는 저크가 있었다 — `ease_in` 옵션은 삭제하고, 양끝(t=0, t=1) 모두 기울기
+  0인 `smoothstep`으로 교체해 램프 시작과 끝 모두 저크 없는 S자 곡선이 되도록 했다.
+  `'linear'`는 비교/폴백용으로 남겨둠.
+
+**알려진 한계:** 2.0m는 실측 없이 고른 초기값(3프레임 관찰로 역산한 대략치일 뿐) —
+실차에서 게이트를 지나 램프가 끝나는 지점이 여전히 너무 이르거나(값을 더 키울 것) 지나치게
+길게 조향이 붙잡혀 있으면(값을 줄일 것) `left_turn_debug` 창의 진행률 표시(§1.19f)로
+확인 후 재조정할 것. (원래 `obstacle_cut_debug` 창의 진행률 표시(§1.19c)로 확인하라고
+적었으나, §1.19f에서 그 창을 껐다 — 아래 참고.)
+
+### 1.19f 좌회전 통합 디버그 창(`left_turn_debug`) 신설 + 차선인식 외 나머지 디버그 창 전부 끔 (2026-08-22)
+
+**배경:** 좌회전(체크무늬 게이트 진입) 관련 상태 — 실행중/실행끝/발행각도/라이다감지 —
+가 `obstacle_cut_debug`(`_current_stage_label()` 헤드라인, §1.19c)와
+`checker_pillar_bev`(§1.19 도입) 두 창에 나눠져 있어 한눈에 보기 불편하다는 요청으로,
+좌회전 전용 통합 창을 새로 만들고 나머지 디버그 창(차선인식용 `DEBUG_VIZ_DL_LANE` 제외)을
+전부 껐다(요청 반영: "차선인식이랑 지금 만든 디버그창 빼고 다 꺼줘").
+
+**수정:**
+- `track_drive.py` `_debug_viz_left_turn()`(신규) — `control_loop()`에서 `self.drive()`
+  호출 **이후**에 그린다(다른 디버그 창들은 behavior override 이전 시점이라 "발행각도"가
+  이번 틱에 실제로 발행된 값과 어긋날 수 있어, 이 창만 발행 시점 이후로 옮김). 표시 내용:
+  - **실행중**: `self._checker_ramp_dist is not None` (램프 진행 중이면 초록)
+  - **실행끝**: 새로 추가한 `self._left_turn_last_done_t`(`_do_checker_ramp_turn()`의
+    `done` 분기에서 `time.time()`으로 세팅) 기준 마지막 완료 후 경과시간 — 3초 이내면
+    강조색(하늘색)으로 "방금 완료" 표시, 그 이후엔 회색으로 계속 경과시간 표시(한 번도
+    완료 안 했으면 "아직 없음").
+  - **발행각도**: `self.ctrl_angle` — 램프 진행 중이면 START→END 각도 범위와
+    `{진행거리}/{CHECKER_TURN_RAMP_DIST_M}m`, 커브 종류(`CHECKER_TURN_RAMP_CURVE`)도 같이 표시.
+  - **라이다감지**: `checker_pillar_trigger` + 디바운스 카운터(`_checker_pillar_trigger_cnt`/
+    `CHECKER_PILLAR_CONFIRM_FRAMES`) + 좌/우 개별 검출 여부 + 실측 간격(`checker_pillar_lat_dist_m`).
+- `config.py`: `DEBUG_VIZ_LEFT_TURN`(신규, `True`) 추가. 아래를 전부 `False`로 내림 —
+  `DEBUG_VIZ_IMU`, `DEBUG_VIZ_CHECKER_GATE`, `DEBUG_VIZ_DASH_COUNTER`,
+  `DEBUG_VIZ_CHECKER_PILLAR`, `DEBUG_VIZ_YOLO_CONE`, `DEBUG_VIZ_OBSTACLE_CUT`,
+  `DEBUG_VIZ_YOLO_VEHICLE`. `DEBUG_VIZ_DL_LANE`(차선인식)만 그대로 `True` 유지. 이미
+  `False`였던 나머지(`DEBUG_VIZ_LIDAR`/`LAVACON`류/`STEER`/`VESC`/`HOUGH_LANE`/`LANE`/
+  `STOPLINE`/`YOLO_SIGNAL_STATE`/`AVOID_HOLD`)는 그대로 둠. `DEBUG_LOG`(CLI 텍스트 로그,
+  cv2 창이 아님)는 이번 정리 대상이 아니라 그대로 유지.
+
+**알려진 한계:** 실차 미검증. 다른 창을 꺼둔 동안 그 창들이 잡아주던 이상 징후(예: 라바콘
+EMA 클러스터링 오검출, avoid-hold 유예 오작동)는 눈으로 못 본다 — 해당 기동을 다시
+디버깅해야 할 때는 그 창의 `DEBUG_VIZ_*`를 개별적으로 다시 `True`로 켤 것(서로 독립
+스위치라 다른 항목엔 영향 없음, config.py "5. 디버깅 ON/OFF" 절 관례).
+
 ---
 
 ## 2. 라인트래킹 (차선주행, S1)

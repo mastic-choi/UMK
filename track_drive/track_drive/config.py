@@ -946,11 +946,11 @@ CHECKER_PILLAR_MIN_RANGE_M = 0.3    # 이 거리(m) 이내로 찍힌 포인트�
 # 실차 보고(요청 반영) — 좌우 각 1포인트만 찍혀도 그 사이드는 검출된 것으로 완화.
 CHECKER_PILLAR_CLUSTER_MIN_PTS = 1  # 클러스터 최소 연속 포인트 수(좌우 각각 이 이상이면 그 사이드 검출)
 CHECKER_PILLAR_CLUSTER_MAX_GAP = 0.35  # 같은 클러스터로 볼 최대 거리편차(m) — 기둥 굵기 실측 후 재조정할 것(콘 지름 근사값 그대로 재사용 중)
-CHECKER_PILLAR_LAT_TARGET_M = 0.5   # 좌우 기둥 사이 최소 횡방향 간격(m, lat_dist가 이 이상이면 통과)
-                                     # [2026-08-22c] 0.98(실측 기둥 간격) → 0.5로 하향(요청 반영) —
-                                     # 실차 미검증, 너무 낮추면 무관한 라이다 클러스터쌍(예: 라바콘,
-                                     # 다른 장애물)을 게이트로 오인할 위험이 커지니 checker_pillar_bev
-                                     # 오탐 여부를 확인할 것.
+CHECKER_PILLAR_LAT_TARGET_M = 0.98   # 좌우 기둥 사이 최소 횡방향 간격(m, lat_dist가 이 이상이면 통과)
+                                     # [2026-08-22h] 0.5 → 0.98(실측 기둥 간격)로 복원(요청 반영) —
+                                     # 실차 미검증, 무관한 라이다 클러스터쌍(예: 라바콘, 다른 장애물)을
+                                     # 게이트로 오인할 위험을 줄이려면 실측값 그대로가 안전하다는 판단.
+                                     # checker_pillar_bev 오탐/미탐 여부를 확인할 것.
 # [2026-08-22b] 대칭 허용오차(± TOLERANCE) 대신 "간격이 이 값 이상이면 통과"로 완화(요청
 # 반영) — 위 CLUSTER_MIN_PTS 완화와 짝: 사이드당 1포인트만으로 잡은 위치는 좌표가 덜
 # 안정적이라, 상한까지 좁게 걸면 실제 기둥쌍인데도 근소하게 밀려나 놓칠 위험이 더 크다고
@@ -967,16 +967,24 @@ CHECKER_PILLAR_TIMEOUT_DIST_M = 2.0  # [안전장치] 커밋 시작 후 이 거�
 #   않고 CHECKER_TURN_RAMP_START_ANGLE에서 CHECKER_TURN_RAMP_END_ANGLE까지
 #   CHECKER_TURN_RAMP_DIST_M 동안 서서히 올린다(요청 반영: "-10~-30으로 완만히"). 거리
 #   적분은 TURN_DIST_M류와 동일하게 _speed_mps_fallback() 기반(VESC 실측 + 명령속도
-#   폴백)이라 이 램프도 그 안전장치를 그대로 물려받는다. CHECKER_TURN_RAMP_CURVE='linear'
-#   면 거리에 선형 비례, 'ease_in'이면 초반은 완만하고 후반에 각도가 빨리 붙는 2차 곡선
-#   (요청의 "선형 or 곡선" 중 곡선 옵션) — 기본은 실차 튜닝 편의상 단순한 linear
-#   (config.py "좌회전 공통" 절의 기존 방침과 동일 이유). _s0_signal()의 'left' 커밋 구간
-#   종료 트리거로 연결됨(요청 반영, S2_COMMIT_DIST_M 거리기반 대신 기둥쌍 검출로 대체) —
-#   CHECKER_PILLAR_TIMEOUT_DIST_M 초과 시엔 기존 거리기반으로 안전 폴백.
+#   폴백)이라 이 램프도 그 안전장치를 그대로 물려받는다. 시간(time.time() 경과) 대신 거리
+#   기준을 쓰는 이유: 조향각-거리 관계가 실제 주행 궤적의 곡률(회전반경)을 결정하므로,
+#   속도가 바뀌어도(SPEED_NORMAL 3→10 등) 같은 거리 기준이면 게이트를 통과하는 물리적
+#   곡선 모양이 그대로 유지된다 — 반대로 시간 기준이면 속도가 오를수록 곡선이 늘어져
+#   버려 궤적이 달라진다. _s0_signal()의 'left' 커밋 구간 종료 트리거로 연결됨(요청 반영,
+#   S2_COMMIT_DIST_M 거리기반 대신 기둥쌍 검출로 대체) — CHECKER_PILLAR_TIMEOUT_DIST_M
+#   초과 시엔 기존 거리기반으로 안전 폴백.
+#   [2026-08-22] SPEED_NORMAL 3→10 상향 이후 0.5m가 실차에서 약 3프레임 만에 끝나버려
+#   (README §"speed10 변경" 참고) 2.0으로 상향 — 20Hz·TURN_SPEED 기준 대략 십수 프레임
+#   구간으로 늘어남. 실차 미검증 초기값이라 재검증 필요. CHECKER_TURN_RAMP_CURVE는
+#   'linear'(거리에 선형 비례) 대신 기본을 'smoothstep'으로 바꿈 — 3t²-2t³ 형태라 양끝
+#   (t=0 램프 시작, t=1 END_ANGLE로 고정 전환되는 지점) 모두 기울기 0이라 저크 없는 S자
+#   곡선이 된다(예전 'ease_in'=t² 는 시작은 완만했지만 t=1에서 END_ANGLE 고정값으로
+#   넘어가는 순간 기울기가 뚝 끊겨 저크가 있었음 — 이번에 대체).
 CHECKER_TURN_RAMP_START_ANGLE = -10.0
-CHECKER_TURN_RAMP_END_ANGLE   = -30.0
-CHECKER_TURN_RAMP_DIST_M      = 0.5     # 이 거리(m) 동안 START→END로 올림 — 실차 미검증 초기값
-CHECKER_TURN_RAMP_CURVE       = 'linear'  # 'linear' | 'ease_in'
+CHECKER_TURN_RAMP_END_ANGLE   = -20.0
+CHECKER_TURN_RAMP_DIST_M      = 3.5     # 이 거리(m) 동안 START→END로 올림 — 실차 미검증 초기값
+CHECKER_TURN_RAMP_CURVE       = 'smoothstep'  # 'linear' | 'smoothstep'
 
 # [2026-08-07] ll을 흰선/노란선으로 분리하는 데 쓰는 커넥티드 컴포넌트 투표 기준
 # (DL_CENTER_MODE='ll' 전용, DLSlideWindow._split_ll_by_yellow() 참고). ll 픽셀 자체는
@@ -1289,7 +1297,9 @@ DEBUG_VIZ_VESC     = False  # VESC 실측속도(/vesc_speed_erpm) 연동 상태(
 # [2026-08-18] IMU(/imu) 연동이 실제로 살아있는지 + 지금 imu_yaw 값이 얼마인지를 보여주는
 #   창. [2026-08-20] 좌회전(_do_left_turn())을 실측거리 기반으로 되돌리며 좌회전 진행상황
 #   표시는 DEBUG_VIZ_VESC 창으로 옮겼다 — 이제 좌회전이 IMU를 참조하지 않으므로.
-DEBUG_VIZ_IMU      = True  # IMU(/imu) 연동 상태 + 현재 yaw값 디버그 창
+DEBUG_VIZ_IMU      = False  # IMU(/imu) 연동 상태 + 현재 yaw값 디버그 창
+                             # [2026-08-22] 요청 반영으로 끔 — 아래 "차선인식/좌회전 통합
+                             #   창만 남기고 나머지 다 끄기" 일괄 정리, 필요하면 다시 True로.
 
 DEBUG_VIZ_DL_LANE    = True  # 차선 — 기본 백엔드('dl') 디버그 창 (perception/dl_lane.py)
 # [2026-08-10] offset 스파크라인이 몇 프레임을 보여줄지 — [2026-08-11] 원래 별도
@@ -1306,22 +1316,36 @@ DEBUG_VIZ_STOPLINE   = False  # 정지선 디버그 창, 백엔드 무관 항상
 # [2026-08-21] 좌회전 진입 랜드마크(체커 게이트/노란 파선 카운터) 디버그 창 — 실차에서
 #   ROI/비율/카운트가 실제로 의도대로 잡히는지 눈으로 확인하기 위해 켜둠(요청 반영).
 #   신뢰도 검증 전이라 기본 True — 확정되면 다른 항목처럼 False로 내릴 것.
-DEBUG_VIZ_CHECKER_GATE = True   # 체커무늬(하프 출발선) 게이트 디버그 창 (perception/hough_lane.py CheckerBandGate)
-DEBUG_VIZ_DASH_COUNTER = True   # 노란 파선 카운터 디버그 창 (perception/hough_lane.py YellowDashCounter)
+DEBUG_VIZ_CHECKER_GATE = False   # 체커무늬(하프 출발선) 게이트 디버그 창 (perception/hough_lane.py CheckerBandGate)
+DEBUG_VIZ_DASH_COUNTER = False   # 노란 파선 카운터 디버그 창 (perception/hough_lane.py YellowDashCounter)
 # [2026-08-22] 위 CHECKER_GATE(비전, hough_lane.py)와는 별개 — 이건 perc_checker_pillar()가
 #   쓰는 라이다 좌우 기둥쌍 검출(체크무늬 게이트 라이다 기둥쌍, checker_pillar_trigger) 전용
 #   BEV 디버그 창. 신호등 좌회전 확정 후 이 트리거가 실제 좌회전 시작 시점을 결정하는
 #   구조로 바뀌면서(요청 반영, track_drive.py _s1_lane_follow()/_s0_signal() 참고) 실차에서
 #   좌우 기둥쌍이 실제로 잡히는지 눈으로 바로 확인할 필요가 생겨 추가했다.
-DEBUG_VIZ_CHECKER_PILLAR = True   # 체크무늬 게이트 라이다 기둥쌍 검출 BEV 디버그 창 (track_drive.py)
-DEBUG_VIZ_YOLO_CONE  = True   # [2026-08-21, 요청 반영] 다시 켬 — 단 콘 원시검출 창
-                               # ('yolo_cone_result')은 이제 표시 직전에 아주 작게(160x120)
-                               # 축소해서 띄운다(yolo_cone.py show_debug_windows() 참고,
-                               # 화면을 너무 많이 차지한다는 요청 반영). 이 플래그가
-                               # obstacle_cut_debug 창의 콘 카메라 패널(cam_stage=='cone'일 때)에
-                               # 쓰는 vis 프레임도 같이 만든다(yolo_cone.py _worker() 참고,
-                               # yolo_vehicle.py DEBUG_VIZ_YOLO_VEHICLE과 동일 관례) — 그쪽은
-                               # 축소 없이 원래 크기 그대로.
+#   [2026-08-22i] 요청 반영으로 끔 — 이 창의 핵심 정보(라이다 감지 트리거 여부)는 아래
+#   DEBUG_VIZ_LEFT_TURN 통합 창에도 요약으로 들어간다. 좌우 점 하나하나의 원시 BEV
+#   좌표까지 봐야 할 때만 다시 True로.
+DEBUG_VIZ_CHECKER_PILLAR = False   # 체크무늬 게이트 라이다 기둥쌍 검출 BEV 디버그 창 (track_drive.py)
+# [2026-08-22i] 좌회전(체크무늬 게이트 진입) 전용 통합 디버그 창 — 실행중/실행끝/발행각도/
+#   라이다감지 4가지를 한 창에 모아 보여준다(요청 반영: "좌회전 관련 ... 합친 디버그창 하나").
+#   기존에 이 정보들이 obstacle_cut_debug(§_current_stage_label())/checker_pillar_bev/
+#   VESC 창 등에 흩어져 있던 것을 좌회전만 따로 떼어 한 곳에 모음
+#   (track_drive.py _debug_viz_left_turn() 참고). 같은 요청으로 이 창과
+#   DEBUG_VIZ_DL_LANE(차선인식)만 남기고 나머지 DEBUG_VIZ_* 는 전부 껐다.
+# [2026-08-22j] 요청 반영("좌회전 디버깅창에 라이다영상도 추가")으로 상태 패널 아래에
+#   perc_checker_pillar()의 라이다 BEV 원시 프레임(_draw_checker_pillar_bev())도 이어붙였다
+#   — DEBUG_VIZ_CHECKER_PILLAR가 꺼져 있어도(기본값) 이 창이 켜져 있으면 BEV가 계속 채워짐.
+# [2026-08-22k] 요청 반영("카메라 영상도 같이 띄워줄래")으로 전방 카메라 원본
+#   (self.img_front)도 이어붙였다. [2026-08-22l] 요청 반영("카메라 영상부분을 옆으로
+#   붙여줘")으로 카메라/BEV를 세로가 아닌 좌우 나란히 배치로 변경 — 최종 레이아웃:
+#   상태 텍스트(위) / FRONT CAM·LIDAR BEV 좌우 나란히(아래).
+DEBUG_VIZ_LEFT_TURN = True   # 좌회전 실행중/실행끝/발행각도/라이다감지+카메라+BEV 통합 디버그 창 (track_drive.py)
+DEBUG_VIZ_YOLO_CONE  = False   # 콘 원시검출 창('yolo_cone_result', yolo_cone.py
+                               # show_debug_windows()) + obstacle_cut_debug 창의 콘 카메라
+                               # 패널(cam_stage=='cone'일 때)용 vis 프레임(yolo_cone.py
+                               # _worker() 참고, yolo_vehicle.py DEBUG_VIZ_YOLO_VEHICLE과
+                               # 동일 관례). [2026-08-22i] 요청 반영으로 끔.
 # [2026-08-21] 신호등 위치+색상 판정을 YOLO 단독(yolo_signal_state.py) 하나로 정리하면서
 #   (README §1.18) 이게 유일한 신호등 결과 창이 됐다 — 실차에서 지금 뭘 보고 판단 중인지
 #   눈으로 확인하기 위함.
@@ -1339,7 +1363,7 @@ DEBUG_VIZ_AVOID_HOLD = False
 # [2026-08-20] da 근접 컷(obstacle-cut, ENABLE_OBSTACLE_CUT 주석 참고) 전용 상태창 —
 #   라이다 raw/YOLO raw/AND확정/유지타이머 잔여시간/해제카운터를 avoid_hold_debug와
 #   같은 구조로 한곳에 모아 보여준다(track_drive.py _debug_viz_obstacle_cut()).
-DEBUG_VIZ_OBSTACLE_CUT = True   # [2026-08-20] 실차 검증 시작과 함께 켬 — dl_lane 창의 마젠타 오버레이와 같이 볼 것
+DEBUG_VIZ_OBSTACLE_CUT = False   # [2026-08-22i] 요청 반영으로 끔 — dl_lane 창의 마젠타 오버레이는 계속 보임(DEBUG_VIZ_DL_LANE과 무관)
 
 
 # #############################################################
@@ -1587,7 +1611,7 @@ YOLO_VEHICLE_MODEL_PATH = None     # None이면 yolo_ros/target_vehicle_best.onn
                                     # v1.1.0(seed+round2 6,041장, mAP50-95=0.985) →
                                     # [2026-08-20 §2.59] v1.2.0(가중치는 v1.1.0과 동일,
                                     # nms 내장 export로 교체)으로 갱신.
-DEBUG_VIZ_YOLO_VEHICLE = True      # [2026-08-20] 실차 검증 시작과 함께 켬 — 카메라가 실제로 target_vehicle을 보는지 원시 박스로 확인용
+DEBUG_VIZ_YOLO_VEHICLE = False      # [2026-08-22i] 요청 반영으로 끔 — 카메라가 실제로 target_vehicle을 보는지 원시 박스로 확인용, 필요하면 다시 True로
 
 # ── 신호등 위치+색상상태 YOLO (perception/yolo_signal_state.py, YOLOv8n ONNX) ──
 #   [2026-08-19] datasets/signal_state/(라벨링 워크플로는 그쪽 README 참고)로 파인튜닝한
