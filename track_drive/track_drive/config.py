@@ -986,8 +986,8 @@ CHECKER_PILLAR_TIMEOUT_DIST_M = 2.0  # [안전장치] 커밋 시작 후 이 거�
 #   곡선이 된다(예전 'ease_in'=t² 는 시작은 완만했지만 t=1에서 END_ANGLE 고정값으로
 #   넘어가는 순간 기울기가 뚝 끊겨 저크가 있었음 — 이번에 대체).
 CHECKER_TURN_RAMP_START_ANGLE = -10.0
-CHECKER_TURN_RAMP_END_ANGLE   = -20.0
-CHECKER_TURN_RAMP_DIST_M      = 3.5     # 이 거리(m) 동안 START→END로 올림 — 실차 미검증 초기값
+CHECKER_TURN_RAMP_END_ANGLE   = -30.0
+CHECKER_TURN_RAMP_DIST_M      = 3.0     # 이 거리(m) 동안 START→END로 올림 — 실차 미검증 초기값
 CHECKER_TURN_RAMP_CURVE       = 'smoothstep'  # 'linear' | 'smoothstep'
 
 # [2026-08-07] ll을 흰선/노란선으로 분리하는 데 쓰는 커넥티드 컴포넌트 투표 기준
@@ -1287,13 +1287,20 @@ DEBUG_PERIOD = 0.5     # 위 로그 주기(s)
 #   참고: track_drive.py _draw_lavacon_bev/_debug_viz_obstacle_cut, perception/dl_lane.py
 #   show_debug_windows). 화면 해상도에 안 맞으면 이 값만 바꾸면 됨 — (x, y)는 창의
 #   좌상단 모서리가 놓일 스크린 픽셀 좌표.
-DEBUG_WIN_POS_DL_LANE       = (0, 0)
 DEBUG_WIN_POS_LAVACON       = (650, 0)
 DEBUG_WIN_POS_OBSTACLE_CUT  = (0, 650)
-# [2026-08-23] 위 3개(DL_LANE/LAVACON/OBSTACLE_CUT)가 지금 다 꺼져 있고 대신 아래 3개
+# [2026-08-23] 위 2개(LAVACON/OBSTACLE_CUT)는 지금 꺼져 있고 대신 아래 3개
 #   (YOLO_신호등/checker_pillar_bev/left_turn_debug)만 켜져 있어서, 같은 그리드 좌표를
-#   그대로 재사용해도 안 겹친다 — 위 3개를 동시에 다시 켤 일이 생기면 이 좌표들이 서로
+#   그대로 재사용해도 안 겹친다 — 위 2개를 동시에 다시 켤 일이 생기면 이 좌표들이 서로
 #   겹치지 않는지 다시 확인할 것.
+# [2026-08-23] 요청 반영으로 da(dl_lane) 디버그 창도 다시 켜면서, 기존 (0,0)이 아래
+#   DEBUG_WIN_POS_YOLO_SIGNAL_STATE=(0,0)과 겹치게 돼 자리를 옮겼다 — 아래 3개 창이
+#   (0,0)/(650,0)/(0,650) 3자리를 다 차지하고 있어, 비어있는 네 번째 그리드 칸
+#   (650,650)로 배치(가로 650칸 간격 그리드를 그대로 연장). dl_lane 창은 BEV
+#   캔버스 실측폭(_slide.roi_w, DL_USE_BEV=True 기준 약 585px)만큼 정사각形에 가깝게
+#   뜨므로 650칸이면 checker_pillar_bev(650,0)/left_turn_debug(0,650) 어느 쪽과도 겹치지
+#   않는다 — 화면 해상도가 이보다 작으면 이 값을 다시 조정할 것.
+DEBUG_WIN_POS_DL_LANE       = (650, 650)
 DEBUG_WIN_POS_YOLO_SIGNAL_STATE = (0, 0)      # 'YOLO_신호등' 창 (perception/yolo_signal_state.py)
                                                #   원본 640x480, [2026-08-23] 표시만 160x120로 축소(요청 반영)
 DEBUG_WIN_POS_CHECKER_PILLAR    = (650, 0)    # 'checker_pillar_bev' 창 (track_drive.py)
@@ -1344,9 +1351,11 @@ DEBUG_VIZ_IMU      = False  # IMU(/imu) 연동 상태 + 현재 yaw값 디버그 
                              # [2026-08-22] 요청 반영으로 끔 — 아래 "차선인식/좌회전 통합
                              #   창만 남기고 나머지 다 끄기" 일괄 정리, 필요하면 다시 True로.
 
-DEBUG_VIZ_DL_LANE    = False  # 차선 — 기본 백엔드('dl') 디버그 창 (perception/dl_lane.py)
-                               # [2026-08-23] 요청 반영으로 끔 — 신호등/da/좌회전 4개 창만
-                               #   켜두기 위해 나머지와 함께 정리.
+DEBUG_VIZ_DL_LANE    = True   # 차선 — 기본 백엔드('dl') 디버그 창 (perception/dl_lane.py),
+                               # da(주행가능영역) 오버레이+경로가 찍히는 'dl_lane' 창
+                               # [2026-08-23] 요청 반영으로 다시 켬 — 신호등/da/좌회전 3개
+                               #   창을 함께 보기 위해. 위 DEBUG_WIN_POS_DL_LANE=(650,650)
+                               #   참고(자리 겹침 없이 배치).
 # [2026-08-10] offset 스파크라인이 몇 프레임을 보여줄지 — [2026-08-11] 원래 별도
 #   'dl_lane_params' 창 하단에 붙었으나, 그 창의 파라미터 텍스트 목록(대부분 config
 #   고정값)을 지우면서 스파크라인만 'dl_lane' 창 맨 아래로 옮겼다(DEBUG_VIZ_DL_LANE
@@ -1424,21 +1433,17 @@ DEBUG_VIZ_OBSTACLE_CUT = False    # [2026-08-22i] 요청 반영으로 껐다가,
 # #############################################################
 # 6. 미션 State / 실차 테스트 범위 제한
 # #############################################################
-# [2026-08-23] B3(방해차량) 통과 후 다음 교차로 신호등 대기(S0_SIGNAL) + S1 차선주행
-#   단독 검증용 override — S0_SIGNAL(출발선 신호등 대기)/B1/B2/B3를 전부 건너뛰고
-#   "이미 다 통과한 것"으로 놓은 채 곧장 S1_LANE_FOLLOW로 시작한다. track_drive.py
-#   __init__의 self.phase도 Phase.DONE + _b2_passed/_b3_passed=True로 맞춰뒀다(위 참고,
-#   9c4371e 좌회전 단독 검증 때와 같은 패턴) — Phase.DONE이면 run_behavior_fsm()이
-#   트리거 검사 없이 B0_NORMAL로 고정되고 _active_yolo_stage()도 'signal'만 돌려,
-#   B1/B2/B3 재발동 없이 곧장 "다음 교차로 신호등 대기"로 이어진다. 검증 끝나면
-#   START_STATE=S0_SIGNAL로 되돌리고 track_drive.py의 phase/b2_passed/b3_passed도
-#   원래값(Phase.LAVACON/False/False)으로 같이 되돌릴 것(이력 있음, 매번 바뀌니 되돌릴
-#   때 track_drive.py __init__ 주석도 같이 확인).
+# [2026-08-23] "B3 통과 후 다음 교차로 신호등 대기" 단독 검증용으로 잠깐 걸어뒀던
+#   START_STATE=S1_LANE_FOLLOW(+ track_drive.py __init__의 Phase.DONE/_b2_passed=
+#   _b3_passed=True) override를 원복했다(요청 반영) — 그 상태로는 직진 신호를 몇 번을
+#   확정받아도 B1이 켜질 수 없다는 게 진단됨(run_behavior_fsm()이 Phase.DONE이면
+#   Phase.LAVACON 분기 자체에 안 들어가 라바콘 트리거 검사를 아예 안 함). 이제 정상
+#   플로우대로 출발선 신호등 대기(S0_SIGNAL)부터 시작한다.
 # [2026-08-20, signal-whiteboard-autocrop 브랜치 병합] START_STATE는 원래 S0_WAIT_GREEN
 #   이었으나, 그 상태와 S2_INTERSECTION이 S0_SIGNAL 하나로 통합됐다(위 MissionState enum
 #   주석 참고, 출발선/교차로 재진입 모두 같은 SignalDetector.detect_s2() 재사용) — 값은
 #   그대로 "맨 처음 신호등 판독" 지점이라 의미상 동일하다.
-START_STATE     = MissionState.S1_LANE_FOLLOW
+START_STATE     = MissionState.S0_SIGNAL
 ENABLE_BEHAVIOR = True  # S1에서 라바콘/장애물/추월 Behavior를 켤지 여부(최상위 스위치)
 
 # ── 실차 테스트 범위 제한 ──
@@ -1457,10 +1462,9 @@ TEST_FORCE_BEHAVIOR = False
 #         S0/S2를 건너뛴 채로도 B1→B2→B3가 정상 발동한다(그렇지 않으면 _behavior_enabled가
 #         S0_SIGNAL 직진 확정 시에만 True가 되는데 그 경로 자체를 안 타므로 계속 False로
 #         남아 Behavior가 영원히 안 켜짐).
-#   False: 원래대로 S0_SIGNAL 직진 신호 확정 시에만 Behavior가 켜짐. [2026-08-23] B3 통과 후
-#         신호등 대기 단독 검증은 위에서 Phase.DONE으로 이미 시작하므로 run_behavior_fsm()이
-#         B0_NORMAL로 고정돼 있어 Behavior를 켤 필요가 없다 — False로 둬도 무방(안전한 쪽).
-#         정상 플로우(신호등부터 실제로 거침) 검증 때는 START_STATE=S0_SIGNAL과 함께 False 유지.
+#   False: 원래대로 S0_SIGNAL 직진 신호 확정 시에만 Behavior가 켜짐. [2026-08-23] 위
+#         START_STATE=S0_SIGNAL 정상 플로우로 원복하면서 이 값도 False 유지 —
+#         S0_SIGNAL 직진 확정 경로를 실제로 타야 Behavior가 켜지는지까지 같이 검증한다.
 
 # [2026-08-11] B2(정지 장애물) Hybrid A* 대안(USE_HYBRID_ASTAR_FOR_B2) 삭제.
 #   대신 _da_avoidance_failed() 게이트 + TargetPassing(실측 기반 하드코딩)로 대체
@@ -1721,7 +1725,7 @@ DEBUG_VIZ_YOLO_VEHICLE = False      # [2026-08-22i] 요청 반영으로 끔 — 
 #   "YOLO 단독 vs YOLO+HSV 하이브리드" 판단 소스 스위치(SIGNAL_USE_YOLO_STATE_FOR_DECISION)를
 #   전부 삭제했다(README §1.18) — 이제 신호등 인식은 이 YOLO 모델 하나뿐이다.
 YOLO_SIGNAL_STATE_INPUT_SIZE = 640     # signal_state_best_n.onnx export 시 imgsz와 반드시 일치시킬 것
-YOLO_SIGNAL_STATE_CONF_THRESHOLD = 0.5 # 이 신뢰도 이상인 검출만 인정(모델이 nms=True로 export돼 좌표 디코딩은 불필요) — 실차 미검증 기본값, cone과 동일하게 잡아둠
+YOLO_SIGNAL_STATE_CONF_THRESHOLD = 0.8 # 이 신뢰도 이상인 검출만 인정(모델이 nms=True로 export돼 좌표 디코딩은 불필요) — [2026-08-23] 0.5→0.8(요청 반영)
 # [2026-08-20 §2.59] target_vehicle과 같은 문제(ultralytics nms=True가 CoreML 전용이라
 # DetectionModel ONNX export엔 안 먹힘)가 여기서도 재현돼 v1.2.0으로 교체 — 가중치는
 # v1.1.0과 완전히 동일, export만 NMS 내장 커스텀 스크립트로 바뀜(output0 [1,N,6] 유지,
@@ -1732,7 +1736,12 @@ YOLO_SIGNAL_STATE_CLASS_NAMES = ('red', 'green_straight', 'green_left')  # class
 SAFETY_DIST      = 5.0        # B2(고정장애물) 발동 거리(m)
 OVERTAKE_TRIGGER = 6.5        # B3(방해차량) 발동 거리(m)
 VEHICLE_TRIGGER_FRAMES = 5    # 라이다 단독검출 연속 N프레임이면 B3_VEHICLE 진입 확정
-SIG_CONFIRM_FRAMES = 3        # 신호등(직진/좌회전) 판정이 연속 N프레임 유지돼야 확정(20Hz→0.15s)
+SIG_CONFIRM_FRAMES = 1        # [2026-08-23, 요청 반영] 신호등(직진/좌회전) 판정이 연속 N프레임
+#   유지돼야 확정(20Hz 기준 N=3이면 0.15s). 원래 3이었으나 실차에서 "3프레임을 못 채우고
+#   1프레임만 찍힌 뒤 YOLO가 꺼진다"는 보고로 1로 낮춤 — 실측 결과 YOLO 신호등 검출
+#   자체의 프레임 간 안정성이 낮아(정확도는 높지만 매 프레임 연속으로 잡히진 않음) 3프레임
+#   연속 조건을 채우기 전에 뭔가 어긋나는 것으로 추정. 디바운스가 사실상 무력화되므로
+#   단발 오검출(빛반사/블러)에 더 취약해진다 — 오출발/오좌회전 재발하면 이 값부터 의심할 것.
 
 # [2026-08-13] 좌/우 차선 공간(left_clear/right_clear, perc_obstacle())이 회피 방향을
 #   정하는 choose_side()에 직접 쓰이는데, 매 프레임 라이다 점 개수를 임계값과 그냥

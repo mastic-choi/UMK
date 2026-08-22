@@ -1407,6 +1407,41 @@ EMA 클러스터링 오검출, avoid-hold 유예 오작동)는 눈으로 못 본
 
 ---
 
+### 1.19g `_signal_yolo_off`를 좌회전 확정에도 적용 — 직진/좌회전 확정 즉시(한 곳에서) 신호등 YOLO 끔 (2026-08-23)
+
+**배경:** 실차에서 "신호등 인식 → (좌회전 확정 후) 좌우 라이다 기둥쌍도 검출되는데 좌회전
+램프로 안 넘어간다"는 증상 진단 요청 — `left_turn_debug` 창으로 짚어보기 전에, 사용자가
+먼저 "신호등이 한 번 정확한 값을 찍으면 YOLO가 죽게 되어 있어서 확정(`SIG_CONFIRM_FRAMES`
+연속 프레임)까지 못 간다"고 지목. 코드를 보니 정확히는 반대 방향 비대칭이 있었다:
+`_signal_yolo_off`는 원래 **직진** 확정 전용으로만 도입됐던 플래그(§주석,
+`_s1_lane_follow()`)라 **좌회전** 확정 경로에는 아예 없었고, 그 결과
+`_active_yolo_stage()`의 `MissionState.S0_SIGNAL` 분기가 이 플래그를 보지도 않고
+무조건 `'signal'`을 반환해 — 좌회전 확정 후 커밋구간(`_s2_commit_dist`)/게이트 램프
+(`_checker_ramp_dist`) 내내 신호등 YOLO 추론이 계속 돌고 있었다. 색은 이미 확정된
+뒤라 더 볼 필요가 없는 불필요한 추론일 뿐 그 자체가 좌회전 미전환의 직접 원인은
+아니었지만(그 라인은 별도 §1.19 라이다 기둥쌍 조건과 무관), 요청대로 직진과 동일하게
+"확정되는 즉시 딱 한 번, 같은 방식으로" 끄도록 통일했다.
+
+**수정:** `track_drive.py`
+- `perc_signal()` 끝에 `if self.signal_straight_confirmed or self.signal_left_confirmed:
+  self._signal_yolo_off = True` 추가 — 직진/좌회전 확정 판정이 나는 그 틱에 한 곳에서
+  공통으로 끈다. `_s1_lane_follow()`의 직진 확정 분기에 개별로 있던
+  `self._signal_yolo_off = True`는 중복이라 제거(주석만 남김).
+- `_active_yolo_stage()`의 `MissionState.S0_SIGNAL` 분기를 `return 'signal'` →
+  `return None if self._signal_yolo_off else 'signal'`로 변경 — 출발선에서 아직 색을
+  못 읽어 대기 중일 때(`_signal_yolo_off=False`)는 그대로 켜두고, 좌회전 확정 뒤
+  커밋구간/램프 구간(`_signal_yolo_off=True`)에서는 실제로 추론이 멈춘다.
+- 리셋 시점은 기존과 동일 — `_update_lap()`의 `RESET_PHASE_EACH_LAP` 분기
+  (`self._signal_yolo_off = False`, 다음 바퀴 시작 시 해제)를 그대로 재사용.
+
+**알려진 한계:** 실차 미검증. 이 변경은 불필요한 YOLO 추론을 끄는 것뿐이라 "좌회전으로
+안 넘어간다"는 원 증상 자체의 근본 원인(체크무늬 게이트 라이다 기둥쌍 `checker_pillar_trigger`
+조건 — 좌우 개별 검출은 되는데 간격이 `CHECKER_PILLAR_LAT_TARGET_M`=0.98m 미달일
+가능성이 가장 유력, §1.19 참고)은 아직 안 건드렸다. `left_turn_debug` 창의 "라이다감지"
+줄(간격 실측값)로 별도 확인 필요.
+
+---
+
 ## 2. 라인트래킹 (차선주행, S1)
 
 **수정할 곳:** `START_STATE=S1_LANE_FOLLOW`, `TEST_FORCE_BEHAVIOR=False`.
@@ -2551,6 +2586,28 @@ B2/B3(`lidar_bev`) 디버깅이 다시 필요하면 `DEBUG_VIZ_LIDAR`를 다시 
 **알려진 한계:** `lavacon_done`(탈출 판정, `process_lavacon()`)은 원래부터 라이다만 쓰고
 YOLO에 의존하지 않으므로 이 변경으로 탈출 판정 자체엔 영향 없음 — 실차 미검증(요청 시점
 기준).
+
+### 3.11 진입 확정 직후 임시 강제조향 "킥" 실험 (`LAVACON_KICK_ENABLED`, 2026-08-23, 실차 미검증)
+
+**배경:** B1 진입이 확정되는 순간(`_lavacon_engaged` False→True) 0.5초간 -20도 고정
+조향각을 강제로 걸어보고 싶다는 실험 요청 — "초반 자세를 확 잡아준다"는 아이디어를 빠르게
+실차로 테스트해보기 위한 임시 스위치.
+
+**구현:**
+- `config.py`: `LAVACON_KICK_ENABLED`(True), `LAVACON_KICK_DURATION_S`(0.5),
+  `LAVACON_KICK_ANGLE_DEG`(-20.0) 신설.
+- `track_drive.py` `run_behavior_fsm()`의 `Phase.LAVACON` 분기 — `_lavacon_engaged`
+  상승엣지(`was_engaged` 스냅샷과 비교)를 딱 한 번만 감지해
+  `_lavacon_kick_cnt = LAVACON_KICK_DURATION_S / 0.05`(20Hz 고정주기 기준 프레임수)로 채운다.
+- `_handle_lavacon()` — `_lavacon_kick_cnt > 0`인 동안은 매 틱 1씩 깎으면서
+  `_lavacon_steer_da_push()`/차선조향 계산을 건너뛰고 `ctrl_angle`에
+  `LAVACON_KICK_ANGLE_DEG`를 그대로 대입(push 디버그 표시 플래그도 같이 꺼서
+  lavacon_bev/DA 창에 "이번 틱은 안 밀림"으로 보이게 함). 속도(`_update_speed()`)는
+  건드리지 않아 킥 구간에서도 평소와 동일하게 동작.
+
+**알려진 한계:** 실차 미검증 — 방향 부호(-20도가 좌/우 어느 쪽인지)도 실차에서 처음
+확인해야 함. 효과가 없거나 오히려 나쁘면 `LAVACON_KICK_ENABLED = False`로 되돌리면
+이 블록 전체가 비활성화되고 기존 push 조향 그대로 동작한다(다른 곳 되돌릴 필요 없음).
 
 ---
 
