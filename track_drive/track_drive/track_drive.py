@@ -232,6 +232,17 @@ class TrackDriverNode(Node):
         self._lavacon_trigger_cnt   = 0      # 동시검출 연속 프레임 수(디바운스 카운터)
         self._lavacon_dbg = (0, 0, 0, 0)     # 디버그용 (좌ROI점수, 좌최대연속묶음, 우ROI점수, 우최대연속묶음)
         self._lavacon_mask_dbg = (0, -1.0)   # 디버그용 (BODY_LO~HI 마스킹 구간 원본 점수, 최소거리)
+        # [2026-08-21] 좌회전 진입 랜드마크 후보 — 체크무늬 게이트 라이다 기둥쌍 검출
+        # (perc_checker_pillar(), config.py "체크무늬 게이트 라이다 기둥쌍 검출" 절 참고).
+        # _s0_signal()의 'left' 커밋 종료 트리거로 연결됨(요청 반영) — 로직 자체는 실제
+        # 라이다 캡처로 검증 못한 상태이니 실차에서 반드시 확인할 것.
+        self.checker_pillar_left_detected  = False  # 좌측 기둥 클러스터 검출 여부
+        self.checker_pillar_right_detected = False  # 우측 기둥 클러스터 검출 여부
+        self.checker_pillar_lat_dist_m     = 0.0    # 좌우 클러스터 사이 실측 횡방향 거리(m, 둘 다 검출됐을 때만 유효)
+        self.checker_pillar_trigger        = False  # (좌우 검출 AND 간격이 실측값과 일치)가 디바운스 프레임수만큼 유지되면 True
+        self._checker_pillar_trigger_cnt   = 0      # 디바운스 카운터
+        self._checker_pillar_dbg = (0, 0, 0, 0, 0.0)  # 디버그용 (좌pts, 좌run, 우pts, 우run, 횡방향거리)
+        self._checker_ramp_dist = None  # None=램프 비활성, 아니면 트리거 이후 누적 이동거리(m) — _do_left_turn()의 _turn_dist와 동일 패턴
         # [2-6 방해차량 트리거]
         self.vehicle_trigger       = False   # 라이다 디바운스 통과 → B3 진입 트리거
         self._vehicle_trigger_cnt  = 0       # 동시검출 연속 프레임 수(디바운스 카운터)
@@ -636,6 +647,7 @@ class TrackDriverNode(Node):
         self.perc_lavacon_trigger()  # 라이다+비전 (YOLO 콘 검출 AND 좌우 클러스터 동시검출 → B1_LAVACON 진입 트리거)
         self.perc_vehicle_trigger()  # 라이다 (전방 장애물 근접 → B3_VEHICLE 진입 트리거)
         self.perc_stopline()    # 비전
+        self.perc_checker_pillar()  # 라이다 (체크무늬 게이트 좌우 기둥쌍 → 좌회전 램프 진입 트리거, S0_SIGNAL 'left' 커밋 중에만 실사용)
 
     # [2-4a] 라바콘 카메라 이중확인 (YOLO)
     #   입력 self.img_front → 출력 self.cone_detected_yolo
@@ -1777,6 +1789,95 @@ class TrackDriverNode(Node):
         cv2.imshow('lavacon_ema_bev', bev)
         cv2.waitKey(1)
 
+    # [2-4d'] 좌회전 진입 랜드마크 후보 — 체크무늬 게이트 라이다 기둥쌍 검출
+    #   입력 self.lidar_ranges → 출력 checker_pillar_left/right_detected, checker_pillar_trigger
+    #   perc_lavacon_trigger()와 완전히 동일한 패턴(극좌표→직교좌표, 종방향 ROI, 좌/우
+    #   클러스터 탐지)이지만, 좌우 클러스터 간 횡방향 거리가 실측 기둥 간격
+    #   (CHECKER_PILLAR_LAT_TARGET_M)과 일치해야만 확정한다는 조건이 추가됐다 — config.py
+    #   "체크무늬 게이트 라이다 기둥쌍 검출" 절 참고.
+    def perc_checker_pillar(self):
+        if self.lidar_ranges is None:
+            self.checker_pillar_left_detected  = False
+            self.checker_pillar_right_detected = False
+            self.checker_pillar_lat_dist_m     = 0.0
+            self._checker_pillar_trigger_cnt   = 0
+            self.checker_pillar_trigger        = False
+            self._checker_pillar_dbg = (0, 0, 0, 0, 0.0)
+            return
+
+        ranges_raw = np.array(self.lidar_ranges, dtype=np.float32)
+        ranges_raw[~np.isfinite(ranges_raw)] = 0.0
+        ranges_raw[ranges_raw <= 0.0] = 0.0
+
+        ranges = ranges_raw.copy()
+        n = len(ranges)
+        if BODY_MASK_ENABLED and n > 215:
+            ranges[215:min(305, n)] = 0.0   # 차체 자기가림 마스킹 (perc_obstacle/perc_lavacon_trigger와 동일 구간)
+
+        m = min(n, 360)
+        deg = np.linspace(0.0, 2.0 * math.pi, m, endpoint=False) - math.radians(LIDAR_ANGLE_OFFSET_DEG)
+        r = ranges[:m]
+        x = r * np.cos(deg)          # 전방(+앞)
+        y = r * np.sin(deg)          # 횡방향(+좌/-우)
+        roi = (r > 0.0) & (x > CHECKER_PILLAR_LON_MIN) & (x < CHECKER_PILLAR_LON_MAX) \
+              & (np.abs(y) < CHECKER_PILLAR_LAT_MAX)
+
+        def _cluster_center(side_mask):
+            """side_mask 안에서 클러스터 조건(연속 포인트 수/거리편차)을 만족하는 가장 큰
+            묶음을 찾아 (found, pts, best_run, lat_center) 반환 — lat_center는 그 묶음의
+            y좌표 평균(횡방향 위치, m)."""
+            idx = np.where(roi & side_mask)[0]
+            pts = len(idx)
+            if pts < CHECKER_PILLAR_CLUSTER_MIN_PTS:
+                return False, pts, 0, 0.0
+            splits = np.where(np.diff(idx) > 1)[0] + 1
+            found, best_run, lat_center = False, 0, 0.0
+            for g in np.split(idx, splits):
+                if len(g) > best_run:
+                    best_run = len(g)
+                if len(g) >= CHECKER_PILLAR_CLUSTER_MIN_PTS and (np.max(r[g]) - np.min(r[g])) <= CHECKER_PILLAR_CLUSTER_MAX_GAP:
+                    found = True
+                    lat_center = float(np.mean(y[g]))
+            return found, pts, best_run, lat_center
+
+        self.checker_pillar_left_detected,  left_pts,  left_run,  left_y  = _cluster_center(y > 0.0)
+        self.checker_pillar_right_detected, right_pts, right_run, right_y = _cluster_center(y < 0.0)
+
+        if self.checker_pillar_left_detected and self.checker_pillar_right_detected:
+            self.checker_pillar_lat_dist_m = abs(left_y - right_y)
+        else:
+            self.checker_pillar_lat_dist_m = 0.0
+        self._checker_pillar_dbg = (left_pts, left_run, right_pts, right_run, self.checker_pillar_lat_dist_m)
+
+        lat_ok = abs(self.checker_pillar_lat_dist_m - CHECKER_PILLAR_LAT_TARGET_M) <= CHECKER_PILLAR_LAT_TOLERANCE_M
+        if self.checker_pillar_left_detected and self.checker_pillar_right_detected and lat_ok:
+            self._checker_pillar_trigger_cnt += 1
+        else:
+            self._checker_pillar_trigger_cnt = 0
+        self.checker_pillar_trigger = self._checker_pillar_trigger_cnt >= CHECKER_PILLAR_CONFIRM_FRAMES
+
+    # [2-4e] 체크무늬 게이트 통과 후 완만한 조향 램프 (_s0_signal() 'left' 커밋 종료 후 사용)
+    #   checker_pillar_trigger가 뜬 시점에 호출부(_begin_checker_ramp_turn())가
+    #   self._checker_ramp_dist=0.0으로 시작하면, 이후 매 제어주기 이 함수가 누적거리를
+    #   갱신하며 CHECKER_TURN_RAMP_START_ANGLE→
+    #   END_ANGLE 사이 조향각을 반환한다. TURN_DIST_M류와 동일하게 _speed_mps_fallback()
+    #   기반 거리적분이라 VESC 죽음에도 안전(무한 램프 없음). 램프가 끝나면(None, angle=
+    #   END_ANGLE) 튜플을 반환 — 호출부가 ramp_dist를 None으로 리셋하고 다음 로직(예:
+    #   차선인식 복귀)으로 넘어가면 된다.
+    def _checker_turn_ramp_angle(self, cmd_speed):
+        if self._checker_ramp_dist is None:
+            return CHECKER_TURN_RAMP_START_ANGLE, False
+
+        t = min(self._checker_ramp_dist / CHECKER_TURN_RAMP_DIST_M, 1.0)
+        if CHECKER_TURN_RAMP_CURVE == 'ease_in':
+            t = t * t   # 초반 완만, 후반 급격 — 2차 이즈인
+        angle = CHECKER_TURN_RAMP_START_ANGLE + (CHECKER_TURN_RAMP_END_ANGLE - CHECKER_TURN_RAMP_START_ANGLE) * t
+
+        done = self._checker_ramp_dist >= CHECKER_TURN_RAMP_DIST_M
+        if not done:
+            self._checker_ramp_dist += self._speed_mps_fallback(cmd_speed) * 0.05  # 20Hz 제어주기(control_loop) 가정
+        return angle, done
+
     # [2-6] 방해차량 진입 트리거 (라이다)
     #   입력 obstacle_front/dist (라이다)
     #   출력 vehicle_trigger
@@ -2010,24 +2111,45 @@ class TrackDriverNode(Node):
              타므로 출발 직후에도 짧게(≈S2_COMMIT_DIST_M=1m) 이 구간을 거친다 — 출발선은 직선이라
              문제는 없을 것으로 보이나 실차 미검증.
         """
-        if self._turn_dist is not None:
-            self._do_left_turn(next_state=MissionState.S3_SHORTCUT)
+        if self._checker_ramp_dist is not None:
+            self._do_checker_ramp_turn()
             return
+
+        # [2026-08-21] 진입 좌회전(S2→S3)의 _turn_dist 오픈루프 경로는 위 체크무늬 게이트
+        # 램프로 대체돼 더 이상 이 state에서 도달하지 않는다(_begin_left_turn()이 여기서
+        # 더는 호출 안 됨 — 아래 'left' 커밋 분기가 _begin_checker_ramp_turn()을 씀).
+        # _do_left_turn()/TURN_ANGLE류는 _s3_shortcut()의 진출(S3→S1) 좌회전에서 계속 쓰인다.
 
         if self._s2_commit_dist is not None:
             self.ctrl_angle = 0.0
             self.ctrl_speed = APPROACH_SPEED
             self._s2_commit_dist += self._speed_mps_fallback(APPROACH_SPEED) * 0.05  # 20Hz 제어주기(control_loop) 가정
+
+            if self._s2_commit_dir == 'left':
+                # [2026-08-21] 커밋 종료 트리거를 거리(S2_COMMIT_DIST_M) 대신 체크무늬 게이트
+                # 라이다 기둥쌍 검출로 대체(요청 반영, config.py "체크무늬 게이트 라이다
+                # 기둥쌍 검출" 절 참고) — 신호확정 후 정지위치 산포에 안 흔들리는 물리적
+                # 트리거. CHECKER_PILLAR_TIMEOUT_DIST_M 넘도록 기둥쌍이 안 잡히면(라이다
+                # 죽음/오검출) 기존 거리기반 방식으로 강제 폴백해 무한 직진을 막는다.
+                timed_out = self._s2_commit_dist >= CHECKER_PILLAR_TIMEOUT_DIST_M
+                if self.checker_pillar_trigger or timed_out:
+                    if timed_out and not self.checker_pillar_trigger:
+                        self.get_logger().warn(
+                            f'체크무늬 게이트 기둥쌍 미검출(거리 {self._s2_commit_dist:.2f}m) '
+                            '— 타임아웃으로 좌회전 램프 강제 시작')
+                    self._s2_commit_dist = None
+                    self._s2_commit_dir  = None
+                    self._begin_checker_ramp_turn()
+                return
+
             if self._s2_commit_dist >= S2_COMMIT_DIST_M:
                 commit_dir = self._s2_commit_dir
                 self._s2_commit_dist = None
                 self._s2_commit_dir  = None
-                if commit_dir == 'straight':
-                    self._behavior_enabled = True
-                    self._signal_reentry_cooldown_t = time.time() + SIGNAL_REENTRY_COOLDOWN
-                    self._change_state(MissionState.S1_LANE_FOLLOW)
-                else:
-                    self._begin_left_turn()
+                # commit_dir == 'straight'만 여기 남는다('left'는 위에서 이미 처리하고 return)
+                self._behavior_enabled = True
+                self._signal_reentry_cooldown_t = time.time() + SIGNAL_REENTRY_COOLDOWN
+                self._change_state(MissionState.S1_LANE_FOLLOW)
             return
 
         self.ctrl_angle, self.ctrl_speed = 0.0, SPEED_STOP
@@ -2124,7 +2246,11 @@ class TrackDriverNode(Node):
         되돌렸다(요청 반영, config.py "좌회전 공통" 절 주석 참고). 고정 조향각(trn_ang)을
         고정 이동거리(trn_dist)만큼 유지하다가 끝낸다 — S2_COMMIT_DIST_M(_s0_signal())과
         동일한 적분 패턴(_speed_mps_fallback(), VESC 실측 + 명령속도 폴백)이라 IMU 없이도
-        VESC 장애 시 무한 회전 없이 항상 끝난다."""
+        VESC 장애 시 무한 회전 없이 항상 끝난다.
+
+        [2026-08-21] next_state==S3_SHORTCUT 분기(TURN_ANGLE류)는 진입 좌회전이 체크무늬
+        게이트 램프(_do_checker_ramp_turn())로 대체되며 현재 호출부가 없다 — 함수/분기는
+        되돌릴 경우를 대비해 남겨둠. next_state==S1_LANE_FOLLOW(진출, S3→S1)는 계속 사용."""
         if next_state == MissionState.S3_SHORTCUT:
             trn_ang, trn_spd, trn_dist = TURN_ANGLE, TURN_SPEED, TURN_DIST_M
         else:
@@ -2140,6 +2266,25 @@ class TrackDriverNode(Node):
             if next_state == MissionState.S1_LANE_FOLLOW:
                 self._signal_reentry_cooldown_t = time.time() + SIGNAL_REENTRY_COOLDOWN
             self._change_state(next_state)
+
+    # ── 진입 좌회전 — 체크무늬 게이트 라이다 기둥쌍 트리거 + 완만한 조향 램프 ──
+    #   [2026-08-21] _begin_left_turn()/_do_left_turn(next_state=S3_SHORTCUT)을 대체(요청
+    #   반영) — S2_COMMIT_DIST_M 거리기반 대신 perc_checker_pillar()의 라이다 기둥쌍
+    #   검출로 커밋 종료를 판단하고(_s0_signal() 'left' 분기 참고), 고정각 즉시 진입 대신
+    #   CHECKER_TURN_RAMP_START_ANGLE→END_ANGLE로 서서히 조향을 올린다.
+    def _begin_checker_ramp_turn(self):
+        self._checker_ramp_dist = 0.0
+        self.get_logger().info('체크무늬 게이트 통과 — 좌회전 램프 시작')
+
+    def _do_checker_ramp_turn(self):
+        angle, done = self._checker_turn_ramp_angle(TURN_SPEED)
+        self.ctrl_angle = angle
+        self.ctrl_speed = TURN_SPEED
+        if done:
+            self.get_logger().info('체크무늬 게이트 좌회전 램프 완료')
+            self._checker_ramp_dist = None
+            self._signal_reentry_cooldown_t = time.time() + SIGNAL_REENTRY_COOLDOWN
+            self._change_state(MissionState.S3_SHORTCUT)
 
     def _yaw_delta(self, start):
         """현재 yaw - start (−π~π wrap)"""
@@ -2668,6 +2813,16 @@ class TrackDriverNode(Node):
                 f'좌회전 중: {self._turn_dist:.2f}m / {trn_dist_target:.2f}m',
                 (10, 140), (0, 255, 255), 16,
                 f'TURNING: {self._turn_dist:.2f} / {trn_dist_target:.2f} m'))
+        elif self._checker_ramp_dist is not None:
+            # [2026-08-21] 체크무늬 게이트 램프(_do_checker_ramp_turn())도 같은 창에서
+            # 보이게 — _turn_dist가 아니라 _checker_ramp_dist를 쓰므로 위 turn_active만
+            # 보면 "진행 중 아님"으로 오인됨.
+            lines.append((
+                f'체크무늬 램프 중: {self._checker_ramp_dist:.2f}m / {CHECKER_TURN_RAMP_DIST_M:.2f}m '
+                f'(angle={self.ctrl_angle:.1f}°)',
+                (10, 140), (0, 255, 255), 14,
+                f'CHECKER RAMP: {self._checker_ramp_dist:.2f} / {CHECKER_TURN_RAMP_DIST_M:.2f} m '
+                f'(angle={self.ctrl_angle:.1f} deg)'))
         else:
             lines.append(('좌회전 진행 중 아님', (10, 140), (150, 150, 150), 14, 'not turning'))
         put_text_kr_multi(canvas, lines)

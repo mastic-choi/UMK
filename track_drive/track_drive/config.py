@@ -936,6 +936,52 @@ CHECKER_DARK_RATIO_TH   = 0.15  # ROI 내 검정 비율이 이 이상이어야 �
 CHECKER_YELLOW_RATIO_TH = 0.10  # ROI 내 노란 비율이 이 이상이어야 함
 CHECKER_CONFIRM_FRAMES = 2      # 연속 이 프레임 이상 위 조건을 만족해야 "게이트 확정"(오검출 디바운스, LAP_YAW_CONFIRM_FRAMES와 동일 패턴)
 
+# ── 좌회전 진입 랜드마크 — 체크무늬 게이트 라이다 기둥쌍 검출 (perc_checker_pillar()) ──
+#   [2026-08-21] 위 CHECKER_ROI_*(비전, HSV+비율)와 이번 세션에 시도한 3가지 변형(면적+
+#   테두리접촉, 전이횟수, 폭균일성)까지 전부 실제 캡처(signal_masking_dataset + lap_001
+#   오검출 프레임)로 검증했지만 배경(사람/의자/나무바닥)이 체커보드보다 더 어둡고 더
+#   노란 경우가 많아 임계값으로 못 갈랐다 — 비전 휴리스틱은 이 마커엔 한계가 뚜렷하다고
+#   판단(요청 반영). 대신 체크무늬 게이트가 걸린 신호등 게이트 구조물의 실측 좌우 기둥
+#   간격(≈0.98m)을 라이다로 직접 재는 방식으로 실험 전환 — perc_lavacon_trigger()와
+#   완전히 동일한 패턴(극좌표→직교좌표, 종방향 ROI, 좌/우(y>0/y<0) 클러스터 각각 탐지)을
+#   재사용하되, 라바콘엔 없던 "좌우 클러스터 간 횡방향 거리가 실측값과 일치해야 함" 조건을
+#   추가해 다른 트랙 구조물과의 오인식을 줄인다. 조명/색상에 전혀 안 흔들리는 순수 기하
+#   측정이라 이번 세션에서 반복 실패한 비전 휴리스틱보다 신뢰도가 높을 것으로 기대되나,
+#   이 저장소엔 실제 라이다 캡처 데이터가 없어 로직 자체를
+#   실측 검증하지 못했다 — 실차에서 반드시 확인할 것. LON_MIN/MAX는 "기둥이 차량 바로
+#   옆을 지나는 순간"을 잡으려는 추정치라 perc_lavacon_trigger()의 0.3~0.5m보다 더 넓게
+#   잡아뒀다(게이트 구조물이 콘보다 커서 감지 가능 구간도 더 길 것으로 추정) — 전부 실차
+#   미검증 초기값.
+CHECKER_PILLAR_LON_MIN = 0.1        # 트리거 ROI 전방 종방향 하한(m)
+CHECKER_PILLAR_LON_MAX = 0.8        # 트리거 ROI 전방 종방향 상한(m)
+CHECKER_PILLAR_LAT_MAX = 2.0        # 트리거 ROI 횡방향 한계(m) — perc_lavacon_trigger()와 동일
+CHECKER_PILLAR_CLUSTER_MIN_PTS = 2  # 클러스터 최소 연속 포인트 수 — perc_lavacon_trigger()와 동일
+CHECKER_PILLAR_CLUSTER_MAX_GAP = 0.35  # 같은 클러스터로 볼 최대 거리편차(m) — 기둥 굵기 실측 후 재조정할 것(콘 지름 근사값 그대로 재사용 중)
+CHECKER_PILLAR_LAT_TARGET_M = 0.98  # 좌우 기둥 사이 실측 횡방향 간격(m) — 사용자 실측값
+CHECKER_PILLAR_LAT_TOLERANCE_M = 0.15  # 위 실측값과의 허용 오차(m) — 라이다 노이즈/기둥 굵기 감안 추정치, 실차 미검증
+CHECKER_PILLAR_CONFIRM_FRAMES = 2   # 연속 이 프레임 이상 좌우+간격 조건을 만족해야 확정(디바운스)
+CHECKER_PILLAR_TIMEOUT_DIST_M = 2.0  # [안전장치] 커밋 시작 후 이 거리(m)까지 기둥쌍이 안 잡히면
+                                      #   (라이다 죽음/오검출 등) _s0_signal()이 기존 S2_COMMIT_DIST_M
+                                      #   방식(고정거리)으로 강제 폴백 — 기둥쌍을 영원히 기다리다 차선을
+                                      #   놓치고 계속 직진하는 사고를 막는다. S2_COMMIT_DIST_M(1.0m)보다
+                                      #   넉넉히 크게 잡아 기둥 검출에 시간을 준다. 실차 미검증 초기값.
+
+# ── 좌회전 진입 — 체크무늬 게이트 통과 후 완만한 조향 램프 ──
+#   [2026-08-21] 위 라이다 기둥쌍 트리거가 확정되는 순간부터, 고정 조향각을 즉시 걸지
+#   않고 CHECKER_TURN_RAMP_START_ANGLE에서 CHECKER_TURN_RAMP_END_ANGLE까지
+#   CHECKER_TURN_RAMP_DIST_M 동안 서서히 올린다(요청 반영: "-10~-30으로 완만히"). 거리
+#   적분은 TURN_DIST_M류와 동일하게 _speed_mps_fallback() 기반(VESC 실측 + 명령속도
+#   폴백)이라 이 램프도 그 안전장치를 그대로 물려받는다. CHECKER_TURN_RAMP_CURVE='linear'
+#   면 거리에 선형 비례, 'ease_in'이면 초반은 완만하고 후반에 각도가 빨리 붙는 2차 곡선
+#   (요청의 "선형 or 곡선" 중 곡선 옵션) — 기본은 실차 튜닝 편의상 단순한 linear
+#   (config.py "좌회전 공통" 절의 기존 방침과 동일 이유). _s0_signal()의 'left' 커밋 구간
+#   종료 트리거로 연결됨(요청 반영, S2_COMMIT_DIST_M 거리기반 대신 기둥쌍 검출로 대체) —
+#   CHECKER_PILLAR_TIMEOUT_DIST_M 초과 시엔 기존 거리기반으로 안전 폴백.
+CHECKER_TURN_RAMP_START_ANGLE = -10.0
+CHECKER_TURN_RAMP_END_ANGLE   = -30.0
+CHECKER_TURN_RAMP_DIST_M      = 0.5     # 이 거리(m) 동안 START→END로 올림 — 실차 미검증 초기값
+CHECKER_TURN_RAMP_CURVE       = 'linear'  # 'linear' | 'ease_in'
+
 # [2026-08-07] ll을 흰선/노란선으로 분리하는 데 쓰는 커넥티드 컴포넌트 투표 기준
 # (DL_CENTER_MODE='ll' 전용, DLSlideWindow._split_ll_by_yellow() 참고). ll 픽셀 자체는
 #   흰/노랑 구분이 없으므로(위 YELLOW_LOWER/UPPER 주석 참고), ll_mask의 커넥티드
