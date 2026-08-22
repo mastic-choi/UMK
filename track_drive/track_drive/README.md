@@ -2533,6 +2533,25 @@ push를 켜는 게이트가 있었는데, 실차에서 라이다 클러스터는
 B2/B3(`lidar_bev`) 디버깅이 다시 필요하면 `DEBUG_VIZ_LIDAR`를 다시 True로 되돌릴 것 — 서로
 독립 스위치라 다른 항목엔 영향 없음.
 
+### 3.10 진입 확정 후 cone YOLO 정지, 탈출 시 재개 (2026-08-23)
+
+**배경:** `_active_yolo_stage()`가 `Phase.LAVACON`인 동안엔 진입 전/후 구분 없이
+`perc_yolo_cone()`을 계속 호출해왔는데, 라바콘 사이를 실제로 통과 주행하는 동안엔 콘이
+카메라 시야를 가려 프레임이 제대로 안 나온다는 실차 관찰(요청 반영) — 이 구간엔 추론을
+계속 돌릴 실익이 없다.
+
+**수정 (`track_drive.py` `_active_yolo_stage()`):** `Phase.LAVACON` 분기를
+`self._lavacon_engaged` 기준으로 나눴다 — 진입 확정 전(트리거 대기 중, `perc_lavacon_trigger()`
+의 `cone_confirmed_cam` 판정에 여전히 필요)엔 그대로 `'cone'`을 반환하고, 진입 확정 후엔
+`None`을 반환해 `perc_yolo_cone()` 호출을 스킵(`perceive_all()`이 `self.cone_detected_yolo`를
+`False`로 리셋)한다. 탈출(`lavacon_done` 확정 → `Phase.OBSTACLE_ZONE` 전환) 시점부터는 별도
+처리 없이 기존 `Phase.OBSTACLE_ZONE` 분기(`'cone' if not self._b2_passed else 'vehicle'`)가
+그대로 다시 켜서, B2(고정장애물) 판정용 cone YOLO가 자동 재개된다.
+
+**알려진 한계:** `lavacon_done`(탈출 판정, `process_lavacon()`)은 원래부터 라이다만 쓰고
+YOLO에 의존하지 않으므로 이 변경으로 탈출 판정 자체엔 영향 없음 — 실차 미검증(요청 시점
+기준).
+
 ---
 
 ## 4. 사물회피 (B2_OBSTACLE, 고정장애물)
@@ -2938,6 +2957,59 @@ PHASE_EACH_LAP` 리셋 경로.
 `perception/perc_lavacon.py` 158번 줄) — **이 좌표에서 해당 위치 유령 점이 실차에서 완전히
 가려지는 것을 확인함.** 근본 원인(차체/마운트 자기반사로 사실상 확정 — 차체를 들어올리면
 점이 사라짐을 확인) 조사 자체는 여전히 미완료.
+
+### 5.11 push 안전마진 좌우 폭 2배 + push 세기 2배 (2026-08-22b, 실차 미검증)
+
+**배경:** 사용자가 `lavacon_bev` 디버그창에서 "인접하면 민다"고 판정하는 보라색 안전마진
+라인(±`LAVACON_PUSH_SAFETY_MARGIN_M`) 구간이 좁아 보인다며 좌우 폭을 2배로, 동시에 실제
+미는 세기(`push_m`)도 2배로 늘려달라고 요청.
+
+**조치:** `config.py`
+- `LAVACON_PUSH_SAFETY_MARGIN_M`: `0.13` → `0.26`(공교롭게도 §3.5의 "0.26→0.13 절반 축소"
+  직전 값으로 정확히 복귀) — margin이 좌우 대칭이라 이 값을 2배 하면 "인접 판정" 구간의
+  좌우 폭이 그대로 2배가 된다.
+- `LAVACON_PUSH_GAIN`(신설, `2.0`) — margin 침범량(`push_m`)에 곱하는 배율. margin 폭
+  확대와는 별개 축으로, "밀리는 정도 자체"를 키우는 게 목적이라 분리했다.
+
+`track_drive.py`
+- `_lavacon_steer_da_push()`: `push_m` 계산 직후(`push_px` 환산 전) `push_m *= LAVACON_PUSH_GAIN`.
+- `_draw_lavacon_bev()`(디버그 표시용 `push_m` 재계산 블록): 위와 동일하게 `LAVACON_PUSH_GAIN`을
+  곱해 실제 조향에 쓰이는 값과 표시값을 동기화(안 하면 디버그창 숫자만 옛날 세기로 보임). 하단
+  `margin=...` 텍스트에 `gain=...x`도 같이 표시하도록 추가.
+
+**알려진 한계:** 실차 미검증 — margin을 넓힌 만큼 콘에 더 일찍 반응하고, gain까지 곱해져
+조향이 더 세게 걸린다. 너무 이르게/세게 꺾이면 §3.5 사례처럼 각각 다시 낮출 것(두 값은
+독립적으로 튜닝 가능).
+
+### 5.12 B1 진입 전 `near_obstacle`(근접 장애물 급회피) 오발동 — `_lane_steer()`에 `Phase.LAVACON` 가드 추가 (2026-08-22)
+
+**증상:** 사용자가 "B1(라바콘) 진입 전에 B2(고정장애물회피)가 먼저 발동되는 것 같다"고 실차에서 보고.
+
+**원인:** `_lane_steer()`(`_lane_drive()`가 매 틱 호출하는 일반 S1 차선주행 조향)가 `path`를
+명시로 안 받는 분기에서 `near_obstacle = self.obstacle_front and self.obstacle_dist <
+AVOID_HOLD_TRIGGER_DIST_M`(§2.46)을 계산할 때 `self.phase`를 전혀 보지 않았다.
+`perc_obstacle()`의 전방 ROI(5m×1.5m 반폭)는 Phase와 무관하게 매 틱 갱신되므로, B1 라바콘
+구간에 접근하는 동안(아직 `lavacon_trigger`가 안 걸려 `_lavacon_engaged=False`인 대기
+구간 — `_s1_lane_follow()`가 그대로 `_lane_drive()`를 돌리는 시점) 콘 자체가 "전방
+고정장애물"로 잡혀 `obstacle_front=True`+`obstacle_dist`가 `AVOID_HOLD_TRIGGER_DIST_M`
+아래로 떨어지면 `near_obstacle=True`가 되고, `pure_pursuit.control()`의 목표점 선택이
+`_target_point_max_deviation()`(장애물 회피 전용 로직, §2.46)으로 전환돼 급조향이 나갔다 —
+B2 FSM(`behavior_state==B2_OBSTACLE`) 자체가 켜진 건 아니지만(그 경로는 §4.3 이후 이미
+죽어있음, `run_behavior_fsm()` 참고) 회피 조향이라는 결과물만 놓고 보면 "B2가 라바콘보다
+먼저 발동"한 것처럼 보였다. `perc_obstacle_cut_trigger()`/`_update_obstacle_cut_hold()`는
+이미 `self.phase == Phase.LAVACON`이면 트리거를 죽이도록 가드가 걸려 있었는데(각 함수
+주석 참고), `_lane_steer()`의 이 분기만 같은 가드가 빠져 있었다.
+
+**수정:** `track_drive.py` `_lane_steer()` — `near_obstacle` 계산에
+`self.phase != Phase.LAVACON` 조건을 AND로 추가. `Phase.OBSTACLE_ZONE`(=B1 완료,
+`run_behavior_fsm()`의 `Phase.LAVACON→OBSTACLE_ZONE` 전환 이후)부터만 이 근접회피가
+실제로 발동한다.
+
+**알려진 한계:** 실차 재검증 필요 — 이번 수정으로 B1 대기/진행 구간에서 콘으로 인한
+급조향은 없어지지만, `perc_obstacle()`의 전방 ROI 자체는 여전히 라바콘을 "고정장애물"로
+계속 인식해 `obstacle_front`/`obstacle_type` 값이 채워진다(표시/스냅샷용이라 무해 —
+avoid_hold의 실제 조향 개입인 `_clip_da_by_ll()`의 방향 힌트는 현재
+`DL_CENTER_MODE='da'`+`DL_DA_SKIP_LL_CLIP=True`라 비활성 상태).
 
 ---
 

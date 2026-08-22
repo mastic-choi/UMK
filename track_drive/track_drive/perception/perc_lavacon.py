@@ -129,6 +129,18 @@ CONE_LAT_LIMIT   = 0.5          # 콘 후보 점의 횡방향 한계 (m) — [20
 OFFSET_CLAMP     = 0.8          # 편차 물리한계 (m) — 콘 사이 폭 초과값은 오검출로 간주
 OFFSET_GAIN      = 1.0          # y평균 → offset 스케일 계수 (제어팀 LAVACON_KP와 별도, 여기선 1:1)
 
+# [2026-08-22] 종료 판정 ROI — 요청 반영, track_drive.py perc_lavacon_trigger()의 진입
+#   트리거 박스(LON_MIN/LON_MAX/LAT_MAX)와 동일 크기로 축소. 예전엔 CONE_LON_MAX/
+#   CONE_LAT_LIMIT(4.0m×±0.5m, 구간 전체를 넓게 보는 종료판정용 ROI)를 그대로 썼으나,
+#   "진입 때 본 것과 같은 크기의 박스에 1개도 안 찍히면 종료"로 판정 기준을 바꿔달라는
+#   요청으로 전용 상수를 새로 둔다 — CONE_LON_MAX/CONE_LAT_LIMIT는 박스 스택 경로(path_m)
+#   탐색 범위로 계속 쓰이므로 그대로 둔다(용도가 다름). 값은 perc_lavacon_trigger()의
+#   LON_MIN/LON_MAX/LAT_MAX(-0.1~0.3m, ±0.75m)를 복사(두 값은 항상 같이 바꿀 것 — 위
+#   BODY_LO/HI 주석과 동일 관례).
+EXIT_LON_MIN     = -0.1
+EXIT_LON_MAX     = 0.3
+EXIT_LAT_LIMIT   = 0.75
+
 # [2026-08-19] 박스 스택 페어링 파라미터 — track_drive.py perc_lavacon_trigger()의 진입
 #   트리거 박스와 반드시 같은 폭을 유지할 것(BOX_LON_START=LON_MIN, BOX_LON_WIDTH=
 #   LON_MAX-LON_MIN, 트리거 쪽은 0.3~0.7). perc_lavacon.py와 perc_lavacon_trigger()가
@@ -448,18 +460,19 @@ def process_lavacon(lidar_ranges, prev_boxes=None):
     if x is None:
         return (0.0, True, [], None)
 
-    # ── 3) 종료 판정용 콘 후보 필터링 : 전방 넓은 ROI 안의 유효 점만 남김 ──
-    # 벽·원거리 구조물처럼 트랙과 무관한 점을 배제하기 위해 콘이 존재할 수 있는 영역으로
-    # 제한한다. 아래 5)의 박스 스택 탐색과는 별개 — 종료 판정은 넓은 범위로 봐야
-    # 콘 간격이 벌어진 순간에 "아직 구간 안"인데도 종료로 오판하지 않는다.
-    cone_mask = (ranges > 0.0) & (x > LON_MIN) & (x < CONE_LON_MAX) & (np.abs(y) < CONE_LAT_LIMIT)
+    # ── 3) 종료 판정용 콘 후보 필터링 : 진입 트리거와 동일 크기 ROI 안의 유효 점만 남김 ──
+    # [2026-08-22] 요청 반영 — 예전엔 CONE_LON_MAX/CONE_LAT_LIMIT(4.0m×±0.5m)로 넓게 봤으나,
+    # "진입 때 본 것과 같은 크기의 박스에 1개도 안 찍히면 종료"로 바꿔 EXIT_LON_MIN/MAX/
+    # LAT_LIMIT(perc_lavacon_trigger() 트리거 박스와 동일 크기, 위 상수 선언부 주석 참고)를 쓴다.
+    cone_mask = (ranges > 0.0) & (x > EXIT_LON_MIN) & (x < EXIT_LON_MAX) & (np.abs(y) < EXIT_LAT_LIMIT)
     py_cone = y[cone_mask]
 
     # ── 4) 종료 판정 : 좌·우 어느 쪽에도 콘이 없어야 라바콘 구간 끝 ──
     # 구 로직은 "우측(y<0) 콘 소멸"만 봤는데, 콘 간격이 유동적인 코스에서는
     # 우측에 넓은 틈이 하나만 있어도 곧바로 '구간 끝'으로 오판한다.
     # 한쪽 줄이라도 보이면 아직 구간 안이라고 보는 편이 안전하다.
-    # (디바운스는 상위 FSM(_handle_lavacon)의 LAVACON_DONE_FRAMES에서 수행)
+    # (디바운스는 상위 FSM(_handle_lavacon)의 LAVACON_DONE_FRAMES에서 수행 — 1초 이상 연속
+    # 유지돼야 확정, config.py LAVACON_DONE_FRAMES 주석 참고)
     has_left  = bool(np.any(py_cone > 0.0))
     has_right = bool(np.any(py_cone < 0.0))
     lavacon_done = not (has_left or has_right)

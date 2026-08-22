@@ -631,7 +631,14 @@ class TrackDriverNode(Node):
             return 'signal'
         if self.mission_state == MissionState.S1_LANE_FOLLOW:
             if self.phase == Phase.LAVACON:
-                return 'cone'
+                # [2026-08-23] 진입 확정(_lavacon_engaged) 전까지는 진입 트리거 판정
+                # (perc_lavacon_trigger()의 cone_confirmed_cam)에 cone YOLO가 필요하지만,
+                # 일단 진입이 확정된 뒤(라바콘 사이를 실제로 통과 주행하는 동안)엔 콘이
+                # 카메라 시야를 가려 프레임이 제대로 안 나오는 구간이라 추론을 계속 돌릴
+                # 실익이 없다 — 여기서 끈다. 탈출(lavacon_done 확정 → Phase.OBSTACLE_ZONE
+                # 전환) 시점부터는 아래 OBSTACLE_ZONE 분기가 고정장애물(B2) 판정을 위해
+                # 자동으로 다시 'cone'을 켠다.
+                return 'cone' if not self._lavacon_engaged else None
             if self.phase == Phase.OBSTACLE_ZONE:
                 return 'cone' if not self._b2_passed else 'vehicle'
             return 'signal'  # Phase.DONE — 다음 교차로 신호등 보드 대기
@@ -1717,18 +1724,19 @@ class TrackDriverNode(Node):
                       to_px(LAVACON_PUSH_LON_MAX, -LAVACON_PUSH_LAT_LIMIT), (200, 0, 200), 1)
         cv2.putText(bev, 'PUSH ROI', to_px(LAVACON_PUSH_LON_MAX, LAVACON_PUSH_LAT_LIMIT),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 0, 200), 1, cv2.LINE_AA)
-        # 안전마진 경계선(±LAVACON_PUSH_SAFETY_MARGIN_M) — 이 선보다 안쪽으로 콘이 들어오면
-        # 반대쪽으로 밀린다.
-        cv2.line(bev, to_px(LAVACON_PUSH_LON_MIN, LAVACON_PUSH_SAFETY_MARGIN_M),
-                 to_px(LAVACON_PUSH_LON_MAX, LAVACON_PUSH_SAFETY_MARGIN_M), (140, 0, 140), 1, cv2.LINE_AA)
-        cv2.line(bev, to_px(LAVACON_PUSH_LON_MIN, -LAVACON_PUSH_SAFETY_MARGIN_M),
-                 to_px(LAVACON_PUSH_LON_MAX, -LAVACON_PUSH_SAFETY_MARGIN_M), (140, 0, 140), 1, cv2.LINE_AA)
+        # 안전마진 경계선(좌 LAVACON_PUSH_SAFETY_MARGIN_L_M / 우 _R_M) — 이 선보다 안쪽으로
+        # 콘이 들어오면 반대쪽으로 밀린다.
+        cv2.line(bev, to_px(LAVACON_PUSH_LON_MIN, LAVACON_PUSH_SAFETY_MARGIN_L_M),
+                 to_px(LAVACON_PUSH_LON_MAX, LAVACON_PUSH_SAFETY_MARGIN_L_M), (140, 0, 140), 1, cv2.LINE_AA)
+        cv2.line(bev, to_px(LAVACON_PUSH_LON_MIN, -LAVACON_PUSH_SAFETY_MARGIN_R_M),
+                 to_px(LAVACON_PUSH_LON_MAX, -LAVACON_PUSH_SAFETY_MARGIN_R_M), (140, 0, 140), 1, cv2.LINE_AA)
         # 검출된 좌/우 최근접 콘의 y위치를 ROI 폭 전체에 걸친 가로 눈금선으로 표시. 마진
         # 침범 중이면 파랑(=지금 미는 중), 안전하면 초록/주황.
-        for py, base_col in ((push_left_y, (0, 255, 0)), (push_right_y, (0, 140, 255))):
+        for py, base_col, margin in ((push_left_y, (0, 255, 0), LAVACON_PUSH_SAFETY_MARGIN_L_M),
+                                      (push_right_y, (0, 140, 255), LAVACON_PUSH_SAFETY_MARGIN_R_M)):
             if py is None:
                 continue
-            col = (255, 80, 0) if abs(py) < LAVACON_PUSH_SAFETY_MARGIN_M else base_col
+            col = (255, 80, 0) if abs(py) < margin else base_col
             cv2.line(bev, to_px(LAVACON_PUSH_LON_MIN, py), to_px(LAVACON_PUSH_LON_MAX, py), col, 2)
         # [2026-08-22] 위 눈금선은 "이 y값이다"라고 ROI 전체 폭에 걸쳐 그은 안내선이라, 그
         # y값을 만든 원본 점이 실제로 어디(전후 x까지) 있는지는 안 보여준다는 문제 제기 —
@@ -1785,10 +1793,11 @@ class TrackDriverNode(Node):
         # push ROI(자홍) 검출값 + 지금 실제로 나가는 push량/방향 — _lavacon_steer_da_push()와
         # 완전히 같은 부호 규약(좌측 콘 침범→+, 우측 콘 침범→-).
         push_m = 0.0
-        if push_left_y is not None and push_left_y < LAVACON_PUSH_SAFETY_MARGIN_M:
-            push_m += LAVACON_PUSH_SAFETY_MARGIN_M - push_left_y
-        if push_right_y is not None and -push_right_y < LAVACON_PUSH_SAFETY_MARGIN_M:
-            push_m -= LAVACON_PUSH_SAFETY_MARGIN_M - (-push_right_y)
+        if push_left_y is not None and push_left_y < LAVACON_PUSH_SAFETY_MARGIN_L_M:
+            push_m += LAVACON_PUSH_SAFETY_MARGIN_L_M - push_left_y
+        if push_right_y is not None and -push_right_y < LAVACON_PUSH_SAFETY_MARGIN_R_M:
+            push_m -= LAVACON_PUSH_SAFETY_MARGIN_R_M - (-push_right_y)
+        push_m *= LAVACON_PUSH_GAIN  # [2026-08-22b] _lavacon_steer_da_push()와 동일 배율 — 표시값 동기화
         push_left_s = 'N/A' if push_left_y is None else f'{push_left_y:.3f}m'
         push_right_s = 'N/A' if push_right_y is None else f'{push_right_y:.3f}m'
         push_col = (255, 80, 0) if push_m != 0.0 else (200, 0, 200)
@@ -1808,7 +1817,7 @@ class TrackDriverNode(Node):
         xr_s = 'N/A' if push_right_x is None else f'{push_right_x:.3f}'
         cv2.putText(bev, f'(range,x ref only) L=({xl_s},{rl_s}) R=({xr_s},{rr_s}) - push uses L_y/R_y only',
                     (8, 154), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 200, 255), 1, cv2.LINE_AA)
-        cv2.putText(bev, f'margin={LAVACON_PUSH_SAFETY_MARGIN_M:.2f}m '
+        cv2.putText(bev, f'margin L={LAVACON_PUSH_SAFETY_MARGIN_L_M:.2f}m R={LAVACON_PUSH_SAFETY_MARGIN_R_M:.2f}m gain={LAVACON_PUSH_GAIN:.1f}x '
                           f'lon={LAVACON_PUSH_LON_MIN:.1f}~{LAVACON_PUSH_LON_MAX:.1f}m '
                           f'lat=+-{LAVACON_PUSH_LAT_LIMIT:.1f}m',
                     (8, 176), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1, cv2.LINE_AA)
@@ -2670,7 +2679,16 @@ class TrackDriverNode(Node):
             # 매 틱 갱신하므로 별도 stale 가드 없이 바로 써도 안전하다(_update_avoid_hold()와
             # 동일 근거). AVOID_HOLD_TRIGGER_DIST_M(기존 상수, 1.5m) 재사용 — 별도 상수
             # 안 늘림(요청 반영). pure_pursuit.py _target_point_max_deviation() 참고.
-            near_obstacle = self.obstacle_front and self.obstacle_dist < AVOID_HOLD_TRIGGER_DIST_M
+            # [2026-08-22] 요청 반영 — B1(Phase.LAVACON) 중엔 이 근접회피도 죽인다.
+            # perc_obstacle()의 전방 ROI(5m×1.5m 반폭)가 라바콘 자체를 "고정장애물"로
+            # 잡아 obstacle_front/dist가 갱신되면, B1 진입 트리거(좌우 라이다 클러스터
+            # 동시검출)가 아직 안 걸린 대기 구간에서도 목표점 선택이 _target_point_max_deviation()
+            # 으로 바뀌어 콘 구간 진입 전부터 급조향(=B2 회피처럼 보이는 거동)이 나가는
+            # 문제가 실차에서 확인됨 — perc_obstacle_cut_trigger()/_update_obstacle_cut_hold()에
+            # 이미 걸려있는 것과 동일한 Phase.LAVACON 가드를 여기도 추가한다. Phase.OBSTACLE_ZONE
+            # 진입(=B1 완료) 후에만 실제로 발동한다.
+            near_obstacle = (self.phase != Phase.LAVACON
+                              and self.obstacle_front and self.obstacle_dist < AVOID_HOLD_TRIGGER_DIST_M)
         if not path or vehicle_x is None:
             return self.pure_pursuit.prev_steer_deg
         vehicle_xy = (vehicle_x, path[0][1] if vehicle_y_px is None else vehicle_y_px)
@@ -3484,10 +3502,11 @@ class TrackDriverNode(Node):
             self.lidar_ranges, LAVACON_PUSH_LON_MIN, LAVACON_PUSH_LON_MAX,
             LAVACON_PUSH_LAT_LIMIT)
         push_m = 0.0
-        if left_y is not None and left_y < LAVACON_PUSH_SAFETY_MARGIN_M:
-            push_m += LAVACON_PUSH_SAFETY_MARGIN_M - left_y        # 좌측 콘 침범 → 우측(+)으로
-        if right_y is not None and -right_y < LAVACON_PUSH_SAFETY_MARGIN_M:
-            push_m -= LAVACON_PUSH_SAFETY_MARGIN_M - (-right_y)    # 우측 콘 침범 → 좌측(-)으로
+        if left_y is not None and left_y < LAVACON_PUSH_SAFETY_MARGIN_L_M:
+            push_m += LAVACON_PUSH_SAFETY_MARGIN_L_M - left_y        # 좌측 콘 침범 → 우측(+)으로
+        if right_y is not None and -right_y < LAVACON_PUSH_SAFETY_MARGIN_R_M:
+            push_m -= LAVACON_PUSH_SAFETY_MARGIN_R_M - (-right_y)    # 우측 콘 침범 → 좌측(-)으로
+        push_m *= LAVACON_PUSH_GAIN  # [2026-08-22b] 요청 반영 — 미는 세기 2배
         push_px = push_m * DL_PIXELS_PER_METER
         # [2026-08-22] 요청 반영 — 이번 틱에 실제로 밀렸는지(lavacon_bev의 push ROI/
         # 자홍 박스가 콘 침범을 잡아 push_m이 0이 아닌 경우)를 DA 디버그창에도 반영한다

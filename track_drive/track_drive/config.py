@@ -1528,8 +1528,12 @@ STABLE_JUMP_MAX = 15   # 이 이상(px) 차이나면 "같은 흐름"이 아닌 �
 PATH_EMA_ALPHA = 0.25   # 새 프레임에 줄 가중치(작을수록 더 부드럽고, 더 느리게 반응)
 
 # ── 라바콘/장애물/방해차량/신호등 트리거 ──
-LAVACON_DONE_FRAMES = 40      # [2026-08-21, 요청 반영] 80(≈4초)→40 — 좌우 콘 미검출이 연속
-                               #   N프레임(20Hz→약 2초) 쌓이면 Phase 전환(디바운스)
+LAVACON_DONE_FRAMES = 20      # [2026-08-22, 요청 반영] 40(≈2초)→20 — 종료판정 ROI를
+                               #   perc_lavacon_trigger() 트리거 박스와 동일 크기로 축소한
+                               #   것과 함께, "그 박스에 1초 이상 아무것도 안 찍히면 종료"로
+                               #   조건을 바꿨다(20Hz 고정주기 기준 20프레임=1초,
+                               #   perc_lavacon.py EXIT_LON_MIN/MAX/LAT_LIMIT 주석 참고).
+                               #   좌우 콘 미검출이 연속 N프레임 쌓이면 Phase 전환(디바운스)
 LAVACON_TRIGGER_FRAMES = 5    # (YOLO 콘 검출 AND 좌우 라이다 클러스터 동시검출)이 연속 N프레임
                                #   쌓이면 B1_LAVACON 진입 확정. [2026-08-07] 카메라(YOLO)+라이다
                                #   이중확인으로 강화 — 값 자체는 기존 그대로 유지.
@@ -1575,7 +1579,19 @@ LAVACON_STEER_MODE_DA_PUSH = True
 #   올릴 것.
 # [2026-08-22] 0.26 → 0.13(요청 반영, 실차 미검증) — push가 너무 세게/일찍 걸린다는
 #   판단으로 절반으로 낮춤. 콘을 스치면 다시 올릴 것.
-LAVACON_PUSH_SAFETY_MARGIN_M = 0.13
+# [2026-08-22b] 0.13 → 0.26(요청 반영, 실차 미검증) — lavacon_bev 디버그창에서 "인접하면
+#   민다"고 판정하는 보라색 안전마진 라인(±margin) 구간이 너무 좁아 보인다는 지적으로
+#   좌우 폭을 2배로 되돌림(공교롭게도 위 2026-08-22 절반값과 정확히 반대라 원래 0.26으로
+#   복귀). push 세기 자체는 이 값과 별개로 LAVACON_PUSH_GAIN이 담당한다(아래).
+# [2026-08-22c] 좌우 비대칭 요청 반영 — 좌측만 0.3으로 확대, 우측은 기존 0.2 유지.
+LAVACON_PUSH_SAFETY_MARGIN_L_M = 0.35
+LAVACON_PUSH_SAFETY_MARGIN_R_M = 0.25
+
+# [2026-08-22b] push량(push_m) 배율 — 안전마진(위 LAVACON_PUSH_SAFETY_MARGIN_M) 침범량에
+#   곱해 실제로 미는 세기를 정한다. margin을 넓힌 것과는 별개로 "밀리는 정도 자체"도
+#   2배로 키워달라는 요청 반영(실차 미검증) — track_drive.py `_lavacon_steer_da_push()`와
+#   lavacon_bev 디버그 표시(둘 다 같은 부호규약) 양쪽에 동일하게 곱한다.
+LAVACON_PUSH_GAIN = 1.3
 
 # [2026-08-19] push 신호 전용 ROI — 박스 스택의 CONE_LON_MAX(4.0m, 구간 전체) 대신 훨씬
 #   가까운 범위만 본다. "지금 당장 스칠 위험이 있는 콘"만 반응해야 하므로, 멀리 있는
