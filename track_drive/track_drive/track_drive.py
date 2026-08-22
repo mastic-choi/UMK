@@ -404,6 +404,11 @@ class TrackDriverNode(Node):
         # DA 디버그창에서 밀리기 전(보라) 원본 경로와 밀린 뒤(주황) 경로를 나란히 그려
         # 게인 튜닝 시 "어느 정도 밀었는지"를 한눈에 보려는 용도(lane_util.py draw_path()).
         self._lavacon_push_px = 0.0
+        # [2026-08-23, 요청 반영] LAVACON_KICK_ENABLED 실험용 — B1 진입 확정 순간부터 남은
+        # "강제 조향각 유지" 프레임 수. run_behavior_fsm()이 진입 상승엣지에서 채우고,
+        # _handle_lavacon()이 매 틱 1씩 깎으며 0보다 큰 동안 push 계산 대신
+        # LAVACON_KICK_ANGLE_DEG를 그대로 ctrl_angle에 꽂는다(config.py 주석 참고).
+        self._lavacon_kick_cnt = 0
         self.ctrl_angle = 0.0
         self.ctrl_speed = SPEED_STOP
         self._prev_angle_out = 0.0    # [5] 직전 발행 조향각(변화율 제한용)
@@ -2331,8 +2336,15 @@ class TrackDriverNode(Node):
             # 호출하게 한다 — 그 전까진 검출/진입판정만 돌고 조향은 그냥 일반 S1 차선 PID가
             # 대신하고 있었다(콘 전용 안전마진 없이 DA가 우연히 피해가는 수준). 그 PID 스킵
             # 가드(behavior_state==B1_LAVACON 기준, _s1_lane_follow() 참고)가 이제 다시 걸린다.
+            was_engaged = self._lavacon_engaged
             if self.lavacon_trigger:
                 self._lavacon_engaged = True
+            if LAVACON_KICK_ENABLED and (not was_engaged) and self._lavacon_engaged:
+                # [2026-08-23, 요청 반영] 진입 확정 상승엣지 — 여기서 딱 한 번만 걸린다
+                # (_lavacon_engaged가 True로 유지되는 동안엔 다시 안 걸림). 프레임수는
+                # 20Hz 고정주기(control_loop() 타이머, 0.05초) 기준 환산 — 이 값을 바꾸려면
+                # LAVACON_KICK_DURATION_S(config.py)만 조정하면 된다.
+                self._lavacon_kick_cnt = int(round(LAVACON_KICK_DURATION_S / 0.05))
             if self._lavacon_engaged:
                 if self.lavacon_done:
                     self._lavacon_empty_cnt += 1
@@ -3448,7 +3460,15 @@ class TrackDriverNode(Node):
         False라 안 켜면 이 함수의 나머지 동작은 전과 100% 동일 — self.lavacon_done 기반
         구간 종료 판정도 두 모드에서 공유한다(perc_lavacon()이 매 틱 그대로 계산해두므로).
         """
-        if LAVACON_STEER_MODE_DA_PUSH:
+        if LAVACON_KICK_ENABLED and self._lavacon_kick_cnt > 0:
+            # [2026-08-23, 요청 반영] 실험용 킥 구간 — push/차선 조향 계산을 건너뛰고 고정
+            # 조향각을 강제. 디버그창(push 표시)이 이번 틱엔 "안 밀림"으로 보이도록 push
+            # 플래그도 같이 꺼둔다. 속도는 손대지 않음 — 아래 _update_speed()가 그대로 돎.
+            self._lavacon_kick_cnt -= 1
+            self.ctrl_angle = LAVACON_KICK_ANGLE_DEG
+            self._lavacon_push_active = False
+            self._lavacon_push_px = 0.0
+        elif LAVACON_STEER_MODE_DA_PUSH:
             self.ctrl_angle = self._lavacon_steer_da_push()
         else:
             self.ctrl_angle = self._lane_steer(

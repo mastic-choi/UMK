@@ -1570,6 +1570,15 @@ LAVACON_TEMPORAL_EMA_ALPHA   = 0.5      # 새 프레임에 줄 가중치(작을�
 #   `_handle_lavacon()`의 폴백 분기로만 남는다.
 LAVACON_STEER_MODE_DA_PUSH = True
 
+# [2026-08-23, 요청 반영] 임시 실험용 — B1 진입 확정(_lavacon_engaged 상승 엣지) 직후
+#   일정 시간 동안 push 계산을 무시하고 고정 조향각을 강제로 꽂아 넣는다(속도는 건드리지
+#   않음, _update_speed()가 그대로 돎). "진입하자마자 확 꺾어서 초반 자세를 잡아준다"는
+#   아이디어를 실차로 빠르게 테스트해보기 위한 스위치 — 효과 없거나 오히려 나쁘면
+#   LAVACON_KICK_ENABLED만 False로 되돌리면 이 블록 전체가 비활성화된다(실차 미검증).
+LAVACON_KICK_ENABLED    = True
+LAVACON_KICK_DURATION_S = 0.2    # 이 시간(초) 동안 고정 조향각 유지 — CONTROL_HZ(20Hz)로 환산해 프레임수로 씀
+LAVACON_KICK_ANGLE_DEG  = -20.0  # 강제 조향각(도) — 부호규약은 ctrl_angle과 동일(우측 콘 쪽으로 짐작, 실차에서 방향 확인 필요)
+
 # [2026-08-19] 안전마진(m) — 이 값보다 콘이 차량 중심에 가깝게 들어오면 그만큼 반대쪽으로
 #   민다. VEHICLE_WIDTH_M(0.31, 실측)/2=0.155(차량 반폭) + DL_DA_SIDE_MARGIN_M(0.1, B2/B3
 #   장애물 회피에서 "실차 테스트로 딱 적당하게 잘 주행함" 확인된 좌우 여유값, 성격이
@@ -1612,7 +1621,7 @@ LAVACON_PUSH_GAIN = 1.3
 #   perc_lavacon_trigger()의 LON_MIN/LON_MAX)도 같은 이유로 뒤이어 -0.1~0.3으로 맞췄다 —
 #   두 ROI는 항상 같이 바꿀 것, 하나만 바꾸면 lavacon_bev에서 둘의 시작점이 다시 어긋나 보인다.
 LAVACON_PUSH_LON_MIN     = -0.1  # 차량(자차 마커) 기준 전방 0.3m(=라이다 원점 기준 -0.1m)부터
-LAVACON_PUSH_LON_MAX     = 0.3   # 이 거리보다 먼 콘은 아직 안 민다
+LAVACON_PUSH_LON_MAX     = 0.25  # 이 거리보다 먼 콘은 아직 안 민다
 LAVACON_PUSH_LAT_LIMIT   = 1.0   # 횡방향 탐색 한계 — CONE_LAT_LIMIT(perc_lavacon.py)와 동일값으로 시작
 
 # [2026-08-19] 박스 안 후보점의 좌/우 배정을 y부호(차량 헤딩 기준 고정 중앙선, y>0=좌/
