@@ -1282,6 +1282,15 @@ LANE_UNSTABLE_FRAMES = 10
 DEBUG_LOG    = True   # 0.5초마다 CLI에 [LAP]/[SENS]/[LANE]/[TRIG]/[SIG]/[LAVA-ROI] 로그
 DEBUG_PERIOD = 0.5     # 위 로그 주기(s)
 
+# [2026-08-22] 디버그 창들이 전부 화면 기본 위치(보통 좌상단 근처)에 겹쳐서 뜬다는 요청으로
+#   추가 — cv2.moveWindow로 창이 처음 뜰 때 한 번만 이 좌표로 옮긴다(각 창 imshow 호출부
+#   참고: track_drive.py _draw_lavacon_bev/_debug_viz_obstacle_cut, perception/dl_lane.py
+#   show_debug_windows). 화면 해상도에 안 맞으면 이 값만 바꾸면 됨 — (x, y)는 창의
+#   좌상단 모서리가 놓일 스크린 픽셀 좌표.
+DEBUG_WIN_POS_DL_LANE       = (0, 0)
+DEBUG_WIN_POS_LAVACON       = (650, 0)
+DEBUG_WIN_POS_OBSTACLE_CUT  = (0, 650)
+
 # [2026-08-11] 라바콘 실차 테스트 중엔 라이다 창만 보고 싶다는 요청으로, 아래 DEBUG_VIZ_LIDAR만
 #   켜고 나머지는 전부 잠시 끔. 다른 디버그창이 다시 필요하면(예: 차선 인식 디버깅) 개별적으로
 #   다시 True로 되돌릴 것 — 서로 독립적인 스위치라 다른 항목엔 영향 없음.
@@ -1564,7 +1573,9 @@ LAVACON_STEER_MODE_DA_PUSH = True
 #   (실측값 없음, perc_lavacon_trigger()의 CLUSTER_MAX_GAP=0.35는 "콘 지름 근사"라 참고는
 #   되나 라이다 스프레드가 섞인 값이라 그대로 쓰지 않음) — 실차에서 콘을 스치면 이 값을
 #   올릴 것.
-LAVACON_PUSH_SAFETY_MARGIN_M = 0.26
+# [2026-08-22] 0.26 → 0.13(요청 반영, 실차 미검증) — push가 너무 세게/일찍 걸린다는
+#   판단으로 절반으로 낮춤. 콘을 스치면 다시 올릴 것.
+LAVACON_PUSH_SAFETY_MARGIN_M = 0.13
 
 # [2026-08-19] push 신호 전용 ROI — 박스 스택의 CONE_LON_MAX(4.0m, 구간 전체) 대신 훨씬
 #   가까운 범위만 본다. "지금 당장 스칠 위험이 있는 콘"만 반응해야 하므로, 멀리 있는

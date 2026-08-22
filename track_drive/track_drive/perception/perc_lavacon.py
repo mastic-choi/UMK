@@ -144,6 +144,22 @@ BOX_LON_START    = 0.3          # 첫 박스 시작 지점(전방, m) — 차체
 #   (track_drive.py가 이 상수를 LAVACON_BOX_LON_WIDTH로 import).
 BOX_LON_WIDTH    = 0.4          # 박스 1개의 종방향 폭(m)
 
+# [2026-08-22] 특정 물리 위치(우측 아주 가까운 지점)에서 반복적으로 유령 라이다 점이 찍히는
+#   문제 — 실차 스크린샷(lavacon_bev)으로 대략 위치 추정(x≈0.08/y≈-0.075) 후, lavacon_bev에
+#   빨간 GHOST MASK 원 + 정확한 좌표 텍스트를 띄워 사용자가 직접 실측 좌표로 보정
+#   (X_M -0.05로 수정, 2026-08-22 22:5x경) — **실차에서 이 위치의 유령 점(노이즈)이 완전히
+#   가려지는 것을 사용자가 확인함**. 사용자가 차체를 들어보면 이 점이 사라지는 것도 확인
+#   → 차량 자체(마운트 등) 반사가 원인. 신호등 검증 때도 같은 지점에서 문제가 됐다고 함.
+#   근본 원인 조사(README/작업기록 "다음 작업" — 각도 오프셋 재측정, 자기가림 경계,
+#   멀티패스 순으로 확인)는 여전히 미해결 — 이건 그 증상의 임시 완화일 뿐, 이 좌표 근처의
+#   좁은 원형 구역 안의 라이다 점만 무효 처리한다. 반경을 넓게 잡으면 그 근처의 진짜
+#   라바콘까지 같이 지워버릴 수 있으니 최소한(6cm)만 잡았다 — 다른 위치에서도 유령 점이
+#   재발하면 이 방식(좌표+반경 추가)을 그대로 반복하기보다 위 "다음 작업"의 근본 원인부터
+#   확인할 것. ※ 코드만 고쳐서는 실행 중이던 노드에 반영 안 됨 — 재시작 후에 확인할 것.
+GHOST_POINT_X_M      = -0.05
+GHOST_POINT_Y_M      = -0.075
+GHOST_POINT_RADIUS_M = 0.06
+
 
 def _lidar_to_xy(lidar_ranges):
     """라이다 1스캔을 전처리(무효값/자기가림 마스킹)하고 직교좌표(x=전방+, y=좌측+)로
@@ -166,10 +182,14 @@ def _lidar_to_xy(lidar_ranges):
     deg = np.linspace(0.0, 2.0 * math.pi, n, endpoint=False) - math.radians(LIDAR_ANGLE_OFFSET_DEG)
     x = ranges * np.cos(deg)    # 종방향(전방거리) 성분
     y = ranges * np.sin(deg)    # 횡방향 성분 — y > 0 좌측, y < 0 우측
+
+    ghost_mask = (x - GHOST_POINT_X_M) ** 2 + (y - GHOST_POINT_Y_M) ** 2 < GHOST_POINT_RADIUS_M ** 2
+    ranges[ghost_mask] = 0.0    # 유령 점 무효화 — 위 GHOST_POINT_* 주석 참고
+
     return x, y, ranges
 
 
-def nearest_cone_lateral(lidar_ranges, lon_min, lon_max, lat_limit):
+def nearest_cone_lateral(lidar_ranges, lon_min, lon_max, lat_limit, return_range=False):
     """[2026-08-19] da(주행가능영역) 경로를 그대로 조향에 쓰고, 콘이 안전마진 안으로
     들어왔을 때만 그만큼 옆으로 미는 방식(track_drive.py `_lavacon_steer_da_push` 참고)
     전용 — 박스 스택 페어링(`_pick_boxed_sides`/`_build_path`)처럼 좌우 콘을 짝짓거나
@@ -179,18 +199,35 @@ def nearest_cone_lateral(lidar_ranges, lon_min, lon_max, lat_limit):
     듬성하게/노이즈 섞여 검출돼도(박스 스택이 실차에서 계속 시달린 문제) 한 점만 있으면
     바로 동작한다.
 
+    [2026-08-22] return_range — 좌우 각각 "실측거리(range) 기준 최근접점"의 y만 보고는
+    "그 점이 실제로 차량에서 얼마나 가까운지"(range)도, "화면에서 정확히 어디 찍히는지"
+    (x, 종방향)도 알 수 없어서, lavacon_bev 디버그창에서 이 y값을 만든 실제 점이 어디
+    있는지 눈으로 못 짚어내겠다는 문제 제기로 추가 — push 판정(margin과 비교하는 대상은
+    여전히 y, 라인 침범 여부라 range/x가 아님) 자체는 그대로 두고, 순수 표시용으로만
+    range와 x를 같이 반환한다. True면 (left_y, right_y, left_range, right_range,
+    left_x, right_x) 6-튜플, False(기본, 기존 호출부 전부 이 경로)면 기존과 동일하게
+    2-튜플만 반환해 하위호환 유지.
+
     출력 : (left_y, right_y) — 각각 없으면 None, 있으면 라이다 미터 좌표(좌측+).
     """
     x, y, ranges = _lidar_to_xy(lidar_ranges)
     if x is None:
-        return None, None
+        return (None, None, None, None, None, None) if return_range else (None, None)
 
     roi = (ranges > 0.0) & (x > lon_min) & (x < lon_max) & (np.abs(y) < lat_limit)
     left_idx = np.where(roi & (y > 0.0))[0]
     right_idx = np.where(roi & (y < 0.0))[0]
-    left_y = float(y[left_idx[int(np.argmin(ranges[left_idx]))]]) if left_idx.size > 0 else None
-    right_y = float(y[right_idx[int(np.argmin(ranges[right_idx]))]]) if right_idx.size > 0 else None
-    return left_y, right_y
+    left_i = left_idx[int(np.argmin(ranges[left_idx]))] if left_idx.size > 0 else None
+    right_i = right_idx[int(np.argmin(ranges[right_idx]))] if right_idx.size > 0 else None
+    left_y = float(y[left_i]) if left_i is not None else None
+    right_y = float(y[right_i]) if right_i is not None else None
+    if not return_range:
+        return left_y, right_y
+    left_range = float(ranges[left_i]) if left_i is not None else None
+    right_range = float(ranges[right_i]) if right_i is not None else None
+    left_x = float(x[left_i]) if left_i is not None else None
+    right_x = float(x[right_i]) if right_i is not None else None
+    return left_y, right_y, left_range, right_range, left_x, right_x
 
 
 def _assign_by_continuity(box_idx, x, y, ranges, prev_left_xy, prev_right_xy, max_jump_m):

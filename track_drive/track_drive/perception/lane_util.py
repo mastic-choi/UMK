@@ -584,6 +584,16 @@ class SlideWindow:
                 cv2.line(self.vis, p1, p2, orange, 2)
             for p in shifted_pts:
                 cv2.circle(self.vis, p, 3, orange, -1)
+            # [2026-08-22] "보라(원본) 대비 주황(밀린 경로)이 화면 어느 쪽으로 갔는지"를
+            # 매 프레임 눈으로 직접 대조해야 했던 문제 — 사다리꼴 BEV라 원근 때문에 좌/우
+            # 판단이 헷갈리기 쉬워서, push_px 부호를 텍스트로 못박아 바로 읽게 한다(캔버스
+            # x가 클수록 화면 오른쪽=물리적 우측이라는 가정 자체가 실차 미검증이라 §5.8
+            # 참고 요청으로 추가 — 이 가정이 맞는지 이 라벨과 실제 콘 위치를 대조해서
+            # 확인할 것).
+            direction = 'RIGHT ->' if push_px > 0 else '<- LEFT'
+            cv2.putText(self.vis, f'PUSH {direction} {abs(push_px):.0f}px',
+                        (shifted_pts[0][0] + 8, shifted_pts[0][1] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, orange, 2, cv2.LINE_AA)
             return
 
         pushed = getattr(self, 'obstacle_cut_active', False) or lavacon_push

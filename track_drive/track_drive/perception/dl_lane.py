@@ -242,6 +242,7 @@ from ..config import (
     DL_LL_YELLOW_VOTE_RATIO, DL_LL_YELLOW_MIN_AREA,
     DEBUG_VIZ_DL_LANE, YELLOW_LOWER, YELLOW_UPPER, FPS_LOG_PERIOD_SEC,
     DL_DEBUG_HISTORY_LEN,
+    DEBUG_WIN_POS_DL_LANE,
 )
 
 # ── [2026-08-14] da 안전마진(차량 폭) 침식 커널 — README §2.30 "da 안전마진 설계 논의" ──
@@ -2563,6 +2564,9 @@ class DLLaneDetector:
         self.engine = TwinLiteNetEngine(model_path=model_path, providers=providers, logger=logger)
         self._slide = DLSlideWindow()
         self._logger = logger
+        # [2026-08-22] 'dl_lane' 창을 처음 띄울 때만 cv2.moveWindow로 위치를 잡기 위한
+        #   1회성 가드(DEBUG_WIN_POS_DL_LANE 참고, track_drive.py의 같은 패턴과 동일 이유).
+        self._dbg_win_positioned = False
 
         # [2026-08-17] 첫 프레임 처리 전까지만 쓰이는 초기 플레이스홀더 — _worker()가 매
         # 추론마다 self._slide.roi_w(실제 da_mask/path 좌표계 폭)로 덮어쓴다. 예전엔 이
@@ -2814,6 +2818,10 @@ class DLLaneDetector:
             speed_text = f'발행 speed: {ctrl_speed:+.2f}'
             put_text_kr(vis, speed_text, (5, vis.shape[0] - 24), font_size=18, color_bgr=(255, 255, 255),
                         fallback=f'pub speed:{ctrl_speed:+.2f}')
+        if not self._dbg_win_positioned:
+            cv2.namedWindow('dl_lane', cv2.WINDOW_AUTOSIZE)
+            cv2.moveWindow('dl_lane', *DEBUG_WIN_POS_DL_LANE)
+            self._dbg_win_positioned = True
         cv2.imshow('dl_lane', vis)
         cv2.waitKey(1)
 

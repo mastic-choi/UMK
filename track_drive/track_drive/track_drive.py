@@ -41,6 +41,10 @@ from cv_bridge import CvBridge
 #   (_draw_lavacon_bev() 상단 주석 참고). BOX_LON_WIDTH(→ LAVACON_BOX_LON_WIDTH)는 자차
 #   마커 위치 계산에 여전히 쓰여 유지.
 from .perception.perc_lavacon import process_lavacon, nearest_cone_lateral, BOX_LON_WIDTH as LAVACON_BOX_LON_WIDTH
+# [2026-08-22] §5.10 유령 점 임시 마스크 좌표 — lavacon_bev에 빨간 원으로 시각화해 마스킹
+#   구역과 실제 유령 점 위치가 맞는지 눈으로 대조하기 위해 import(마스킹 자체는
+#   perc_lavacon.py `_lidar_to_xy()`가 이미 적용).
+from .perception.perc_lavacon import GHOST_POINT_X_M, GHOST_POINT_Y_M, GHOST_POINT_RADIUS_M
 from .perception.hough_lane import HoughLaneDetector
 from .perception.perc_floor import check_stopline, LaneDetector as ClassicLaneDetector
 from .perception.lane_util import CameraProcessor, SlideWindow
@@ -77,6 +81,10 @@ class TrackDriverNode(Node):
     def __init__(self):
         super().__init__('driver')
         self.bridge = CvBridge()
+        # [2026-08-22] 디버그 창을 처음 띄울 때만 cv2.moveWindow로 위치를 잡기 위한
+        #   1회성 가드(DEBUG_WIN_POS_* 참고) — 매 프레임 moveWindow를 부르면 사용자가
+        #   직접 옮겨놔도 다음 프레임에 도로 스냅백돼서, 창 이름을 여기 기록해두고 한 번만 옮긴다.
+        self._dbg_windows_positioned = set()
 
         # ── 원본 센서 버퍼 ──
         self.img_front = self.img_left = self.img_right = self.img_behind = None
@@ -1681,9 +1689,30 @@ class TrackDriverNode(Node):
 
         cv2.rectangle(bev, to_px(lon_min, lat_max), to_px(lon_max, -lat_max), (0, 220, 220), 1)
 
+        # [2026-08-22] §5.10 유령 점 임시 마스크(GHOST_POINT_*, perc_lavacon.py) 시각화용
+        #   빨간 원 — 실제 마스킹된 라이다 점은 ranges=0으로 지워지므로 이 화면에 안 찍힌다,
+        #   이 원은 "마스킹 중인 구역"을 보여줄 뿐이다. 실제 반경(6cm→PPM=100이면 6px)이
+        #   화면에서 거의 안 보여 픽셀로 눈대중 대조하다 오차가 컸던 문제(2026-08-22 사용자
+        #   지적) — 실제 마스킹 반경은 원(반투명 채움)으로 정확히 그리되, 중심은 십자선으로
+        #   또렷이 표시하고 옆에 미터 좌표를 텍스트로 같이 찍어 픽셀이 아니라 숫자로
+        #   대조할 수 있게 한다(위 "range,x ref only" 텍스트 줄의 실제 검출 좌표와 비교).
+        _gpx, _gpy = to_px(GHOST_POINT_X_M, GHOST_POINT_Y_M)
+        _gp_overlay = bev.copy()
+        cv2.circle(_gp_overlay, (_gpx, _gpy), max(int(GHOST_POINT_RADIUS_M * PPM), 1), (0, 0, 255), -1)
+        cv2.addWeighted(_gp_overlay, 0.35, bev, 0.65, 0, bev)
+        cv2.circle(bev, (_gpx, _gpy), max(int(GHOST_POINT_RADIUS_M * PPM), 1), (0, 0, 255), 1)
+        cv2.drawMarker(bev, (_gpx, _gpy), (0, 0, 255), cv2.MARKER_CROSS, 10, 1)
+        cv2.putText(bev, f'GHOST MASK ({GHOST_POINT_X_M:.3f},{GHOST_POINT_Y_M:.3f}) r={GHOST_POINT_RADIUS_M:.2f}m',
+                    (_gpx + 8, _gpy), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1, cv2.LINE_AA)
+
         # ── push ROI(자홍) — 지금 실제 조향(_lavacon_steer_da_push())이 보는 좌우 최근접 콘 ──
-        push_left_y, push_right_y = nearest_cone_lateral(
-            self.lidar_ranges, LAVACON_PUSH_LON_MIN, LAVACON_PUSH_LON_MAX, LAVACON_PUSH_LAT_LIMIT)
+        # [2026-08-22] return_range=True — "y가 작은 쪽"과 "실제로 더 가까운 쪽"이 다를 수
+        # 있다는 문제 제기로 range도 같이 받아 아래 PUSH 텍스트에 표시(순수 표시용, push
+        # 판정 자체는 여전히 y-마진 비교 그대로 — nearest_cone_lateral() docstring 참고).
+        (push_left_y, push_right_y, push_left_range, push_right_range,
+         push_left_x, push_right_x) = nearest_cone_lateral(
+            self.lidar_ranges, LAVACON_PUSH_LON_MIN, LAVACON_PUSH_LON_MAX, LAVACON_PUSH_LAT_LIMIT,
+            return_range=True)
         cv2.rectangle(bev, to_px(LAVACON_PUSH_LON_MIN, LAVACON_PUSH_LAT_LIMIT),
                       to_px(LAVACON_PUSH_LON_MAX, -LAVACON_PUSH_LAT_LIMIT), (200, 0, 200), 1)
         cv2.putText(bev, 'PUSH ROI', to_px(LAVACON_PUSH_LON_MAX, LAVACON_PUSH_LAT_LIMIT),
@@ -1694,14 +1723,22 @@ class TrackDriverNode(Node):
                  to_px(LAVACON_PUSH_LON_MAX, LAVACON_PUSH_SAFETY_MARGIN_M), (140, 0, 140), 1, cv2.LINE_AA)
         cv2.line(bev, to_px(LAVACON_PUSH_LON_MIN, -LAVACON_PUSH_SAFETY_MARGIN_M),
                  to_px(LAVACON_PUSH_LON_MAX, -LAVACON_PUSH_SAFETY_MARGIN_M), (140, 0, 140), 1, cv2.LINE_AA)
-        # 검출된 좌/우 최근접 콘의 y위치를 ROI 폭 전체에 걸친 가로 눈금선으로 표시(x는 함수가
-        # 안 줘서 모름 — ROI 안 어딘가라는 뜻). 마진 침범 중이면 파랑(=지금 미는 중), 안전
-        # 하면 초록/주황.
+        # 검출된 좌/우 최근접 콘의 y위치를 ROI 폭 전체에 걸친 가로 눈금선으로 표시. 마진
+        # 침범 중이면 파랑(=지금 미는 중), 안전하면 초록/주황.
         for py, base_col in ((push_left_y, (0, 255, 0)), (push_right_y, (0, 140, 255))):
             if py is None:
                 continue
             col = (255, 80, 0) if abs(py) < LAVACON_PUSH_SAFETY_MARGIN_M else base_col
             cv2.line(bev, to_px(LAVACON_PUSH_LON_MIN, py), to_px(LAVACON_PUSH_LON_MAX, py), col, 2)
+        # [2026-08-22] 위 눈금선은 "이 y값이다"라고 ROI 전체 폭에 걸쳐 그은 안내선이라, 그
+        # y값을 만든 원본 점이 실제로 어디(전후 x까지) 있는지는 안 보여준다는 문제 제기 —
+        # 그 점의 (x,y) 정확한 위치에 노란 링 마커를 따로 찍어 "안내선"과 "진짜 그 점"을
+        # 구분한다(PPM=100이라 margin=0.13m이 화면상 ±13px밖에 안 돼서 눈금선끼리 거의
+        # 겹쳐 보일 수 있음 — 이 마커가 없으면 그 좁은 구간에서 실제 점을 못 짚어낸다).
+        for px_, py_ in ((push_left_x, push_left_y), (push_right_x, push_right_y)):
+            if px_ is None or py_ is None:
+                continue
+            cv2.circle(bev, to_px(px_, py_), 6, (0, 255, 255), 2)
 
         # 마스킹 전 원본(raw) 점 중 BODY_LO~BODY_HI(자기가림 구간)에 해당하는 것만 자홍색으로 표시.
         # ROI 필터 없이 원거리까지 전부 그려서, 이 "자기가림 구간"에 실제로 뭔가 찍히는지 그대로 보여준다.
@@ -1752,16 +1789,33 @@ class TrackDriverNode(Node):
             push_m += LAVACON_PUSH_SAFETY_MARGIN_M - push_left_y
         if push_right_y is not None and -push_right_y < LAVACON_PUSH_SAFETY_MARGIN_M:
             push_m -= LAVACON_PUSH_SAFETY_MARGIN_M - (-push_right_y)
-        push_left_s = 'N/A' if push_left_y is None else f'{push_left_y:.2f}m'
-        push_right_s = 'N/A' if push_right_y is None else f'{push_right_y:.2f}m'
+        push_left_s = 'N/A' if push_left_y is None else f'{push_left_y:.3f}m'
+        push_right_s = 'N/A' if push_right_y is None else f'{push_right_y:.3f}m'
         push_col = (255, 80, 0) if push_m != 0.0 else (200, 0, 200)
         cv2.putText(bev, f'PUSH L_y={push_left_s} R_y={push_right_s} '
                           f'push={push_m:+.2f}m engaged={self._lavacon_engaged}',
                     (8, 132), cv2.FONT_HERSHEY_SIMPLEX, 0.45, push_col, 1, cv2.LINE_AA)
+        # [2026-08-22] L_y/R_y(횡방향 침범량, push 판정 기준)만으로는 "어느 쪽 콘이
+        # 실제로 더 가까운지"(직선거리) 판단이 안 돼서 헷갈린다는 문제 제기 — range를
+        # 따로 한 줄 더 찍는다. 어느 한쪽 range가 더 작아도 push 방향은 여전히 L_y/R_y
+        # 마진 침범 여부로만 결정된다(설계 그대로, 아래 텍스트는 순수 참고용).
+        rl_s = 'N/A' if push_left_range is None else f'{push_left_range:.3f}m'
+        rr_s = 'N/A' if push_right_range is None else f'{push_right_range:.3f}m'
+        # [2026-08-22] §5.10 유령 점 좌표를 화면(픽셀)으로 눈대중 대조하다 오차가 컸던 문제
+        #   — x,y를 소수점 3자리까지 텍스트로 바로 찍어 GHOST_POINT_X_M/Y_M을 픽셀 눈대중 대신
+        #   숫자로 정확히 맞출 수 있게 함(아래 GHOST MASK 원 옆 좌표 텍스트와 대조).
+        xl_s = 'N/A' if push_left_x is None else f'{push_left_x:.3f}'
+        xr_s = 'N/A' if push_right_x is None else f'{push_right_x:.3f}'
+        cv2.putText(bev, f'(range,x ref only) L=({xl_s},{rl_s}) R=({xr_s},{rr_s}) - push uses L_y/R_y only',
+                    (8, 154), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 200, 255), 1, cv2.LINE_AA)
         cv2.putText(bev, f'margin={LAVACON_PUSH_SAFETY_MARGIN_M:.2f}m '
                           f'lon={LAVACON_PUSH_LON_MIN:.1f}~{LAVACON_PUSH_LON_MAX:.1f}m '
                           f'lat=+-{LAVACON_PUSH_LAT_LIMIT:.1f}m',
-                    (8, 154), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1, cv2.LINE_AA)
+                    (8, 176), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1, cv2.LINE_AA)
+        if 'lavacon_bev' not in self._dbg_windows_positioned:
+            cv2.namedWindow('lavacon_bev', cv2.WINDOW_AUTOSIZE)
+            cv2.moveWindow('lavacon_bev', *DEBUG_WIN_POS_LAVACON)
+            self._dbg_windows_positioned.add('lavacon_bev')
         cv2.imshow('lavacon_bev', bev)
         cv2.waitKey(1)
 
@@ -3168,6 +3222,10 @@ class TrackDriverNode(Node):
         cv2.rectangle(bev, (0, 0), (PANEL_W - 1, PANEL_H - 1), (80, 80, 80), 1)
 
         cv2.rectangle(canvas, (0, 0), (canvas.shape[1] - 1, canvas.shape[0] - 1), active_color, 3)
+        if 'obstacle_cut_debug' not in self._dbg_windows_positioned:
+            cv2.namedWindow('obstacle_cut_debug', cv2.WINDOW_AUTOSIZE)
+            cv2.moveWindow('obstacle_cut_debug', *DEBUG_WIN_POS_OBSTACLE_CUT)
+            self._dbg_windows_positioned.add('obstacle_cut_debug')
         cv2.imshow('obstacle_cut_debug', canvas)
         cv2.waitKey(1)
 
