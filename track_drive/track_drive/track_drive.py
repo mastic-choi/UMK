@@ -35,7 +35,12 @@ from sensor_msgs.msg import Image, LaserScan, Imu
 from std_msgs.msg import Float32MultiArray, Float32
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy, HistoryPolicy
 from cv_bridge import CvBridge
-from .perception.perc_lavacon import process_lavacon, nearest_cone_lateral, CONE_LON_MAX as LAVACON_PATH_LON_MAX, CONE_LAT_LIMIT as LAVACON_PATH_LAT_LIMIT, BOX_LON_START as LAVACON_BOX_LON_START, BOX_LON_WIDTH as LAVACON_BOX_LON_WIDTH
+# [2026-08-22k] CONE_LON_MAX/CONE_LAT_LIMIT/BOX_LON_START(→ LAVACON_PATH_LON_MAX/
+#   LAVACON_PATH_LAT_LIMIT/LAVACON_BOX_LON_START) 별칭 삭제 — 이 값들을 쓰던 lavacon_bev의
+#   박스 스택 시각화(흰 cone ROI 선/파란 박스 경계)를 지우면서 더 이상 안 쓰임
+#   (_draw_lavacon_bev() 상단 주석 참고). BOX_LON_WIDTH(→ LAVACON_BOX_LON_WIDTH)는 자차
+#   마커 위치 계산에 여전히 쓰여 유지.
+from .perception.perc_lavacon import process_lavacon, nearest_cone_lateral, BOX_LON_WIDTH as LAVACON_BOX_LON_WIDTH
 from .perception.hough_lane import HoughLaneDetector
 from .perception.perc_floor import check_stopline, LaneDetector as ClassicLaneDetector
 from .perception.lane_util import CameraProcessor, SlideWindow
@@ -349,15 +354,13 @@ class TrackDriverNode(Node):
         # ── 판단/제어 상태 ──
         self.mission_state  = START_STATE
         self.behavior_state = BehaviorState.B0_NORMAL
-        # [2026-08-22, 임시] 좌회전 진입(체크무늬 게이트 라이다 기둥쌍 + 조향 램프,
-        # perc_checker_pillar()/_do_checker_ramp_turn()) 단독 검증 — B1/B2/B3를 전부
-        # "이미 통과한 것"으로 놓고 Phase.DONE에서 시작한다. Phase.DONE이면
-        # run_behavior_fsm()이 매 틱 그냥 B0_NORMAL로 고정하고(아래 else 분기) 트리거 검사
-        # 자체를 안 하므로 B1/B2/B3가 어떤 경로로도 재발동하지 않는다. _active_yolo_stage()도
-        # Phase.DONE에서 'signal'을 리턴해 신호등 YOLO만 돈다 — 곧장 다음 교차로 신호등(보드
-        # 인식 → S0_SIGNAL 재진입 → 좌회전 신호 확정)으로 이어지는 정상 경로를 그대로 탄다.
-        # 검증 끝나면 Phase.LAVACON + _b2_passed/_b3_passed=False로 되돌릴 것(아래 두 줄도 같이).
-        self.phase          = Phase.DONE
+        # [2026-08-22] 라바콘(B1) 단독 검증 — S0_SIGNAL(출발선 신호등 대기)을 건너뛰고
+        # 곧장 S1_LANE_FOLLOW + Phase.LAVACON으로 시작한다(START_STATE/TEST_FORCE_BEHAVIOR는
+        # config.py "6. 미션 State / 실차 테스트 범위 제한" 참고). 직전엔 이 자리가 좌회전
+        # 진입 단독 검증용으로 Phase.DONE + _b2_passed/_b3_passed=True였다(B1/B2/B3를 전부
+        # "이미 통과한 것"으로 놓고 다음 교차로 신호등 대기부터 시작) — 그 검증은 끝났으므로
+        # 원래값으로 되돌린다.
+        self.phase          = Phase.LAVACON
         # [2026-08-15] Phase.OBSTACLE_ZONE 통합(da_based_b2b3_proposal.md B안) —
         # B2/B3 각각 최소 한 번 완료됐는지 추적. 둘 다 True가 돼야 Phase.DONE으로
         # 넘어간다(_mark_behavior_passed() 참고).
@@ -365,11 +368,9 @@ class TrackDriverNode(Node):
         # 확정된 순서다(§5.2) — §5.4에서 잠깐 반대로 뒤집었다가(요청 반영), [2026-08-22]
         # 요청으로 다시 "B2 먼저"로 되돌렸다(README §5.5). run_behavior_fsm()에서 B3 트리거를
         # self._b2_passed가 True일 때만 받아들이도록 순서를 강제한다(아래 참고).
-        # [2026-08-22, 임시] 위 좌회전 단독 검증과 짝 — Phase.DONE 진입 조건(_mark_behavior_passed())
-        # 이 원래 요구하는 값(둘 다 True)을 시작부터 맞춰둔다. 디버그 상태창/로그가 "B2/B3
-        # 이미 통과"로 정확히 보이게 하기 위함(동작 자체엔 phase만으로 충분).
-        self._b2_passed = True
-        self._b3_passed = True
+        # [2026-08-22] 라바콘(B1) 단독 검증 — 아직 아무것도 안 지난 원래 시작값으로 되돌림.
+        self._b2_passed = False
+        self._b3_passed = False
         # [2026-08-20] 요청 반영 — B2/B3 실제 처리를 da 근접 컷(obstacle_cut_active) 기반으로
         # 바꾸면서 추가. obstacle_cut_active 진입 순간 'B2'/'B3' 중 하나를 latch해뒀다가,
         # obstacle_cut_active가 다시 꺼지는 순간(탈출) 그 태그로 _mark_behavior_passed()를
@@ -377,7 +378,7 @@ class TrackDriverNode(Node):
         # 동일한 진입~탈출 latch 패턴.
         self._obscut_zone_tag = None
         self._behavior_enabled = TEST_FORCE_BEHAVIOR  # 원래 S0_SIGNAL "직진" 확정 시에만 True
-                                                       #   (TEST_FORCE_BEHAVIOR=True면 라바콘 단독 테스트용으로 시작부터 강제 ON)
+                                                       #   (TEST_FORCE_BEHAVIOR=True — 라바콘 단독 테스트용으로 시작부터 강제 ON)
         # [2026-08-20] S0_SIGNAL 통합(S0_WAIT_GREEN+S2_INTERSECTION → 하나)으로 같은 state를
         # 출발 때와 매 바퀴 교차로에서 반복 재진입하게 됐다 — "이번이 진짜 첫 출발인지"는
         # prev_state 비교로 더 이상 구분이 안 되므로(둘 다 같은 state) 이 플래그로 직접
@@ -386,6 +387,15 @@ class TrackDriverNode(Node):
         self._departed = False
         self._lavacon_engaged  = False          # B1_LAVACON 진입 확정 latch (트리거 이후 잠깐 한쪽 클러스터가
                                                  #   끊겨도 중간에 일반주행으로 안 튀도록 유지, lavacon_done으로 해제)
+        # [2026-08-22] _lavacon_steer_da_push()가 이번 틱에 실제로 경로를 옆으로 밀었는지
+        # (push_m != 0.0) — perc_lane()이 set_lavacon_push()로 DL 백엔드에 넘겨 DA
+        # 디버그창의 경로 색(자홍/주황)에 반영한다(lane_util.py draw_path() 참고).
+        # run_behavior_fsm()이 _lavacon_engaged가 꺼지는 즉시 False로 되돌린다.
+        self._lavacon_push_active = False
+        # [2026-08-22] 위 플래그와 함께 넘기는 실제 push량(px, +면 우측으로 밀림) —
+        # DA 디버그창에서 밀리기 전(보라) 원본 경로와 밀린 뒤(주황) 경로를 나란히 그려
+        # 게인 튜닝 시 "어느 정도 밀었는지"를 한눈에 보려는 용도(lane_util.py draw_path()).
+        self._lavacon_push_px = 0.0
         self.ctrl_angle = 0.0
         self.ctrl_speed = SPEED_STOP
         self._prev_angle_out = 0.0    # [5] 직전 발행 조향각(변화율 제한용)
@@ -732,6 +742,12 @@ class TrackDriverNode(Node):
         # 트리거 전) _clip_da_by_obstacle()이 그대로 통과시키므로 영향 없다.
         getattr(self.lane_detector, 'set_obstacle', lambda *_a, **_k: None)(
             self._obstacle_cut_y, self.obstacle_cut_active)
+        # [2026-08-22] B1 콘 침범 push(_lavacon_steer_da_push()) 상태도 같이 넘긴다 —
+        # set_obstacle()과 동일한 1틱 지연 허용(위 주석 참고). DA 디버그창 경로 색
+        # (자홍/보라/주황, lane_util.py draw_path())과, 밀리기 전/후 두 경로를 나란히
+        # 그리기 위한 실제 push량(px)에 쓰인다.
+        getattr(self.lane_detector, 'set_lavacon_push', lambda *_a, **_k: None)(
+            self._lavacon_push_active, self._lavacon_push_px)
 
         # hough_lane.py의 HoughLaneDetector를 사용하여 차선 인식 수행
         valid, offset, lookahead, lane_center, path, debug_img = self.lane_detector.detect(self.img_front)
@@ -887,6 +903,11 @@ class TrackDriverNode(Node):
     def perc_obstacle(self):
         # ── 튜닝 파라미터 ──
         FRONT_X_MIN, FRONT_X_MAX = 0.0, 5.0   # 전방 ROI 종방향(m)
+        # [2026-08-22k] 1.5 → 0.5로 축소했다가(라바콘 트리거 ROI 축소와 같이 묶어서 요청)
+        #   다시 1.5로 원복(요청 반영) — 이 값은 lidar_bev 표시 전용이 아니라 B2/B3 회피
+        #   판정(front_mask → obstacle_front/dist/type/width)에 직접 쓰이는 ROI라, 라바콘과는
+        #   별개로 다뤄야 한다는 판단. 라바콘 쪽 축소(perc_lavacon_trigger() LAT_MAX,
+        #   perc_lavacon.py CONE_LAT_LIMIT, 둘 다 0.5)는 그대로 유지.
         FRONT_Y_HALF             = 1.5         # 전방 ROI 횡방향 반폭(m)
         FRONT_MIN_PTS            = 2           # 전방 장애물 확정 최소 포인트
         FRONT_VEHICLE_PTS        = 12          # 이 이상이면 차량, 미만이면 고정장애물
@@ -1241,9 +1262,10 @@ class TrackDriverNode(Node):
         self._lavacon_path_m = path_m
         # [2026-08-19] self._lavacon_boxes_prev는 process_lavacon()이 이번 프레임에 반환한
         # boxes(LAVACON_TEMPORAL_EMA_ENABLED면 프레임간 EMA 이미 반영됨)로 위에서 막 갱신됨 —
-        # _draw_lavacon_ema_bev()가 이 값을 그대로 "박스별 검출 + 좌우 EMA 차선" 시각화에 쓴다.
-        if DEBUG_VIZ_LAVACON_EMA and self._lavacon_boxes_prev is not None:
-            self._draw_lavacon_ema_bev(self._lavacon_boxes_prev, path_m)
+        # [2026-08-22] 예전엔 여기서 곧장 별도 창(lavacon_ema_bev)에 그렸으나, DEBUG_VIZ_LAVACON
+        # 통합 창으로 합치면서 실제 그리기는 이 프레임의 뒤 순서인 perc_lavacon_trigger() →
+        # _draw_lavacon_bev()로 넘겼다(같은 틱 안에서 self._lavacon_boxes_prev를 그대로
+        # 읽으므로 값은 최신 그대로).
 
     # [2026-08-20] da 근접 컷(ENABLE_OBSTACLE_CUT) 진입 트리거 — perc_lavacon_trigger()와
     #   동일한 "라이다 AND YOLO 카메라" 이중확인 패턴이지만, perc_obstacle()의 공유 ROI
@@ -1259,7 +1281,13 @@ class TrackDriverNode(Node):
     #   출력 self.obstacle_cut_trigger, self.obstacle_cut_type('fixed'/'vehicle'),
     #        self._obstacle_cut_y(트리거 확정 순간 장애물 횡위치, m, +좌측)
     def perc_obstacle_cut_trigger(self):
-        if not ENABLE_OBSTACLE_CUT:
+        # [2026-08-22] 요청 반영 — B1(Phase.LAVACON) 중엔 이 트리거 자체를 죽인다.
+        # perc_yolo_cone()이 라바콘 구간에서도 계속 돌아서(위 perceive_all()) 콘이
+        # 잡히는 순간 여기서도 라이다+YOLO AND가 성립해버려, 아직 B2 대기 상태(Phase.
+        # OBSTACLE_ZONE)로 넘어가기도 전에 obstacle_cut_active가 켜지는 문제가 있었다
+        # (DA창에 CUT이 뜨는 원인). ENABLE_OBSTACLE_CUT=False와 동일한 완전 비활성
+        # 경로를 그대로 태워 처리 — Phase.OBSTACLE_ZONE 진입 후에만 실제로 발동한다.
+        if not ENABLE_OBSTACLE_CUT or self.phase == Phase.LAVACON:
             self._obstacle_cut_trigger_cnt = 0
             self.obstacle_cut_trigger = False
             return
@@ -1378,7 +1406,10 @@ class TrackDriverNode(Node):
     #   위 트리거와 같은 독립 ROI로 재계산한 clear 상태를 쓴다 — 범위가 다르면 해제 타이밍이
     #   트리거 설계 의도와 어긋난다.
     def _update_obstacle_cut_hold(self):
-        if not ENABLE_OBSTACLE_CUT:
+        # [2026-08-22] 요청 반영 — perc_obstacle_cut_trigger()와 동일하게 B1(Phase.
+        # LAVACON) 중엔 유지 타이머도 강제로 끈다. 안 끄면 라바콘 구간에서 직전 틱까지
+        # 남아있던 obstacle_cut_active/hold 타이머가 그대로 유지될 수 있다.
+        if not ENABLE_OBSTACLE_CUT or self.phase == Phase.LAVACON:
             self.obstacle_cut_active = False
             return
 
@@ -1471,8 +1502,20 @@ class TrackDriverNode(Node):
         # [2026-08-19] LON_MAX 0.5→0.7(폭 0.2→0.4m) — perc_lavacon.py BOX_LON_WIDTH를
         #   실측 콘 간격(옛 박스 폭 기준 2칸≈0.4m)에 맞춰 키운 것과 동일 폭으로 유지
         #   (perc_lavacon.py 상단 "박스 스택 페어링 파라미터" 주석 — 두 값은 항상 같이 바꿀 것).
-        LON_MIN, LON_MAX = 0.3, 0.7   # 트리거 ROI 전방 종방향(m) — 너무 가깝거나(차체 반사) 먼 점 배제
-        LAT_MAX           = 2.0        # 트리거 ROI 횡방향 한계(m)
+        # [2026-08-22] 0.3~0.7 → -0.1~0.3(요청 반영, 폭 0.4m 유지한 채 통째로 앞으로 당김) —
+        #   push ROI(config.py LAVACON_PUSH_LON_MIN/MAX)를 같은 이유로 먼저 옮긴 것과 맞춤
+        #   (자차 마커 기준 전방 0.3m부터 시작하도록 — 마커는 라이다 원점보다
+        #   LAVACON_BOX_LON_WIDTH(0.4m)만큼 뒤에 그려지므로 라이다 원점 기준으로는
+        #   0.3-0.4=-0.1부터). 두 ROI는 항상 같이 맞출 것(위 push ROI 주석 참고) — 하나만
+        #   바꾸면 lavacon_bev에서 노란/보라 박스 시작점이 다시 어긋나 보인다.
+        LON_MIN, LON_MAX = -0.1, 0.3   # 트리거 ROI 전방 종방향(m) — 너무 가깝거나(차체 반사) 먼 점 배제
+        # [2026-08-22k] 2.0 → 0.5 → 0.75(요청 반영) — 좌우 각 0.75m(총 1.5m). 처음 0.5로
+        #   좁힐 땐 perc_lavacon.py CONE_LAT_LIMIT(좌우 검출 박스 폭)도 같은 값으로 맞춰서
+        #   lavacon_bev의 트리거 박스와 검출 박스 사이 빈 공간을 없앴었는데, 그 박스 스택
+        #   시각화 자체를 §3.8(2026-08-22k)에서 지우면서 "두 값을 항상 같이 맞출" 이유가
+        #   없어졌다 — 이번엔 트리거 박스(LAT_MAX)만 단독으로 조정. CONE_LAT_LIMIT은 여전히
+        #   0.5로 남아있고(perc_lavacon.py, cone 후보 필터링용), 필요하면 별도로 바꿀 것.
+        LAT_MAX           = 0.75       # 트리거 ROI 횡방향 한계(m)
         CLUSTER_MIN_PTS   = 2          # 클러스터로 인정할 최소 연속 포인트 수(단일 반사점 노이즈 배제)
         CLUSTER_MAX_GAP   = 0.35       # 같은 클러스터로 볼 최대 거리편차(m) — 콘 지름 근사
         BODY_LO, BODY_HI  = 215, 305   # 차체 자기가림 구간 (perc_obstacle과 동일, 최종 확정 2026-07-22)
@@ -1534,6 +1577,8 @@ class TrackDriverNode(Node):
         self._lavacon_dbg = (left_pts, left_run, right_pts, right_run)
 
         if DEBUG_VIZ_LAVACON:
+            # [2026-08-22k, 요청 반영] 박스 스택 페어링(boxes/path_m) 시각화는 지워서 더 이상
+            # 안 넘긴다 — 그 조향 방식 자체가 이미 폐기됐다(_draw_lavacon_bev() 상단 주석 참고).
             self._draw_lavacon_bev(r, x, y, roi, LON_MIN, LON_MAX, LAT_MAX,
                                     left_pts, left_run, right_pts, right_run,
                                     r_raw, deg, BODY_LO, body_hi_eff)
@@ -1548,18 +1593,47 @@ class TrackDriverNode(Node):
             self._lavacon_trigger_cnt = 0
         self.lavacon_trigger = self._lavacon_trigger_cnt >= LAVACON_TRIGGER_FRAMES
 
-    # [2-4c] [DEBUG_VIZ_LAVACON] 라바콘 트리거 ROI/좌우 클러스터 BEV 시각화
-    #   perc_obstacle()의 DEBUG_VIZ_LIDAR 창과 같은 스타일, ROI/축척만 라바콘 트리거에 맞게 확대.
-    #   초록=좌측(y>0) ROI점, 주황=우측(y<0) ROI점, 회색=ROI 밖. 자홍(magenta)=BODY_LO~BODY_HI
-    #   "차체 자기가림"이라고 보고 지워버리는 구간의 마스킹 전 원본(raw) 점 — 이 구간에 실제
-    #   물체(콘)가 있는데도 마스크가 지우고 있는 건 아닌지 진단용. 반투명 회색 부채꼴 =
-    #   그 구간의 각도 범위 자체(데드존, 135~224도/정후방 중심 90도 폭) — 실제 반사점
-    #   유무와 무관하게 항상 표시. 텍스트로 pts(ROI 내 점수)/
-    #   run(최대 연속묶음, CLUSTER_MIN_PTS=2 이상이어야 클러스터로 인정) 표시.
+    # [2-4c] [DEBUG_VIZ_LAVACON] 라바콘 통합 디버그 BEV — 'lavacon_bev' 창 하나.
+    #   [2026-08-22k, 요청 반영] 예전엔 박스 스택 페어링(perc_lavacon.py `_pick_boxed_sides`/
+    #   `_build_path`, 초록/주황 채움 박스 + EMA 좌우 차선 + 노란 경로선)까지 같이 그렸는데,
+    #   그 조향 방식 자체가 이미 두 단계로 폐기됐다 — 2026-08-19에 `LAVACON_STEER_MODE_DA_PUSH
+    #   =True`로 전환되며 박스 스택 경로는 `_handle_lavacon()`의 안 쓰는 폴백 분기로 밀려났고,
+    #   2026-08-20엔 `_handle_lavacon()` 자체가 아예 안 불리게 됐다(`run_behavior_fsm()`이
+    #   B1_LAVACON 진입/탈출 트리거만 쓰고 그 사이는 그냥 S1 차선주행). 화면엔 계속 그려지고
+    #   있었지만 조향엔 이미 관여하지 않던 잔존 시각화라 지웠다. 지금 실제로 쓰이는 정보만
+    #   그린다:
+    #   ① 트리거 ROI(노란 박스, BGR로는 청록 `(0,220,220)`) — `perc_lavacon_trigger()`의
+    #      `LAT_MAX`/`LON_MIN~MAX`. 좌우 라이다 클러스터 동시검출로 B1_LAVACON 진입을
+    #      확정하는 판정 범위(YOLO 콘 AND 조건은 별도, 아래 텍스트 참고).
+    #   ② push ROI(자홍 박스) — `_lavacon_steer_da_push()`(`_lane_drive()`가
+    #      `self._lavacon_engaged`일 때 매 틱 호출, 지금 실제 조향에 쓰이는 유일한 라바콘
+    #      전용 로직)가 보는 `LAVACON_PUSH_LON_MIN~MAX × ±LAVACON_PUSH_LAT_LIMIT` 범위 —
+    #      이 안에서 좌/우 각각 가장 가까운 콘 1점의 횡위치(y)만 본다. 자홍 가로 눈금선이
+    #      실제 검출된 y위치(정확한 종방향 위치가 아니라 ROI 안에 있다는 표시일 뿐 — 함수
+    #      자체가 y만 반환하고 x는 안 준다), 어두운 자홍 실선이 안전마진
+    #      (`LAVACON_PUSH_SAFETY_MARGIN_M`) 경계 — 콘이 이 선보다 안쪽으로 들어오면 반대쪽
+    #      으로 밀린다(파랑=마진 침범 중, 초록=안전).
+    #   · perc_obstacle()의 DEBUG_VIZ_LIDAR 창과 같은 스타일, ROI/축척만 라바콘 트리거에
+    #     맞게 확대. 초록=좌측(y>0) ROI점, 주황=우측(y<0) ROI점, 회색=ROI 밖.
+    #   · 자홍(magenta) 점=BODY_LO~BODY_HI "차체 자기가림"이라고 보고 지워버리는 구간의
+    #     마스킹 전 원본(raw) 점 — 이 구간에 실제 물체(콘)가 있는데도 마스크가 지우고
+    #     있는 건 아닌지 진단용(push ROI 박스 테두리와 색이 비슷하니 혼동 주의 — 점은 항상
+    #     원본 라이다 반사점, 박스/눈금선은 항상 ROI 경계·검출값).
+    #   · 반투명 회색 부채꼴 = 그 구간의 각도 범위 자체(데드존, 135~224도/정후방 중심
+    #     90도 폭) — 실제 반사점 유무와 무관하게 항상 표시.
+    #   · 텍스트: pts(트리거 ROI 내 점수)/run(최대 연속묶음, CLUSTER_MIN_PTS=2 이상이어야
+    #     클러스터로 인정), YOLO 콘 검출, 트리거 디바운스 카운터, push ROI 좌우 검출값/현재
+    #     push량/방향/engaged 여부.
     def _draw_lavacon_bev(self, r, x, y, roi, lon_min, lon_max, lat_max,
                            left_pts, left_run, right_pts, right_run,
                            r_raw, deg, body_lo, body_hi_eff):
-        PPM = 80           # 1m = 80px (좁은 트리거 ROI라 perc_obstacle보다 확대)
+        # [2026-08-22k] 80→100(요청 반영) — 트리거/검출 ROI 폭이 좌우 ±2.0m/±1.0m에서
+        #   ±0.5m로 좁아진 만큼 배율도 같이 키웠다. 100으로 잡은 이유: 전방 시야 한도가
+        #   ORIGIN_EY(아래 정의, 460px)/PPM이라 CONE_LON_MAX(perc_lavacon.py, 4.0m, 박스
+        #   스택 전체 깊이)를 잘라먹지 않을 최댓값 근방을 골라야 한다 — 100이면
+        #   460/100=4.6m로 4.0m에 여유(0.6m)가 남는다. 그보다 더 키우면(예: 120 →
+        #   460/120≈3.83m) 원거리 박스/경로가 창 위로 잘려나갈 위험.
+        PPM = 100          # 1m = 100px (좁은 트리거 ROI라 perc_obstacle보다 확대)
         W, H = 500, 600    # [2026-08-19] 상단이 너무 길다는 요청으로 900→600(2/3)로 축소
         # [2026-08-19] 진짜 원인 발견: EX,EY를 "라이다 원점(모든 센서점의 좌표변환 기준)"과
         #   "자차 마커(파란 점) 그리는 위치"에 동시에 같은 값으로 써왔다 — to_px()도, 거리원도,
@@ -1607,6 +1681,28 @@ class TrackDriverNode(Node):
 
         cv2.rectangle(bev, to_px(lon_min, lat_max), to_px(lon_max, -lat_max), (0, 220, 220), 1)
 
+        # ── push ROI(자홍) — 지금 실제 조향(_lavacon_steer_da_push())이 보는 좌우 최근접 콘 ──
+        push_left_y, push_right_y = nearest_cone_lateral(
+            self.lidar_ranges, LAVACON_PUSH_LON_MIN, LAVACON_PUSH_LON_MAX, LAVACON_PUSH_LAT_LIMIT)
+        cv2.rectangle(bev, to_px(LAVACON_PUSH_LON_MIN, LAVACON_PUSH_LAT_LIMIT),
+                      to_px(LAVACON_PUSH_LON_MAX, -LAVACON_PUSH_LAT_LIMIT), (200, 0, 200), 1)
+        cv2.putText(bev, 'PUSH ROI', to_px(LAVACON_PUSH_LON_MAX, LAVACON_PUSH_LAT_LIMIT),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 0, 200), 1, cv2.LINE_AA)
+        # 안전마진 경계선(±LAVACON_PUSH_SAFETY_MARGIN_M) — 이 선보다 안쪽으로 콘이 들어오면
+        # 반대쪽으로 밀린다.
+        cv2.line(bev, to_px(LAVACON_PUSH_LON_MIN, LAVACON_PUSH_SAFETY_MARGIN_M),
+                 to_px(LAVACON_PUSH_LON_MAX, LAVACON_PUSH_SAFETY_MARGIN_M), (140, 0, 140), 1, cv2.LINE_AA)
+        cv2.line(bev, to_px(LAVACON_PUSH_LON_MIN, -LAVACON_PUSH_SAFETY_MARGIN_M),
+                 to_px(LAVACON_PUSH_LON_MAX, -LAVACON_PUSH_SAFETY_MARGIN_M), (140, 0, 140), 1, cv2.LINE_AA)
+        # 검출된 좌/우 최근접 콘의 y위치를 ROI 폭 전체에 걸친 가로 눈금선으로 표시(x는 함수가
+        # 안 줘서 모름 — ROI 안 어딘가라는 뜻). 마진 침범 중이면 파랑(=지금 미는 중), 안전
+        # 하면 초록/주황.
+        for py, base_col in ((push_left_y, (0, 255, 0)), (push_right_y, (0, 140, 255))):
+            if py is None:
+                continue
+            col = (255, 80, 0) if abs(py) < LAVACON_PUSH_SAFETY_MARGIN_M else base_col
+            cv2.line(bev, to_px(LAVACON_PUSH_LON_MIN, py), to_px(LAVACON_PUSH_LON_MAX, py), col, 2)
+
         # 마스킹 전 원본(raw) 점 중 BODY_LO~BODY_HI(자기가림 구간)에 해당하는 것만 자홍색으로 표시.
         # ROI 필터 없이 원거리까지 전부 그려서, 이 "자기가림 구간"에 실제로 뭔가 찍히는지 그대로 보여준다.
         masked_x = r_raw[body_lo:body_hi_eff] * np.cos(deg[body_lo:body_hi_eff])
@@ -1630,47 +1726,6 @@ class TrackDriverNode(Node):
             else:                col = (60, 60, 60)
             cv2.circle(bev, (sx, sy), 3, col, -1)
 
-        # [2026-08-19] process_lavacon()의 콘 후보 필터링 횡방향 한계(CONE_LAT_LIMIT,
-        # perc_lavacon.py에서 import — 요청 반영으로 ±2.5m→±1.8m→±1.0m로 축소) 시각화. 이 선
-        # 밖의 점은 종료판정에도, 박스 스택 페어링(_pick_boxed_sides())에도 안 들어간다
-        # — 트리거 ROI(위 청록 박스, LAT_MAX=2.0)와는 별개의 경계선이니 혼동하지 말 것.
-        cv2.line(bev, to_px(0.0, LAVACON_PATH_LAT_LIMIT), to_px(LAVACON_PATH_LON_MAX, LAVACON_PATH_LAT_LIMIT),
-                 (255, 255, 255), 1)
-        cv2.line(bev, to_px(0.0, -LAVACON_PATH_LAT_LIMIT), to_px(LAVACON_PATH_LON_MAX, -LAVACON_PATH_LAT_LIMIT),
-                 (255, 255, 255), 1)
-        cv2.putText(bev, f'cone ROI lat=+-{LAVACON_PATH_LAT_LIMIT:.1f}m', to_px(LAVACON_PATH_LON_MAX, LAVACON_PATH_LAT_LIMIT),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
-
-        # [2026-08-19] process_lavacon()의 _pick_boxed_sides()가 실제로 훑는 박스 경계를
-        # 파란 가로선으로 표시(요청 반영 — 노란 경로선/점과 헷갈리지 않게 다른 색 사용).
-        # 흰색 콘 후보 횡방향 한계선(±LAVACON_PATH_LAT_LIMIT) 사이 폭으로만 그린다 — 그
-        # 밖은 애초에 박스 탐색에서도 후보로 안 보는 영역이라 그릴 필요가 없다. 경계 개수는
-        # perc_lavacon.py _pick_boxed_sides()의 n_boxes 계산과 반드시 같은 공식을 쓸 것
-        # (floor + 1e-6 부동소수 오차 가드) — 안 맞추면 이 파란선이 실제 박스 경계와 어긋난다.
-        n_lavacon_boxes = max(0, int(math.floor(
-            (LAVACON_PATH_LON_MAX - LAVACON_BOX_LON_START) / LAVACON_BOX_LON_WIDTH + 1e-6)))
-        for bi in range(n_lavacon_boxes + 1):
-            box_lon = LAVACON_BOX_LON_START + bi * LAVACON_BOX_LON_WIDTH
-            cv2.line(bev, to_px(box_lon, LAVACON_PATH_LAT_LIMIT), to_px(box_lon, -LAVACON_PATH_LAT_LIMIT),
-                     (255, 120, 0), 1)
-
-        # [2026-08-11] 실제 조향에 쓰이는 경로(self._lavacon_path_m, perc_lavacon()이 채운
-        # 박스 스택 페어링 결과 — [2026-08-19] 보로노이 → 클러스터 순번 매칭 → 클러스터
-        # 최근접 이웃 매칭 → 박스 스택 페어링 순으로 교체됨, perc_lavacon.py 상단 주석 참고) 시각화.
-        # 노란 선분이 Pure Pursuit/LQR이 _target_point()에서 그대로 걷는 꺾은선이다 —
-        # 차량(원점)에서 시작해 정점을 순서대로 잇는다. 원은 정점 하나하나(각 박스의
-        # 좌/우 픽 포인트 중점 — "영역"이 아니라 점 하나씩).
-        path_m = self._lavacon_path_m
-        if DEBUG_VIZ_LAVACON_SHOW_PATH and path_m:
-            prev_px = (ORIGIN_EX, ORIGIN_EY)
-            for wx, wy in path_m:
-                cur_px = to_px(wx, wy)
-                cv2.line(bev, prev_px, cur_px, (0, 255, 255), 2)
-                prev_px = cur_px
-            for wx, wy in path_m:
-                cv2.circle(bev, to_px(wx, wy), 5, (0, 255, 255), -1)
-                cv2.circle(bev, to_px(wx, wy), 5, (0, 0, 0), 1)
-
         cv2.circle(bev, (MARKER_EX, MARKER_EY), 6, (255, 220, 0), -1)
         cv2.line(bev, (MARKER_EX, MARKER_EY), (MARKER_EX, MARKER_EY - BEAK_LEN), (255, 220, 0), 2)
 
@@ -1689,109 +1744,25 @@ class TrackDriverNode(Node):
         masked_min_s = f'{masked_min:.2f}m' if masked_min >= 0 else 'N/A'
         cv2.putText(bev, f'masked(magenta) pts={masked_pts} min={masked_min_s}',
                     (8, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1, cv2.LINE_AA)
-        cv2.putText(bev, f'yellow=lavacon_path(boxed L/R nearest-pair midpoint, n={len(path_m)})',
-                    (8, 132), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
-        cv2.putText(bev, 'white=cone candidate lat limit, blue=box boundaries',
-                    (8, 154), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+
+        # push ROI(자홍) 검출값 + 지금 실제로 나가는 push량/방향 — _lavacon_steer_da_push()와
+        # 완전히 같은 부호 규약(좌측 콘 침범→+, 우측 콘 침범→-).
+        push_m = 0.0
+        if push_left_y is not None and push_left_y < LAVACON_PUSH_SAFETY_MARGIN_M:
+            push_m += LAVACON_PUSH_SAFETY_MARGIN_M - push_left_y
+        if push_right_y is not None and -push_right_y < LAVACON_PUSH_SAFETY_MARGIN_M:
+            push_m -= LAVACON_PUSH_SAFETY_MARGIN_M - (-push_right_y)
+        push_left_s = 'N/A' if push_left_y is None else f'{push_left_y:.2f}m'
+        push_right_s = 'N/A' if push_right_y is None else f'{push_right_y:.2f}m'
+        push_col = (255, 80, 0) if push_m != 0.0 else (200, 0, 200)
+        cv2.putText(bev, f'PUSH L_y={push_left_s} R_y={push_right_s} '
+                          f'push={push_m:+.2f}m engaged={self._lavacon_engaged}',
+                    (8, 132), cv2.FONT_HERSHEY_SIMPLEX, 0.45, push_col, 1, cv2.LINE_AA)
+        cv2.putText(bev, f'margin={LAVACON_PUSH_SAFETY_MARGIN_M:.2f}m '
+                          f'lon={LAVACON_PUSH_LON_MIN:.1f}~{LAVACON_PUSH_LON_MAX:.1f}m '
+                          f'lat=+-{LAVACON_PUSH_LAT_LIMIT:.1f}m',
+                    (8, 154), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1, cv2.LINE_AA)
         cv2.imshow('lavacon_bev', bev)
-        cv2.waitKey(1)
-
-    # [2-4d] [DEBUG_VIZ_LAVACON_EMA] 라바콘 박스 스택 클러스터링 + 프레임간 EMA 전용 디버그 BEV
-    #   perc_lavacon()이 process_lavacon()에서 돌려받은 boxes(박스별 좌/우 최근접점 —
-    #   LAVACON_TEMPORAL_EMA_ENABLED면 프레임간 EMA가 이미 반영된 값)를 그대로 시각화한다.
-    #   위 _draw_lavacon_bev()(진입 트리거 판정용, ROI 0.3~0.5m 좁은 구간만 봄)와는 별개 —
-    #   이 창은 process_lavacon()이 실제 조향 경로 재료로 쓰는 boxes 자체(BOX_LON_START~
-    #   CONE_LON_MAX 전체 박스 스택)에 집중한다. 박스 안에서 좌(초록)/우(주황) 점이
-    #   검출되면 그 절반을 색으로 채우고, 검출된 점들을 박스 순서대로 이어 "좌우 라바콘
-    #   차선"(LAVACON_TEMPORAL_EMA_ENABLED면 프레임간 EMA로 스무딩된 바운더리 라인)을 그린다.
-    def _draw_lavacon_ema_bev(self, boxes, path_m):
-        PPM = 80           # lavacon_bev와 동일 축척 — 두 창을 나란히 놓고 비교하기 쉽게
-        W, H = 500, 600
-        ORIGIN_EX, ORIGIN_EY = 250, 460
-        EGO_MARKER_PULLBACK_PX = int(LAVACON_BOX_LON_WIDTH * PPM)
-        MARKER_EX, MARKER_EY = ORIGIN_EX, ORIGIN_EY + EGO_MARKER_PULLBACK_PX
-        BEAK_LEN = 18
-        bev = np.zeros((H, W, 3), dtype=np.uint8)
-
-        for d in (1, 2, 3):
-            cv2.circle(bev, (ORIGIN_EX, ORIGIN_EY), d * PPM, (50, 50, 50), 1)
-            cv2.putText(bev, f'{d}m', (ORIGIN_EX + 4, ORIGIN_EY - d * PPM + 12),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (80, 80, 80), 1)
-
-        def to_px(wx, wy): return (int(ORIGIN_EX - wy * PPM), int(ORIGIN_EY - wx * PPM))
-
-        n_boxes = max(0, int(math.floor(
-            (LAVACON_PATH_LON_MAX - LAVACON_BOX_LON_START) / LAVACON_BOX_LON_WIDTH + 1e-6)))
-
-        # 박스별 검출 색칠(좌=초록/우=주황, 그 박스의 절반만 채움) — 한 번에 반투명 블렌딩.
-        overlay = bev.copy()
-        left_hits = right_hits = 0
-        for i, (left_xy, right_xy) in enumerate(boxes):
-            b_lo = LAVACON_BOX_LON_START + i * LAVACON_BOX_LON_WIDTH
-            b_hi = b_lo + LAVACON_BOX_LON_WIDTH
-            if left_xy is not None:
-                left_hits += 1
-                cv2.rectangle(overlay, to_px(b_lo, LAVACON_PATH_LAT_LIMIT), to_px(b_hi, 0.0),
-                              (0, 180, 0), -1)
-            if right_xy is not None:
-                right_hits += 1
-                cv2.rectangle(overlay, to_px(b_lo, 0.0), to_px(b_hi, -LAVACON_PATH_LAT_LIMIT),
-                              (0, 110, 200), -1)
-        cv2.addWeighted(overlay, 0.35, bev, 0.65, 0, bev)
-
-        # 박스 경계선(파랑) + 콘 후보 횡방향 한계선(흰색) — _draw_lavacon_bev()와 동일 스타일.
-        for bi in range(n_boxes + 1):
-            box_lon = LAVACON_BOX_LON_START + bi * LAVACON_BOX_LON_WIDTH
-            cv2.line(bev, to_px(box_lon, LAVACON_PATH_LAT_LIMIT), to_px(box_lon, -LAVACON_PATH_LAT_LIMIT),
-                     (255, 120, 0), 1)
-        cv2.line(bev, to_px(0.0, LAVACON_PATH_LAT_LIMIT), to_px(LAVACON_PATH_LON_MAX, LAVACON_PATH_LAT_LIMIT),
-                 (255, 255, 255), 1)
-        cv2.line(bev, to_px(0.0, -LAVACON_PATH_LAT_LIMIT), to_px(LAVACON_PATH_LON_MAX, -LAVACON_PATH_LAT_LIMIT),
-                 (255, 255, 255), 1)
-
-        # 좌/우 EMA 차선 — 박스 순서대로 검출점을 이은 선. 미검출(None) 박스에서는 선을
-        # 끊어서(연결하지 않고) "그 구간은 실제로 안 보였다"를 잔상 없이 그대로 보여준다.
-        def _draw_lane(side_getter, color):
-            prev_px = None
-            for left_xy, right_xy in boxes:
-                pt = side_getter(left_xy, right_xy)
-                if pt is None:
-                    prev_px = None
-                    continue
-                cur_px = to_px(pt[0], pt[1])
-                if prev_px is not None:
-                    cv2.line(bev, prev_px, cur_px, color, 2)
-                cv2.circle(bev, cur_px, 4, color, -1)
-                cv2.circle(bev, cur_px, 4, (0, 0, 0), 1)
-                prev_px = cur_px
-
-        _draw_lane(lambda l, r: l, (0, 255, 0))     # 좌측 라바콘 차선(초록)
-        _draw_lane(lambda l, r: r, (0, 140, 255))   # 우측 라바콘 차선(주황)
-
-        # 참고용 — 이 boxes로부터 계산된 최종 조향 경로(중점). _draw_lavacon_bev()의 노란
-        # 선/점과 같은 재료(self._lavacon_path_m)라 여긴 얇게만 겹쳐 그려 좌/우 차선을 가리지 않게 함.
-        if DEBUG_VIZ_LAVACON_SHOW_PATH and path_m:
-            prev_px = (ORIGIN_EX, ORIGIN_EY)
-            for wx, wy in path_m:
-                cur_px = to_px(wx, wy)
-                cv2.line(bev, prev_px, cur_px, (0, 255, 255), 1)
-                prev_px = cur_px
-
-        cv2.circle(bev, (MARKER_EX, MARKER_EY), 6, (255, 220, 0), -1)
-        cv2.line(bev, (MARKER_EX, MARKER_EY), (MARKER_EX, MARKER_EY - BEAK_LEN), (255, 220, 0), 2)
-
-        cv2.putText(bev, f'boxes={len(boxes)} L_detect={left_hits} R_detect={right_hits}', (8, 22),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
-        cv2.putText(bev, f'temporal_ema={LAVACON_TEMPORAL_EMA_ENABLED}(a={LAVACON_TEMPORAL_EMA_ALPHA}) '
-                          f'sparse_fallback={LAVACON_SPARSE_FALLBACK_ENABLED}(a={LAVACON_HALFWIDTH_EMA_ALPHA})',
-                    (8, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 200), 1, cv2.LINE_AA)
-        cv2.putText(bev, f'line_continuity={LAVACON_LINE_CONTINUITY_ENABLED}'
-                          f'(max_jump={LAVACON_LINE_TRACK_MAX_JUMP_M}m)',
-                    (8, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 200), 1, cv2.LINE_AA)
-        cv2.putText(bev, 'green=left lane(EMA), orange=right lane(EMA), yellow=steer path midpoint',
-                    (8, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
-
-        cv2.imshow('lavacon_ema_bev', bev)
         cv2.waitKey(1)
 
     # [2-4d'] 좌회전 진입 랜드마크 후보 — 체크무늬 게이트 라이다 기둥쌍 검출
@@ -2146,14 +2117,10 @@ class TrackDriverNode(Node):
             S1을 유지한 채 Behavior만 재활성화해 다음 바퀴(라바콘부터)를 바로 준비한다.
         """
         # Behavior가 조향을 전담하는 구간에서는 Mission의 차선 PID를 건너뛴다.
-        # [2026-08-20] 요청 반영 — 라바콘 구간은 지금 진입/탈출 트리거만 판정하고(아래
-        # run_behavior_fsm() 참고) 그 사이엔 실제 B1 회피 조향(_handle_lavacon())을 쓰지
-        # 않는다. behavior_state가 B1_LAVACON이 되는 경로 자체가 없어서 이 가드는 항상
-        # False라 라바콘 구간에서도 아래 else 분기의 일반 차선주행(_lane_drive)이 끊기지
-        # 않고 계속 돈다(phase/`_lavacon_engaged`가 아니라 behavior_state로 게이팅을 바꿔서,
-        # `_lavacon_engaged`가 구간 추적용으로 다시 True가 돼도 이 가드엔 영향 없음). 나중에
-        # 실제 B1 조향을 되살리면 behavior_state=B1_LAVACON 대입도 같이 복원해야 이 가드가
-        # 다시 걸린다.
+        # [2026-08-22] 요청 반영 — run_behavior_fsm()이 다시 behavior_state=B1_LAVACON을
+        # 세팅하게 되면서(_lavacon_engaged인 동안) 이 가드가 다시 걸린다. B1 구간 조향은
+        # apply_behavior_override()의 _handle_lavacon()(→ _lavacon_steer_da_push())이
+        # 전담하고, 여기 아래 else 분기의 일반 차선주행(_lane_drive)은 그 구간엔 안 돈다.
         if self._behavior_enabled and self.behavior_state == BehaviorState.B1_LAVACON:
             return
         if self._obstacle_active or self._overtake_active:
@@ -2289,20 +2256,18 @@ class TrackDriverNode(Node):
         다시 넣을 수 있게 된 것.
         """
         if self.phase == Phase.LAVACON:
-            # [2026-08-20] 요청 반영 — B1은 지금 단계에서 진입/탈출 두 트리거만 쓴다.
+            # [2026-08-20] 요청 반영 — B1은 진입/탈출 두 트리거로 latch를 관리한다.
             # 진입: 좌우 라이다 클러스터 동시검출(lavacon_trigger)로 self._lavacon_engaged를
             # latch. 탈출: process_lavacon()이 매 틱 계산해두는 lavacon_done(우측 콘
-            # 연속 미검출)이 LAVACON_DONE_FRAMES만큼 유지되면 확정 — 이 판정 자체는
-            # 예전 _handle_lavacon() 안에 있던 것을 그대로 옮겨왔다(behavior_state가
-            # B1_LAVACON이 될 일이 없어져 그 함수가 더 이상 안 불리므로, exit 판정을
-            # 계속 돌리려면 여기로 옮겨야 한다). 진입~탈출 사이엔 실제 B1 회피 조향
-            # (_handle_lavacon()의 _lane_steer(path=lavacon_path) 등)을 쓰지 않고
-            # behavior_state를 B0_NORMAL로 유지 — apply_behavior_override()가 아무것도
-            # 안 해서 _s1_lane_follow()의 일반 차선 PID가 라바콘 구간에서도 그대로 조향한다
-            # (그 PID 스킵 가드도 behavior_state==B1_LAVACON 기준으로 바꿔둠, 위 참고).
-            # 나중에 실제 회피 조향을 다시 붙일 땐 이 아래에서 behavior_state를
-            # B1_LAVACON으로 바꾸고 _handle_lavacon() 안의 중복된 exit 판정 블록을
-            # 지우면 된다(_handle_lavacon()/process_lavacon() 경로 자체는 그대로 남겨둠).
+            # 연속 미검출)이 LAVACON_DONE_FRAMES만큼 유지되면 확정 — 이 판정은 exit 시점을
+            # 여기 한 곳에서만 확정하고 _handle_lavacon()에서는 중복으로 하지 않는다
+            # (그 함수 docstring 참고).
+            # [2026-08-22] 요청 반영 — behavior_state를 B0_NORMAL로 묶어두던 걸 되돌렸다.
+            # _lavacon_engaged인 동안은 B1_LAVACON으로 세팅해 apply_behavior_override()가
+            # 실제로 _handle_lavacon()(→ _lavacon_steer_da_push(), 콘 침범 시 옆으로 밀기)을
+            # 호출하게 한다 — 그 전까진 검출/진입판정만 돌고 조향은 그냥 일반 S1 차선 PID가
+            # 대신하고 있었다(콘 전용 안전마진 없이 DA가 우연히 피해가는 수준). 그 PID 스킵
+            # 가드(behavior_state==B1_LAVACON 기준, _s1_lane_follow() 참고)가 이제 다시 걸린다.
             if self.lavacon_trigger:
                 self._lavacon_engaged = True
             if self._lavacon_engaged:
@@ -2313,11 +2278,15 @@ class TrackDriverNode(Node):
                         self._lavacon_engaged = False
                         self.phase = Phase.OBSTACLE_ZONE
                         self.get_logger().info(
-                            '[LAVACON] 탈출 트리거 확정 → 장애물 구간 '
-                            '(구간 내부는 S1 차선주행으로 통과, B1 회피조향 미사용)')
+                            '[LAVACON] 탈출 트리거 확정 → 장애물 구간')
                 else:
                     self._lavacon_empty_cnt = 0
-            self.behavior_state = BehaviorState.B0_NORMAL
+            if self._lavacon_engaged:
+                self.behavior_state = BehaviorState.B1_LAVACON
+            else:
+                self.behavior_state = BehaviorState.B0_NORMAL
+                self._lavacon_push_active = False  # 진입 전/탈출 직후엔 항상 꺼둔다
+                self._lavacon_push_px = 0.0
         elif self.phase == Phase.OBSTACLE_ZONE:
             # TEST_DISABLE_B2_B3=True면 트리거 검사를 아예 안 하고 바로 리턴 — 장애물/방해차량이
             # 실제로 잡혀도 통과 처리가 안 되어 Phase가 영원히 OBSTACLE_ZONE에 머문다(placeholder
@@ -2409,12 +2378,28 @@ class TrackDriverNode(Node):
         `behavior_state`는 여전히 B0_NORMAL로 유지되므로(§3.4 결정 유지, B2/B3 단독 검증에
         영향 없음) 이건 `_handle_lavacon()`을 되살리는 게 아니라, 상시로 도는 안전 보정
         하나를 여기 얹는 것뿐이다(§4.3 da 근접 컷이 behavior_state와 무관하게 상시로 도는
-        것과 같은 패턴)."""
+        것과 같은 패턴).
+
+        [2026-08-22] 속도 계산(코너 감속/가속 램프)은 `_update_speed()`로 분리했다 — B1
+        (`_handle_lavacon()`)도 조향만 라바콘 전용으로 바꿔 쓰고 속도는 이 S1 로직을
+        "똑같이" 그대로 타게 하려는 목적(요청 반영, speed15 프리셋 기준 SPEED_NORMAL=12/
+        SPEED_CORNER_MIN=10로 자연히 그 사이에서 움직임). behavior_state==B1_LAVACON인
+        동안은 `_s1_lane_follow()`가 이 함수 자체를 안 부르므로(가드 참고), 이 함수는
+        여전히 S1(+커밋 구간의 S0_SIGNAL)에서만 실행된다."""
         if self._lavacon_engaged:
             self.ctrl_angle = self._lavacon_steer_da_push()
         else:
             self.ctrl_angle = self._lane_steer()
+        self._update_speed()
 
+    def _update_speed(self):
+        """`_lane_drive()`(S1)와 `_handle_lavacon()`(B1)이 공유하는 속도 계산 — 코너 감속/
+        가속 램프 로직 자체는 조향 소스(일반 차선 PID든 라바콘 da-push든)와 무관하게
+        self.ctrl_angle 하나만 보고 돌아간다(아래 self._corner_signal 갱신 참고). ctrl_speed·
+        _prev_speed·_corner_hold 갱신. [2026-08-22] _lane_drive()에서 분리 — B1 진입 시
+        속도가 SPEED_LAVACON(2.5 고정)으로 "굳던" 문제(이전 수정으로 일단 "진입 시점 속도
+        유지"로 바꿨었음) 대신, S1과 동일한 동적 속도 로직을 B1에도 그대로 적용하기 위함
+        (요청 반영)."""
         # [2026-08-06, 2026-08-10 복원] 코너 감속 판단은 "지금 순간 조향각이 얼마나 큰가"가
         # 아니라 "최근 한동안 같은 방향으로 얼마나 꺾여 있었는가"를 봐야 한다. pure_pursuit은
         # 구조상 좌우로 조금씩 진동("와리가리")하는데, turn_now를 매 틱 abs(ctrl_angle)로 그대로
@@ -3355,14 +3340,12 @@ class TrackDriverNode(Node):
     # ── B1-라바콘: 박스 스택 페어링 경로 추종([2026-08-19] 보로노이 → 클러스터 매칭 → 박스 스택으로 교체) ──
     def _handle_lavacon(self):
         """
-        [2026-08-20] 요청 반영으로 지금은 behavior_state가 B1_LAVACON이 되는 경로가 없어져
-        (run_behavior_fsm() 참고, 진입/탈출 트리거만 쓰고 그 사이는 S1 일반 차선주행)
-        이 함수 자체가 호출되지 않는다 — 나중에 실제 회피 조향을 다시 붙일 때를 위해
-        구현만 남겨둔 상태. 되살릴 땐 run_behavior_fsm()에서 behavior_state를
-        B1_LAVACON으로 다시 세팅하고, exit 판정(현재 run_behavior_fsm()의 Phase.LAVACON
-        분기로 옮겨져 있음)을 여기서 다시 하지 않도록 주의할 것(중복 디바운스 방지).
+        [2026-08-22] 요청 반영 — run_behavior_fsm()이 다시 behavior_state=B1_LAVACON을
+        세팅하게 되면서(_lavacon_engaged인 동안) 이 함수가 다시 호출된다. exit(구간 종료)
+        판정은 여전히 run_behavior_fsm()의 Phase.LAVACON 분기가 전담하므로 여기서는
+        중복으로 하지 않는다(아래 함수 끝 주석 참고).
 
-        (아래는 예전 문서 — 실제 회피 조향 로직 자체 설명, 여전히 유효)
+        (아래는 실제 회피 조향 로직 자체 설명)
         우측 콘이 연속 LAVACON_DONE_FRAMES 프레임 미검출되면 고정장애물 구간으로 전환.
 
         [2026-08-11] 조향은 라바콘 전용 P게인(LAVACON_KP, 폐기) 대신 _lane_steer()를
@@ -3395,7 +3378,15 @@ class TrackDriverNode(Node):
             self.ctrl_angle = self._lane_steer(
                 path=self.lavacon_path, vehicle_x=0.0,
                 vehicle_y_px=LIDAR_TO_VEHICLE_FRONT_M * DL_PIXELS_PER_METER)
-        self.ctrl_speed = SPEED_LAVACON
+        # [2026-08-22] SPEED_LAVACON(2.5 고정) 삭제(요청 반영) — 여기서 매 틱 고정속도로
+        # 덮어써서 B1 진입 즉시 그 값에 "굳는" 증상이 실차에서 확인됐다. 이후(같은 날
+        # 재요청) "S1 주행하던 대로 똑같이"로 다시 바뀌어, 진입 시점 속도를 얼려두는 대신
+        # _update_speed()(_lane_drive()와 공유하는 코너 감속/가속 램프 로직, speed15
+        # 프리셋 기준 SPEED_NORMAL=12/SPEED_CORNER_MIN=10 사이에서 동적으로 움직임)를
+        # 그대로 재사용한다 — self.ctrl_angle만 위에서 이미 라바콘 조향으로 바뀐 상태라
+        # _update_speed()는 조향 소스를 몰라도(코너 신호는 ctrl_angle 하나만 봄) 동일하게
+        # 동작한다.
+        self._update_speed()
         # exit(구간 종료) 판정은 run_behavior_fsm()의 Phase.LAVACON 분기로 옮겨졌다 —
         # 이 함수가 다시 불리게 되는 시점에도 여기서 중복으로 하지 않는다(위 docstring 참고).
 
@@ -3440,6 +3431,13 @@ class TrackDriverNode(Node):
         if right_y is not None and -right_y < LAVACON_PUSH_SAFETY_MARGIN_M:
             push_m -= LAVACON_PUSH_SAFETY_MARGIN_M - (-right_y)    # 우측 콘 침범 → 좌측(-)으로
         push_px = push_m * DL_PIXELS_PER_METER
+        # [2026-08-22] 요청 반영 — 이번 틱에 실제로 밀렸는지(lavacon_bev의 push ROI/
+        # 자홍 박스가 콘 침범을 잡아 push_m이 0이 아닌 경우)를 DA 디버그창에도 반영한다
+        # (perc_lane()의 set_lavacon_push() 참고, lane_util.py draw_path()가 소비).
+        # push_px(실제 밀린 양)도 같이 넘겨서, 디버그창이 밀리기 전(보라) 원본과 밀린 뒤
+        # (주황) 경로를 나란히 그릴 수 있게 한다 — 게인 튜닝 시 밀림 정도를 눈으로 참고.
+        self._lavacon_push_active = (push_m != 0.0)
+        self._lavacon_push_px = push_px
 
         shifted_path = [(x + push_px, y) for x, y in self.lane_path]
 

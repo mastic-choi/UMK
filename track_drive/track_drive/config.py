@@ -106,7 +106,11 @@ SPEED_NORMAL  = 15.0   # [2026-08-17g] 10.0 → 15.0(요청 반영, 증속). 이
                         #   ★주의★ README §6.5의 METERS_PER_SPEED_UNIT 회귀는 speed=5/10 두 점만 실측한
                         #   것이라 15도 측정 범위 밖 외삽 — 실제 m/s·제동거리·코너 반응이 그 선형식대로
                         #   나올지 실차 재검증 필요.
-SPEED_LAVACON = 2.5    # 라바콘 구간 속도
+# [2026-08-22] SPEED_LAVACON(2.5 고정) 삭제(요청 반영) — B1 진입 시 속도가 그 값으로
+#   매 틱 강제 고정되는 게 "굳는다"는 증상으로 실차에서 확인됨(track_drive.py
+#   _handle_lavacon() 참고). B1 구간은 _lane_drive()가 안 돌아 속도가 갱신되지 않으므로,
+#   대신 진입 직전 마지막 ctrl_speed를 그대로 들고 간다(_handle_lavacon()에서 ctrl_speed를
+#   건드리지 않는 방식으로 변경).
 SPEED_STOP    = 0.0
 # [2026-08-06] 코너 감속(_lane_drive())의 목표속도 하한 — 원래 SPEED_NORMAL*0.15(=1.2, 두 곳에
 #   하드코딩)로 잡혀 있었는데, config.py "6. 단위환산" 절의 실측 근거(정속 회귀선의 절편이
@@ -1281,14 +1285,33 @@ DEBUG_PERIOD = 0.5     # 위 로그 주기(s)
 # [2026-08-11] 라바콘 실차 테스트 중엔 라이다 창만 보고 싶다는 요청으로, 아래 DEBUG_VIZ_LIDAR만
 #   켜고 나머지는 전부 잠시 끔. 다른 디버그창이 다시 필요하면(예: 차선 인식 디버깅) 개별적으로
 #   다시 True로 되돌릴 것 — 서로 독립적인 스위치라 다른 항목엔 영향 없음.
+# [2026-08-22k] True → False(요청 반영) — 이 창은 B2/B3(사물회피) 전용이라 라바콘과는 무관.
+#   지금은 라바콘 검출(lavacon_bev, 아래 DEBUG_VIZ_LAVACON) 확인이 목적이라 끔. B2/B3 디버깅이
+#   다시 필요하면 True로 되돌릴 것.
 DEBUG_VIZ_LIDAR    = False   # 라이다 BEV 장애물 감지 디버그 창 (track_drive.py)
 # [2026-08-19] ENABLE_BEHAVIOR=False(라바콘/장애물/추월 Behavior 전체 비활성, 순수 차선주행만
-#   사용)로 전환하면서, 더 이상 발동되지 않는 라바콘 디버그창 3개도 함께 끔(요청 반영: "디버깅창도
-#   다른거 다 끄고 ll창만"). 나머지 창들도 아래에서 전부 꺼져 있고 DEBUG_VIZ_DL_LANE만 켜져
-#   있다. 라바콘을 다시 켜면(ENABLE_BEHAVIOR=True) 아래 세 개도 다시 True로 되돌릴 것.
-DEBUG_VIZ_LAVACON  = False  # 라바콘 트리거 좌우 클러스터 BEV 디버그 창 (track_drive.py)
-DEBUG_VIZ_LAVACON_EMA = False  # 라바콘 박스 클러스터링 검출 + 좌우 EMA 차선 디버그 창 (track_drive.py)
-DEBUG_VIZ_LAVACON_SHOW_PATH = False
+#   사용)로 전환하면서, 더 이상 발동되지 않는 라바콘 디버그창 관련 스위치도 함께 끔(요청 반영:
+#   "디버깅창도 다른거 다 끄고 ll창만"). 나머지 창들도 아래에서 전부 꺼져 있고 DEBUG_VIZ_DL_LANE만
+#   켜져 있다. 라바콘을 다시 켜면(ENABLE_BEHAVIOR=True) 아래도 다시 True로 되돌릴 것.
+#   ([2026-08-22] 당시 "3개"였던 라바콘 창은 이후 통합·삭제로 아래 두 개(DEBUG_VIZ_LAVACON/
+#   DEBUG_VIZ_LAVACON_SHOW_PATH)만 남음.)
+# [2026-08-22] 원래 DEBUG_VIZ_LAVACON('lavacon_bev', 트리거 좌우 클러스터)과
+#   DEBUG_VIZ_LAVACON_EMA('lavacon_ema_bev', 박스 클러스터링+좌우 EMA 차선)가 별개 창
+#   두 개였는데, 요청 반영으로 'lavacon_bev' 창 하나로 통합했다(track_drive.py
+#   _draw_lavacon_bev() 참고) — 스위치도 DEBUG_VIZ_LAVACON 하나면 충분해져 EMA 전용
+#   스위치는 삭제.
+
+# [2026-08-22k] False → True(요청 반영) — lavacon_bev 창 자체가 꺼져 있어서 라바콘 트리거
+#   ROI(LAT_MAX)/검출 박스(CONE_LAT_LIMIT) 수정 결과가 실제로는 화면에 안 보이고 있었다
+#   (2026-08-11 당시 "라바콘 실차 테스트 중엔 라이다 창만" 요청으로 꺼둔 게 그대로 남아있던
+#   것 — 위 DEBUG_VIZ_LIDAR 주석 참고). 처음엔 DEBUG_VIZ_LIDAR(B2/B3 전용)와 같이 켰다가,
+#   지금은 라바콘 검출 확인이 목적이라 위 DEBUG_VIZ_LIDAR를 다시 False로 끄고 이 창만 남김
+#   (요청 반영).
+DEBUG_VIZ_LAVACON  = True   # 라바콘 트리거 ROI + push ROI(지금 실제 조향에 쓰이는 좌우 최근접
+                             #   콘 검출) 통합 BEV 디버그 창 (track_drive.py _draw_lavacon_bev())
+# [2026-08-22k] DEBUG_VIZ_LAVACON_SHOW_PATH 삭제(요청 반영) — 박스 스택 페어링 조향
+#   (_handle_lavacon()의 폴백 분기, 2026-08-20부터 이미 안 불림)이 쓰던 노란 경로선(path_m)
+#   시각화를 _draw_lavacon_bev()에서 지우면서 이 스위치가 아무것도 안 하게 됐다.
 DEBUG_PLANNER      = False  # Hybrid A* OccupancyGrid 디버그 창 (track_drive.py, USE_HYBRID_ASTAR_FOR_B3=True일 때만 의미있음)
 DEBUG_VIZ_STEER    = False  # 조향 컨트롤러(직전값유지/현재값반영) 한글 디버그 창 (track_drive.py)
 DEBUG_VIZ_VESC     = False  # VESC 실측속도(/vesc_speed_erpm) 연동 상태(수신중/끊김/미수신) +
@@ -1340,7 +1363,7 @@ DEBUG_VIZ_CHECKER_PILLAR = False   # 체크무늬 게이트 라이다 기둥쌍 
 #   (self.img_front)도 이어붙였다. [2026-08-22l] 요청 반영("카메라 영상부분을 옆으로
 #   붙여줘")으로 카메라/BEV를 세로가 아닌 좌우 나란히 배치로 변경 — 최종 레이아웃:
 #   상태 텍스트(위) / FRONT CAM·LIDAR BEV 좌우 나란히(아래).
-DEBUG_VIZ_LEFT_TURN = True   # 좌회전 실행중/실행끝/발행각도/라이다감지+카메라+BEV 통합 디버그 창 (track_drive.py)
+DEBUG_VIZ_LEFT_TURN = False   # 좌회전 실행중/실행끝/발행각도/라이다감지+카메라+BEV 통합 디버그 창 (track_drive.py)
 DEBUG_VIZ_YOLO_CONE  = False   # 콘 원시검출 창('yolo_cone_result', yolo_cone.py
                                # show_debug_windows()) + obstacle_cut_debug 창의 콘 카메라
                                # 패널(cam_stage=='cone'일 때)용 vis 프레임(yolo_cone.py
@@ -1363,21 +1386,24 @@ DEBUG_VIZ_AVOID_HOLD = False
 # [2026-08-20] da 근접 컷(obstacle-cut, ENABLE_OBSTACLE_CUT 주석 참고) 전용 상태창 —
 #   라이다 raw/YOLO raw/AND확정/유지타이머 잔여시간/해제카운터를 avoid_hold_debug와
 #   같은 구조로 한곳에 모아 보여준다(track_drive.py _debug_viz_obstacle_cut()).
-DEBUG_VIZ_OBSTACLE_CUT = False   # [2026-08-22i] 요청 반영으로 끔 — dl_lane 창의 마젠타 오버레이는 계속 보임(DEBUG_VIZ_DL_LANE과 무관)
+DEBUG_VIZ_OBSTACLE_CUT = True    # [2026-08-22i] 요청 반영으로 껐다가, [2026-08-22m] 회피(da 근접 컷)
+#   검출범위 확인용으로 다시 켬 — 이 창의 "LIDAR TRIGGER ROI" BEV 패널이 라이다 검출범위
+#   (OBSTACLE_CUT_TRIGGER_X_MAX_M x Y_HALF_M 박스)를 보여주는 창이다. dl_lane 창의 경로선
+#   색 구분(draw_path(), lane_util.py)과 같이 켜서 "라이다가 왜 지금 잡았는지"와 "그래서
+#   경로가 실제로 밀렸는지"를 두 창에서 나란히 확인한다.
 
 
 # #############################################################
 # 6. 미션 State / 실차 테스트 범위 제한
 # #############################################################
-# [2026-08-22, 임시] 좌회전 진입(체크무늬 게이트 라이다 기둥쌍+조향 램프) 단독 검증용
-#   override — S0_SIGNAL(출발선 신호등 대기)을 건너뛰고 곧장 S1_LANE_FOLLOW로 시작한다.
-#   track_drive.py __init__의 self.phase를 Phase.DONE + _b2_passed/_b3_passed=True로도
-#   같이 바꿔서(위 참고) B1/B2/B3를 전부 건너뛰고 바로 "다음 교차로 신호등 대기" 상태로
-#   출발한다 — 신호등 보드 인식 즉시 S0_SIGNAL 재진입 → 좌회전 신호 확정 → 체크무늬
-#   게이트 트리거 순으로 실제 좌회전 진입 경로를 그대로 탄다. 검증 끝나면 START_STATE=
-#   S0_SIGNAL / TEST_FORCE_BEHAVIOR=False(아래, 이미 False)로 되돌리고 track_drive.py의
-#   phase/b2_passed/b3_passed도 원래값(Phase.LAVACON/False/False)으로 같이 되돌릴 것
-#   (라바콘(B1)/B3 단독 검증 때도 같은 패턴을 썼다가 원복한 이력 있음).
+# [2026-08-22] 라바콘(B1) 단독 검증용 override — S0_SIGNAL(출발선 신호등 대기)을
+#   건너뛰고 곧장 S1_LANE_FOLLOW로 시작한다. track_drive.py __init__의 self.phase도
+#   Phase.LAVACON + _b2_passed/_b3_passed=False로 맞춰뒀다(위 참고) — S0_SIGNAL을 안
+#   거치므로 TEST_FORCE_BEHAVIOR(아래)로 _behavior_enabled를 시작부터 강제 True로 켜야
+#   B1이 실제로 발동한다. 검증 끝나면 START_STATE=S0_SIGNAL / TEST_FORCE_BEHAVIOR=False로
+#   되돌리고 track_drive.py의 phase/b2_passed/b3_passed는 그대로 둘 것(좌회전 단독 검증
+#   때는 Phase.DONE+True/True로 다시 바꿔야 함 — 이력 있음, 매번 바뀌니 되돌릴 때
+#   track_drive.py __init__ 주석도 같이 확인).
 # [2026-08-20, signal-whiteboard-autocrop 브랜치 병합] START_STATE는 원래 S0_WAIT_GREEN
 #   이었으나, 그 상태와 S2_INTERSECTION이 S0_SIGNAL 하나로 통합됐다(위 MissionState enum
 #   주석 참고, 출발선/교차로 재진입 모두 같은 SignalDetector.detect_s2() 재사용) — 값은
@@ -1396,15 +1422,14 @@ TEST_DISABLE_B2_B3 = False
 #         이중으로 걸어 B2/B3가 어떤 경로로도 안 켜지게 한다(안전판).
 #   False: 원래대로 SAFETY_DIST/OVERTAKE_TRIGGER 트리거 검사해서 B2/B3 정상 발동 —
 #         이번 B3 검증이 보고 싶은 게 바로 이 발동이라 False.
-TEST_FORCE_BEHAVIOR = False
+TEST_FORCE_BEHAVIOR = True
 #   True: _behavior_enabled를 시작부터 강제 True로 켜서, START_STATE=S1_LANE_FOLLOW로
 #         S0/S2를 건너뛴 채로도 B1→B2→B3가 정상 발동한다(그렇지 않으면 _behavior_enabled가
 #         S0_SIGNAL 직진 확정 시에만 True가 되는데 그 경로 자체를 안 타므로 계속 False로
-#         남아 Behavior가 영원히 안 켜짐).
-#   False: 원래대로 S0_SIGNAL 직진 신호 확정 시에만 Behavior가 켜짐. [2026-08-22] 좌회전
-#         단독 검증은 위에서 Phase.DONE으로 이미 시작하므로 run_behavior_fsm()이 B0_NORMAL로
-#         고정돼 있어 Behavior를 켤 필요가 없다 — False로 둬도 무방(안전한 쪽). 정상 플로우
-#         (신호등부터 실제로 거침) 검증 때는 START_STATE=S0_SIGNAL과 함께 False 유지.
+#         남아 Behavior가 영원히 안 켜짐). [2026-08-22] 라바콘(B1) 단독 검증 중이라 True —
+#         위에서 Phase.LAVACON으로 이미 시작하므로 이게 없으면 B1이 영원히 안 켜진다.
+#   False: 원래대로 S0_SIGNAL 직진 신호 확정 시에만 Behavior가 켜짐. 정상 플로우(신호등부터
+#         실제로 거침) 검증 때는 START_STATE=S0_SIGNAL과 함께 False로 되돌릴 것.
 
 # [2026-08-11] B2(정지 장애물) Hybrid A* 대안(USE_HYBRID_ASTAR_FOR_B2) 삭제.
 #   대신 _da_avoidance_failed() 게이트 + TargetPassing(실측 기반 하드코딩)로 대체
@@ -1505,8 +1530,10 @@ LAVACON_TRIGGER_FRAMES = 5    # (YOLO 콘 검출 AND 좌우 라이다 클러스�
 #   `_pick_boxed_centers`와 결과가 100% 동일함이 보장돼야 한다(perc_lavacon.py 상단 주석
 #   5) 참고). 실차에서 콘 간격이 벌어지는 구간 대응이 필요하면 켤 것.
 # [2026-08-19] 자가 테스트로 기존 동작과 동일함이 확인된 상태에서(0d1b55) 실차 검증 단계로
-#   전환 — sparse fallback + 프레임간 EMA(아래) 둘 다 True로 켬. DEBUG_VIZ_LAVACON_EMA
-#   전용 창(track_drive.py `_draw_lavacon_ema_bev()`)으로 좌우 EMA 차선을 직접 보면서 튜닝할 것.
+#   전환 — sparse fallback + 프레임간 EMA(아래) 둘 다 True로 켬. [2026-08-22 이후]
+#   DEBUG_VIZ_LAVACON 통합 창('lavacon_bev', track_drive.py `_draw_lavacon_bev()`)으로
+#   좌우 EMA 차선을 직접 보면서 튜닝할 것(원래는 DEBUG_VIZ_LAVACON_EMA 전용 창이었으나
+#   'lavacon_bev' 하나로 통합됨).
 LAVACON_SPARSE_FALLBACK_ENABLED = True
 LAVACON_HALFWIDTH_EMA_ALPHA     = 0.3   # 좌우 반폭 러닝 추정 EMA 계수(작을수록 더 느리게 반응)
 
@@ -1543,8 +1570,22 @@ LAVACON_PUSH_SAFETY_MARGIN_M = 0.26
 #   가까운 범위만 본다. "지금 당장 스칠 위험이 있는 콘"만 반응해야 하므로, 멀리 있는
 #   콘까지 보면 아직 위협도 아닌데 미리 밀거나(오조향) 다음 콘으로 넘어가면서 push가
 #   들쭉날쭉 튈 위험이 있다. 실측 아님 — 실차에서 튜닝 필요.
-LAVACON_PUSH_LON_MIN     = 0.1   # 차체 바로 앞 반사 배제(perc_lavacon.py LON_MIN과 동일 이유)
-LAVACON_PUSH_LON_MAX     = 0.5   # 이 거리보다 먼 콘은 아직 안 민다
+# [2026-08-22] 0.1~0.5 → 0.3~0.7(요청 반영, 폭 0.4m 유지한 채 통째로 뒤로 밈) — lavacon_bev
+#   디버그창에서 push ROI(보라 박스)가 트리거 ROI(노란 박스, perc_lavacon_trigger()의
+#   LON_MIN=0.3~LON_MAX=0.7)보다 앞쪽에서 시작해 둘의 검출 시작 지점이 어긋나 보인다는
+#   지적으로, 두 박스의 종방향 시작점을 0.3m로 맞췄다. 폭은 그대로 유지했으므로 끝점도
+#   0.5→0.7로 같이 밀렸다.
+# [2026-08-22] 0.3~0.7 → -0.1~0.3(요청 반영, 폭 0.4m 유지한 채 통째로 앞으로 당김) — 위
+#   0.3~0.7은 "라이다 원점" 기준값인데, lavacon_bev의 자차 마커(파란 점, _draw_lavacon_bev()
+#   EGO_MARKER_PULLBACK_PX)는 라이다 원점보다 LAVACON_BOX_LON_WIDTH(0.4m)만큼 뒤에 그려진다
+#   — 즉 자차 마커(=차량 실제 위치, 이 마커는 절대 건드리지 않기로 함)를 기준으로 보면
+#   push ROI는 실제로 차량 앞 0.3+0.4=0.7m 지점부터 시작하고 있었다. "차량 전방 0.3m부터
+#   감지"가 되려면 라이다 원점 기준으로는 0.3(요청값) - 0.4(마커 뒤당김량) = -0.1부터여야
+#   한다(폭 0.4m는 그대로 유지 → 끝점도 0.7→0.3). 트리거 ROI(노란 박스,
+#   perc_lavacon_trigger()의 LON_MIN/LON_MAX)도 같은 이유로 뒤이어 -0.1~0.3으로 맞췄다 —
+#   두 ROI는 항상 같이 바꿀 것, 하나만 바꾸면 lavacon_bev에서 둘의 시작점이 다시 어긋나 보인다.
+LAVACON_PUSH_LON_MIN     = -0.1  # 차량(자차 마커) 기준 전방 0.3m(=라이다 원점 기준 -0.1m)부터
+LAVACON_PUSH_LON_MAX     = 0.3   # 이 거리보다 먼 콘은 아직 안 민다
 LAVACON_PUSH_LAT_LIMIT   = 1.0   # 횡방향 탐색 한계 — CONE_LAT_LIMIT(perc_lavacon.py)와 동일값으로 시작
 
 # [2026-08-19] 박스 안 후보점의 좌/우 배정을 y부호(차량 헤딩 기준 고정 중앙선, y>0=좌/

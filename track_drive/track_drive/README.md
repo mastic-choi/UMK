@@ -2447,6 +2447,92 @@ push를 켜는 게이트가 있었는데, 실차에서 라이다 클러스터는
 `_lavacon_engaged`가 1바퀴째는 True가 될 기회 자체가 없다 — 이 안전판은 `RESET_PHASE_EACH_LAP`
 로 `Phase.LAVACON`이 다시 도는 2바퀴째부터만 실제로 걸린다.
 
+### 3.6 라바콘 디버그창 2개(`lavacon_bev`/`lavacon_ema_bev`) → 하나로 통합 (2026-08-22)
+
+**배경:** 요청 반영. 트리거 ROI/좌우 클러스터 전용 창(`DEBUG_VIZ_LAVACON`, `_draw_lavacon_bev()`)과
+박스 스택 클러스터링+프레임간 EMA 전용 창(`DEBUG_VIZ_LAVACON_EMA`, `_draw_lavacon_ema_bev()`)이
+따로 떠 있어서 같이 보려면 창 두 개를 번갈아 봐야 했다. 둘 다 같은 축척(`PPM=80`)/원점을
+쓰던 창이라 그대로 한 캔버스에 겹쳐 그릴 수 있었다.
+
+**수정:**
+- `_draw_lavacon_ema_bev()`를 삭제하고 그 내용(박스별 좌/우 반투명 채움, EMA 좌/우 차선,
+  `boxes=`/`temporal_ema=`/`line_continuity=` 텍스트)을 `_draw_lavacon_bev()` 안으로 옮겨,
+  트리거 ROI 점구름·데드존·박스 경계선과 같은 창(`'lavacon_bev'`)에 겹쳐 그린다
+  (track_drive.py `_draw_lavacon_bev()`).
+- 호출부도 통합 — `perc_lavacon()`(박스/경로 계산)은 더 이상 직접 그리지 않고, 같은 틱
+  뒤에 도는 `perc_lavacon_trigger()`가 `self._lavacon_boxes_prev`/`self._lavacon_path_m`을
+  같이 넘겨서 한 번에 그린다. `process_lavacon()`이 라이다 입력이 아직 불충분할 때
+  `boxes=None`을 반환할 수 있어(`perc_lavacon.py` 참고) 호출부에서 빈 리스트로 폴백한다.
+- `DEBUG_VIZ_LAVACON_EMA` 스위치는 삭제 — `DEBUG_VIZ_LAVACON` 하나로 통합 창 전체를 켜고 끈다
+  (config.py).
+
+**되돌리는 법:** 필요하면 git 이력에서 `_draw_lavacon_ema_bev()`/`DEBUG_VIZ_LAVACON_EMA`를
+되살리고, `perc_lavacon()`의 호출부를 원래 자리로 되돌리면 된다 — 통합 전후로 그리는 내용
+자체는 동일해서 로직 손실은 없다.
+
+### 3.7 트리거/검출 ROI 폭 축소 + 디버그 배율 조정 (2026-08-22k)
+
+**배경:** 요청 반영. 좌우 라이다 클러스터 트리거(`perc_lavacon_trigger()`의 `LAT_MAX`,
+2.0m)와 좌우 콘 검출 박스(`perc_lavacon.py`의 `CONE_LAT_LIMIT`, 1.0m)가 서로 다른 폭이라
+`lavacon_bev` 창에서 트리거 박스(청록)와 검출 박스(초록/주황) 사이에 안 쓰이는 빈 공간이
+남아 있었다. 실차 확인 결과 두 ROI 모두 좌우 0.5m(총 1m)로 좁혀도 충분하다고 판단.
+
+**수정:**
+- `LAT_MAX`(track_drive.py `perc_lavacon_trigger()`) 2.0 → 0.5.
+- `CONE_LAT_LIMIT`(perc_lavacon.py) 1.0 → 0.5 — 두 값을 같게 맞춰 트리거 박스와 검출
+  박스가 같은 폭이 되므로 빈 공간이 없어진다(종방향 길이는 원래부터 좌/우 대칭이라 그대로).
+- `_draw_lavacon_bev()`의 `PPM`(축척) 80 → 100 — ROI가 좁아진 만큼 확대. 100으로 잡은
+  이유는 `CONE_LON_MAX`(4.0m, 박스 스택 전체 깊이)가 창 위로 잘리지 않는 한도 근방이기
+  때문(`ORIGIN_EY=460px`이므로 460/100=4.6m로 여유 0.6m 확보 — 더 키우면 원거리 박스/경로가
+  잘릴 수 있음).
+
+**실차 미검증** — 좌우 0.5m ROI가 실제 콘 간격/차폭 대비 너무 좁지 않은지, `lavacon_bev`
+창에서 새 배율이 보기 편한지 확인할 것.
+
+**[2026-08-22k 후속] 요청 반영으로 `LAT_MAX`만 0.5 → 0.75(좌우, 총 1.5m)로 재조정.**
+`CONE_LAT_LIMIT`(perc_lavacon.py)은 0.5 그대로 — §3.8에서 박스 스택 시각화(둘을 맞출
+이유였던 "빈 공간" 문제)를 지우면서 두 값을 같이 맞출 필요가 없어졌다.
+
+### 3.8 `lavacon_bev` 창에서 안 쓰이는 박스 스택 시각화 삭제, push ROI 추가 (2026-08-22k)
+
+**배경:** 요청 반영. `lavacon_bev` 창의 초록/주황 이어지는 선(박스 스택 페어링 EMA 차선)과
+노란 경로선(`path_m`)이 실제로는 §3.4(2026-08-20, `_handle_lavacon()` 자체가 안 불림)+§3.3
+이전 이력으로 이미 조향에 안 쓰이는 잔존 시각화라는 게 대화 중 확인됨 — 화면엔 계속
+그려지고 있어서 "지금 저게 실제로 쓰이는 로직이냐"는 질문이 나왔다. 사용자 요청: 지금 실제
+쓰이는 정보(①트리거 검출박스 ②전면 좌우 라바콘 검출박스) 위주로 다시 그리기.
+
+**수정 (`track_drive.py` `_draw_lavacon_bev()`):**
+- 삭제 — 박스 스택 반투명 채움(초록/주황), 흰 `cone ROI lat` 경계선, 파란 박스 경계선,
+  좌/우 EMA 이어짐 선(`_draw_lane()`), 노란 `path_m` 경로선(`DEBUG_VIZ_LAVACON_SHOW_PATH`,
+  스위치 자체도 config.py에서 삭제 — 더는 아무것도 안 그려서). 이제 안 쓰는
+  `LAVACON_PATH_LON_MAX`/`LAVACON_PATH_LAT_LIMIT`/`LAVACON_BOX_LON_START` import 별칭도 정리
+  (`LAVACON_BOX_LON_WIDTH`는 자차 마커 위치 계산에 여전히 쓰여 유지).
+- 추가 — **push ROI**(자홍 박스, `LAVACON_PUSH_LON_MIN~MAX × ±LAVACON_PUSH_LAT_LIMIT`):
+  `_lane_drive()`가 `self._lavacon_engaged`일 때 매 틱 부르는 `_lavacon_steer_da_push()`가
+  실제로 보는 좌우 최근접 콘 ROI. `nearest_cone_lateral()`을 시각화 전용으로 다시 호출해서
+  좌/우 검출 y값을 가로 눈금선으로 표시(그 함수가 x는 안 줘서 ROI 폭 전체에 걸쳐 그림 —
+  정확한 종방향 위치가 아니라 "ROI 안 어딘가"라는 뜻), 안전마진(`LAVACON_PUSH_SAFETY_MARGIN_M`)
+  경계선, 마진 침범 시 파랑으로 강조. 텍스트로 `L_y`/`R_y`/현재 `push` 량·방향/
+  `self._lavacon_engaged` 상태까지 표시.
+- 유지 — 트리거 ROI(노란/청록 박스, `LAT_MAX`), ROI 점구름(초록/주황/회색), 자기가림
+  데드존 부채꼴, 자기가림 구간 원본 magenta 점, 자차 마커, L/R pts·run/YOLO 콘/트리거
+  카운터 텍스트.
+
+**참고:** `perc_lavacon()`(박스 스택 계산 자체, `lavacon_done` 종료판정용으로 여전히 필요)은
+안 건드림 — 계산은 계속 매 틱 돌지만 이제 그 결과(`boxes`/`path_m`)를 시각화로 넘기지 않을
+뿐. `mission_realcar_test_checklist.md`의 `DEBUG_VIZ_LAVACON_SHOW_PATH` 언급도 갱신.
+
+### 3.9 디버그창 스위치 — `DEBUG_VIZ_LIDAR` 끄고 `DEBUG_VIZ_LAVACON` 켬 (2026-08-22k)
+
+**배경:** `DEBUG_VIZ_LAVACON`이 2026-08-11 이후 계속 `False`로 꺼져 있던 게 이번 세션에서
+드러났다(§3.7 트리거 ROI를 고쳐도 화면엔 반영이 안 보였던 원인) — 당시 "라바콘 실차
+테스트 중엔 라이다 창(`DEBUG_VIZ_LIDAR`, B2/B3 전용)만 보고 싶다"는 요청으로 꺼둔 게 그대로
+남아있었다. 지금은 반대로 라바콘 검출 확인이 목적이라 요청 반영으로 전환.
+
+**수정 (`config.py`):** `DEBUG_VIZ_LIDAR` True→False, `DEBUG_VIZ_LAVACON` False→True.
+B2/B3(`lidar_bev`) 디버깅이 다시 필요하면 `DEBUG_VIZ_LIDAR`를 다시 True로 되돌릴 것 — 서로
+독립 스위치라 다른 항목엔 영향 없음.
+
 ---
 
 ## 4. 사물회피 (B2_OBSTACLE, 고정장애물)
@@ -2532,6 +2618,21 @@ SHIFT(`PASS_OFFSET=80px`, §6.1 실측 기반) → ALONGSIDE(장애물 안 보�
 `obstacle_cut_type`을 확정해두므로(`perceive_all()` 호출 순서) 진입 순간 바로 읽어도 안전하다.
 해제 디바운스(`OBSTACLE_CUT_RELEASE_CONFIRM_FRAMES`)는 B2/B3 공용으로 그대로 유지 — 이번 변경은
 "floor"(최소 유지 시간)만 낮춘 것. 실차 미검증.
+
+### 4.5 전방 장애물 ROI 횡방향 반폭 — 축소했다가 원복 (2026-08-22k)
+
+**배경:** 요청 반영. `lidar_bev` 디버그창의 노란(청록, BGR `(0,220,220)`) FRONT ROI 박스가
+좌우 ±1.5m(총 3m)로 커 보인다는 지적으로 §3.7(라바콘 트리거 ROI 축소)과 함께 0.5m로
+좁혔다가, 이 값은 `lavacon_bev`가 아니라 `lidar_bev`(B2/B3 전용)에 속한 별개 ROI라는 게
+확인되면서 다시 1.5m로 원복(요청 반영).
+
+**수정:** `perc_obstacle()`의 `FRONT_Y_HALF` 1.5 → 0.5 → **1.5로 원복** (track_drive.py:892).
+라바콘 쪽(§3.7의 `perc_lavacon_trigger()` `LAT_MAX`, `perc_lavacon.py` `CONE_LAT_LIMIT`, 둘 다
+0.5)은 원복 대상이 아니고 그대로 유지.
+
+**참고:** 이 값은 표시 전용이 아니라 `front_mask`(→ `obstacle_front`/`obstacle_dist`/
+`obstacle_type`/`obstacle_width`) 전부의 입력이라 B2/B3 회피 판정 자체에 직접 영향을 준다 —
+`SIDE_X_MIN/MAX`, `LEFT/RIGHT_Y_MIN/MAX`(좌우 차선공간 판정용, §4.2)는 애초에 건드린 적 없음.
 
 ---
 
@@ -2671,6 +2772,78 @@ PHASE_EACH_LAP` 리셋 경로.
 §5.2의 한계가 그대로 적용된다 — 실제 트랙에서 예외적으로 순서가 섞이면 오분류 위험. 단계
 표시창(`obstacle_cut_debug`)은 `DEBUG_VIZ_OBSTACLE_CUT=True`일 때만 보이므로, 꺼둔 상태라면
 여전히 터미널 로그로만 확인 가능.
+
+### 5.6 `DEBUG_VIZ_OBSTACLE_CUT` 재점등 + `dl_lane` 창 경로선을 "밀린 경로"일 때 주황으로 (2026-08-22)
+
+**배경:** 지금 실제 회피(B2/B3)는 `BehaviorState`가 아니라 da 근접 컷(`ENABLE_OBSTACLE_CUT`,
+§2.48~§2.52)이 라이다로 장애물을 가까이서 잡으면 da(주행가능영역) 자체를 클리핑해 경로를
+미는 방식이다 — 이걸 실차에서 바로 확인할 디버그 창이 필요하다는 요청. 라이다 쪽
+"검출범위"를 보여주는 창은 §2.56에서 이미 `obstacle_cut_debug`(`_debug_viz_obstacle_cut()`)의
+"LIDAR TRIGGER ROI" BEV 패널로 구현돼 있었는데, §1.19c(2026-08-22)에서 좌회전 디버깅에
+집중하려고 `DEBUG_VIZ_OBSTACLE_CUT=False`로 꺼둔 상태였다 — 새 창을 만드는 대신 이걸 다시
+켰다. 반면 da 쪽 "지금 추종 중인 경로가 밀렸는지"는 기존 `dl_lane` 창에 아예 표시가
+없었다(§2.52에서 컷 사각형만 빨강으로 표시, 경로선은 켜져 있든 아니든 항상 자홍색 고정) —
+이 부분만 새로 추가.
+
+**수정한 곳:**
+- `config.py` `DEBUG_VIZ_OBSTACLE_CUT`: `False → True`. `obstacle_cut_debug` 창의 "LIDAR
+  TRIGGER ROI" BEV 패널(노란 테두리 사각형 = `OBSTACLE_CUT_TRIGGER_X_MAX_M` x
+  `OBSTACLE_CUT_TRIGGER_Y_HALF_M` 검출범위, 빨간 점 = 그 범위 안에 실제로 잡힌 라이다 점,
+  회색 점 = 표시범위 안이지만 트리거 밖)가 이 창의 라이다 검출범위 표시 그 자체다 — 새로
+  만들 필요 없이 기존 구현을 다시 켠 것.
+- `perception/lane_util.py` `SlideWindow.draw_path()`: `self.obstacle_cut_active`(DL 백엔드
+  전용 속성, 비-DL `SlideWindow`엔 없어 `getattr(..., False)`로 안전 처리)가 True인
+  프레임엔 경로선/점 색을 자홍색(`(255,0,255)`) 대신 주황(`(0,140,255)`)으로 그린다. 이
+  저장소 관례상 주황은 이미 `da_fallback_used`/가상경계 ll 클리핑 등 "정상 경로가 아니라
+  차선책"을 뜻하는 색이라, 별도 색을 새로 고르지 않고 그 의미를 그대로 재사용했다. 컷
+  사각형(빨강, §2.52)과는 색이 달라 그때 고친 "경로선이 채움에 묻히는" 문제와도 계속
+  호환된다.
+- `perception/dl_lane.py` `visualize()` 위 주석: 경로 색이 이제 고정이 아니라
+  `obstacle_cut_active`에 따라 바뀐다는 점을 반영해 갱신.
+
+**영향받지 않는 것:** 실제 회피 로직(`_clip_da_by_obstacle()`, 클리핑 폭/트리거/유지타이머)은
+전혀 안 건드림 — 순수 시각화(디버그 창 on/off, 경로선 색상 분기)만 바꿨다.
+
+**알려진 한계:** `ENABLE_OBSTACLE_CUT`의 부호규약 자체가 실차 미검증이라는 §2.52의 경고가
+그대로 적용된다 — 이번 변경은 "밀렸을 때 이렇게 보인다"만 보여줄 뿐, 미는 방향이 실제로
+장애물 반대쪽인지는 이 디버그 창만으로 확인 안 됨(직접 정지/저속 주행 관찰 필요).
+
+---
+
+### 5.7 라바콘 push 시 `dl_lane` 창에 밀리기 전(보라) 원본 경로도 같이 표시 (2026-08-22)
+
+**배경:** §5.6에서 `lavacon_push_active`가 True일 때 경로선을 주황으로 바꿨는데, B1 라바콘
+케이스는 B2 da 근접 컷과 달리 `path`(=`DLSlideWindow.self.path`) 자체는 전혀 안 밀린다 —
+`_lavacon_steer_da_push()`(track_drive.py)가 `self.lane_path`를 **별도 복사본**
+(`shifted_path`)으로만 밀어서 조향에 쓰고, da 피팅 결과인 `self.path`는 원본 그대로 둔다.
+그래서 지금까진 주황으로 바뀌어도 선 좌표는 그대로라 "밀린 티"만 나고 실제로 얼마나
+밀었는지는 안 보였다 — 게인(안전마진/밀기 비율) 튜닝에 참고하려면 밀리기 전/후를 같이
+봐야 한다는 요청.
+
+**수정한 곳:**
+- `track_drive.py` `_lavacon_steer_da_push()`: `push_px` 계산 직후 `self._lavacon_push_px`에
+  같이 저장(부호 규약은 `shifted_path` 계산과 동일 — 우측+). `run_behavior_fsm()`의 라바콘
+  진입/탈출 리셋 지점, `__init__`에도 `0.0` 초기화 추가(`_lavacon_push_active`와 항상 짝
+  맞춰 리셋).
+- `track_drive.py` `perc_lane()`: `set_lavacon_push()` 호출에 `self._lavacon_push_px`도
+  같이 전달.
+- `perception/dl_lane.py` `DLLaneDetector`: `set_lavacon_push(active, push_px=0.0)`으로
+  시그니처 확장, `_latest_lavacon_push_px`로 저장 → `_worker()`가 매 프레임 같이 읽어
+  `DLSlideWindow.detect(..., lavacon_push_px=...)`로 전달 → `self.lavacon_push_px`에 대입
+  (`lavacon_push_active`와 동일 관례).
+- `perception/lane_util.py` `SlideWindow.draw_path()`: `lavacon_push_active`가 True고
+  `lavacon_push_px != 0`이면, 원본 `path`를 보라(`(238,130,238)`)로 그리고 이어서 x좌표에
+  `push_px`를 더한 경로를 주황(`(0,140,255)`)으로 나란히 그린다 — 두 선의 가로 간격이 곧
+  `push_px`다. da 근접 컷(`obstacle_cut_active`) 케이스는 `path` 자체가 이미 클리핑된
+  결과라 비교할 원본이 없으므로 그대로 단일 주황선 유지.
+
+**영향받지 않는 것:** 실제 조향에 쓰이는 `shifted_path`/`_lane_steer()` 로직은 전혀
+안 건드림 — 순수 시각화(디버그 창에 두 번째 폴리라인 추가)만 바꿨다. B2 근접 컷 쪽 색상
+분기(§5.6)도 그대로.
+
+**알려진 한계:** `push_px`는 `_lavacon_steer_da_push()`가 계산한 이번 틱 값을 다음 추론
+틱에 반영하는 구조라(`set_avoid_hold()` 등과 동일한 1틱 지연 관례) 엄밀히는 한 프레임
+어긋날 수 있다 — 디버깅 목적엔 무시 가능한 수준.
 
 ---
 
