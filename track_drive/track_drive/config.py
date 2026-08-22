@@ -1381,8 +1381,9 @@ DEBUG_VIZ_YOLO_CONE  = False   # 콘 원시검출 창('yolo_cone_result', yolo_c
 # [2026-08-21] 신호등 위치+색상 판정을 YOLO 단독(yolo_signal_state.py) 하나로 정리하면서
 #   (README §1.18) 이게 유일한 신호등 결과 창이 됐다 — 실차에서 지금 뭘 보고 판단 중인지
 #   눈으로 확인하기 위함.
-DEBUG_VIZ_YOLO_SIGNAL_STATE = False  # 신호등 위치+색상상태 YOLO 검출 박스 디버그 창 (perception/yolo_signal_state.py, 창 이름 'YOLO_신호등')
-                                      # [2026-08-22h] 요청 반영으로 끔 — 필요하면 다시 True로.
+DEBUG_VIZ_YOLO_SIGNAL_STATE = True  # 신호등 위치+색상상태 YOLO 검출 박스 디버그 창 (perception/yolo_signal_state.py, 창 이름 'YOLO_신호등')
+                                      # [2026-08-22h] 요청 반영으로 껐다가, [2026-08-23] B3 통과 후
+                                      #   S0_SIGNAL 대기 검증(아래 "6. 미션 State" override) 위해 다시 켬.
 # [2026-08-15] avoid-hold(§2.32) 전용 상태창 — 지금 유예가 걸려있는지/왜 걸렸는지/방향
 #   힌트/조기해제 진행상황을 한곳에 모아 보여주고, 실측 안 된 파라미터 값도 항상 같이
 #   띄워서 "이 숫자 아직 지어낸 값"이라는 걸 상기시킨다(track_drive.py
@@ -1405,14 +1406,16 @@ DEBUG_VIZ_OBSTACLE_CUT = True    # [2026-08-22i] 요청 반영으로 껐다가, 
 # #############################################################
 # 6. 미션 State / 실차 테스트 범위 제한
 # #############################################################
-# [2026-08-22] 라바콘(B1) 단독 검증용 override — S0_SIGNAL(출발선 신호등 대기)을
-#   건너뛰고 곧장 S1_LANE_FOLLOW로 시작한다. track_drive.py __init__의 self.phase도
-#   Phase.LAVACON + _b2_passed/_b3_passed=False로 맞춰뒀다(위 참고) — S0_SIGNAL을 안
-#   거치므로 TEST_FORCE_BEHAVIOR(아래)로 _behavior_enabled를 시작부터 강제 True로 켜야
-#   B1이 실제로 발동한다. 검증 끝나면 START_STATE=S0_SIGNAL / TEST_FORCE_BEHAVIOR=False로
-#   되돌리고 track_drive.py의 phase/b2_passed/b3_passed는 그대로 둘 것(좌회전 단독 검증
-#   때는 Phase.DONE+True/True로 다시 바꿔야 함 — 이력 있음, 매번 바뀌니 되돌릴 때
-#   track_drive.py __init__ 주석도 같이 확인).
+# [2026-08-23] B3(방해차량) 통과 후 다음 교차로 신호등 대기(S0_SIGNAL) + S1 차선주행
+#   단독 검증용 override — S0_SIGNAL(출발선 신호등 대기)/B1/B2/B3를 전부 건너뛰고
+#   "이미 다 통과한 것"으로 놓은 채 곧장 S1_LANE_FOLLOW로 시작한다. track_drive.py
+#   __init__의 self.phase도 Phase.DONE + _b2_passed/_b3_passed=True로 맞춰뒀다(위 참고,
+#   9c4371e 좌회전 단독 검증 때와 같은 패턴) — Phase.DONE이면 run_behavior_fsm()이
+#   트리거 검사 없이 B0_NORMAL로 고정되고 _active_yolo_stage()도 'signal'만 돌려,
+#   B1/B2/B3 재발동 없이 곧장 "다음 교차로 신호등 대기"로 이어진다. 검증 끝나면
+#   START_STATE=S0_SIGNAL로 되돌리고 track_drive.py의 phase/b2_passed/b3_passed도
+#   원래값(Phase.LAVACON/False/False)으로 같이 되돌릴 것(이력 있음, 매번 바뀌니 되돌릴
+#   때 track_drive.py __init__ 주석도 같이 확인).
 # [2026-08-20, signal-whiteboard-autocrop 브랜치 병합] START_STATE는 원래 S0_WAIT_GREEN
 #   이었으나, 그 상태와 S2_INTERSECTION이 S0_SIGNAL 하나로 통합됐다(위 MissionState enum
 #   주석 참고, 출발선/교차로 재진입 모두 같은 SignalDetector.detect_s2() 재사용) — 값은
@@ -1431,14 +1434,15 @@ TEST_DISABLE_B2_B3 = False
 #         이중으로 걸어 B2/B3가 어떤 경로로도 안 켜지게 한다(안전판).
 #   False: 원래대로 SAFETY_DIST/OVERTAKE_TRIGGER 트리거 검사해서 B2/B3 정상 발동 —
 #         이번 B3 검증이 보고 싶은 게 바로 이 발동이라 False.
-TEST_FORCE_BEHAVIOR = True
+TEST_FORCE_BEHAVIOR = False
 #   True: _behavior_enabled를 시작부터 강제 True로 켜서, START_STATE=S1_LANE_FOLLOW로
 #         S0/S2를 건너뛴 채로도 B1→B2→B3가 정상 발동한다(그렇지 않으면 _behavior_enabled가
 #         S0_SIGNAL 직진 확정 시에만 True가 되는데 그 경로 자체를 안 타므로 계속 False로
-#         남아 Behavior가 영원히 안 켜짐). [2026-08-22] 라바콘(B1) 단독 검증 중이라 True —
-#         위에서 Phase.LAVACON으로 이미 시작하므로 이게 없으면 B1이 영원히 안 켜진다.
-#   False: 원래대로 S0_SIGNAL 직진 신호 확정 시에만 Behavior가 켜짐. 정상 플로우(신호등부터
-#         실제로 거침) 검증 때는 START_STATE=S0_SIGNAL과 함께 False로 되돌릴 것.
+#         남아 Behavior가 영원히 안 켜짐).
+#   False: 원래대로 S0_SIGNAL 직진 신호 확정 시에만 Behavior가 켜짐. [2026-08-23] B3 통과 후
+#         신호등 대기 단독 검증은 위에서 Phase.DONE으로 이미 시작하므로 run_behavior_fsm()이
+#         B0_NORMAL로 고정돼 있어 Behavior를 켤 필요가 없다 — False로 둬도 무방(안전한 쪽).
+#         정상 플로우(신호등부터 실제로 거침) 검증 때는 START_STATE=S0_SIGNAL과 함께 False 유지.
 
 # [2026-08-11] B2(정지 장애물) Hybrid A* 대안(USE_HYBRID_ASTAR_FOR_B2) 삭제.
 #   대신 _da_avoidance_failed() 게이트 + TargetPassing(실측 기반 하드코딩)로 대체

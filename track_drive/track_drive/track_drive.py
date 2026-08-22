@@ -362,13 +362,16 @@ class TrackDriverNode(Node):
         # ── 판단/제어 상태 ──
         self.mission_state  = START_STATE
         self.behavior_state = BehaviorState.B0_NORMAL
-        # [2026-08-22] 라바콘(B1) 단독 검증 — S0_SIGNAL(출발선 신호등 대기)을 건너뛰고
-        # 곧장 S1_LANE_FOLLOW + Phase.LAVACON으로 시작한다(START_STATE/TEST_FORCE_BEHAVIOR는
-        # config.py "6. 미션 State / 실차 테스트 범위 제한" 참고). 직전엔 이 자리가 좌회전
-        # 진입 단독 검증용으로 Phase.DONE + _b2_passed/_b3_passed=True였다(B1/B2/B3를 전부
-        # "이미 통과한 것"으로 놓고 다음 교차로 신호등 대기부터 시작) — 그 검증은 끝났으므로
-        # 원래값으로 되돌린다.
-        self.phase          = Phase.LAVACON
+        # [2026-08-23] B3 통과 후 다음 교차로 신호등 대기(S0_SIGNAL) + S1 차선주행 단독
+        # 검증 — S0_SIGNAL(출발선 신호등 대기)/B1/B2/B3를 전부 "이미 통과한 것"으로 놓고
+        # Phase.DONE에서 시작한다(START_STATE/TEST_FORCE_BEHAVIOR는 config.py "6. 미션
+        # State / 실차 테스트 범위 제한" 참고, 9c4371e 좌회전 단독 검증 때와 같은 패턴).
+        # Phase.DONE이면 run_behavior_fsm()이 매 틱 그냥 B0_NORMAL로 고정하고 트리거 검사
+        # 자체를 안 하므로 B1/B2/B3가 어떤 경로로도 재발동하지 않는다. _active_yolo_stage()도
+        # Phase.DONE에서 'signal'을 리턴해 신호등 YOLO만 돈다. 직전엔 이 자리가 라바콘(B1)
+        # 단독 검증용으로 Phase.LAVACON + _b2_passed/_b3_passed=False였다 — 검증 끝나면
+        # 그 값으로 되돌릴 것.
+        self.phase          = Phase.DONE
         # [2026-08-15] Phase.OBSTACLE_ZONE 통합(da_based_b2b3_proposal.md B안) —
         # B2/B3 각각 최소 한 번 완료됐는지 추적. 둘 다 True가 돼야 Phase.DONE으로
         # 넘어간다(_mark_behavior_passed() 참고).
@@ -376,9 +379,11 @@ class TrackDriverNode(Node):
         # 확정된 순서다(§5.2) — §5.4에서 잠깐 반대로 뒤집었다가(요청 반영), [2026-08-22]
         # 요청으로 다시 "B2 먼저"로 되돌렸다(README §5.5). run_behavior_fsm()에서 B3 트리거를
         # self._b2_passed가 True일 때만 받아들이도록 순서를 강제한다(아래 참고).
-        # [2026-08-22] 라바콘(B1) 단독 검증 — 아직 아무것도 안 지난 원래 시작값으로 되돌림.
-        self._b2_passed = False
-        self._b3_passed = False
+        # [2026-08-23] 위 Phase.DONE 시작과 짝 — Phase.DONE 진입 조건(_mark_behavior_passed())
+        # 이 원래 요구하는 값(둘 다 True)을 시작부터 맞춰둔다. 디버그 상태창/로그가 "B2/B3
+        # 이미 통과"로 정확히 보이게 하기 위함(동작 자체엔 phase만으로 충분).
+        self._b2_passed = True
+        self._b3_passed = True
         # [2026-08-20] 요청 반영 — B2/B3 실제 처리를 da 근접 컷(obstacle_cut_active) 기반으로
         # 바꾸면서 추가. obstacle_cut_active 진입 순간 'B2'/'B3' 중 하나를 latch해뒀다가,
         # obstacle_cut_active가 다시 꺼지는 순간(탈출) 그 태그로 _mark_behavior_passed()를
@@ -386,7 +391,7 @@ class TrackDriverNode(Node):
         # 동일한 진입~탈출 latch 패턴.
         self._obscut_zone_tag = None
         self._behavior_enabled = TEST_FORCE_BEHAVIOR  # 원래 S0_SIGNAL "직진" 확정 시에만 True
-                                                       #   (TEST_FORCE_BEHAVIOR=True — 라바콘 단독 테스트용으로 시작부터 강제 ON)
+                                                       #   (TEST_FORCE_BEHAVIOR=False — Phase.DONE 시작이라 강제 ON 불필요)
         # [2026-08-20] S0_SIGNAL 통합(S0_WAIT_GREEN+S2_INTERSECTION → 하나)으로 같은 state를
         # 출발 때와 매 바퀴 교차로에서 반복 재진입하게 됐다 — "이번이 진짜 첫 출발인지"는
         # prev_state 비교로 더 이상 구분이 안 되므로(둘 다 같은 state) 이 플래그로 직접
