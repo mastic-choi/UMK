@@ -345,11 +345,15 @@ class TrackDriverNode(Node):
         # ── 판단/제어 상태 ──
         self.mission_state  = START_STATE
         self.behavior_state = BehaviorState.B0_NORMAL
-        # [2026-08-21] B1(라바콘) 재검증 — YOLO 콘 검출이 B2 단독 테스트(위 임시 override,
-        # 2026-08-21 오전) 중 3회 실행 중 1회만 검출되는 등 불안정한 게 확인돼(README §4.3
-        # 한계 참고), B2/B3 단독 진입 override를 걷어내고 원래대로 Phase.LAVACON(B1 진입
-        # 대기)부터 시작한다.
-        self.phase          = Phase.LAVACON
+        # [2026-08-22, 임시] 좌회전 진입(체크무늬 게이트 라이다 기둥쌍 + 조향 램프,
+        # perc_checker_pillar()/_do_checker_ramp_turn()) 단독 검증 — B1/B2/B3를 전부
+        # "이미 통과한 것"으로 놓고 Phase.DONE에서 시작한다. Phase.DONE이면
+        # run_behavior_fsm()이 매 틱 그냥 B0_NORMAL로 고정하고(아래 else 분기) 트리거 검사
+        # 자체를 안 하므로 B1/B2/B3가 어떤 경로로도 재발동하지 않는다. _active_yolo_stage()도
+        # Phase.DONE에서 'signal'을 리턴해 신호등 YOLO만 돈다 — 곧장 다음 교차로 신호등(보드
+        # 인식 → S0_SIGNAL 재진입 → 좌회전 신호 확정)으로 이어지는 정상 경로를 그대로 탄다.
+        # 검증 끝나면 Phase.LAVACON + _b2_passed/_b3_passed=False로 되돌릴 것(아래 두 줄도 같이).
+        self.phase          = Phase.DONE
         # [2026-08-15] Phase.OBSTACLE_ZONE 통합(da_based_b2b3_proposal.md B안) —
         # B2/B3 각각 최소 한 번 완료됐는지 추적. 둘 다 True가 돼야 Phase.DONE으로
         # 넘어간다(_mark_behavior_passed() 참고).
@@ -357,8 +361,11 @@ class TrackDriverNode(Node):
         # 확정된 순서다(§5.2) — §5.4에서 잠깐 반대로 뒤집었다가(요청 반영), [2026-08-22]
         # 요청으로 다시 "B2 먼저"로 되돌렸다(README §5.5). run_behavior_fsm()에서 B3 트리거를
         # self._b2_passed가 True일 때만 받아들이도록 순서를 강제한다(아래 참고).
-        self._b2_passed = False
-        self._b3_passed = False
+        # [2026-08-22, 임시] 위 좌회전 단독 검증과 짝 — Phase.DONE 진입 조건(_mark_behavior_passed())
+        # 이 원래 요구하는 값(둘 다 True)을 시작부터 맞춰둔다. 디버그 상태창/로그가 "B2/B3
+        # 이미 통과"로 정확히 보이게 하기 위함(동작 자체엔 phase만으로 충분).
+        self._b2_passed = True
+        self._b3_passed = True
         # [2026-08-20] 요청 반영 — B2/B3 실제 처리를 da 근접 컷(obstacle_cut_active) 기반으로
         # 바꾸면서 추가. obstacle_cut_active 진입 순간 'B2'/'B3' 중 하나를 latch해뒀다가,
         # obstacle_cut_active가 다시 꺼지는 순간(탈출) 그 태그로 _mark_behavior_passed()를
