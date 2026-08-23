@@ -720,7 +720,7 @@ SPEED_OBSTACLE_CUT = 12.0  # [2026-08-20] 8.0 → 12.0(요청 반영, 사실상 
 #   정확한 값으로 강제 고정해 "굳는" 증상을 일으켰던 방식이 아니라, accel_step 램프가
 #   그대로 적용된 채로만 상한을 낮추므로 그 문제가 재현되지 않을 것으로 예상 —
 #   실차 미검증, 라바콘 구간에서 급감속/정지처럼 느껴지면 값을 올릴 것.
-SPEED_LAVACON_CAP = 9.0
+SPEED_LAVACON_CAP = 8.0
 
 # [2026-08-10] DL_CENTER_MODE='ll' 내부에서 실제 밴드 중심 계산 알고리즘을 고르는
 #   2차 스위치 — 같은 날 두 사람이 독립적으로 서로 다른 재설계를 했다(origin/main
@@ -1711,9 +1711,9 @@ LAVACON_STEER_MODE_DA_PUSH = True
 #   아이디어를 실차로 빠르게 테스트해보기 위한 스위치 — 효과 없거나 오히려 나쁘면
 #   LAVACON_KICK_ENABLED만 False로 되돌리면 이 블록 전체가 비활성화된다(실차 미검증).
 LAVACON_KICK_ENABLED    = True
-LAVACON_KICK_DURATION_S = 0.2    # 이 시간(초) 동안 고정 조향각 유지 — CONTROL_HZ(20Hz)로 환산해 프레임수로 씀
+LAVACON_KICK_DURATION_S = 0.4    # 이 시간(초) 동안 고정 조향각 유지 — CONTROL_HZ(20Hz)로 환산해 프레임수로 씀
                                   # [2026-08-23] 0.2 → 0.4 → 0.2 → 0.0 → 0.2(요청 반영)
-LAVACON_KICK_ANGLE_DEG  = -20.0  # 강제 조향각(도) — 부호규약은 ctrl_angle과 동일(우측 콘 쪽으로 짐작, 실차에서 방향 확인 필요)
+LAVACON_KICK_ANGLE_DEG  = -10.0  # 강제 조향각(도) — 부호규약은 ctrl_angle과 동일(우측 콘 쪽으로 짐작, 실차에서 방향 확인 필요)
                                   # [2026-08-23] -20.0 → -30.0 → 0.0 → -20.0(요청 반영)
 
 # [2026-08-19] 안전마진(m) — 이 값보다 콘이 차량 중심에 가깝게 들어오면 그만큼 반대쪽으로
@@ -1737,7 +1737,7 @@ LAVACON_PUSH_SAFETY_MARGIN_R_M = 0.25
 #   곱해 실제로 미는 세기를 정한다. margin을 넓힌 것과는 별개로 "밀리는 정도 자체"도
 #   2배로 키워달라는 요청 반영(실차 미검증) — track_drive.py `_lavacon_steer_da_push()`와
 #   lavacon_bev 디버그 표시(둘 다 같은 부호규약) 양쪽에 동일하게 곱한다.
-LAVACON_PUSH_GAIN = 1.2 #1.13
+LAVACON_PUSH_GAIN = 1.35 #1.13
 
 # [2026-08-19] push 신호 전용 ROI — 박스 스택의 CONE_LON_MAX(4.0m, 구간 전체) 대신 훨씬
 #   가까운 범위만 본다. "지금 당장 스칠 위험이 있는 콘"만 반응해야 하므로, 멀리 있는
@@ -1758,7 +1758,7 @@ LAVACON_PUSH_GAIN = 1.2 #1.13
 #   perc_lavacon_trigger()의 LON_MIN/LON_MAX)도 같은 이유로 뒤이어 -0.1~0.3으로 맞췄다 —
 #   두 ROI는 항상 같이 바꿀 것, 하나만 바꾸면 lavacon_bev에서 둘의 시작점이 다시 어긋나 보인다.
 LAVACON_PUSH_LON_MIN     = -0.1  # 차량(자차 마커) 기준 전방 0.3m(=라이다 원점 기준 -0.1m)부터
-LAVACON_PUSH_LON_MAX     = 0.3  # 이 거리보다 먼 콘은 아직 안 민다
+LAVACON_PUSH_LON_MAX     = 0.25  # 이 거리보다 먼 콘은 아직 안 민다
 LAVACON_PUSH_LAT_LIMIT   = 1.0   # 횡방향 탐색 한계 — CONE_LAT_LIMIT(perc_lavacon.py)와 동일값으로 시작
 
 # [2026-08-19] 박스 안 후보점의 좌/우 배정을 y부호(차량 헤딩 기준 고정 중앙선, y>0=좌/
@@ -2087,8 +2087,8 @@ PP_TUNE_PRESETS = {
 
         PP_LOOKAHEAD_CURVATURE_GAIN=120, PP_LOOKAHEAD_MIN_PX=80,
         SPEED_CORNER_MIN=10.0, CORNER_SIGN_EMA_ALPHA=0.15, LANE_LOOKAHEAD_REF=220.0,
-        SPEED_CORNER_STEER_GAIN=0.80,
-        SPEED_ACCEL_STEP=0.4, CORNER_HOLD_DECAY_LO=0.92, CORNER_HOLD_DECAY_HI=0.97,
+        SPEED_CORNER_STEER_GAIN=0.50,
+        SPEED_ACCEL_STEP=0.8, CORNER_HOLD_DECAY_LO=0.92, CORNER_HOLD_DECAY_HI=0.97,
         CORNER_MIN_RADIUS_PX=250.0, CORNER_MIN_SPEED_SCALE=0.35,
         PATH_EMA_ALPHA=0.7, DL_STABLE_FRAME_MIN=1, DL_STABLE_JUMP_MAX=37.44,
         SPEED_NORMAL=12.0, #직진 잘한 상태
