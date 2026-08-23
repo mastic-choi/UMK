@@ -192,6 +192,13 @@ CORNER_HOLD_DECAY_HI = 0.97  # 고속 시 코너 hold 감쇠 (느린 회복, 연
 #   실차에서 진동 주기/코너 반응 둘 다 보며 조정할 것.
 CORNER_SIGN_EMA_ALPHA = 0.15
 LANE_LOOKAHEAD_REF = 220.0   # 예측감속 최대가 되는 lookahead 편차(px) — _lane_drive() 속도계획용
+# [2026-08-23] track_drive.py._update_speed()에 리터럴 0.80으로 박혀 있던 조향각 기반
+#   3제곱 감속식의 최대 감속 게인을 이름 있는 상수로 분리(요청 반영) — 프리셋별로 다르게
+#   가져갈 수 있게. target_speed = SPEED_NORMAL*(1 - SPEED_CORNER_STEER_GAIN*turn_for_speed**3)
+#   공식에서 turn_for_speed=1(최대 코너 신호)일 때 SPEED_NORMAL 대비 이 비율만큼 깎인다.
+# [2026-08-19] 0.90 → 0.80(요청 반영) — 조향(turn_for_speed)에 따른 감속이 너무 강하게
+#   느껴진다는 피드백으로 소폭 완화. 실차 재검증 필요 — 여전히 과하면 더 낮출 것.
+SPEED_CORNER_STEER_GAIN = 0.80
 # [2026-08-11] LAVACON_KP(라바콘 전용 P게인, 210.0) 삭제 — 라바콘 조향이 이제
 # _lane_steer()(Pure Pursuit/LQR)를 그대로 재사용해서(track_drive.py _handle_lavacon()/
 # perc_lavacon() 참고) 더 이상 쓰이지 않는다.
@@ -2080,6 +2087,7 @@ PP_TUNE_PRESETS = {
 
         PP_LOOKAHEAD_CURVATURE_GAIN=120, PP_LOOKAHEAD_MIN_PX=80,
         SPEED_CORNER_MIN=10.0, CORNER_SIGN_EMA_ALPHA=0.15, LANE_LOOKAHEAD_REF=220.0,
+        SPEED_CORNER_STEER_GAIN=0.80,
         SPEED_ACCEL_STEP=0.4, CORNER_HOLD_DECAY_LO=0.92, CORNER_HOLD_DECAY_HI=0.97,
         CORNER_MIN_RADIUS_PX=250.0, CORNER_MIN_SPEED_SCALE=0.35,
         PATH_EMA_ALPHA=0.7, DL_STABLE_FRAME_MIN=1, DL_STABLE_JUMP_MAX=37.44,
