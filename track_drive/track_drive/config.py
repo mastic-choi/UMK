@@ -680,7 +680,8 @@ ENABLE_OBSTACLE_CUT = True    # [2026-08-21, 임시] B3(방해차량) 회피 실
 #   "먼 경계"는 항상 캔버스 끝으로 클램프된다).
 OBSTACLE_CUT_TRIGGER_X_MAX_M  = 1.0   # 실차 미검증(2026-08-20 논의로 확정)
 OBSTACLE_CUT_TRIGGER_Y_HALF_M = 0.55  # 횡방향 반폭 — LANE_WIDTH_M(0.4m) 기준 한 차선+여유, 실차 미검증 추정치
-OBSTACLE_CUT_TRIGGER_FRAMES   = 3     # 라이다 AND YOLO 연속확인 프레임 수(디바운스) — 실차 미검증
+OBSTACLE_CUT_TRIGGER_FRAMES   = 2     # [2026-08-23, 요청 반영] 3→2 — 더 빨리 감지(디바운스 완화). 라이다 AND YOLO 연속확인 프레임 수(디바운스) — 실차 미검증
+                                       #   ★값을 더 낮출수록(1까지) 반응은 빨라지지만 노이즈(순간 오검출) 하나로도 트리거가 걸릴 위험이 커진다 — 실차에서 오검출 잦으면 다시 3으로.
 
 # ── da 근접 컷 지오메트리 + 유지/해제 타이머 ──
 #   [2026-08-20] 트리거 확정 시점엔 obstacle_dist가 항상 0.7~1.0m(=da 크롭 한계 이내)
@@ -705,17 +706,25 @@ OBSTACLE_CUT_HOLD_SEC_MIN_FIXED = 0.5     # B2(고정장애물) 전용 최소유
 OBSTACLE_CUT_RELEASE_DIST_M = 1.0         # [2026-08-20] 1.5→1.0(요청 반영, 트리거와 동일 — 히스테리시스 없앰). 실차 미검증
 OBSTACLE_CUT_RELEASE_CONFIRM_FRAMES = 4   # 해제 디바운스 — AVOID_HOLD_RELEASE_CONFIRM_FRAMES와 동일 관례, 실차 미검증
 
-# ── 컷 활성 중 속도 캡(물리적 회피 여유 확보) ──
-#   [2026-08-20] da 가시범위(0.7m)와 실제 축거(WHEELBASE_M=0.335m) 기준 원호 기하
-#   계산 결과, 필요 횡이동(≈0.3m, 차폭 절반+장애물 반폭+여유)을 확보하려면 조향각
-#   20°대 후반~30° 근방이 나와야 하고 그게 겨우 0.7m 안에 들어오는 수준(15°는 0.82m
-#   필요해서 못 들어옴) — 여유가 얇다. ANGLE_RATE_MAX 램프업 시간까지 감안하면 더
-#   줄어든다. 거리를 늘릴 순 없어도 속도를 낮추면 같은 거리를 지나는 데 걸리는
-#   시간이 늘어 램프업 여유가 커진다 — 실차 미검증, 물리적 여유 실측 후 재조정 필요.
-SPEED_OBSTACLE_CUT = 12.0  # [2026-08-20] 8.0 → 12.0(요청 반영, 사실상 무영향 수준으로 완화)
+# ── 컷 활성 "전"(장애물 미감지 구간) 속도 캡 ──
+#   [2026-08-23, 요청 반영] 기존엔 회피(obstacle_cut_active) "중"에 속도를 낮추는
+#   SPEED_OBSTACLE_CUT(12.0) 캡이 있었으나(아래 옛 주석 — da 가시범위 0.7m 기준 원호
+#   기하 계산상 회피 조향에 필요한 여유가 얇다는 근거였음), 요청으로 방향이 뒤집혔다.
+#   이제는 반대로 라바콘 탈출 직후(Phase.OBSTACLE_ZONE 진입)부터 실제로 장애물을
+#   감지해 회피 조향이 들어가는 순간(obstacle_cut_active=True)까지 이 값으로 속도를
+#   낮춰 유지하고, 회피가 시작되면 캡을 아예 풀어(_update_speed() 참고) 일반
+#   주행속도(SPEED_NORMAL 기반 코너감속 로직)로 올린다. 옛 SPEED_OBSTACLE_CUT의
+#   "회피 중엔 느리게" 안전판 근거는 더 이상 적용되지 않으니, 실차에서 회피 기동 중
+#   불안정하면 이 캡 대신 회피 조향 로직 자체(da 근접 컷) 쪽 튜닝을 먼저 볼 것.
+#   실차 미검증.
+SPEED_PRE_OBSTACLE_CAP = 8.0
+#   [2026-08-23, 요청 반영] 취소 — track_drive.py _update_speed()에서 이 캡을 적용하던 분기를
+#   제거했다. 이제 라바콘 탈출 후(Phase.OBSTACLE_ZONE) 장애물 미감지 구간은 감속 없이 곧장
+#   일반 코너감속 속도(SPEED_NORMAL 기반)를 쓴다 — 속도 8 유지는 B1(라바콘) 중에만 적용
+#   (SPEED_LAVACON_CAP). 이 상수는 더 이상 어디서도 참조되지 않는다.
 
 # [2026-08-23, 요청 반영] B1(Phase.LAVACON) 중 목표속도 상한 — track_drive.py
-#   `_update_speed()`가 SPEED_OBSTACLE_CUT과 동일한 방식(target_speed에 min()으로만
+#   `_update_speed()`가 SPEED_PRE_OBSTACLE_CAP과 동일한 방식(target_speed에 min()으로만
 #   얹음)으로 적용한다. 과거 SPEED_LAVACON(2.5 고정, §2.22/§0.5.11 이력)처럼 매 틱
 #   정확한 값으로 강제 고정해 "굳는" 증상을 일으켰던 방식이 아니라, accel_step 램프가
 #   그대로 적용된 채로만 상한을 낮추므로 그 문제가 재현되지 않을 것으로 예상 —
@@ -1483,7 +1492,7 @@ DEBUG_VIZ_OBSTACLE_CUT = True    # [2026-08-22i] 요청 반영으로 껐다가, 
 #     (지금 켜둔 Phase.LAVACON/_b2_passed=_b3_passed=False B1 테스트 세팅 그대로 이어짐).
 #   - _s1_lane_follow()에서 signal_left_confirmed → S0_SIGNAL 커밋구간 →
 #     _begin_checker_ramp_turn()/_do_checker_ramp_turn()으로 좌회전 조향 램프 실행.
-START_STATE     = MissionState.S1_LANE_FOLLOW
+START_STATE     = MissionState.S0_SIGNAL
 ENABLE_BEHAVIOR = True  # S1에서 라바콘/장애물/추월 Behavior를 켤지 여부(최상위 스위치)
 
 # ── 실차 테스트 범위 제한 ──
@@ -1711,7 +1720,7 @@ LAVACON_STEER_MODE_DA_PUSH = True
 #   아이디어를 실차로 빠르게 테스트해보기 위한 스위치 — 효과 없거나 오히려 나쁘면
 #   LAVACON_KICK_ENABLED만 False로 되돌리면 이 블록 전체가 비활성화된다(실차 미검증).
 LAVACON_KICK_ENABLED    = True
-LAVACON_KICK_DURATION_S = 0.4    # 이 시간(초) 동안 고정 조향각 유지 — CONTROL_HZ(20Hz)로 환산해 프레임수로 씀
+LAVACON_KICK_DURATION_S = 0.3    # 이 시간(초) 동안 고정 조향각 유지 — CONTROL_HZ(20Hz)로 환산해 프레임수로 씀
                                   # [2026-08-23] 0.2 → 0.4 → 0.2 → 0.0 → 0.2(요청 반영)
 LAVACON_KICK_ANGLE_DEG  = -10.0  # 강제 조향각(도) — 부호규약은 ctrl_angle과 동일(우측 콘 쪽으로 짐작, 실차에서 방향 확인 필요)
                                   # [2026-08-23] -20.0 → -30.0 → 0.0 → -20.0(요청 반영)

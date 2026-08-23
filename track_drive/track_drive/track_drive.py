@@ -2215,14 +2215,22 @@ class TrackDriverNode(Node):
           - 전환 로그 출력(디버깅 추적용)
           - PID 누적값 초기화: 이전 상태에서 쌓인 적분/미분 잔여가 새 상태로 넘어와 튀는 것을 방지한다.
         모든 상태 전환은 반드시 이 함수를 통해서만 한다(직접 대입 금지).
+
+        [2026-08-23] 예전엔 여기서 ctrl_angle/ctrl_speed를 무조건 0.0/SPEED_STOP으로
+        찍었는데, 그게 그대로 이번 틱 drive()에 발행되면서 "주행 중 전환"(예:
+        _s1_lane_follow()의 좌회전 확정 → S0_SIGNAL 커밋 구간, _do_checker_ramp_turn()
+        완료 → S0_SIGNAL)에서 순항/램프 속도로 달리다가 한 틱만 조향0/급정지 명령이
+        나가는 "뚝 끊김" 현상을 만들었다(실차 확인). 실제로 정지가 필요한 전환
+        (S4_FINISH, S0_SIGNAL의 "정지 대기" 분기)은 각 state 핸들러(_s4_finish(),
+        _s0_signal())가 그 상태로 실행될 때 스스로 0/STOP을 세팅하므로 여기서 미리
+        찍어둘 필요가 없다 — 그래서 제거. 이제 전환 직후 첫 틱은 직전 틱의 ctrl_angle/
+        ctrl_speed가 그대로 유지된 채 발행되고, 새 state 핸들러가 실행되는 시점부터
+        그 값을 이어받거나 필요하면 스스로 정지시킨다.
         """
         self.get_logger().info(f'[전환] {self.mission_state.name} → {new_state.name}')
-        prev_state = self.mission_state
         self.mission_state = new_state
         self._pid_prev_error = 0.0
         self._pid_integral   = 0.0
-        self.ctrl_angle = 0.0
-        self.ctrl_speed = SPEED_STOP
         # S0_SIGNAL 진입 시 신호값 초기화 (색상 확정은 이 state 진입 후부터 새로 시작)
         if new_state == MissionState.S0_SIGNAL:
             self.signal_red_on      = False
@@ -2332,9 +2340,12 @@ class TrackDriverNode(Node):
         확정 하나뿐이다 — 아래 "1. 진입 즉시 정지" 분기도 좌회전 신호만 본다. 그 분기가
         실제로 쓰이는 건 (a) START_STATE=S0_SIGNAL로 노드가 맨 처음 시작하는 출발선
         경우(대회 규정상 심판이 신호를 초록으로 바꾸기 전까지 출발 자체가 금지 — 출발선
-        신호가 직진이면 곧장 S1로 넘어가고 이 state에 남지 않는다), (b) [2026-08-23q]
-        좌회전 램프 완료 후(_do_checker_ramp_turn()) 다시 여기로 돌아와 다음 신호를
-        기다리는 경우 — 둘 다 아직 신호를 못 읽어 정지 대기 중이라는 점은 동일하다.
+        신호가 직진이면 곧장 S1로 넘어가고 이 state에 남지 않는다) 하나뿐이다 — 아직
+        신호를 못 읽어 정지 대기 중인 경우. [2026-08-23, 08-23q 되돌림] 좌회전 램프
+        완료(_do_checker_ramp_turn())는 이제 여기로 돌아오지 않고 곧장 S1_LANE_FOLLOW로
+        복귀한다 — 이 트랙은 좌회전 직후 바로 차선주행이라 읽을 다음 신호등이 없고,
+        예전처럼 여기로 돌아오면 확정될 리 없는 신호를 영원히 기다리며 속도 0으로
+        굳는 문제가 있었다.
           1. 진입 즉시 정지 (기본값 STOP, 좌회전 신호만 커밋 구간 시작) — 출발선 전용, 위 참고
           2. 좌회전 신호(signal_left_confirmed) → 커밋 구간(_s2_commit_dist) 거쳐 좌회전
              후 S1 복귀(3바퀴 중 2·3바퀴째에 한 번만 등장). 커밋 구간 동안은 S1과 동일한
@@ -2396,12 +2407,17 @@ class TrackDriverNode(Node):
     #   전용이던 _s3_shortcut()/_shortcut_end()/_begin_left_turn()/_do_left_turn()과
     #   MissionState.S3_SHORTCUT enum 값 자체를 삭제했다(README §1.19b 참고) — 되돌릴
     #   경우 git 이력에서 복원할 것.
-    #   [2026-08-23q, 요청 반영] 위 S1_LANE_FOLLOW+Behavior 즉시 재개를 다시 뒤집었다 —
-    #   램프 완료 후 곧장 S0_SIGNAL(신호 대기)로 돌아가고, Behavior(B1 라바콘 포함)는
-    #   그 다음 직진이 확정될 때만 켠다(_do_checker_ramp_turn() 본문 참고). "좌회전 후
-    #   바로 정상 주행 재개"라는 원래 전제가, 좌회전 직후에도 Phase가 아직 LAVACON로
-    #   남아있는 상황(예: 이번 바퀴 B1을 아직 안 거친 채로 좌회전만 먼저 확정된 경우)에서
-    #   B1이 검증 없이 곧장 발동해버리는 문제를 실차에서 드러냈다.
+    #   [2026-08-23q] 좌회전 직후 Phase가 아직 LAVACON(이번 바퀴 B1을 아직 안 거친 상태)로
+    #   남아있으면 Behavior가 곧장 켜져 B1이 검증 없이 바로 발동하는 문제가 실차에서
+    #   드러나, 램프 완료 후 곧장 S0_SIGNAL(신호 대기)로 돌아가 "다음 직진 신호"가 확정될
+    #   때까지 정지 대기하도록 바꿨었다. 그런데 이 트랙은 좌회전(지름길) 직후 곧바로
+    #   차선주행 구간으로 이어지고 그 사이엔 읽을 신호등 자체가 없어서, 확정될 리 없는
+    #   신호를 영원히 기다리며 속도 0으로 완전히 굳어버리는 문제로 이어졌다(실차 확인,
+    #   2026-08-23). S1_LANE_FOLLOW+Behavior 즉시 재개로 되돌린다 — 위 08-23q가 우려한
+    #   Phase.LAVACON 상태의 B1 오발동은, 그 사이 유령 라이다 점 마스킹(perc_lavacon.py
+    #   GHOST_POINT_*, 2026-08-22 작업기록 참고)으로 완화됐을 가능성이 있어 실차에서
+    #   재확인할 것 — 다시 문제가 보이면 이 되돌림 대신 좌회전 직후에만 짧게 B1 감지를
+    #   유예하는 방향으로 갈 것.
     def _begin_checker_ramp_turn(self):
         self._checker_ramp_dist = 0.0
         self.get_logger().info('체크무늬 게이트 통과 — 좌회전 램프 시작')
@@ -2414,18 +2430,19 @@ class TrackDriverNode(Node):
             self.get_logger().info('체크무늬 게이트 좌회전 램프 완료')
             self._checker_ramp_dist = None
             self._left_turn_last_done_t = time.time()  # left_turn_debug 창 "실행끝" 표시용
-            # [2026-08-23q, 요청 반영] 좌회전 완료 직후 곧장 S1+Behavior 재개하던 걸
-            # 그만두고, 다시 S0_SIGNAL(신호 대기)로 돌아가 다음 신호를 기다린다 — 라바콘
-            # (B1)은 오직 "직진"을 받은 뒤에만 들어가야 한다는 요청 반영(좌회전 직후
-            # Phase가 아직 LAVACON인 채로 남아있으면 Behavior가 곧장 켜져 B1이 바로
-            # 트리거되는 문제가 실차에서 확인됨). Behavior 재활성화(_behavior_enabled=True)는
-            # 이제 _s0_signal()의 직진 확정 분기가 전담하므로 여기서는 세팅하지 않는다.
-            # _signal_yolo_off/_signal_off_hold_cnt는 좌회전 확정 때 이미 True로 굳어있으므로,
-            # 새로 진입하는 S0_SIGNAL이 신호를 다시 읽을 수 있도록 여기서 직접 푼다(예전엔
-            # TEST_SIGNAL_LOOP 테스트 모드에서만 하던 걸 기본 동작으로 승격).
-            self._signal_yolo_off = False
-            self._signal_off_hold_cnt = None
-            self._change_state(MissionState.S0_SIGNAL)
+            # 'straight' 커밋 완료(_s0_signal())와 동일하게 처리 — 좌회전도 별도 지름길
+            # state 없이 곧장 일반 차선주행으로 복귀하고, B1→B2→B3 Behavior를 다시 연다.
+            self._behavior_enabled = True
+            self._signal_reentry_cooldown_t = time.time() + SIGNAL_REENTRY_COOLDOWN
+            if TEST_SIGNAL_LOOP and self.phase == Phase.DONE:
+                # 격리 테스트 전용 — phase가 그대로 Phase.DONE이면(=이 좌회전이 신호 판단
+                # 테스트 대기 상태에서 시작된 것) "아까 상태"로 되돌아가는 것이므로, 다음
+                # 테스트를 위해 신호등 YOLO를 다시 켠다. 정상 레이스에선 이 리셋을
+                # _update_lap()(결승선 통과)만 담당해야 하므로 phase==LAVACON/
+                # OBSTACLE_ZONE(=실제 레이스 중 좌회전)일 땐 안 건드린다.
+                self._signal_yolo_off = False
+                self._signal_off_hold_cnt = None
+            self._change_state(MissionState.S1_LANE_FOLLOW)
 
     def _yaw_delta(self, start):
         """현재 yaw - start (−π~π wrap)"""
@@ -2500,7 +2517,8 @@ class TrackDriverNode(Node):
             # 패턴으로 단순화했다. 실제 회피 조향/감속은 behavior_state와 무관하게 상시로
             # 도는 da 근접 컷(ENABLE_OBSTACLE_CUT — perc_obstacle_cut_trigger()의 라이다+
             # YOLO(콘 또는 차량) 이중확인 → obstacle_cut_active → _clip_da_by_obstacle()의
-            # da 클리핑 + SPEED_OBSTACLE_CUT 속도캡, perception/dl_lane.py)이 이미 처리하므로,
+            # da 클리핑 + SPEED_PRE_OBSTACLE_CAP 속도캡(감지 전 구간, _update_speed() 참고),
+            # perception/dl_lane.py)이 이미 처리하므로,
             # 여기서는 obstacle_cut_active의 진입~탈출을 그대로 B2/B3 신호로 재사용해서
             # Phase 완료 처리(_mark_behavior_passed)만 담당한다 — B1의 lavacon_trigger/
             # lavacon_done latch와 완전히 같은 구조. TargetPassing 기반
@@ -2660,19 +2678,16 @@ class TrackDriverNode(Node):
         # 백엔드엔 이 속성이 없으니 getattr로 조회(다른 DL 전용 속성과 동일 관례).
         if getattr(self.lane_detector, 'near_band_stale', False):
             target_speed = min(target_speed, SPEED_LANE_STALE)
-        # [2026-08-20] da 근접 컷 활성 중 속도 캡(config.py SPEED_OBSTACLE_CUT 주석 —
-        # 원호 기하 계산상 물리적 회피 여유가 얇아서 추가). self.obstacle_cut_active는
-        # ENABLE_OBSTACLE_CUT=True + 실제 트리거·유지타이머를 거쳐야만 True가 되고,
-        # _update_obstacle_cut_hold()가 스스로 풀어주는 해제 경로가 있으므로 아래
-        # SPEED_AVOID_HOLD_BLOCKED(삭제됨, §2.43)처럼 "풀 방법 없이 무한정 고정"되는
-        # 구조가 아니다.
-        if self.obstacle_cut_active:
-            target_speed = min(target_speed, SPEED_OBSTACLE_CUT)
+        # [2026-08-23, 요청 반영 후 취소] 라바콘 탈출 후(Phase.OBSTACLE_ZONE) 장애물 미감지
+        # 구간을 SPEED_PRE_OBSTACLE_CAP(8.0)으로 캡하던 로직을 없앴다 — 요청 반영, 속도 8
+        # 유지는 B1(라바콘 주행) 중에만 적용하고 그 이후(장애물 구간)는 감지 여부와 무관하게
+        # 곧장 일반 코너감속 로직(SPEED_NORMAL 기반)을 탄다. SPEED_PRE_OBSTACLE_CAP(config.py)
+        # 상수 자체는 남겨뒀지만 이제 아무 데서도 참조하지 않는다.
         # [2026-08-23, 요청 반영] B1(Phase.LAVACON) 중엔 목표속도 상한을 SPEED_LAVACON_CAP으로
         # 추가 제한 — 과거 SPEED_LAVACON(2.5 고정, 삭제됨)처럼 매 틱 정확한 값으로 강제
         # 고정하는 게 아니라, 위 코너감속 등과 동일하게 target_speed에 min()으로만 얹는다.
         # 아래 accel_step 램프가 그대로 적용되므로 급감속/굳는 증상 없이 부드럽게 이 상한까지
-        # 내려간다(SPEED_OBSTACLE_CUT과 동일 패턴, config.py SPEED_LAVACON_CAP 주석 참고).
+        # 내려간다(위 SPEED_PRE_OBSTACLE_CAP과 동일 패턴, config.py SPEED_LAVACON_CAP 주석 참고).
         if self.phase == Phase.LAVACON:
             target_speed = min(target_speed, SPEED_LAVACON_CAP)
         # [2026-08-18] avoid-hold 적용4(SPEED_AVOID_HOLD_BLOCKED 안전판) 삭제 — 실차 테스트에서
@@ -2870,12 +2885,22 @@ class TrackDriverNode(Node):
         status_color = (0, 140, 255) if held else (0, 200, 0)
         status_text = '직전값 유지 (경로 부족/노이즈)' if held else '현재값 반영'
 
+        # [2026-08-23] 조향각(아래) = Pure Pursuit 컨트롤러 자체의 출력, behavior override
+        # (B1 라바콘 등)나 drive()의 ANGLE_MAX/ANGLE_RATE_MAX 클립을 아직 안 거친 값이라
+        # 실제 발행값과 다를 수 있다. 이 창의 호출 시점이 drive() 이후로 옮겨졌으니(호출부
+        # control_loop() 참고) self._prev_angle_out(drive()가 이번 틱에 마지막으로 클립해
+        # 발행한 각도)을 "발행조향"으로 같이 보여줘서 둘이 다를 때 바로 보이게 한다.
+        override_active = self.behavior_state != BehaviorState.B0_NORMAL
+        publish_color = (0, 140, 255) if override_active else (255, 255, 255)
+        publish_suffix = f' [override:{self.behavior_state.name}]' if override_active else ''
         lines = [
             ('컨트롤러: Pure Pursuit', (10, 8), (255, 255, 255), 20, 'Controller: Pure Pursuit'),
             (f'상태: {status_text}', (10, 40), status_color, 20,
              f'Status: {"HOLD (prev)" if held else "LIVE (fresh)"}'),
-            (f'조향각: {controller.prev_steer_deg:+.1f}도', (10, 72), (255, 255, 255), 20,
-             f'Steer: {controller.prev_steer_deg:+.1f}deg'),
+            (f'PP조향각: {controller.prev_steer_deg:+.1f}도', (10, 72), (255, 255, 255), 20,
+             f'PP steer: {controller.prev_steer_deg:+.1f}deg'),
+            (f'발행조향: {self._prev_angle_out:+.1f}도{publish_suffix}', (10, 104), publish_color, 20,
+             f'Published: {self._prev_angle_out:+.1f}deg{publish_suffix}'),
         ]
         # [2026-08-06] IMU curvature damping 보강이 실제로 반영되는지(그냥 코드만
         # 들어가고 IMU/VESC 둘 중 하나가 죽어서 조용히 폴백 중인 건 아닌지) 여기서
@@ -3321,10 +3346,10 @@ class TrackDriverNode(Node):
             ('── ★ 전 파라미터 실차 미검증 ★', (10, text_y0 + 140), UNMEASURED, 13,
              '-- ALL PARAMS UNMEASURED --'),
             (f'TRIGGER X_MAX={OBSTACLE_CUT_TRIGGER_X_MAX_M}m Y_HALF={OBSTACLE_CUT_TRIGGER_Y_HALF_M}m  '
-             f'NEAR_M={OBSTACLE_CUT_NEAR_M}m  SPEED_CAP={SPEED_OBSTACLE_CUT}',
+             f'NEAR_M={OBSTACLE_CUT_NEAR_M}m  PRE_CUT_SPEED_CAP={SPEED_PRE_OBSTACLE_CAP}(감지 전만)',
              (10, text_y0 + 162), UNMEASURED, 12,
              f'trigger_x={OBSTACLE_CUT_TRIGGER_X_MAX_M} y_half={OBSTACLE_CUT_TRIGGER_Y_HALF_M} '
-             f'near={OBSTACLE_CUT_NEAR_M} speed_cap={SPEED_OBSTACLE_CUT}'),
+             f'near={OBSTACLE_CUT_NEAR_M} pre_cut_speed_cap={SPEED_PRE_OBSTACLE_CAP}(pre-detect only)'),
         ]
         put_text_kr_multi(canvas, headline + lines)
 
@@ -3984,10 +4009,10 @@ class TrackDriverNode(Node):
         self._update_lap()                  #    바퀴 카운트(누적 yaw + 정지선)
         self.run_mission_fsm()              # 2. 판단(Mission)
 
-        if DEBUG_VIZ_STEER:
-            # behavior override 이전 시점 — 차선 조향 컨트롤러 자체의 상태를 보여준다
-            # (_debug_viz_steer() 상단 주석 참고).
-            self._debug_viz_steer()
+        # [2026-08-23] DEBUG_VIZ_STEER는 여기 있었으나 behavior override/drive()의 각도
+        # 클립(ANGLE_MAX, ANGLE_RATE_MAX) 이전 시점이라 "조향각" 줄이 실제 발행값과
+        # 다를 수 있었다(디버그창엔 찍히는데 실제로는 다른 각도가 나가는 것처럼 보이는
+        # 원인) — DEBUG_VIZ_LEFT_TURN과 동일하게 drive() 이후로 옮겼다(아래 참고).
         if DEBUG_VIZ_VESC:
             self._debug_viz_vesc()
         if DEBUG_VIZ_IMU:
@@ -4009,9 +4034,15 @@ class TrackDriverNode(Node):
         self.pose_estimator.update(self.v_mps, math.radians(self.ctrl_angle), 0.05)
 
         self.drive(self.ctrl_angle, self.ctrl_speed)   # 4. 발행
+        if DEBUG_VIZ_STEER:
+            # [2026-08-23] behavior override + drive()의 각도 클립(ANGLE_MAX,
+            # ANGLE_RATE_MAX)까지 다 반영된 뒤(=이번 틱에 실제로 발행된 값)에 그린다.
+            # _debug_viz_steer() 안의 "발행조향" 줄이 self._prev_angle_out(drive()가
+            # 방금 갱신한 최종 클립값)을 쓰는 이유.
+            self._debug_viz_steer()
         if DEBUG_VIZ_LEFT_TURN:
             # [2026-08-22i] "발행각도"가 이번 틱에 실제로 발행된 값이어야 하므로
-            # drive() 이후에 그린다(위 STEER/VESC/IMU/OBSTACLE_CUT 창들은 behavior
+            # drive() 이후에 그린다(위 VESC/IMU/OBSTACLE_CUT 창들은 behavior
             # override 이전 시점이라 이 창과 달리 최종 발행값과 어긋날 수 있음).
             self._debug_viz_left_turn()
         if DEBUG_LOG:                                    # 5. 디버그

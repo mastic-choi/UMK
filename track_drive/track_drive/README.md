@@ -1652,6 +1652,30 @@ override가 벌써 두 번째로 원복 대상이 됐다는 점을 특히 유의
 `TEST_FORCE_SIGNAL_YOLO`, `START_STATE=S1_LANE_FOLLOW`, `phase=Phase.DONE`)과 함께
 §1.19l 체크리스트에 실전 복귀 전 원복 대상으로 추가할 것.
 
+### 1.19n §1.19q(구 코드 주석 번호) 되돌림 — 좌회전 램프 완료 후 S0_SIGNAL 재진입 제거, 곧장 S1 복귀 (2026-08-23)
+
+**증상(사용자 확인):** 좌회전(지름길) 신호를 받아 체크무늬 게이트 램프까지 완료한 뒤, 차량이
+속도 0으로 완전히 굳어서 "신호등 판독 대기" 상태에 영원히 머무름.
+
+**원인:** `_do_checker_ramp_turn()`이 램프 완료 시 `MissionState.S0_SIGNAL`로 돌아가도록
+돼 있었다("좌회전 직후 Phase가 아직 LAVACON이면 B1이 검증 없이 곧장 발동한다"는 실차 문제
+대응으로 넣었던 것) — `_s0_signal()`은 커밋/램프 둘 다 아니면 `ctrl_speed=SPEED_STOP`으로
+정지한 채 다음 신호 확정을 기다리는데(`_s0_signal()` 참고), **이 트랙은 좌회전(지름길) 직후
+곧바로 차선주행 구간으로 이어지고 그 사이엔 읽을 신호등 자체가 없다**(사용자 확인) — 그래서
+확정될 수 없는 신호를 무한 대기하며 완전히 정지해버린 것.
+
+**수정:** `_do_checker_ramp_turn()`을 그 이전(§1.19g 이전) 동작으로 되돌림 — 램프 완료 시
+곧장 `_behavior_enabled=True` + `MissionState.S1_LANE_FOLLOW`로 복귀(`_s0_signal()`의
+직진 확정 분기와 동일한 처리). `TEST_SIGNAL_LOOP` 격리 테스트용 `_signal_yolo_off` 리셋
+분기(`phase==Phase.DONE`일 때만)도 함께 복원.
+
+**알려진 한계:** 이 되돌림이 우려했던 "좌회전 직후 Phase.LAVACON 상태에서 B1 오발동" 문제가
+재발할 가능성은 남아있음 — 다만 그 문제가 실차에서 처음 확인된 시점과 라이다 유령 점 마스킹
+(`perc_lavacon.py` `GHOST_POINT_*`, 2026-08-22 작업기록 참고) 적용 시점이 겹쳐서, 유령 점이
+B1 오발동의 실제 원인이었을 가능성이 있음(미확인). 다음 실차 테스트에서 좌회전 직후 B1이
+부당하게 곧장 켜지는지 반드시 재확인할 것 — 재발하면 이 되돌림 대신 좌회전 완료 후 몇 초간만
+B1 감지를 유예하는 방향(`_signal_reentry_cooldown_t`와 같은 타임스탬프 가드 패턴)으로 갈 것.
+
 ---
 
 ## 2. 라인트래킹 (차선주행, S1)
@@ -3279,6 +3303,40 @@ B2 FSM(`behavior_state==B2_OBSTACLE`) 자체가 켜진 건 아니지만(그 경�
 계속 인식해 `obstacle_front`/`obstacle_type` 값이 채워진다(표시/스냅샷용이라 무해 —
 avoid_hold의 실제 조향 개입인 `_clip_da_by_ll()`의 방향 힌트는 현재
 `DL_CENTER_MODE='da'`+`DL_DA_SKIP_LL_CLIP=True`라 비활성 상태).
+
+---
+
+### 5.13 회피 중 속도 캡을 "감지 전" 구간으로 이동 — `SPEED_OBSTACLE_CUT` 삭제, `SPEED_PRE_OBSTACLE_CAP` 신설 (2026-08-23, 요청 반영)
+
+**요청:** 라바콘 탈출 후 장애물을 감지하기 전까지는 속도를 8로 유지하다가, 장애물을
+감지해 회피 조향(`obstacle_cut_active`)이 들어가는 순간 속도를 일반 주행속도로 올려서
+주행하게 해달라는 요청.
+
+**이전 동작:** 정확히 반대 방향이었다 — `_update_speed()`가 `obstacle_cut_active=True`
+"동안"(=회피 조향이 실제로 나가는 중)에만 `SPEED_OBSTACLE_CUT`(12.0, da 가시범위 0.7m
+기준 원호 기하 계산상 회피 여유 확보 목적으로 §4.x에서 도입)으로 감속시켰고,
+`Phase.OBSTACLE_ZONE`에 진입했지만 아직 아무것도 감지 못한 구간(=B1 탈출 직후 ~ B2/B3
+트리거 전, 또는 B2 통과 후 B3 트리거 전 공백)은 별도 캡 없이 일반 코너감속 로직(최대
+`SPEED_NORMAL`)이 그대로 적용됐다.
+
+**수정:** `config.py` — `SPEED_OBSTACLE_CUT`(12.0) 삭제, `SPEED_PRE_OBSTACLE_CAP = 8.0`
+신설. `track_drive.py` `_update_speed()` — 캡 조건을 `self.obstacle_cut_active`(회피 중)
+에서 `self.phase == Phase.OBSTACLE_ZONE and not self.obstacle_cut_active`(감지 전)로
+뒤집었다. 결과적으로:
+- `Phase.OBSTACLE_ZONE` 진입(라바콘 탈출) 직후 ~ `obstacle_cut_active`가 처음 True가
+  되기 전까지: 목표속도가 `SPEED_PRE_OBSTACLE_CAP`(8.0)로 상한.
+- `obstacle_cut_active`가 True로 바뀌는 순간(회피 조향 진입 엣지): 캡이 즉시 풀리고
+  일반 코너감속 로직이 계산한 `target_speed`(=`SPEED_NORMAL` 기반)를 그대로 쓴다 —
+  `SPEED_LAVACON_CAP`(B1용, §변경 없음)과 동일하게 `accel_step` 램프 위에 min()으로만
+  얹는 방식이라 급감속/급가속으로 "턱"지지 않고 부드럽게 캡 경계를 오간다.
+- B2 통과 후 B3 트리거 전 공백처럼 `obstacle_cut_active`가 다시 False로 풀리는 구간에도
+  같은 조건이 다시 걸려 속도가 8로 되돌아간다(요청 문구 "장애물을 감지하기 전까지"를
+  B2/B3 각각에 동일하게 적용한 해석 — 트랙 전체에서 한 번만 적용하는 게 아님).
+
+**알려진 한계:** 실차 미검증. 옛 `SPEED_OBSTACLE_CUT`이 있던 이유(회피 조향 중 da
+가시범위 안에서 필요한 횡이동을 확보하려면 여유가 얇다는 원호 기하 계산, §708 옛 주석)는
+이번 변경으로 더 이상 반영되지 않는다 — 회피 기동 중 불안정하면 이 속도캡을 되살리기보다
+회피 조향 로직(da 근접 컷) 자체의 여유(`OBSTACLE_CUT_TRIGGER_X_MAX_M` 등)를 먼저 볼 것.
 
 ---
 
