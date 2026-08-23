@@ -1769,11 +1769,11 @@ YOLO_SIGNAL_STATE_CLASS_NAMES = ('red', 'green_straight', 'green_left')  # class
 #   좌표는 letterbox 없이 640x640으로 단순 리사이즈된 스케일(yolo_signal_state.py 참고) —
 #   원본 종횡비(640x480)와 다르므로 실제 물리 거리와 정확히 비례하진 않지만, 멀어질수록
 #   bbox가 작아지는 방향성은 유효. 실차 미검증 기본값 — 오검출/미검출 사례 보며 재조정할 것.
-#   [2026-08-23 2차] 하한(원거리 오검출)뿐 아니라 상한도 둬서 "너무 가까이/크게 잡힌"
-#   검출(예: 오검출로 프레임 대부분을 채우는 비정상 박스)도 함께 배제 — 유효 인식 구간을
-#   y높이 40~50px로 좁힘.
-YOLO_SIGNAL_STATE_MIN_BOX_HEIGHT_PX = 40
-YOLO_SIGNAL_STATE_MAX_BOX_HEIGHT_PX = 50
+#   [2026-08-23 2차] 상한(40~50 범위)을 시도했다가 되돌림 — 실제 관찰된 문제는 "멀리서
+#   오검출"뿐이고 "가까이서 오검출"은 근거가 없었는데, 상한을 두면 차량이 신호등에 접근해
+#   실제로 판단해야 하는(=bbox가 커지는) 결정적 순간의 정상 검출까지 걸러버릴 위험이 있어
+#   하한 단일 게이트로 되돌림.
+YOLO_SIGNAL_STATE_MIN_BOX_HEIGHT_PX = 45
 
 SAFETY_DIST      = 5.0        # B2(고정장애물) 발동 거리(m)
 OVERTAKE_TRIGGER = 6.5        # B3(방해차량) 발동 거리(m)
