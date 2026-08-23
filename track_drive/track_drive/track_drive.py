@@ -35,16 +35,22 @@ from sensor_msgs.msg import Image, LaserScan, Imu
 from std_msgs.msg import Float32MultiArray, Float32
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy, HistoryPolicy
 from cv_bridge import CvBridge
-from .perception.perc_lavacon import (
-    process_lavacon, process_lavacon_camera, CONE_LON_MAX as LAVACON_PATH_LON_MAX,
-)
+# [2026-08-22k] CONE_LON_MAX/CONE_LAT_LIMIT/BOX_LON_START(→ LAVACON_PATH_LON_MAX/
+#   LAVACON_PATH_LAT_LIMIT/LAVACON_BOX_LON_START) 별칭 삭제 — 이 값들을 쓰던 lavacon_bev의
+#   박스 스택 시각화(흰 cone ROI 선/파란 박스 경계)를 지우면서 더 이상 안 쓰임
+#   (_draw_lavacon_bev() 상단 주석 참고). BOX_LON_WIDTH(→ LAVACON_BOX_LON_WIDTH)는 자차
+#   마커 위치 계산에 여전히 쓰여 유지.
+from .perception.perc_lavacon import process_lavacon, nearest_cone_lateral, BOX_LON_WIDTH as LAVACON_BOX_LON_WIDTH
+# [2026-08-22] §5.10 유령 점 임시 마스크 좌표 — lavacon_bev에 빨간 원으로 시각화해 마스킹
+#   구역과 실제 유령 점 위치가 맞는지 눈으로 대조하기 위해 import(마스킹 자체는
+#   perc_lavacon.py `_lidar_to_xy()`가 이미 적용).
+from .perception.perc_lavacon import GHOST_POINT_X_M, GHOST_POINT_Y_M, GHOST_POINT_RADIUS_M
 from .perception.hough_lane import HoughLaneDetector
 from .perception.perc_floor import check_stopline, LaneDetector as ClassicLaneDetector
 from .perception.lane_util import CameraProcessor, SlideWindow
 from .perception.dl_lane import DLLaneDetector
-from .perception.traffic_signal import SignalDetector
 from .perception.yolo_cone import YoloConeDetector
-from .perception.yolo_signal import YoloSignalDetector
+from .perception.yolo_vehicle import YoloVehicleDetector
 from .perception.yolo_signal_state import YoloSignalStateDetector
 from .controller.obstacle_avoidance import ObstacleAvoidance, AvoidPhase
 # vehicle_overtake.py 의 구 VehicleOvertake 는 더 이상 쓰지 않는다.
@@ -75,6 +81,10 @@ class TrackDriverNode(Node):
     def __init__(self):
         super().__init__('driver')
         self.bridge = CvBridge()
+        # [2026-08-22] 디버그 창을 처음 띄울 때만 cv2.moveWindow로 위치를 잡기 위한
+        #   1회성 가드(DEBUG_WIN_POS_* 참고) — 매 프레임 moveWindow를 부르면 사용자가
+        #   직접 옮겨놔도 다음 프레임에 도로 스냅백돼서, 창 이름을 여기 기록해두고 한 번만 옮긴다.
+        self._dbg_windows_positioned = set()
 
         # ── 원본 센서 버퍼 ──
         self.img_front = self.img_left = self.img_right = self.img_behind = None
@@ -141,18 +151,29 @@ class TrackDriverNode(Node):
         self.signal_left_confirmed     = False
         self._sig_straight_cnt = 0   # signal_straight_on 연속 유지 프레임 수
         self._sig_left_cnt     = 0   # signal_left_on 연속 유지 프레임 수
-        # [2026-08-20] S1→S0_SIGNAL 진입 트리거를 정지선에서 "신호등 보드 자체가 인식되는
-        # 시점"으로 교체 — perc_signal()이 이제 S1_LANE_FOLLOW 중에도 detect_s2()를 돌려,
-        # 색상과 무관하게 4구 보드 자체가 잡혔는지(SignalDetector.s2_chosen_idx>=0)만 본다.
-        self.signal_board_confirmed = False
-        self._sig_board_cnt = 0      # 보드 인식(색상 무관) 연속 유지 프레임 수
-        # [2026-08-19] YOLO 신호등 색상상태 검출(perception/yolo_signal.py) 비교용 — 위
-        # signal_*_on(Hough Circle)과 나란히 보기만 하고 아직 FSM 판단에는 안 씀(YOLO_SIGNAL_*
-        # config.py 주석 참고).
-        self.signal_red_on_yolo      = False
-        self.signal_straight_on_yolo = False
-        self.signal_left_on_yolo     = False
-        self.stopline = False            # 굵은 가로 흰선(정지선/지름길 끝 단서, S3 진출·바퀴카운트용)
+        # [2026-08-23, 요청 반영] 직진/좌회전 어느 쪽이든 확정되는 즉시 신호등 YOLO 추론을
+        # 끈다(perc_signal() 참고) — 원래는 직진만 Phase.DONE 동안 계속 켜져 있다가 다음
+        # 바퀴(_update_lap()의 Phase.LAVACON 리셋)에야 꺼졌고, 좌회전 쪽은 S0_SIGNAL 커밋
+        # 구간/게이트 램프 내내 아예 안 꺼졌었다(_active_yolo_stage() S0_SIGNAL 분기가 이
+        # 플래그를 안 보고 무조건 'signal' 반환) — 이미 색이 확정된 뒤라 더 볼 필요가 없는데도
+        # 불필요한 추론이 계속 돌던 비대칭을 없앴다. _active_yolo_stage() S0_SIGNAL/Phase.DONE
+        # 분기 참고, RESET_PHASE_EACH_LAP에서 다음 바퀴 시작 시 해제.
+        self._signal_yolo_off = False
+        # [2026-08-23, 요청 반영] "확정되자마자 바로 꺼서 디버그창에서 검출된 걸 확인할
+        # 새도 없다"는 보고로, 확정 순간 바로 끄지 않고 SIGNAL_YOLO_OFF_HOLD_FRAMES만큼
+        # 더 돈 뒤에 끄도록 유예를 둔다. None=아직 확정 안 됨(카운트 시작 전), 확정되는
+        # 순간 0부터 세기 시작 — perc_signal() 참고. mission_state가 S0_SIGNAL로 바뀌면서
+        # _change_state()가 signal_left_confirmed 등을 곧바로 리셋해버려도(좌회전 확정
+        # 시 같은 틱에 전환됨) 이 카운터 자체는 안 건드리므로 유예가 끊기지 않는다.
+        self._signal_off_hold_cnt = None
+        # [2026-08-22] S1→S0_SIGNAL 진입 트리거를 "보드 인식(색상 무관)" → "색상 확정
+        # (signal_straight/left_confirmed)"으로 교체(요청 반영) — 예전엔 보드만 보여도
+        # 곧장 S0_SIGNAL로 넘어가 그 안에서 다시 멈춰 서서 색상을 판독했다(그 사이 속도가
+        # 0으로 굳음). 이제 색상이 실제로 확정될 때까지 S1 차선주행을 그대로 유지하고,
+        # 확정되는 순간 정지 없이 곧장 커밋 구간으로 들어간다 — perc_signal()/
+        # _s1_lane_follow() 참고. 이에 따라 보드 인식 전용 트리거(signal_board_confirmed)는
+        # 더 이상 쓰지 않는다.
+        self.stopline = False            # 굵은 가로 흰선(정지선 단서, 바퀴카운트용)
         self._signal_reentry_cooldown_t = 0.0  # 이 시각까지 신호등 보드 재감지(S0_SIGNAL 재진입) 무시
         self._last_stopline_t = 0.0      # [10] 정지선을 마지막으로 본 시각(교차로 근처 기동 금지용)
         # [2-3 장애물(전방/측면)]
@@ -229,9 +250,10 @@ class TrackDriverNode(Node):
         self.lavacon_done   = False
         self.lavacon_path   = []     # _lane_steer()에 그대로 태우는 px 스케일 경로(perc_lavacon() 참고)
         self._lavacon_path_m = []    # 위와 같은 경로의 원본(라이다 미터 좌표) — DEBUG_VIZ_LAVACON 시각화용
-        self._lavacon_cam_path_m = []  # [2026-08-22] YOLO 카메라 BEV 기준 경로(process_lavacon_camera())
-                                        # — 조향 반영 실험용, 현재는 DEBUG_VIZ_LAVACON 창에 겹쳐 그려
-                                        # 라이다 경로와 오차를 비교하는 용도로만 씀(perc_yolo_cone() 참고)
+        # [2026-08-19] process_lavacon()의 프레임간 좌/우 EMA(LAVACON_TEMPORAL_EMA_ENABLED)용
+        # 상태 — process_lavacon() 자체는 무상태라 이 노드가 직전 boxes를 들고 있다가
+        # 매 틱 다시 넘겨준다(perc_lavacon.py 상단 주석 6) 참고). 첫 틱엔 None.
+        self._lavacon_boxes_prev = None
         self._lavacon_empty_cnt = 0   # 우측콘 연속 미검출 프레임 수(Phase 전환 디바운스)
         self.lavacon_left_detected  = False  # 좌측 라이다 클러스터 검출 여부(B1 진입 트리거용)
         self.lavacon_right_detected = False  # 우측 라이다 클러스터 검출 여부(B1 진입 트리거용)
@@ -250,10 +272,59 @@ class TrackDriverNode(Node):
         self.checker_pillar_trigger        = False  # (좌우 검출 AND 간격이 실측값과 일치)가 디바운스 프레임수만큼 유지되면 True
         self._checker_pillar_trigger_cnt   = 0      # 디바운스 카운터
         self._checker_pillar_dbg = (0, 0, 0, 0, 0.0)  # 디버그용 (좌pts, 좌run, 우pts, 우run, 횡방향거리)
-        self._checker_ramp_dist = None  # None=램프 비활성, 아니면 트리거 이후 누적 이동거리(m) — _do_left_turn()의 _turn_dist와 동일 패턴
+        self._checker_pillar_bev_img = None  # 최근 라이다 BEV 프레임(_draw_checker_pillar_bev()가 채움) — left_turn_debug 통합창이 그대로 재사용
+        self._checker_ramp_dist = None  # None=램프 비활성, 아니면 트리거 이후 누적 이동거리(m) — _s2_commit_dist와 동일한 VESC 거리적분 패턴
+        self._left_turn_last_done_t = None  # 좌회전 램프가 가장 최근에 "완료"된 time.time() — left_turn_debug 창의 "실행끝" 표시용(None=아직 한 번도 완료 안 됨)
         # [2-6 방해차량 트리거]
         self.vehicle_trigger       = False   # 라이다 디바운스 통과 → B3 진입 트리거
         self._vehicle_trigger_cnt  = 0       # 동시검출 연속 프레임 수(디바운스 카운터)
+
+        # [2026-08-20] da 근접 컷(ENABLE_OBSTACLE_CUT) — TargetPassing(B2/B3 FSM)과
+        # avoid_hold_active(§2.32)와는 완전히 독립된 상태. avoid_hold_active는 이미
+        # DL 워커의 _clip_da_by_ll() 재활성화용으로 쓰이고 있어(perception/dl_lane.py),
+        # 재사용하면 두 메커니즘이 뒤섞인다.
+        self.vehicle_detected_yolo_cut = False   # 이번 프레임 YOLO 'car' 원시 검출(근접컷 전용 인스턴스)
+        self._obstacle_cut_trigger_cnt = 0       # (라이다 근접 AND YOLO(콘 또는 차량)) 연속확인 프레임 수(디바운스)
+        self.obstacle_cut_trigger      = False   # 위 디바운스가 OBSTACLE_CUT_TRIGGER_FRAMES 넘겨 확정됐는지
+        # [2026-08-20] 요청 반영 — 이 트리거를 B2(고정장애물=라바콘 1개)/B3(방해차량) 공용으로
+        # 확장하면서 추가. 'fixed'(YOLO 콘 검출로 확정)/'vehicle'(YOLO 차량 검출로 확정) —
+        # perc_obstacle_cut_trigger() 참고, run_behavior_fsm()의 Phase.OBSTACLE_ZONE 분기가
+        # 진입 순간 이 값을 스냅샷해 B2/B3 중 어느 쪽을 통과 중인지 결정한다.
+        self.obstacle_cut_type         = 'none'
+        self._obstacle_cut_y           = None    # 트리거 확정 순간의 장애물 횡위치(m, +좌측) — set_obstacle()에 넘길 값
+        self._obstacle_cut_until_t     = 0.0     # 이 시각까지는 obstacle_cut_active=True 유지
+        self.obstacle_cut_active       = False   # perc_lane()이 set_obstacle()로 DL 백엔드에 전달하는 최종 상태
+        self._obstacle_cut_hold_start_t = 0.0    # 최소유지시간(OBSTACLE_CUT_HOLD_SEC_MIN) 판정 기준 시각
+        # [2026-08-21] 이번 진입에 적용 중인 최소유지시간 — B2(fixed)면 OBSTACLE_CUT_HOLD_SEC_MIN_FIXED,
+        # 그 외(B3/vehicle 등)는 OBSTACLE_CUT_HOLD_SEC_MIN. _update_obstacle_cut_hold() 진입 순간 결정.
+        self._obstacle_cut_hold_sec_min = OBSTACLE_CUT_HOLD_SEC_MIN
+        self._obstacle_cut_release_cnt  = 0      # 해제 판단용 라이다 클리어 연속 프레임 수(디바운스 카운터)
+        self.obstacle_cut_release_reason = ''    # 디버그용 — 'floor_and_lidar_clear' 등
+        self._obstacle_cut_lidar_near = False    # 디버그용 — 이번 프레임 트리거 ROI에 라이다 점이 잡혔는지(원시값)
+        # [2026-08-21] 방해차량 좌우 교차검증 디버그용(perc_obstacle_cut_trigger() 참고) —
+        # 매틱 갱신, _debug_viz_obstacle_cut()에서 그대로 표시.
+        self._obstacle_cut_lidar_side = None   # 'L'/'R'/None(lidar_near 아니었으면)
+        self._obstacle_cut_yolo_side  = None   # 'L'/'R'/None(YOLO 미검출)
+        self._obstacle_cut_side_veto  = False  # True면 이번 틱 좌우 불일치로 vehicle_seen 취소됨
+        # [2026-08-21] 진입을 확정지은 그 순간의 장애물 좌/우('L'/'R') — _update_obstacle_cut_hold()의
+        # 새 진입 분기에서 self._obstacle_cut_y 부호로 한 번 캡처해두고, 활성 유지 중엔 안 바뀐다.
+        # _obstacle_cut_roi_clear()가 해제 판정 시 이 쪽만 본다(요청 반영 — 아래 해당 함수 주석 참고).
+        self._obstacle_cut_trigger_side = None  # 'L'/'R'/None(아직 한 번도 진입 안 함)
+        # [2026-08-21] obstacle_cut_active 진입 순간 PP_LOOKAHEAD_CURVATURE_GAIN을
+        # PP_CURVATURE_BOOST_GAIN으로 잠깐 올려두는 타이머 — 이 시각까지는 부스트 유지
+        # (_update_obstacle_cut_hold()가 진입 엣지에서 세팅, _lane_steer()가 매틱 소비).
+        self._pp_curvature_boost_until_t = 0.0
+        # avoid_hold 새 트리거(=da 마진 확장) 시점에 obstacle_type=='vehicle'면 세팅 —
+        # 이 시각까지 lookahead 고정(_update_avoid_hold()가 세팅, _lane_steer()가 소비).
+        self._pp_vehicle_lookahead_fix_until_t = 0.0
+        # [2026-08-20] _debug_viz_obstacle_cut() BEV 패널용 — avoid_hold_debug의
+        # _obstacle_front_all_x/y·_obstacle_cluster_x/y와 동일 패턴(매틱 갱신되는 라이브 값).
+        # bg_*는 표시범위 안의 배경점 전부(회색), roi_*는 실제 트리거 ROI 안에 잡힌 점만(빨강).
+        self._obstacle_cut_bg_x  = np.array([])
+        self._obstacle_cut_bg_y  = np.array([])
+        self._obstacle_cut_roi_x = np.array([])
+        self._obstacle_cut_roi_y = np.array([])
+
         # [2-7 장애물 위치 판단]
         self.lane_center   = 320.0           # 차선 중앙 x좌표(px) — 첫 카메라 프레임 전까지 화면 중앙 기본값
 
@@ -264,52 +335,73 @@ class TrackDriverNode(Node):
         # 초기화가 실패하면 _build_lane_detector()의 dl→hough 폴백과 달리 대체 백엔드가
         # 없으므로(카메라 이중확인 자체가 선택사항), None으로 두고 perc_lavacon_trigger()가
         # "카메라 확인 불가 시 라이다 단독 판정으로 폴백"하도록 한다 — 원인은 에러 로그로 남긴다.
-        try:
-            self.yolo_cone_detector = YoloConeDetector(logger=self.get_logger())
-        except Exception as e:
-            self.get_logger().error(
-                f'YOLO 콘 검출기 초기화 실패, 라바콘 트리거는 라이다 단독 판정으로 폴백합니다: {e}'
-            )
-            self.yolo_cone_detector = None
-
-        # [2026-08-19, 파일럿] 신호등 배경판 위치 탐지용 YOLO — YOLO_SIGNAL_ENABLE=False가
-        # 기본값이라(datasets/yolo_signal_pilot 스모크테스트 데이터뿐, 실데이터 재학습 전)
-        # 평소엔 이 블록이 아예 안 돈다. 켜져 있는데 모델 파일이 없으면 위 콘 검출기와 동일한
-        # 패턴으로 None 폴백 — SignalDetector가 yolo_detector=None이면 기존 HSV 자동크롭으로
-        # 자동 복귀하므로(traffic_signal.py 참고) 안전하다.
-        self.yolo_signal_detector = None
-        if YOLO_SIGNAL_ENABLE:
+        # [2026-08-20] ENABLE_OBSTACLE_CUT과 동일 패턴으로 YOLO_CONE_ENABLE 게이트 추가(요청
+        # 반영) — ENABLE_BEHAVIOR=False로 라바콘 자체를 안 쓰는 지금, 이 검출기가 매 프레임
+        # 백그라운드에서 계속 도는 게 순전한 오버헤드라 꺼둔다(config.py YOLO_CONE_ENABLE
+        # 주석 참고). perc_yolo_cone()은 self.yolo_cone_detector=None일 때 조용히 스킵한다.
+        self.yolo_cone_detector = None
+        if YOLO_CONE_ENABLE:
             try:
-                self.yolo_signal_detector = YoloSignalDetector(logger=self.get_logger())
+                self.yolo_cone_detector = YoloConeDetector(logger=self.get_logger())
             except Exception as e:
                 self.get_logger().error(
-                    f'YOLO 신호등 검출기 초기화 실패, 배경판 탐색은 기존 HSV 자동크롭으로 폴백합니다: {e}'
+                    f'YOLO 콘 검출기 초기화 실패, 라바콘 트리거는 라이다 단독 판정으로 폴백합니다: {e}'
                 )
-                self.yolo_signal_detector = None
-        self.signal_detector = SignalDetector(yolo_detector=self.yolo_signal_detector)  # 신호등(3구/4구) 인식기
+                self.yolo_cone_detector = None
 
-        # 신호등 색상상태 YOLO 검출기(위 배경판 위치 탐지용과는 별개 모델/역할 —
-        # perception/yolo_signal_state.py 헤더 주석 참고) — 아직 주행 판단에는 안 쓰고 Hough
-        # Circle과 비교만 하는 단계라(YOLO_SIGNAL_STATE_* config.py 주석 참고), 초기화 실패해도
-        # 폴백 없이 그냥 None으로 두고 비교 창만 안 뜨게 한다(주행 자체엔 영향 없음).
+        # [2026-08-20] da 근접 컷(ENABLE_OBSTACLE_CUT) 전용 YOLO 차량 검출기 — 이 저장소의
+        # 다른 YOLO 검출기와 동일 패턴(초기화 실패 시 None, 라이다 단독 판정으로 폴백).
+        # ENABLE_OBSTACLE_CUT=False(기본값)면 초기화 자체를 건너뛴다 — 이미 dl_lane/
+        # yolo_cone/yolo_signal_state 세 개가 돌고 있는 상황에서 안 쓰는 4번째 추론 스레드를
+        # 굳이 띄워 자원경합을 더할 이유가 없다(꺼져있을 땐 정말로 아무 영향 없게).
+        self.yolo_vehicle_cut_detector = None
+        if ENABLE_OBSTACLE_CUT:
+            try:
+                self.yolo_vehicle_cut_detector = YoloVehicleDetector(logger=self.get_logger())
+            except Exception as e:
+                self.get_logger().error(
+                    f'YOLO 차량(근접컷) 검출기 초기화 실패, 근접 컷 트리거는 라이다 단독 판정으로 폴백합니다: {e}'
+                )
+
+        # [2026-08-21] 신호등 인식은 이 YOLO 단독 모델(위치+색상상태를 한 스테이지로 동시
+        # 예측) 하나뿐이다 — 예전에 있던 HSV/Hough Circle 기반 검출(traffic_signal.py/
+        # frst.py) 및 배경판 위치 전용 YOLO(yolo_signal.py)는 삭제했다(README §1.18). 초기화
+        # 실패 시(모델 파일 없음 등) 폴백 없이 None으로 두면 perc_signal()이 신호등을 계속
+        # "미검출"로만 보고한다 — 다른 YOLO 검출기와 달리 이 모델이 없으면 대체 경로가 없다.
         try:
             self.yolo_signal_state_detector = YoloSignalStateDetector(logger=self.get_logger())
         except Exception as e:
-            self.get_logger().error(f'YOLO 신호등 색상상태 검출기 초기화 실패, 비교 창 없이 진행합니다: {e}')
+            self.get_logger().error(f'YOLO 신호등 검출기 초기화 실패, 신호등을 인식할 수 없습니다: {e}')
             self.yolo_signal_state_detector = None
 
         # ── 판단/제어 상태 ──
         self.mission_state  = START_STATE
         self.behavior_state = BehaviorState.B0_NORMAL
-        self.phase          = Phase.LAVACON     # S1 내부 진행 순서(라바콘부터 시작)
+        # [2026-08-23] 위 "B3 통과 후 신호등 판단만" 격리 검증 끝나서 원복(요청 반영,
+        # config.py START_STATE/TEST_SIGNAL_LOOP와 짝) — 이제 출발선에서 초록불 대기부터
+        # B1(라바콘)→B2(고정장애물)→B3(이동장애물) 전체 흐름을 정상대로 시작한다.
+        self.phase          = Phase.LAVACON
         # [2026-08-15] Phase.OBSTACLE_ZONE 통합(da_based_b2b3_proposal.md B안) —
         # B2/B3 각각 최소 한 번 완료됐는지 추적. 둘 다 True가 돼야 Phase.DONE으로
-        # 넘어간다(_mark_behavior_passed() 참고) — 순서를 안 따지므로 어느 쪽이 먼저
-        # 끝나도 상관없다.
+        # 넘어간다(_mark_behavior_passed() 참고).
+        # [2026-08-20] 대회 트랙은 고정장애물(B2)이 항상 이동장애물(B3)보다 먼저 나오는 게
+        # 확정된 순서다(§5.2) — §5.4에서 잠깐 반대로 뒤집었다가(요청 반영), [2026-08-22]
+        # 요청으로 다시 "B2 먼저"로 되돌렸다(README §5.5). run_behavior_fsm()에서 B3 트리거를
+        # self._b2_passed가 True일 때만 받아들이도록 순서를 강제한다(아래 참고).
+        # [2026-08-23] 위 Phase.LAVACON 원복과 짝 — B2/B3 둘 다 아직 안 지났으므로 False로
+        # 시작(원래 정상 레이스 시작값).
         self._b2_passed = False
         self._b3_passed = False
+        # [2026-08-20] 요청 반영 — B2/B3 실제 처리를 da 근접 컷(obstacle_cut_active) 기반으로
+        # 바꾸면서 추가. obstacle_cut_active 진입 순간 'B2'/'B3' 중 하나를 latch해뒀다가,
+        # obstacle_cut_active가 다시 꺼지는 순간(탈출) 그 태그로 _mark_behavior_passed()를
+        # 부른다(run_behavior_fsm()의 Phase.OBSTACLE_ZONE 분기 참고) — B1의 _lavacon_engaged와
+        # 동일한 진입~탈출 latch 패턴.
+        self._obscut_zone_tag = None
         self._behavior_enabled = TEST_FORCE_BEHAVIOR  # 원래 S0_SIGNAL "직진" 확정 시에만 True
-                                                       #   (TEST_FORCE_BEHAVIOR=True면 라바콘 단독 테스트용으로 시작부터 강제 ON)
+                                                       #   (TEST_FORCE_BEHAVIOR=False — S0_SIGNAL부터
+                                                       #    정상 시작이라 강제 ON 불필요, 직진 신호
+                                                       #    확정 분기가 그때 가서 직접 켠다)
         # [2026-08-20] S0_SIGNAL 통합(S0_WAIT_GREEN+S2_INTERSECTION → 하나)으로 같은 state를
         # 출발 때와 매 바퀴 교차로에서 반복 재진입하게 됐다 — "이번이 진짜 첫 출발인지"는
         # prev_state 비교로 더 이상 구분이 안 되므로(둘 다 같은 state) 이 플래그로 직접
@@ -318,17 +410,27 @@ class TrackDriverNode(Node):
         self._departed = False
         self._lavacon_engaged  = False          # B1_LAVACON 진입 확정 latch (트리거 이후 잠깐 한쪽 클러스터가
                                                  #   끊겨도 중간에 일반주행으로 안 튀도록 유지, lavacon_done으로 해제)
+        # [2026-08-22] _lavacon_steer_da_push()가 이번 틱에 실제로 경로를 옆으로 밀었는지
+        # (push_m != 0.0) — perc_lane()이 set_lavacon_push()로 DL 백엔드에 넘겨 DA
+        # 디버그창의 경로 색(자홍/주황)에 반영한다(lane_util.py draw_path() 참고).
+        # run_behavior_fsm()이 _lavacon_engaged가 꺼지는 즉시 False로 되돌린다.
+        self._lavacon_push_active = False
+        # [2026-08-22] 위 플래그와 함께 넘기는 실제 push량(px, +면 우측으로 밀림) —
+        # DA 디버그창에서 밀리기 전(보라) 원본 경로와 밀린 뒤(주황) 경로를 나란히 그려
+        # 게인 튜닝 시 "어느 정도 밀었는지"를 한눈에 보려는 용도(lane_util.py draw_path()).
+        self._lavacon_push_px = 0.0
+        # [2026-08-23, 요청 반영] LAVACON_KICK_ENABLED 실험용 — B1 진입 확정 순간부터 남은
+        # "강제 조향각 유지" 프레임 수. run_behavior_fsm()이 진입 상승엣지에서 채우고,
+        # _handle_lavacon()이 매 틱 1씩 깎으며 0보다 큰 동안 push 계산 대신
+        # LAVACON_KICK_ANGLE_DEG를 그대로 ctrl_angle에 꽂는다(config.py 주석 참고).
+        self._lavacon_kick_cnt = 0
         self.ctrl_angle = 0.0
         self.ctrl_speed = SPEED_STOP
         self._prev_angle_out = 0.0    # [5] 직전 발행 조향각(변화율 제한용)
         self._pid_prev_error = 0.0
         self._pid_integral   = 0.0
-        self._turn_dist      = None   # 좌회전 진행 중 누적 이동거리(m, None=미회전) — [2026-08-20] IMU yaw 대신 거리 기반
-        self._s2_commit_dist = None   # S2 신호 확정 후 물리적 분기 커밋 구간 누적 이동거리(m, None=미진입)
-        self._s2_commit_dir  = None   # 커밋 구간에서 진행 중인 방향 ('straight'/'left')
-        self._exit_approach_t0 = None # [진출] S3 탈출 정지선 감지 후 감속 시작 시각
-        self._shortcut_t0    = None   # 지름길 진입 시각(끝감지 타이밍용)
-        self._shortcut_ref_yaw = None # S3 진입 1초 후 기록한 기준 yaw (탈출 좌회전 전 보정용)
+        self._s2_commit_dist = None   # 좌회전 커밋 구간(체크무늬 게이트까지) 누적 이동거리(m, None=미진입)
+        self._s2_commit_dir  = None   # [2026-08-22h] 직진은 커밋 구간 자체가 없어져 이제 'left'만 들어온다
         self._prev_speed     = 0.0    # 가속 속도제한용(직전 출력 속도)
         self._corner_hold    = 0.0    # 코너 활성도(감쇠 peak-hold)
         self._corner_signal  = 0.0    # 코너 감속 판단용 조향각 signed EMA(부호 유지, _lane_drive() 참고)
@@ -487,7 +589,7 @@ class TrackDriverNode(Node):
         # 구독하도록 이미 전환되어 있음(ros1_bridge가 커스텀 XycarMotor 타입을 못 넘기는 문제 우회).
         clipped_angle = float(np.clip(angle, -ANGLE_MAX, ANGLE_MAX))
         # [5] 변화율 제한: 크기(clip)만으로는 한 주기에 0도→-60도 같은 계단 명령이 그대로 나간다
-        #     (_do_left_turn 의 즉시 대입, B0→B1 전환, Stanley 출력 교체 등에서 실제로 발생).
+        #     (_begin_checker_ramp_turn() 진입 시 즉시 대입, B0→B1 전환, Stanley 출력 교체 등에서 실제로 발생).
         #     서보 기계부하와 제어 오실레이션을 동시에 줄인다.
         clipped_angle = float(np.clip(clipped_angle,
                                       self._prev_angle_out - ANGLE_RATE_MAX,
@@ -524,14 +626,90 @@ class TrackDriverNode(Node):
     # #########################################################
     # [2] 인지 (Perception)
     # #########################################################
+    # [2026-08-20] 요청 반영 — YOLO 카메라 검출기 3종(콘/차량/신호등색상)을 항상 다 같이
+    #   돌리지 않고, 지금 mission_state/phase가 실제로 필요로 하는 것 하나만 이번 틱에
+    #   추론시킨다. YoloConeDetector 등은 detect(frame)에 새 프레임을 안 넘기면 백그라운드
+    #   추론 스레드가 할 일이 없어 그냥 논다(perception/yolo_cone.py _worker() 참고) —
+    #   그래서 perceive_all()에서 "호출 자체를 건너뛴다"가 곧 "그 모델의 추론을 끈다"와
+    #   같다(스레드/세션은 살아있지만 GPU/CPU 추론 자체는 안 돎).
+    #
+    #   매핑: S0_SIGNAL(신호등 판단 대기) → 신호등. S1_LANE_FOLLOW 중 Phase.LAVACON(B1
+    #   진입 대기) → 콘. Phase.OBSTACLE_ZONE 중 B2(고정장애물) 아직 안 지났으면 → 콘,
+    #   지났으면(B3 방해차량 대기) → 차량. Phase.DONE(다음 교차로 신호등 대기) → 신호등.
+    #   S4_FINISH는 카메라 YOLO 자체가 불필요해 전부 끈다.
+    #   [2026-08-22, 요청 반영] §5.4에서 "B3(방해차량) → B2(고정장애물)"로 뒤집었던 트랙
+    #   순서를 다시 원래 순서 "B1(라바콘) → B2(고정장애물) → B3(방해차량)"로 되돌렸다
+    #   (README §5.5) — 아래 Phase.OBSTACLE_ZONE 분기, run_behavior_fsm() 참고.
+    #
+    #   [2026-08-20] §1.16은 신호등 YOLO를 "S3/S4 포함 항상 켜서 오탐률을 전체 구간에서
+    #   로그로 본다"는 의도로 상시 가동시켰는데, 이번 요청으로 그 부분을 뒤집는다 —
+    #   상시 오탐 로깅보다 동시 추론 개수를 줄이는 쪽(연산 자원 절약)을 우선했다. 오탐률을
+    #   다시 전체 구간에서 보고 싶으면 이 함수가 'signal' 아닌 다른 stage일 때도
+    #   perc_yolo_signal_state()를 호출하도록 되돌리면 된다.
+    def _active_yolo_stage(self):
+        if TEST_FORCE_SIGNAL_YOLO:
+            # [2026-08-23, 요청 반영] "욜로 안 끊기게, 검출만 테스트" 전용 — mission_state/
+            # phase/_signal_yolo_off 등 FSM 상태와 완전히 무관하게 신호등 YOLO를 항상 켠다.
+            # TEST_SIGNAL_LOOP의 phase 조기 이탈이나 확정 후 hold-off 로직(perc_signal())에
+            # 전혀 영향받지 않으므로, 순수하게 YOLO_신호등 창의 검출 정확도만 보고 싶을 때 켤 것.
+            return 'signal'
+        if self.mission_state == MissionState.S0_SIGNAL:
+            # [2026-08-23] 좌회전 확정 뒤 커밋구간/게이트 램프(_s2_commit_dist/
+            # _checker_ramp_dist)를 도는 동안은 색상이 이미 확정된 뒤라 더 볼 필요가 없다
+            # (_signal_yolo_off, perc_signal() 참고). 아직 신호를 못 읽어 대기 중인
+            # 출발선(START_STATE로 S0_SIGNAL 시작, 확정 전이라 _signal_yolo_off=False)
+            # 에서는 그대로 계속 켜둔다.
+            return None if self._signal_yolo_off else 'signal'
+        if self.mission_state == MissionState.S1_LANE_FOLLOW:
+            if self.phase == Phase.LAVACON:
+                # [2026-08-23] 진입 확정(_lavacon_engaged) 전까지는 진입 트리거 판정
+                # (perc_lavacon_trigger()의 cone_confirmed_cam)에 cone YOLO가 필요하지만,
+                # 일단 진입이 확정된 뒤(라바콘 사이를 실제로 통과 주행하는 동안)엔 콘이
+                # 카메라 시야를 가려 프레임이 제대로 안 나오는 구간이라 추론을 계속 돌릴
+                # 실익이 없다 — 여기서 끈다. 탈출(lavacon_done 확정 → Phase.OBSTACLE_ZONE
+                # 전환) 시점부터는 아래 OBSTACLE_ZONE 분기가 고정장애물(B2) 판정을 위해
+                # 자동으로 다시 'cone'을 켠다.
+                return 'cone' if not self._lavacon_engaged else None
+            if self.phase == Phase.OBSTACLE_ZONE:
+                return 'cone' if not self._b2_passed else 'vehicle'
+            # Phase.DONE — 다음 교차로 신호등 보드 대기. 단, 이번 바퀴 신호등을 이미
+            # 직진/좌회전 어느 쪽으로든 확정했다면(_signal_yolo_off) 다음 바퀴 리셋
+            # 전까지 추론 자체를 끈다.
+            return None if self._signal_yolo_off else 'signal'
+        return None  # S4_FINISH — 카메라 YOLO 불필요
+
     def perceive_all(self):
-        self.perc_lane()        # 비전
+        self.perc_lane()        # 비전 — set_obstacle()가 여기서 "직전 틱"의 obstacle_cut_active를
+                                 #   DL 백엔드로 넘긴다(set_avoid_hold()와 동일한 1틱 지연 허용, 아래 참고)
+        yolo_stage = self._active_yolo_stage()
+
+        # [2026-08-21] perc_signal()이 이 결과(self.signal_red/straight/left_on)를 그대로
+        #   디바운스(확정) 처리하므로, 같은 틱의 최신값을 넘겨주려면 perc_signal()보다 먼저
+        #   돌아야 한다(1틱 지연을 추가로 만들지 않기 위함).
+        if yolo_stage == 'signal':
+            self.perc_yolo_signal_state() # 비전 (YOLO, 신호등 위치+색상상태 동시 예측)
+        else:
+            self.signal_red_on = self.signal_straight_on = self.signal_left_on = False
         self.perc_signal()      # 비전
         self.perc_obstacle()    # 라이다
         self._update_avoid_hold()  # 라이다(위 obstacle_front/dist 기반) — perc_obstacle() 직후여야 함
+        # [2026-08-20] da 근접 컷(ENABLE_OBSTACLE_CUT) — 라이다+YOLO AND 트리거 → 유지/해제
+        #   타이머 순서. run_behavior_fsm()의 B2/B3 진입~탈출 신호로 쓰인다(§4/§5 README).
+        #   [2026-08-20] perc_obstacle_cut_trigger()가 B2(고정장애물=라바콘) 판정에
+        #   self.cone_detected_yolo를 쓰게 되면서, 그 값을 채우는 perc_yolo_cone()을
+        #   perc_lavacon_trigger()용으로 두던 원래 위치보다 앞으로 당겼다 — 안 당기면
+        #   1틱 지연된(직전 프레임) 콘 검출값을 obstacle_cut 판정에 쓰게 된다.
+        if yolo_stage == 'vehicle':
+            self.perc_yolo_vehicle_cut()      # 비전 (YOLO 차량, perc_obstacle_cut_trigger()가 라이다와 AND 결합)
+        else:
+            self.vehicle_detected_yolo_cut = False
+        if yolo_stage == 'cone':
+            self.perc_yolo_cone()             # 비전 (YOLO 콘, perc_obstacle_cut_trigger()/perc_lavacon_trigger() 공용)
+        else:
+            self.cone_detected_yolo = False
+        self.perc_obstacle_cut_trigger()  # 라이다+비전 → 근접 컷 진입 트리거(디바운스), B2/B3 타입 판정
+        self._update_obstacle_cut_hold()  # 최소유지시간 + 라이다 클리어 디바운스로 유지/해제 판단
         self.perc_lavacon()     # 라이다
-        self.perc_yolo_cone()   # 비전 (YOLO, perc_lavacon_trigger()가 라이다와 AND 결합해서 씀)
-        self.perc_yolo_signal_state() # 비전 (YOLO, 아직 비교용 — _debug_viz_signal_status()에서만 씀)
         self.perc_lavacon_trigger()  # 라이다+비전 (YOLO 콘 검출 AND 좌우 클러스터 동시검출 → B1_LAVACON 진입 트리거)
         self.perc_vehicle_trigger()  # 라이다 (전방 장애물 근접 → B3_VEHICLE 진입 트리거)
         self.perc_stopline()    # 비전
@@ -552,26 +730,33 @@ class TrackDriverNode(Node):
         self.cone_detected_yolo = self.yolo_cone_detector.detect(self.img_front)
         self.yolo_cone_detector.show_debug_windows()  # 메인 스레드에서만 호출(yolo_cone.py 주석 참고)
 
-        # [2026-08-22] 조향 반영 실험용 카메라 BEV 경로 — 아직 조향엔 안 태우고
-        # DEBUG_VIZ_LAVACON 창에서 라이다 경로와 겹쳐보는 용도로만 쓰므로, 그 플래그가
-        # 꺼져 있으면 계산 자체를 스킵한다(불필요한 CPU 사용 방지).
-        if DEBUG_VIZ_LAVACON:
-            detections = self.yolo_cone_detector.get_detections()
-            self._lavacon_cam_path_m = process_lavacon_camera(detections)
-
-    # [2-4b] 신호등 색상상태 YOLO (비교용, 아직 주행 판단에는 미연결)
-    #   입력 self.img_front → 출력 self.signal_*_on_yolo
-    #   yolo_signal_state.py가 별도 스레드에서 자기 페이스로 추론하므로 여기선 논블로킹으로
-    #   최신 결과만 받아온다(perc_yolo_cone()과 동일한 패턴). perc_signal()과 달리 상태 무관하게
-    #   (S3/S4 포함) 항상 돌린다 — 실차 영상 전체 구간에서 이 모델이 얼마나 오탐하는지도
-    #   같이 보고 싶어서(정상 주행 중 신호등 아닌 걸 신호로 잘못 잡는지 확인 목적).
-    def perc_yolo_signal_state(self):
-        if self.yolo_signal_state_detector is None:
-            self.signal_red_on_yolo = self.signal_straight_on_yolo = self.signal_left_on_yolo = False
+    # [2026-08-20] da 근접 컷 전용 YOLO 차량 이중확인 (ENABLE_OBSTACLE_CUT)
+    #   입력 self.img_front → 출력 self.vehicle_detected_yolo_cut
+    #   perc_yolo_cone()과 동일 패턴 — yolo_vehicle.py가 별도 스레드에서 자기 페이스로
+    #   추론하므로 여기선 논블로킹으로 최신 결과만 받아온다. perc_yolo_vehicle()(다른
+    #   브랜치, near_obstacle 트리거용)과는 별개 인스턴스/용도다.
+    def perc_yolo_vehicle_cut(self):
+        if not ENABLE_OBSTACLE_CUT or self.yolo_vehicle_cut_detector is None:
+            self.vehicle_detected_yolo_cut = False
             return
         if self.img_front is None:
             return
-        self.signal_red_on_yolo, self.signal_straight_on_yolo, self.signal_left_on_yolo = \
+        self.vehicle_detected_yolo_cut = self.yolo_vehicle_cut_detector.detect(self.img_front)
+        # [2026-08-20] 여기서 별도 창으로 안 띄운다 — _debug_viz_obstacle_cut()이
+        # get_latest_debug_frame()으로 이 프레임을 가져다 라이다 ROI 패널과 한 창에 합쳐 그린다.
+
+    # [2-4b] 신호등 위치+색상상태 YOLO
+    #   입력 self.img_front → 출력 self.signal_red/straight/left_on
+    #   yolo_signal_state.py가 별도 스레드에서 자기 페이스로 추론하므로 여기선 논블로킹으로
+    #   최신 결과만 받아온다(perc_yolo_cone()과 동일한 패턴). perceive_all()이 _active_yolo_stage()
+    #   로 'signal' 단계일 때만 이 함수를 호출한다 — perc_signal()보다 먼저 돌도록 순서를 맞춰뒀다.
+    def perc_yolo_signal_state(self):
+        if self.yolo_signal_state_detector is None:
+            self.signal_red_on = self.signal_straight_on = self.signal_left_on = False
+            return
+        if self.img_front is None:
+            return
+        self.signal_red_on, self.signal_straight_on, self.signal_left_on = \
             self.yolo_signal_state_detector.detect(self.img_front)
         self.yolo_signal_state_detector.show_debug_windows()  # 메인 스레드에서만 호출(yolo_signal_state.py 주석 참고)
 
@@ -601,6 +786,17 @@ class TrackDriverNode(Node):
         # set_speed()/config.py DL_DA_REAR_MARGIN_* 주석 참고). hough/classic_cv처럼 이
         # 메서드가 없는 백엔드는 set_avoid_hold()와 동일하게 getattr로 조용히 건너뛴다.
         getattr(self.lane_detector, 'set_speed', lambda *_a, **_k: None)(self.v_mps)
+        # [2026-08-20] da 근접 컷(ENABLE_OBSTACLE_CUT) 상태도 같이 넘긴다 — set_avoid_hold()와
+        # 동일한 1틱 지연 허용(위 주석 참고). obstacle_cut_active=False면(기본, 또는 아직
+        # 트리거 전) _clip_da_by_obstacle()이 그대로 통과시키므로 영향 없다.
+        getattr(self.lane_detector, 'set_obstacle', lambda *_a, **_k: None)(
+            self._obstacle_cut_y, self.obstacle_cut_active)
+        # [2026-08-22] B1 콘 침범 push(_lavacon_steer_da_push()) 상태도 같이 넘긴다 —
+        # set_obstacle()과 동일한 1틱 지연 허용(위 주석 참고). DA 디버그창 경로 색
+        # (자홍/보라/주황, lane_util.py draw_path())과, 밀리기 전/후 두 경로를 나란히
+        # 그리기 위한 실제 push량(px)에 쓰인다.
+        getattr(self.lane_detector, 'set_lavacon_push', lambda *_a, **_k: None)(
+            self._lavacon_push_active, self._lavacon_push_px)
 
         # hough_lane.py의 HoughLaneDetector를 사용하여 차선 인식 수행
         valid, offset, lookahead, lane_center, path, debug_img = self.lane_detector.detect(self.img_front)
@@ -613,12 +809,15 @@ class TrackDriverNode(Node):
         #   엄밀히는 직전 틱 값(0.05s 이내 오차, 디버깅 목적엔 무시 가능).
         lookahead_xy = self.pure_pursuit.last_target_xy
         lookahead_px = self.pure_pursuit.last_lookahead_px
-        # [2026-08-19] wheelbase 부스트 전/후 조향각도 같이 넘겨서 ll 패널 상단에 표시한다
-        # (perception/dl_lane.py show_debug_windows() steer_deg_raw/steer_deg_final 주석,
-        # 요청 반영) — lookahead_xy와 동일하게 이번 틱 _lane_steer() 실행 전 시점이라
+        # [2026-08-19] wheelbase 부스트 전/후 조향각도 같이 넘겨서 result 패널 하단에
+        # 표시한다(perception/dl_lane.py show_debug_windows() steer_deg_raw/steer_deg_final
+        # 주석, 요청 반영) — lookahead_xy와 동일하게 이번 틱 _lane_steer() 실행 전 시점이라
         # 직전 틱 값(0.05s 이내 오차, 무시 가능).
+        # [2026-08-20] 디버그창 간소화(요청 반영) — v_mps(실측) 대신 self.ctrl_speed(지금
+        # drive()로 실제 발행 중인 speed 명령값)를 넘긴다. show_debug_windows() docstring
+        # ctrl_speed 주석 참고.
         getattr(self.lane_detector, 'show_debug_windows', lambda *a, **k: None)(
-            lookahead_xy, lookahead_px, self.v_mps,
+            lookahead_xy, lookahead_px, self.ctrl_speed,
             steer_deg_raw=self.pure_pursuit.last_pre_boost_steer_deg,
             steer_deg_final=self.pure_pursuit.prev_steer_deg)
 
@@ -698,47 +897,76 @@ class TrackDriverNode(Node):
     #   출력 signal_red/straight/left_on (S0_SIGNAL 공용 — 출발/교차로 겸용)
     #   주의 4구는 직진·좌회전 모두 초록 → 점등 '위치'로 구분
     def perc_signal(self):
-        """신호등 판별 — traffic_signal.py의 SignalDetector.detect_s2()(4구 Hough Circle)에 위임.
-          대회 규정 변경으로 출발과 교차로가 동일한 4구 신호등을 재사용하고, [2026-08-20]부터는
-          그 둘을 아예 하나의 state(MissionState.S0_SIGNAL)로 합쳤다 — 이 함수는 매번 같은 의미로
-          판독한다: signal_straight_confirmed(초록만 점등) = 직진(출발 시점엔 "출발"과 동의어),
+        """신호등 판별 — perc_yolo_signal_state()가 같은 틱에 먼저 갱신해둔
+          self.signal_red/straight/left_on(YOLO 단독, 위치+색상 동시 예측)을 디바운스만
+          적용해 확정값으로 승격시킨다. 대회 규정 변경으로 출발과 교차로가 동일한 4구
+          신호등을 재사용하고, [2026-08-20]부터는 그 둘을 아예 하나의
+          state(MissionState.S0_SIGNAL)로 합쳤다 — 이 함수는 매번 같은 의미로 판독한다:
+          signal_straight_confirmed(초록만 점등) = 직진(출발 시점엔 "출발"과 동의어),
           signal_left_confirmed(초록+빨강 동시) = 좌회전(지름길, 출발 지점에선 사실상 안 뜸).
-        detect_s2()는 원 4개가 정확히 안 잡히면(초과분은 pick_best_4()로 어느 정도 흡수하지만,
-        미달은 흡수 불가) 그 프레임은 인식 실패로 순간값이 False가 될 수 있다. 여기서
-        SIG_CONFIRM_FRAMES 연속 유지를 확인해 confirmed로 승격시켜, 단발성 오검출/오검출실패가
-        바로 FSM 전환(출발/좌회전)으로 새는 걸 막는다(라바콘/차량 트리거와 동일한 패턴).
-        DEBUG_LOG_SIGNAL=True면(기본값) 매 프레임 _log_signal_debug()로 실패 원인+힌트를 찍는다
-        — DEBUG_VIZ_SIGNAL(창)과 별개 스위치라 터미널 로그만 원하면 이것만 켜도 됨.
+        YOLO 검출이 그 프레임에 실패하면(신뢰도 미달/각도 등) signal_*_on이 False가 될 수
+        있다. 여기서 SIG_CONFIRM_FRAMES 연속 유지를 확인해 confirmed로 승격시켜, 단발성
+        오검출/미검출이 바로 FSM 전환(출발/좌회전)으로 새는 걸 막는다(라바콘/차량 트리거와
+        동일한 패턴).
 
-        [2026-08-20] S1_LANE_FOLLOW 중에도 detect_s2()를 돌리도록 확장(요청 반영) — 예전엔
+        [2026-08-20] S1_LANE_FOLLOW 중에도 신호등 검출을 돌리도록 확장(요청 반영) — 예전엔
         S0_SIGNAL 진입 후에야 신호등을 "보기" 시작해서, 그 진입 자체는 정지선(바닥 흰선)
         검출이 트리거였다. 그런데 "정지선을 밟아야 신호를 읽기 시작한다"는 신호등 자체를
         인식하는 것과는 다른 신호원이라, 정지선 인식이 어긋나면(치우침/블러 등) 신호등이
-        이미 빨간불인데도 계속 차선주행 속도로 접근하는 상황이 가능했다. 이제 S1 중에도
-        보드 인식 자체(색상 무관, SignalDetector.s2_chosen_idx>=0)를 매 프레임 확인해
-        _s1_lane_follow()가 이걸로 S0_SIGNAL 진입을 트리거한다 — 정지선은 더 이상 이 전환에
-        관여하지 않는다(다른 용도— _shortcut_end()/_update_lap()/교차로 근처 기동 금지—는
-        그대로 유지)."""
+        이미 빨간불인데도 계속 차선주행 속도로 접근하는 상황이 가능했다. 정지선은 더 이상
+        이 전환에 관여하지 않는다(다른 용도— _update_lap()/교차로 근처 기동 금지—는
+        그대로 유지).
+
+        [2026-08-22] "보드 인식(색상 무관) → S0_SIGNAL 진입 → 그 안에서 색상 확정"이던
+        2단계 트리거를 없앴다(요청 반영, S0_SIGNAL 진입 시 속도가 0으로 굳는 문제) —
+        S1_LANE_FOLLOW/S0_SIGNAL 구분 없이 매 프레임 직진/좌회전 색상 확정
+        (signal_straight/left_confirmed)을 갱신하고, _s1_lane_follow()가 이 확정값을
+        직접 보고 커밋 구간 진입을 트리거한다. 색상 확정 전까지는 S1 차선주행이 멈추지
+        않는다."""
         if self.img_front is None:
             return
         if self.mission_state not in (MissionState.S1_LANE_FOLLOW, MissionState.S0_SIGNAL):
             return
 
-        self.signal_red_on, self.signal_straight_on, self.signal_left_on = \
-            self.signal_detector.detect_s2(self.img_front)
-        if self.yolo_signal_detector is not None:
-            self.yolo_signal_detector.show_debug_windows()  # 메인 스레드 전용(yolo_signal.py 주석 참고)
-
-        if self.mission_state == MissionState.S1_LANE_FOLLOW:
-            # S0_SIGNAL 진입 트리거용 — 색상은 아직 안 보고 "보드 자체가 잡혔는가"만 본다.
-            board_seen = self.signal_detector.s2_chosen_idx >= 0
-            self._sig_board_cnt = self._sig_board_cnt + 1 if board_seen else 0
-            self.signal_board_confirmed = self._sig_board_cnt >= SIG_CONFIRM_FRAMES
-        else:  # S0_SIGNAL — 직진/좌회전 색상 확정
-            self._sig_straight_cnt = self._sig_straight_cnt + 1 if self.signal_straight_on else 0
-            self._sig_left_cnt     = self._sig_left_cnt + 1 if self.signal_left_on else 0
-            self.signal_straight_confirmed = self._sig_straight_cnt >= SIG_CONFIRM_FRAMES
-            self.signal_left_confirmed     = self._sig_left_cnt >= SIG_CONFIRM_FRAMES
+        self._sig_straight_cnt = self._sig_straight_cnt + 1 if self.signal_straight_on else 0
+        self._sig_left_cnt     = self._sig_left_cnt + 1 if self.signal_left_on else 0
+        self.signal_straight_confirmed = self._sig_straight_cnt >= SIG_CONFIRM_FRAMES
+        self.signal_left_confirmed     = self._sig_left_cnt >= SIG_CONFIRM_FRAMES
+        # ★★★ [2026-08-23j, 요청 반영, 중대 임시 스위치 — 반드시 원복!] ★★★
+        # TEST_FORCE_LEFT_TURN_SIGNAL=True면 실제 YOLO 판독 결과를 완전히 무시하고
+        # "좌회전 신호를 이미 받은 것"으로 강제한다 — 좌회전 로직(커밋 구간 →
+        # perc_checker_pillar() 좌우 라이다 기둥쌍 검출 → 조향 램프)만 신호등 인식과
+        # 분리해서 단독 검증하려는 목적(config.py TEST_FORCE_LEFT_TURN_SIGNAL 주석 참고).
+        # ⚠️ 검증 끝나면 config.py에서 False로 되돌릴 것 — 실차 레이스 중 켜진 채로
+        # 있으면 신호와 무관하게 항상 좌회전으로 우겨서 코스를 이탈한다.
+        if TEST_FORCE_LEFT_TURN_SIGNAL:
+            self.signal_left_confirmed = True
+        # [2026-08-23] 직진/좌회전 둘 중 하나라도 확정되면 신호등 YOLO 추론을 끈다 —
+        # 색상이 이미 확정된 이상 더 볼 필요가 없다(다음 바퀴 리셋까지, _update_lap()
+        # RESET_PHASE_EACH_LAP 분기 참고). 예전엔 직진 확정 분기(_s1_lane_follow())에서만
+        # 개별적으로 껐는데, 좌회전 확정 뒤 S0_SIGNAL 커밋구간에서는 _active_yolo_stage()가
+        # S0_SIGNAL이면 이 플래그와 무관하게 무조건 'signal'을 켜고 있어 좌회전 쪽만
+        # 추론이 안 꺼지는 비대칭이 있었다 — 여기 한 곳에서 양쪽 다 같은 순간(확정되는 틱)에
+        # 끄도록 합쳤다(_active_yolo_stage() S0_SIGNAL 분기도 같이 수정).
+        # [2026-08-23b, 요청 반영] "YOLO_신호등 창에 좌회전이 분명히 찍혔는데도 확정
+        # 표시가 바로 사라져서 확인이 안 된다"는 보고 — 좌회전 확정은 같은 틱에 곧장
+        # S0_SIGNAL로 전환되고 _change_state()가 signal_left_confirmed/signal_left_on/
+        # _sig_left_cnt를 그 자리에서 즉시 리셋해버리는데(S0_SIGNAL 진입 시 새로 판독
+        # 시작하려는 의도, 그 자체는 정상), 곧이어 이 조건이 True→False로 바로 꺼져
+        # YOLO도 다음 틱부터 바로 멈춰버려 육안/디버그창으로 확인할 틈이 없었다. 그래서
+        # 확정되는 즉시 끄지 않고, 확정된 틱부터 SIGNAL_YOLO_OFF_HOLD_FRAMES만큼 더 돈
+        # 뒤에 끄도록 유예를 둔다 — _signal_off_hold_cnt는 _change_state()가 안 건드리는
+        # 별도 필드라 위 리셋과 무관하게 계속 유지된다. FSM의 실제 상태전환(좌회전이면
+        # S0_SIGNAL 진입, 직진이면 Behavior 재활성화)은 이 유예와 무관하게 확정되는 그
+        # 틱에 이미 끝나 있으므로, 이 유예는 순수하게 "YOLO를 몇 프레임 더 돌려서 눈으로
+        # 확인 가능하게" 하는 것뿐 — FSM 반응 속도에는 영향 없다.
+        if (self.signal_straight_confirmed or self.signal_left_confirmed) \
+                and self._signal_off_hold_cnt is None:
+            self._signal_off_hold_cnt = 0
+        if self._signal_off_hold_cnt is not None:
+            self._signal_off_hold_cnt += 1
+            if self._signal_off_hold_cnt >= SIGNAL_YOLO_OFF_HOLD_FRAMES:
+                self._signal_yolo_off = True
 
     # [2026-08-13] mask(불리언 배열)에서 True인 인덱스들 중 가장 긴 "연속(인접 인덱스)"
     # 구간의 길이를 구한다. 전방 장애물 그룹핑(perc_obstacle()의 fidx/groups, np.split을
@@ -759,6 +987,11 @@ class TrackDriverNode(Node):
     def perc_obstacle(self):
         # ── 튜닝 파라미터 ──
         FRONT_X_MIN, FRONT_X_MAX = 0.0, 5.0   # 전방 ROI 종방향(m)
+        # [2026-08-22k] 1.5 → 0.5로 축소했다가(라바콘 트리거 ROI 축소와 같이 묶어서 요청)
+        #   다시 1.5로 원복(요청 반영) — 이 값은 lidar_bev 표시 전용이 아니라 B2/B3 회피
+        #   판정(front_mask → obstacle_front/dist/type/width)에 직접 쓰이는 ROI라, 라바콘과는
+        #   별개로 다뤄야 한다는 판단. 라바콘 쪽 축소(perc_lavacon_trigger() LAT_MAX,
+        #   perc_lavacon.py CONE_LAT_LIMIT, 둘 다 0.5)는 그대로 유지.
         FRONT_Y_HALF             = 1.5         # 전방 ROI 횡방향 반폭(m)
         FRONT_MIN_PTS            = 2           # 전방 장애물 확정 최소 포인트
         FRONT_VEHICLE_PTS        = 12          # 이 이상이면 차량, 미만이면 고정장애물
@@ -988,6 +1221,13 @@ class TrackDriverNode(Node):
                         (8, 84), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                         (0, 255, 0) if (self.left_clear_confirmed or self.right_clear_confirmed) else (0, 0, 255),
                         1, cv2.LINE_AA)
+            # [2026-08-23] 'lidar_bev' 창만 다른 디버그 창들과 달리 moveWindow가 아예 없어서
+            #   OS 기본 위치(대개 화면 좌상단)에 떠 다른 창(YOLO_신호등 등)과 겹쳤다(요청 반영
+            #   — "디버깅창 뜰때 안겹치게") — 나머지 창과 동일한 1회성 가드 패턴 적용.
+            if 'lidar_bev' not in self._dbg_windows_positioned:
+                cv2.namedWindow('lidar_bev', cv2.WINDOW_AUTOSIZE)
+                cv2.moveWindow('lidar_bev', *DEBUG_WIN_POS_LIDAR)
+                self._dbg_windows_positioned.add('lidar_bev')
             cv2.imshow('lidar_bev', bev)
             cv2.waitKey(1)
 
@@ -1054,6 +1294,11 @@ class TrackDriverNode(Node):
                 self._avoid_hold_trigger_cause = (
                     'lidar' if (self.obstacle_front and self.obstacle_dist < AVOID_HOLD_TRIGGER_DIST_M)
                     else 'da_jump')
+                # da 마진 확장(avoid_hold)이 걸리는 이 시점이 실제 "차량 감지" 순간이다 —
+                # obstacle_cut_active(ENABLE_OBSTACLE_CUT+라이다근접+YOLO+디바운스)는 훨씬
+                # 늦게/드물게 걸려서 여기 걸어야 lookahead 고정이 실제로 동작한다.
+                if self.obstacle_type == 'vehicle':
+                    self._pp_vehicle_lookahead_fix_until_t = now + PP_VEHICLE_LOOKAHEAD_FIX_SEC
             self._avoid_hold_until_t = now + self.avoid_hold_hold_sec
 
         # ③ 조기 해제 판정용 상태 갱신 — obstacle_front가 True인 동안(=아직 가까움)은
@@ -1086,7 +1331,11 @@ class TrackDriverNode(Node):
     # [2-4] 라바콘
     #   출력 lavacon_offset(디버그용)/lavacon_done, lavacon_path(조향용 — _handle_lavacon() 참고)
     def perc_lavacon(self):
-        self.lavacon_offset, self.lavacon_done, path_m = process_lavacon(self.lidar_ranges)
+        self.lavacon_offset, self.lavacon_done, path_m, self._lavacon_boxes_prev = \
+            process_lavacon(self.lidar_ranges, self._lavacon_boxes_prev)
+        # [2026-08-19] process_lavacon()이 프레임간 좌/우 EMA(LAVACON_TEMPORAL_EMA_ENABLED,
+        # perc_lavacon.py 상단 주석 6) 참고)용으로 반환한 boxes를 self._lavacon_boxes_prev에
+        # 그대로 들고 있다가 다음 틱에 다시 넘긴다 — process_lavacon() 자체는 무상태.
         # [2026-08-11] 라바콘 조향 파라미터를 라인주행(_lane_steer())과 완전히 일치시키기로
         # 한 결정 — LAVACON_KP 같은 라바콘 전용 P게인 대신, self.lane_path와 동일하게
         # self.pure_pursuit(같은 PP_* 게인)에 태운다. "1m=DL_PIXELS_PER_METER px,
@@ -1095,13 +1344,235 @@ class TrackDriverNode(Node):
         # 좌표(x=전방+, y=좌측+)를 그 스케일로 그대로 변환하면 물리적으로 일관된 입력이
         # 된다 — 차량 기준점은 원점(0,0)으로 두고(_handle_lavacon()이 vehicle_x=0.0으로
         # 호출), 좌측(+y_m)은 이미지 왼쪽(-col_px)에 대응한다.
-        # [2026-08-19] path_m 생성 로직 자체는 보로노이 → 좌우 콘 클러스터 중앙 페어링으로
-        # 교체됐지만(perc_lavacon.py 상단 주석 참고), 여기 변환/호출부는 출력 형식이 그대로라
-        # 변경 없음.
+        # [2026-08-19] path_m 생성 로직 자체는 보로노이 → 콘 클러스터 페어링 → 박스 스택
+        # 페어링 순으로 여러 차례 교체됐지만(perc_lavacon.py 상단 주석 참고), 여기 변환/
+        # 호출부는 출력 형식이 그대로라 변경 없음.
         self.lavacon_path = [(-y * DL_PIXELS_PER_METER, -x * DL_PIXELS_PER_METER) for x, y in path_m]
         # 위 px 변환 전 원본(라이다 미터 좌표) — _draw_lavacon_bev()가 DEBUG_VIZ_LAVACON일 때
         # 그대로 그려서 "실제로 조향에 쓰이는 경로"를 시각적으로 보여준다.
         self._lavacon_path_m = path_m
+        # [2026-08-19] self._lavacon_boxes_prev는 process_lavacon()이 이번 프레임에 반환한
+        # boxes(LAVACON_TEMPORAL_EMA_ENABLED면 프레임간 EMA 이미 반영됨)로 위에서 막 갱신됨 —
+        # [2026-08-22] 예전엔 여기서 곧장 별도 창(lavacon_ema_bev)에 그렸으나, DEBUG_VIZ_LAVACON
+        # 통합 창으로 합치면서 실제 그리기는 이 프레임의 뒤 순서인 perc_lavacon_trigger() →
+        # _draw_lavacon_bev()로 넘겼다(같은 틱 안에서 self._lavacon_boxes_prev를 그대로
+        # 읽으므로 값은 최신 그대로).
+
+    # [2026-08-20] da 근접 컷(ENABLE_OBSTACLE_CUT) 진입 트리거 — perc_lavacon_trigger()와
+    #   동일한 "라이다 AND YOLO 카메라" 이중확인 패턴이지만, perc_obstacle()의 공유 ROI
+    #   (FRONT_X_MAX/FRONT_Y_HALF, 다른 B2/B3/avoid_hold 소비처와 공유)를 재사용하지
+    #   않고 이 목적 전용의 독립 라이다 ROI(OBSTACLE_CUT_TRIGGER_X_MAX_M/Y_HALF_M)를
+    #   새로 계산한다 — 그 소비처들의 튜닝이 나중에 이 트리거와 갈라져도 서로 간섭하지
+    #   않게(config.py 해당 상수 주석 참고).
+    #   [2026-08-20] 요청 반영 — B3(방해차량) 전용이던 걸 B2(고정장애물=라바콘 1개)까지
+    #   포함하도록 확장했다. run_behavior_fsm()의 Phase.OBSTACLE_ZONE 분기가 이 트리거를
+    #   B2/B3 공용 진입~탈출 신호로 그대로 재사용한다(§4/§5 README 참고).
+    #   입력 self.lidar_ranges, self.cone_detected_yolo(perc_yolo_cone()이 먼저 채워둠),
+    #        self.vehicle_detected_yolo_cut(perc_yolo_vehicle_cut()이 먼저 채워둠)
+    #   출력 self.obstacle_cut_trigger, self.obstacle_cut_type('fixed'/'vehicle'),
+    #        self._obstacle_cut_y(트리거 확정 순간 장애물 횡위치, m, +좌측)
+    def perc_obstacle_cut_trigger(self):
+        # [2026-08-22] 요청 반영 — B1(Phase.LAVACON) 중엔 이 트리거 자체를 죽인다.
+        # perc_yolo_cone()이 라바콘 구간에서도 계속 돌아서(위 perceive_all()) 콘이
+        # 잡히는 순간 여기서도 라이다+YOLO AND가 성립해버려, 아직 B2 대기 상태(Phase.
+        # OBSTACLE_ZONE)로 넘어가기도 전에 obstacle_cut_active가 켜지는 문제가 있었다
+        # (DA창에 CUT이 뜨는 원인). ENABLE_OBSTACLE_CUT=False와 동일한 완전 비활성
+        # 경로를 그대로 태워 처리 — Phase.OBSTACLE_ZONE 진입 후에만 실제로 발동한다.
+        if not ENABLE_OBSTACLE_CUT or self.phase == Phase.LAVACON:
+            self._obstacle_cut_trigger_cnt = 0
+            self.obstacle_cut_trigger = False
+            return
+
+        BODY_LO, BODY_HI = 215, 305   # perc_obstacle()/perc_lavacon_trigger()와 동일(차체 자기가림)
+
+        if self.lidar_ranges is None:
+            self._obstacle_cut_trigger_cnt = 0
+            self.obstacle_cut_trigger = False
+            self._obstacle_cut_lidar_near = False
+            self._obstacle_cut_bg_x = self._obstacle_cut_bg_y = np.array([])
+            self._obstacle_cut_roi_x = self._obstacle_cut_roi_y = np.array([])
+            return
+
+        ranges = np.array(self.lidar_ranges, dtype=np.float32)
+        ranges[~np.isfinite(ranges)] = 0.0
+        ranges[ranges <= 0.0] = 0.0
+        n = len(ranges)
+        if BODY_MASK_ENABLED and n > BODY_LO:
+            ranges[BODY_LO:min(BODY_HI, n)] = 0.0
+
+        m = min(n, 360)
+        deg = np.linspace(0.0, 2.0 * math.pi, m, endpoint=False) - math.radians(LIDAR_ANGLE_OFFSET_DEG)
+        r = ranges[:m]
+        x = r * np.cos(deg)          # 전방(+앞)
+        y = r * np.sin(deg)          # 횡방향(+좌/-우, perc_lavacon_trigger()와 동일 규약)
+        roi_mask = ((r > 0.0) & (x > 0.0) & (x < OBSTACLE_CUT_TRIGGER_X_MAX_M)
+                    & (np.abs(y) < OBSTACLE_CUT_TRIGGER_Y_HALF_M))
+
+        lidar_near = bool(np.any(roi_mask))
+        self._obstacle_cut_lidar_near = lidar_near
+        if lidar_near:
+            idx = np.where(roi_mask)[0]
+            nearest = idx[int(np.argmin(r[idx]))]  # 가장 가까운 점의 횡위치를 대표값으로
+            self._obstacle_cut_y = float(y[nearest])
+
+        # [2026-08-20] _debug_viz_obstacle_cut() BEV 패널용 라이브 스냅샷 — ROI보다 조금
+        # 넓게 잡아서(여백 없으면 박스 바로 밖 점이 왜 트리거 안 됐는지 안 보임) 배경으로
+        # 같이 그린다. roi_mask 안쪽만 별도로 빼서 "실제로 트리거에 쓰인 점"을 구분.
+        disp_mask = ((r > 0.0) & (x > 0.0) & (x < OBSTACLE_CUT_TRIGGER_X_MAX_M + 1.0)
+                     & (np.abs(y) < OBSTACLE_CUT_TRIGGER_Y_HALF_M + 0.45))
+        self._obstacle_cut_bg_x, self._obstacle_cut_bg_y = x[disp_mask], y[disp_mask]
+        self._obstacle_cut_roi_x, self._obstacle_cut_roi_y = x[roi_mask], y[roi_mask]
+
+        # [2026-08-20] 요청 반영 — B2(고정장애물=라바콘 1개)/B3(방해차량) 공용 트리거로 확장.
+        # 카메라 확인을 "차량 YOLO 단독"에서 "콘 YOLO OR 차량 YOLO"로 넓힌다 — B1 진입
+        # 트리거(perc_lavacon_trigger())가 이미 매 틱 갱신해두는 self.cone_detected_yolo를
+        # 그대로 재사용(B1이 지금 placeholder라 해당 검출기가 유휴 상태인 것과 무관하게
+        # perc_yolo_cone() 자체는 계속 돈다, perceive_all() 참고).
+        cone_seen    = self.cone_detected_yolo        if self.yolo_cone_detector        is not None else False
+        vehicle_seen = self.vehicle_detected_yolo_cut  if self.yolo_vehicle_cut_detector is not None else False
+        # [2026-08-21] 방해차량(vehicle) 오검출 방지 — 라이다/YOLO가 각각 판단한 좌우가
+        # 일치할 때만 vehicle_seen을 신뢰한다. 라이다·카메라가 "이번 틱에 뭔가 있다"까지는
+        # 둘 다 맞아도 서로 다른 위치(예: 라이다는 우측 근접 장애물, YOLO는 좌측 배경
+        # 오검출)를 보고 있으면 우연히 같은 프레임에 겹친 것뿐이라 방해차량 확정 근거로
+        # 부족하다 — 좌우 부호가 어긋나면 이번 틱은 vehicle_seen을 취소해 cone_seen/라이다
+        # 단독 판정 경로로 폴백시킨다(아래 cam_confirmed 계산 참고). self._obstacle_cut_y는
+        # 위에서 lidar_near일 때만 갱신되므로 그 경우에만 비교한다. y>0=좌측 규약(위 x,y
+        # 계산부 주석)과 yolo_vehicle.py get_latest_side()의 'L'/'R'은 둘 다 전방 카메라/
+        # 라이다 기준 같은 실세계 좌우라 부호만 맞춰주면 바로 비교 가능하다.
+        # [2026-08-21 수정, 요청 반영] "가장 가까운 점 하나"만으로 정한 lidar_side가 YOLO와
+        # 어긋나도, ROI 안에 YOLO가 가리키는 쪽 점이 실제로 있으면(=좌우 양쪽 다 찍힌 경우,
+        # 가장 가까운 점이 우연히 반대쪽이었을 뿐) 더 이상 veto하지 않는다 — 대신 YOLO가
+        # 가리키는 쪽 점들 중 가장 가까운 점으로 self._obstacle_cut_y를 다시 골라, 실제
+        # 컷 방향이 YOLO 검출 방향을 따라가게 한다(set_obstacle()이 이 값을 그대로 씀,
+        # perc_lane() 참고). veto는 이제 "YOLO가 가리키는 쪽엔 라이다 점이 아예 없다"는
+        # 진짜 불일치일 때만 발동한다.
+        self._obstacle_cut_lidar_side = self._obstacle_cut_yolo_side = None
+        self._obstacle_cut_side_veto = False
+        if vehicle_seen and lidar_near and self.yolo_vehicle_cut_detector is not None:
+            yolo_side = self.yolo_vehicle_cut_detector.get_latest_side()
+            lidar_side = 'L' if self._obstacle_cut_y > 0.0 else 'R'
+            self._obstacle_cut_lidar_side, self._obstacle_cut_yolo_side = lidar_side, yolo_side
+            if yolo_side is not None and yolo_side != lidar_side:
+                yolo_side_mask = roi_mask & ((y > 0.0) if yolo_side == 'L' else (y < 0.0))
+                if np.any(yolo_side_mask):
+                    yolo_side_idx = np.where(yolo_side_mask)[0]
+                    nearest_yolo_side = yolo_side_idx[int(np.argmin(r[yolo_side_idx]))]
+                    self._obstacle_cut_y = float(y[nearest_yolo_side])
+                    self._obstacle_cut_lidar_side = yolo_side
+                else:
+                    vehicle_seen = False
+                    self._obstacle_cut_side_veto = True
+        # 두 검출기 다 초기화 실패면(드묾) perc_lavacon_trigger()와 동일 원칙으로 라이다
+        # 단독 판정으로 폴백(카메라 확인 자체를 생략, cam_confirmed=True).
+        both_cams_unavailable = self.yolo_cone_detector is None and self.yolo_vehicle_cut_detector is None
+        cam_confirmed = cone_seen or vehicle_seen or both_cams_unavailable
+        confirmed_now = lidar_near and cam_confirmed
+        self._obstacle_cut_trigger_cnt = self._obstacle_cut_trigger_cnt + 1 if confirmed_now else 0
+        self.obstacle_cut_trigger = self._obstacle_cut_trigger_cnt >= OBSTACLE_CUT_TRIGGER_FRAMES
+
+        if confirmed_now:
+            if vehicle_seen and not cone_seen:
+                self.obstacle_cut_type = 'vehicle'
+            elif cone_seen and not vehicle_seen:
+                self.obstacle_cut_type = 'fixed'
+            else:
+                # 둘 다 잡히거나(드묾) 둘 다 카메라 폴백인 경우 — perc_obstacle()의 라이다
+                # 폭 기반 obstacle_type으로 타이브레이크, 그것도 미확정('none')이면 트랙
+                # 순서상 먼저 나오는 'fixed'를 기본값으로 둔다.
+                self.obstacle_cut_type = self.obstacle_type if self.obstacle_type != 'none' else 'fixed'
+
+    # [2026-08-20] da 근접 컷 유지/해제 타이머 — "카메라에서 장애물이 잠깐 안 보인다고
+    #   회피가 바로 꺼지면 안 된다"(요청 원문)에 대한 대응. avoid_hold(§2.32)와 완전히
+    #   독립된 상태이며, avoid_hold와 정확히 같은 이유(README §2.32: "카메라가 차량
+    #   앞코에 있어 장애물을 지나치는 순간 즉시 원래 폭으로 돌아와... 너무 이른 복귀가
+    #   충돌로 이어질 위험")를 이 컷 메커니즘에도 그대로 적용한다.
+    #   설계:
+    #     진입: perc_obstacle_cut_trigger()가 디바운스 통과시키는 순간 hold-start 시각을 찍는다.
+    #     최소유지(floor): OBSTACLE_CUT_HOLD_SEC_MIN 동안은 라이다/YOLO가 뭐라 하든 무조건 유지.
+    #     해제: floor를 넘긴 뒤 "진입과 동일한 전용 트리거 ROI"가 더 이상 아무것도 안 잡음이
+    #           OBSTACLE_CUT_RELEASE_CONFIRM_FRAMES 연속 유지돼야 해제한다 — 일부러 YOLO는
+    #           여기서 다시 안 본다(카메라가 옆/뒤로 빠진 차를 놓치는 건 정상 현상이지 "회피가
+    #           끝났다"는 근거가 아니므로, 진입 확신에만 쓰고 퇴장 판단에는 안 쓴다).
+    #   perc_obstacle()의 공유 obstacle_front/obstacle_dist(범위가 다름, 5.0m/1.5m)가 아니라
+    #   위 트리거와 같은 독립 ROI로 재계산한 clear 상태를 쓴다 — 범위가 다르면 해제 타이밍이
+    #   트리거 설계 의도와 어긋난다.
+    def _update_obstacle_cut_hold(self):
+        # [2026-08-22] 요청 반영 — perc_obstacle_cut_trigger()와 동일하게 B1(Phase.
+        # LAVACON) 중엔 유지 타이머도 강제로 끈다. 안 끄면 라바콘 구간에서 직전 틱까지
+        # 남아있던 obstacle_cut_active/hold 타이머가 그대로 유지될 수 있다.
+        if not ENABLE_OBSTACLE_CUT or self.phase == Phase.LAVACON:
+            self.obstacle_cut_active = False
+            return
+
+        now = time.time()
+        if self.obstacle_cut_trigger:
+            if self._obstacle_cut_until_t <= now:   # 새 진입(직전엔 비활성이었음)
+                self._obstacle_cut_hold_start_t = now
+                # [2026-08-21] B2(고정장애물)는 정지해 있어 회피가 끝나면 바로 지나쳐가므로
+                # B3(방해차량, OBSTACLE_CUT_HOLD_SEC_MIN)보다 짧은 최소유지시간을 쓴다 —
+                # perc_obstacle_cut_trigger()가 바로 이번 틱에 obstacle_cut_type을 이미
+                # 확정해뒀으므로(같은 틱 내 호출 순서, perceive_all() 참고) 여기서 바로 읽어도 된다.
+                self._obstacle_cut_hold_sec_min = (
+                    OBSTACLE_CUT_HOLD_SEC_MIN_FIXED if self.obstacle_cut_type == 'fixed'
+                    else OBSTACLE_CUT_HOLD_SEC_MIN)
+                # [2026-08-21, 요청 반영] 진입을 확정지은 이번 틱의 self._obstacle_cut_y
+                # 부호로 트리거 쪽을 캡처 — 해제 판정(_obstacle_cut_roi_clear())이 이 쪽만
+                # 보고 반대쪽 라이다 상황과 무관하게 판단하게 한다.
+                self._obstacle_cut_trigger_side = (
+                    'L' if self._obstacle_cut_y is not None and self._obstacle_cut_y > 0.0 else 'R')
+            self._obstacle_cut_until_t = now + self._obstacle_cut_hold_sec_min
+            self._obstacle_cut_release_cnt = 0
+        else:
+            # 트리거 ROI가 클리어됐는지(라이다만, YOLO는 안 봄 — 위 클래스 주석 참고)
+            lidar_clear = self.lidar_ranges is not None and self._obstacle_cut_roi_clear()
+            self._obstacle_cut_release_cnt = self._obstacle_cut_release_cnt + 1 if lidar_clear else 0
+
+        floor_elapsed = (now - self._obstacle_cut_hold_start_t) >= self._obstacle_cut_hold_sec_min
+        was_active = self.obstacle_cut_active
+        if (was_active and floor_elapsed
+                and self._obstacle_cut_release_cnt >= OBSTACLE_CUT_RELEASE_CONFIRM_FRAMES):
+            self._obstacle_cut_until_t = now
+            self.obstacle_cut_release_reason = 'floor_and_lidar_clear'
+
+        self.obstacle_cut_active = now < self._obstacle_cut_until_t
+        if was_active and not self.obstacle_cut_active and self.obstacle_cut_release_reason != 'floor_and_lidar_clear':
+            self.obstacle_cut_release_reason = 'timeout'
+        # [2026-08-21] obstacle_cut 진입 엣지(직전엔 비활성 → 이번 틱 활성)에서만 부스트
+        # 타이머를 새로 찍는다 — 활성 유지 중에는 안 건드려서(재진입 아닌 한) 1초가 매틱
+        # 늘어나 계속 부스트 상태로 안 남게 한다. config.py PP_CURVATURE_BOOST_GAIN 주석 참고.
+        if not was_active and self.obstacle_cut_active:
+            self._pp_curvature_boost_until_t = now + PP_CURVATURE_BOOST_SEC
+
+    def _obstacle_cut_roi_clear(self):
+        """perc_obstacle_cut_trigger()와 동일한 전용 ROI(OBSTACLE_CUT_RELEASE_DIST_M로
+        약간 넓힌 히스테리시스 거리)에 아무 점도 안 잡히는지 — 해제 판단 전용이라
+        obstacle_cut_trigger 계산과 별개로 다시 라이다를 훑는다(가벼운 연산).
+
+        [2026-08-21, 요청 반영] 좌우 대칭(|y|<Y_HALF_M) 전체가 아니라, 진입을 확정지었던
+        그 순간의 쪽(self._obstacle_cut_trigger_side, 'L'/'R')만 본다 — 반대쪽에 뭐가
+        잡히든 안 잡히든 해제 판정과 무관하게, "그때 트리거됐던 라이다"가 사라졌는지로만
+        판단한다. side가 아직 None(진입 이력 없음)이면 이전처럼 양쪽 다 본다(안전 폴백)."""
+        BODY_LO, BODY_HI = 215, 305
+        ranges = np.array(self.lidar_ranges, dtype=np.float32)
+        ranges[~np.isfinite(ranges)] = 0.0
+        ranges[ranges <= 0.0] = 0.0
+        n = len(ranges)
+        if BODY_MASK_ENABLED and n > BODY_LO:
+            ranges[BODY_LO:min(BODY_HI, n)] = 0.0
+        m = min(n, 360)
+        deg = np.linspace(0.0, 2.0 * math.pi, m, endpoint=False) - math.radians(LIDAR_ANGLE_OFFSET_DEG)
+        r = ranges[:m]
+        x = r * np.cos(deg)
+        y = r * np.sin(deg)
+        side = self._obstacle_cut_trigger_side
+        if side == 'L':
+            side_mask = (y > 0.0) & (y < OBSTACLE_CUT_TRIGGER_Y_HALF_M)
+        elif side == 'R':
+            side_mask = (y < 0.0) & (y > -OBSTACLE_CUT_TRIGGER_Y_HALF_M)
+        else:
+            side_mask = np.abs(y) < OBSTACLE_CUT_TRIGGER_Y_HALF_M
+        roi_mask = (r > 0.0) & (x > 0.0) & (x < OBSTACLE_CUT_RELEASE_DIST_M) & side_mask
+        return not bool(np.any(roi_mask))
 
     # [2-4b] 라바콘 좌우 클러스터 검출 + YOLO 카메라 이중확인 → B1_LAVACON 진입 트리거
     #   입력 self.lidar_ranges, self.cone_detected_yolo(perc_yolo_cone()이 먼저 채워둠)
@@ -1119,9 +1590,29 @@ class TrackDriverNode(Node):
     #     폴백한다(전체가 영영 안 켜지는 것보다 낫다는 판단).
     def perc_lavacon_trigger(self):
         # ── 튜닝 파라미터 (실측 라바콘 간격 기준 추정치, 실차 튜닝 필요) ──
-        LON_MIN, LON_MAX = 0.3, 0.5   # 트리거 ROI 전방 종방향(m) — 너무 가깝거나(차체 반사) 먼 점 배제
-        LAT_MAX           = 2.0        # 트리거 ROI 횡방향 한계(m)
-        CLUSTER_MIN_PTS   = 2          # 클러스터로 인정할 최소 연속 포인트 수(단일 반사점 노이즈 배제)
+        # [2026-08-19] LON_MAX 0.5→0.7(폭 0.2→0.4m) — perc_lavacon.py BOX_LON_WIDTH를
+        #   실측 콘 간격(옛 박스 폭 기준 2칸≈0.4m)에 맞춰 키운 것과 동일 폭으로 유지
+        #   (perc_lavacon.py 상단 "박스 스택 페어링 파라미터" 주석 — 두 값은 항상 같이 바꿀 것).
+        # [2026-08-22] 0.3~0.7 → -0.1~0.3(요청 반영, 폭 0.4m 유지한 채 통째로 앞으로 당김) —
+        #   push ROI(config.py LAVACON_PUSH_LON_MIN/MAX)를 같은 이유로 먼저 옮긴 것과 맞춤
+        #   (자차 마커 기준 전방 0.3m부터 시작하도록 — 마커는 라이다 원점보다
+        #   LAVACON_BOX_LON_WIDTH(0.4m)만큼 뒤에 그려지므로 라이다 원점 기준으로는
+        #   0.3-0.4=-0.1부터). 두 ROI는 항상 같이 맞출 것(위 push ROI 주석 참고) — 하나만
+        #   바꾸면 lavacon_bev에서 노란/보라 박스 시작점이 다시 어긋나 보인다.
+        LON_MIN, LON_MAX = -0.1, 0.3   # 트리거 ROI 전방 종방향(m) — 너무 가깝거나(차체 반사) 먼 점 배제
+        # [2026-08-22k] 2.0 → 0.5 → 0.75(요청 반영) — 좌우 각 0.75m(총 1.5m). 처음 0.5로
+        #   좁힐 땐 perc_lavacon.py CONE_LAT_LIMIT(좌우 검출 박스 폭)도 같은 값으로 맞춰서
+        #   lavacon_bev의 트리거 박스와 검출 박스 사이 빈 공간을 없앴었는데, 그 박스 스택
+        #   시각화 자체를 §3.8(2026-08-22k)에서 지우면서 "두 값을 항상 같이 맞출" 이유가
+        #   없어졌다 — 이번엔 트리거 박스(LAT_MAX)만 단독으로 조정. CONE_LAT_LIMIT은 여전히
+        #   0.5로 남아있고(perc_lavacon.py, cone 후보 필터링용), 필요하면 별도로 바꿀 것.
+        LAT_MAX           = 0.75       # 트리거 ROI 횡방향 한계(m)
+        # [2026-08-23p, 요청 반영] 2 → 1(최소치) — B1 라바콘 진입 트리거가 너무 늦게/안
+        #   걸린다는 판단으로 라이다 클러스터 인정 기준을 완화. CHECKER_PILLAR_CLUSTER_MIN_PTS
+        #   =1(config.py, 체크무늬 게이트 기둥쌍 검출)에서 이미 쓰던 것과 동일한 완화 —
+        #   사이드당 1포인트만 잡혀도 클러스터로 인정한다. 노이즈(단일 반사점)에 더 민감해질
+        #   여지가 있으니, 실차에서 유령 트리거(콘이 없는데 B1 진입)가 보이면 되돌릴 것.
+        CLUSTER_MIN_PTS   = 1          # 클러스터로 인정할 최소 연속 포인트 수(단일 반사점 노이즈 배제)
         CLUSTER_MAX_GAP   = 0.35       # 같은 클러스터로 볼 최대 거리편차(m) — 콘 지름 근사
         BODY_LO, BODY_HI  = 215, 305   # 차체 자기가림 구간 (perc_obstacle과 동일, 최종 확정 2026-07-22)
 
@@ -1182,6 +1673,8 @@ class TrackDriverNode(Node):
         self._lavacon_dbg = (left_pts, left_run, right_pts, right_run)
 
         if DEBUG_VIZ_LAVACON:
+            # [2026-08-22k, 요청 반영] 박스 스택 페어링(boxes/path_m) 시각화는 지워서 더 이상
+            # 안 넘긴다 — 그 조향 방식 자체가 이미 폐기됐다(_draw_lavacon_bev() 상단 주석 참고).
             self._draw_lavacon_bev(r, x, y, roi, LON_MIN, LON_MAX, LAT_MAX,
                                     left_pts, left_run, right_pts, right_run,
                                     r_raw, deg, BODY_LO, body_hi_eff)
@@ -1196,27 +1689,145 @@ class TrackDriverNode(Node):
             self._lavacon_trigger_cnt = 0
         self.lavacon_trigger = self._lavacon_trigger_cnt >= LAVACON_TRIGGER_FRAMES
 
-    # [2-4c] [DEBUG_VIZ_LAVACON] 라바콘 트리거 ROI/좌우 클러스터 BEV 시각화
-    #   perc_obstacle()의 DEBUG_VIZ_LIDAR 창과 같은 스타일, ROI/축척만 라바콘 트리거에 맞게 확대.
-    #   초록=좌측(y>0) ROI점, 주황=우측(y<0) ROI점, 회색=ROI 밖. 자홍(magenta)=BODY_LO~BODY_HI
-    #   "차체 자기가림"이라고 보고 지워버리는 구간의 마스킹 전 원본(raw) 점 — 이 구간에 실제
-    #   물체(콘)가 있는데도 마스크가 지우고 있는 건 아닌지 진단용. 텍스트로 pts(ROI 내 점수)/
-    #   run(최대 연속묶음, CLUSTER_MIN_PTS=2 이상이어야 클러스터로 인정) 표시.
+    # [2-4c] [DEBUG_VIZ_LAVACON] 라바콘 통합 디버그 BEV — 'lavacon_bev' 창 하나.
+    #   [2026-08-22k, 요청 반영] 예전엔 박스 스택 페어링(perc_lavacon.py `_pick_boxed_sides`/
+    #   `_build_path`, 초록/주황 채움 박스 + EMA 좌우 차선 + 노란 경로선)까지 같이 그렸는데,
+    #   그 조향 방식 자체가 이미 두 단계로 폐기됐다 — 2026-08-19에 `LAVACON_STEER_MODE_DA_PUSH
+    #   =True`로 전환되며 박스 스택 경로는 `_handle_lavacon()`의 안 쓰는 폴백 분기로 밀려났고,
+    #   2026-08-20엔 `_handle_lavacon()` 자체가 아예 안 불리게 됐다(`run_behavior_fsm()`이
+    #   B1_LAVACON 진입/탈출 트리거만 쓰고 그 사이는 그냥 S1 차선주행). 화면엔 계속 그려지고
+    #   있었지만 조향엔 이미 관여하지 않던 잔존 시각화라 지웠다. 지금 실제로 쓰이는 정보만
+    #   그린다:
+    #   ① 트리거 ROI(노란 박스, BGR로는 청록 `(0,220,220)`) — `perc_lavacon_trigger()`의
+    #      `LAT_MAX`/`LON_MIN~MAX`. 좌우 라이다 클러스터 동시검출로 B1_LAVACON 진입을
+    #      확정하는 판정 범위(YOLO 콘 AND 조건은 별도, 아래 텍스트 참고).
+    #   ② push ROI(자홍 박스) — `_lavacon_steer_da_push()`(`_lane_drive()`가
+    #      `self._lavacon_engaged`일 때 매 틱 호출, 지금 실제 조향에 쓰이는 유일한 라바콘
+    #      전용 로직)가 보는 `LAVACON_PUSH_LON_MIN~MAX × ±LAVACON_PUSH_LAT_LIMIT` 범위 —
+    #      이 안에서 좌/우 각각 가장 가까운 콘 1점의 횡위치(y)만 본다. 자홍 가로 눈금선이
+    #      실제 검출된 y위치(정확한 종방향 위치가 아니라 ROI 안에 있다는 표시일 뿐 — 함수
+    #      자체가 y만 반환하고 x는 안 준다), 어두운 자홍 실선이 안전마진
+    #      (`LAVACON_PUSH_SAFETY_MARGIN_M`) 경계 — 콘이 이 선보다 안쪽으로 들어오면 반대쪽
+    #      으로 밀린다(파랑=마진 침범 중, 초록=안전).
+    #   · perc_obstacle()의 DEBUG_VIZ_LIDAR 창과 같은 스타일, ROI/축척만 라바콘 트리거에
+    #     맞게 확대. 초록=좌측(y>0) ROI점, 주황=우측(y<0) ROI점, 회색=ROI 밖.
+    #   · 자홍(magenta) 점=BODY_LO~BODY_HI "차체 자기가림"이라고 보고 지워버리는 구간의
+    #     마스킹 전 원본(raw) 점 — 이 구간에 실제 물체(콘)가 있는데도 마스크가 지우고
+    #     있는 건 아닌지 진단용(push ROI 박스 테두리와 색이 비슷하니 혼동 주의 — 점은 항상
+    #     원본 라이다 반사점, 박스/눈금선은 항상 ROI 경계·검출값).
+    #   · 반투명 회색 부채꼴 = 그 구간의 각도 범위 자체(데드존, 135~224도/정후방 중심
+    #     90도 폭) — 실제 반사점 유무와 무관하게 항상 표시.
+    #   · 텍스트: pts(트리거 ROI 내 점수)/run(최대 연속묶음, CLUSTER_MIN_PTS=2 이상이어야
+    #     클러스터로 인정), YOLO 콘 검출, 트리거 디바운스 카운터, push ROI 좌우 검출값/현재
+    #     push량/방향/engaged 여부.
     def _draw_lavacon_bev(self, r, x, y, roi, lon_min, lon_max, lat_max,
                            left_pts, left_run, right_pts, right_run,
                            r_raw, deg, body_lo, body_hi_eff):
-        PPM = 80           # 1m = 80px (좁은 트리거 ROI라 perc_obstacle보다 확대)
-        W, H = 500, 500
-        EX, EY = 250, 460  # 자차 위치(하단 중앙)
+        # [2026-08-22k] 80→100(요청 반영) — 트리거/검출 ROI 폭이 좌우 ±2.0m/±1.0m에서
+        #   ±0.5m로 좁아진 만큼 배율도 같이 키웠다. 100으로 잡은 이유: 전방 시야 한도가
+        #   ORIGIN_EY(아래 정의, 460px)/PPM이라 CONE_LON_MAX(perc_lavacon.py, 4.0m, 박스
+        #   스택 전체 깊이)를 잘라먹지 않을 최댓값 근방을 골라야 한다 — 100이면
+        #   460/100=4.6m로 4.0m에 여유(0.6m)가 남는다. 그보다 더 키우면(예: 120 →
+        #   460/120≈3.83m) 원거리 박스/경로가 창 위로 잘려나갈 위험.
+        PPM = 100          # 1m = 100px (좁은 트리거 ROI라 perc_obstacle보다 확대)
+        W, H = 500, 600    # [2026-08-19] 상단이 너무 길다는 요청으로 900→600(2/3)로 축소
+        # [2026-08-19] 진짜 원인 발견: EX,EY를 "라이다 원점(모든 센서점의 좌표변환 기준)"과
+        #   "자차 마커(파란 점) 그리는 위치"에 동시에 같은 값으로 써왔다 — to_px()도, 거리원도,
+        #   ROI 점(라인 1208/1216 부근)도 전부 EX,EY를 원점으로 삼는다. 그래서 EX,EY를 옮기면
+        #   마커와 센서점(실제로 찍히는 라바콘 반사점)이 "같이" 움직여서, 화면상 마커와
+        #   반사점의 상대 위치는 절대 안 바뀌었던 것 — 사용자가 실측 물체를 두고 그 반사점과
+        #   마커를 맞춰보려 했는데 계속 그대로였던 진짜 원인. 라이다 원점(ORIGIN_EX/EY, 센서
+        #   좌표변환 전용 — 실측 캘리브레이션 기준이라 고정)과 자차 마커 위치(MARKER_EX/EY)를
+        #   분리해서, 마커만 따로 움직이게 고쳤다.
+        ORIGIN_EX, ORIGIN_EY = 250, 460   # 라이다 원점(센서점 좌표변환 전용, 고정)
+        BEAK_LEN = 18      # 자차 마커 헤딩 표시선("주둥이") 길이(px, 표시용) — 위치 오프셋과는 무관
+        # 자차 마커(파란 원)를 실제 물리거리 기준으로 라이다 원점보다 뒤로 당겨서 그린다 —
+        #   지금은 "적절한 위치가 어디인지" 찾는 튜닝 단계라 이 상수를 눈으로 보면서 조절 중.
+        #   이후 값이 확정되면 이게 곧 "라이다 원점 vs 차량 실제 기준점 차이"라는 뜻이 되므로,
+        #   그때 process_lavacon()/perc_lavacon_trigger()가 쓰는 x=0 원점 자체도 이 값만큼
+        #   실제로 옮길 예정(요청에 따라 순서상 지금은 시각화만, 원점 이동은 다음 단계).
+        # [2026-08-19] 임의 픽셀 대신 파란 박스 스택 경계선 한 칸의 세로(종방향) 길이
+        #   (LAVACON_BOX_LON_WIDTH, perc_lavacon.py에서 import된 값 — 하드코딩 안 하고
+        #   상수로 참조해 값이 바뀌어도 항상 최신값을 따라감)만큼 뒤로 당김 — 요청 반영.
+        #   값을 또 바꾸려면 여기 말고 perc_lavacon.py의 BOX_LON_WIDTH를 바꿀 것
+        #   (그래야 실제 박스 스택 페어링 로직과 이 마커 위치가 계속 같은 값을 공유한다).
+        EGO_MARKER_PULLBACK_PX = int(LAVACON_BOX_LON_WIDTH * PPM)
+        MARKER_EX, MARKER_EY = ORIGIN_EX, ORIGIN_EY + EGO_MARKER_PULLBACK_PX
         bev = np.zeros((H, W, 3), dtype=np.uint8)
 
         for d in (1, 2, 3):
-            cv2.circle(bev, (EX, EY), d * PPM, (50, 50, 50), 1)
-            cv2.putText(bev, f'{d}m', (EX + 4, EY - d * PPM + 12),
+            cv2.circle(bev, (ORIGIN_EX, ORIGIN_EY), d * PPM, (50, 50, 50), 1)
+            cv2.putText(bev, f'{d}m', (ORIGIN_EX + 4, ORIGIN_EY - d * PPM + 12),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.35, (80, 80, 80), 1)
 
-        def to_px(wx, wy): return (int(EX - wy * PPM), int(EY - wx * PPM))
+        def to_px(wx, wy): return (int(ORIGIN_EX - wy * PPM), int(ORIGIN_EY - wx * PPM))
+
+        # [2026-08-19] 라이다 자기가림 데드존(BODY_LO~BODY_HI, LIDAR_ANGLE_OFFSET_DEG 보정 후
+        # 135~224도, 폭 90도, 정후방 중심) 시각화 — 반투명 회색 부채꼴로 "이 각도 구간은
+        # 애초에 아예 안 본다"는 걸 항상 보여준다. 기존 자홍 점(아래)은 그 구간에 실제로
+        # 뭔가 찍혔는지만 보여줄 뿐 각도 범위 자체는 안 보여줬어서 추가. deg 배열(라디안,
+        # 이미 LIDAR_ANGLE_OFFSET_DEG 보정됨)을 그대로 재사용해 각도 계산을 이중화하지 않는다.
+        DEADZONE_R = 3.0  # 부채꼴 표시 반경(m) — 3m 거리원까지 채워서 눈에 띄게
+        dz_pts = ([(ORIGIN_EX, ORIGIN_EY)]
+                  + [to_px(DEADZONE_R * math.cos(a), DEADZONE_R * math.sin(a)) for a in deg[body_lo:body_hi_eff]]
+                  + [(ORIGIN_EX, ORIGIN_EY)])
+        overlay = bev.copy()
+        cv2.fillPoly(overlay, [np.array(dz_pts, dtype=np.int32)], (70, 70, 70))
+        cv2.addWeighted(overlay, 0.4, bev, 0.6, 0, bev)
+
         cv2.rectangle(bev, to_px(lon_min, lat_max), to_px(lon_max, -lat_max), (0, 220, 220), 1)
+
+        # [2026-08-22] §5.10 유령 점 임시 마스크(GHOST_POINT_*, perc_lavacon.py) 시각화용
+        #   빨간 원 — 실제 마스킹된 라이다 점은 ranges=0으로 지워지므로 이 화면에 안 찍힌다,
+        #   이 원은 "마스킹 중인 구역"을 보여줄 뿐이다. 실제 반경(6cm→PPM=100이면 6px)이
+        #   화면에서 거의 안 보여 픽셀로 눈대중 대조하다 오차가 컸던 문제(2026-08-22 사용자
+        #   지적) — 실제 마스킹 반경은 원(반투명 채움)으로 정확히 그리되, 중심은 십자선으로
+        #   또렷이 표시하고 옆에 미터 좌표를 텍스트로 같이 찍어 픽셀이 아니라 숫자로
+        #   대조할 수 있게 한다(위 "range,x ref only" 텍스트 줄의 실제 검출 좌표와 비교).
+        _gpx, _gpy = to_px(GHOST_POINT_X_M, GHOST_POINT_Y_M)
+        _gp_overlay = bev.copy()
+        cv2.circle(_gp_overlay, (_gpx, _gpy), max(int(GHOST_POINT_RADIUS_M * PPM), 1), (0, 0, 255), -1)
+        cv2.addWeighted(_gp_overlay, 0.35, bev, 0.65, 0, bev)
+        cv2.circle(bev, (_gpx, _gpy), max(int(GHOST_POINT_RADIUS_M * PPM), 1), (0, 0, 255), 1)
+        cv2.drawMarker(bev, (_gpx, _gpy), (0, 0, 255), cv2.MARKER_CROSS, 10, 1)
+        cv2.putText(bev, f'GHOST MASK ({GHOST_POINT_X_M:.3f},{GHOST_POINT_Y_M:.3f}) r={GHOST_POINT_RADIUS_M:.2f}m',
+                    (_gpx + 8, _gpy), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1, cv2.LINE_AA)
+
+        # ── push ROI(자홍) — 지금 실제 조향(_lavacon_steer_da_push())이 보는 좌우 최근접 콘 ──
+        # [2026-08-22] return_range=True — "y가 작은 쪽"과 "실제로 더 가까운 쪽"이 다를 수
+        # 있다는 문제 제기로 range도 같이 받아 아래 PUSH 텍스트에 표시(순수 표시용, push
+        # 판정 자체는 여전히 y-마진 비교 그대로 — nearest_cone_lateral() docstring 참고).
+        (push_left_y, push_right_y, push_left_range, push_right_range,
+         push_left_x, push_right_x) = nearest_cone_lateral(
+            self.lidar_ranges, LAVACON_PUSH_LON_MIN, LAVACON_PUSH_LON_MAX, LAVACON_PUSH_LAT_LIMIT,
+            return_range=True)
+        cv2.rectangle(bev, to_px(LAVACON_PUSH_LON_MIN, LAVACON_PUSH_LAT_LIMIT),
+                      to_px(LAVACON_PUSH_LON_MAX, -LAVACON_PUSH_LAT_LIMIT), (200, 0, 200), 1)
+        cv2.putText(bev, 'PUSH ROI', to_px(LAVACON_PUSH_LON_MAX, LAVACON_PUSH_LAT_LIMIT),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 0, 200), 1, cv2.LINE_AA)
+        # 안전마진 경계선(좌 LAVACON_PUSH_SAFETY_MARGIN_L_M / 우 _R_M) — 이 선보다 안쪽으로
+        # 콘이 들어오면 반대쪽으로 밀린다.
+        cv2.line(bev, to_px(LAVACON_PUSH_LON_MIN, LAVACON_PUSH_SAFETY_MARGIN_L_M),
+                 to_px(LAVACON_PUSH_LON_MAX, LAVACON_PUSH_SAFETY_MARGIN_L_M), (140, 0, 140), 1, cv2.LINE_AA)
+        cv2.line(bev, to_px(LAVACON_PUSH_LON_MIN, -LAVACON_PUSH_SAFETY_MARGIN_R_M),
+                 to_px(LAVACON_PUSH_LON_MAX, -LAVACON_PUSH_SAFETY_MARGIN_R_M), (140, 0, 140), 1, cv2.LINE_AA)
+        # 검출된 좌/우 최근접 콘의 y위치를 ROI 폭 전체에 걸친 가로 눈금선으로 표시. 마진
+        # 침범 중이면 파랑(=지금 미는 중), 안전하면 초록/주황.
+        for py, base_col, margin in ((push_left_y, (0, 255, 0), LAVACON_PUSH_SAFETY_MARGIN_L_M),
+                                      (push_right_y, (0, 140, 255), LAVACON_PUSH_SAFETY_MARGIN_R_M)):
+            if py is None:
+                continue
+            col = (255, 80, 0) if abs(py) < margin else base_col
+            cv2.line(bev, to_px(LAVACON_PUSH_LON_MIN, py), to_px(LAVACON_PUSH_LON_MAX, py), col, 2)
+        # [2026-08-22] 위 눈금선은 "이 y값이다"라고 ROI 전체 폭에 걸쳐 그은 안내선이라, 그
+        # y값을 만든 원본 점이 실제로 어디(전후 x까지) 있는지는 안 보여준다는 문제 제기 —
+        # 그 점의 (x,y) 정확한 위치에 노란 링 마커를 따로 찍어 "안내선"과 "진짜 그 점"을
+        # 구분한다(PPM=100이라 margin=0.13m이 화면상 ±13px밖에 안 돼서 눈금선끼리 거의
+        # 겹쳐 보일 수 있음 — 이 마커가 없으면 그 좁은 구간에서 실제 점을 못 짚어낸다).
+        for px_, py_ in ((push_left_x, push_left_y), (push_right_x, push_right_y)):
+            if px_ is None or py_ is None:
+                continue
+            cv2.circle(bev, to_px(px_, py_), 6, (0, 255, 255), 2)
 
         # 마스킹 전 원본(raw) 점 중 BODY_LO~BODY_HI(자기가림 구간)에 해당하는 것만 자홍색으로 표시.
         # ROI 필터 없이 원거리까지 전부 그려서, 이 "자기가림 구간"에 실제로 뭔가 찍히는지 그대로 보여준다.
@@ -1225,7 +1836,7 @@ class TrackDriverNode(Node):
         for xi, yi, ri in zip(masked_x, masked_y, r_raw[body_lo:body_hi_eff]):
             if ri <= 0.0:
                 continue
-            sx, sy = int(EX - yi * PPM), int(EY - xi * PPM)
+            sx, sy = int(ORIGIN_EX - yi * PPM), int(ORIGIN_EY - xi * PPM)
             if 0 <= sx < W and 0 <= sy < H:
                 cv2.circle(bev, (sx, sy), 2, (255, 0, 255), -1)
 
@@ -1233,7 +1844,7 @@ class TrackDriverNode(Node):
         for i in range(len(r)):
             if r[i] <= 0.0:
                 continue
-            sx, sy = int(EX - y[i] * PPM), int(EY - x[i] * PPM)
+            sx, sy = int(ORIGIN_EX - y[i] * PPM), int(ORIGIN_EY - x[i] * PPM)
             if not (0 <= sx < W and 0 <= sy < H):
                 continue
             if left_mask[i]:    col = (0, 255, 0)
@@ -1241,48 +1852,8 @@ class TrackDriverNode(Node):
             else:                col = (60, 60, 60)
             cv2.circle(bev, (sx, sy), 3, col, -1)
 
-        # [2026-08-19] dl_lane.py의 vehicle_center_x 빨간 세로선(차량이 자기 위치/정면이라
-        # 믿는 기준선)과 동일한 개념 — 라이다 기준 차량 정면 방향(y=0, 전방 x축)을 빨간
-        # 직선으로 그린다. process_lavacon()의 최근접 이웃 페어링(_pair_nearest())이 바로
-        # 이 선 위에서 "가까운 좌측 콘부터, 그때 가장 가까운 우측 콘"을 찾아 짝짓는다 —
-        # 이 선이 곧 그 페어링의 기준이라는 걸 시각적으로 보여준다.
-        cv2.line(bev, to_px(0.0, 0.0), to_px(LAVACON_PATH_LON_MAX, 0.0), (0, 0, 255), 1)
-        cv2.putText(bev, 'vehicle_x (y=0)', (EX + 4, EY - 14),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1, cv2.LINE_AA)
-
-        # [2026-08-11] 실제 조향에 쓰이는 경로(self._lavacon_path_m, perc_lavacon()이 채운
-        # 좌우 콘 클러스터 중점 → x오름차순 정렬 결과, [2026-08-19] 보로노이 → 클러스터
-        # 중앙 추종 → 최근접 이웃 페어링 순으로 교체됨) 시각화. 노란 선분이 Pure Pursuit/LQR이
-        # _target_point()에서 그대로 걷는 꺾은선이다 — 차량(원점)에서 시작해 정점을 순서대로
-        # 잇는다. 원은 정점 하나하나(§질문 답변: "영역"이 아니라 점 하나씩).
-        path_m = self._lavacon_path_m
-        if path_m:
-            prev_px = (EX, EY)
-            for wx, wy in path_m:
-                cur_px = to_px(wx, wy)
-                cv2.line(bev, prev_px, cur_px, (0, 255, 255), 2)
-                prev_px = cur_px
-            for wx, wy in path_m:
-                cv2.circle(bev, to_px(wx, wy), 5, (0, 255, 255), -1)
-                cv2.circle(bev, to_px(wx, wy), 5, (0, 0, 0), 1)
-
-        # [2026-08-22] YOLO 카메라 BEV 경로(process_lavacon_camera()) — 파란색으로 겹쳐
-        # 그려서 라이다 경로(노란색)와 실차에서 얼마나 어긋나는지 눈으로 비교한다. 아직
-        # 조향엔 안 태움(perc_yolo_cone() 주석 참고) — 이 오버레이가 실차에서 라이다
-        # 경로와 충분히 가깝게 나와야 다음 단계(폴백/융합)로 넘어갈 근거가 된다.
-        cam_path_m = self._lavacon_cam_path_m
-        if cam_path_m:
-            prev_px = (EX, EY)
-            for wx, wy in cam_path_m:
-                cur_px = to_px(wx, wy)
-                cv2.line(bev, prev_px, cur_px, (255, 120, 0), 2)
-                prev_px = cur_px
-            for wx, wy in cam_path_m:
-                cv2.circle(bev, to_px(wx, wy), 4, (255, 120, 0), -1)
-                cv2.circle(bev, to_px(wx, wy), 4, (0, 0, 0), 1)
-
-        cv2.circle(bev, (EX, EY), 6, (255, 220, 0), -1)
-        cv2.line(bev, (EX, EY), (EX, EY - 18), (255, 220, 0), 2)
+        cv2.circle(bev, (MARKER_EX, MARKER_EY), 6, (255, 220, 0), -1)
+        cv2.line(bev, (MARKER_EX, MARKER_EY), (MARKER_EX, MARKER_EY - BEAK_LEN), (255, 220, 0), 2)
 
         l_col = (0, 255, 0)   if self.lavacon_left_detected  else (0, 0, 255)
         r_col = (0, 140, 255) if self.lavacon_right_detected else (0, 0, 255)
@@ -1299,21 +1870,52 @@ class TrackDriverNode(Node):
         masked_min_s = f'{masked_min:.2f}m' if masked_min >= 0 else 'N/A'
         cv2.putText(bev, f'masked(magenta) pts={masked_pts} min={masked_min_s}',
                     (8, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1, cv2.LINE_AA)
-        cv2.putText(bev, f'yellow=lavacon_path(lidar, n={len(path_m)})',
-                    (8, 132), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
-        cv2.putText(bev, f'orange=cam_path(YOLO BEV, experimental, n={len(cam_path_m)})',
-                    (8, 154), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 120, 0), 1, cv2.LINE_AA)
-        cv2.putText(bev, 'red=vehicle heading ref line (nearest-neighbor pairing axis)',
-                    (8, 176), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1, cv2.LINE_AA)
+
+        # push ROI(자홍) 검출값 + 지금 실제로 나가는 push량/방향 — _lavacon_steer_da_push()와
+        # 완전히 같은 부호 규약(좌측 콘 침범→+, 우측 콘 침범→-).
+        push_m = 0.0
+        if push_left_y is not None and push_left_y < LAVACON_PUSH_SAFETY_MARGIN_L_M:
+            push_m += LAVACON_PUSH_SAFETY_MARGIN_L_M - push_left_y
+        if push_right_y is not None and -push_right_y < LAVACON_PUSH_SAFETY_MARGIN_R_M:
+            push_m -= LAVACON_PUSH_SAFETY_MARGIN_R_M - (-push_right_y)
+        push_m *= LAVACON_PUSH_GAIN  # [2026-08-22b] _lavacon_steer_da_push()와 동일 배율 — 표시값 동기화
+        push_left_s = 'N/A' if push_left_y is None else f'{push_left_y:.3f}m'
+        push_right_s = 'N/A' if push_right_y is None else f'{push_right_y:.3f}m'
+        push_col = (255, 80, 0) if push_m != 0.0 else (200, 0, 200)
+        cv2.putText(bev, f'PUSH L_y={push_left_s} R_y={push_right_s} '
+                          f'push={push_m:+.2f}m engaged={self._lavacon_engaged}',
+                    (8, 132), cv2.FONT_HERSHEY_SIMPLEX, 0.45, push_col, 1, cv2.LINE_AA)
+        # [2026-08-22] L_y/R_y(횡방향 침범량, push 판정 기준)만으로는 "어느 쪽 콘이
+        # 실제로 더 가까운지"(직선거리) 판단이 안 돼서 헷갈린다는 문제 제기 — range를
+        # 따로 한 줄 더 찍는다. 어느 한쪽 range가 더 작아도 push 방향은 여전히 L_y/R_y
+        # 마진 침범 여부로만 결정된다(설계 그대로, 아래 텍스트는 순수 참고용).
+        rl_s = 'N/A' if push_left_range is None else f'{push_left_range:.3f}m'
+        rr_s = 'N/A' if push_right_range is None else f'{push_right_range:.3f}m'
+        # [2026-08-22] §5.10 유령 점 좌표를 화면(픽셀)으로 눈대중 대조하다 오차가 컸던 문제
+        #   — x,y를 소수점 3자리까지 텍스트로 바로 찍어 GHOST_POINT_X_M/Y_M을 픽셀 눈대중 대신
+        #   숫자로 정확히 맞출 수 있게 함(아래 GHOST MASK 원 옆 좌표 텍스트와 대조).
+        xl_s = 'N/A' if push_left_x is None else f'{push_left_x:.3f}'
+        xr_s = 'N/A' if push_right_x is None else f'{push_right_x:.3f}'
+        cv2.putText(bev, f'(range,x ref only) L=({xl_s},{rl_s}) R=({xr_s},{rr_s}) - push uses L_y/R_y only',
+                    (8, 154), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 200, 255), 1, cv2.LINE_AA)
+        cv2.putText(bev, f'margin L={LAVACON_PUSH_SAFETY_MARGIN_L_M:.2f}m R={LAVACON_PUSH_SAFETY_MARGIN_R_M:.2f}m gain={LAVACON_PUSH_GAIN:.1f}x '
+                          f'lon={LAVACON_PUSH_LON_MIN:.1f}~{LAVACON_PUSH_LON_MAX:.1f}m '
+                          f'lat=+-{LAVACON_PUSH_LAT_LIMIT:.1f}m',
+                    (8, 176), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1, cv2.LINE_AA)
+        if 'lavacon_bev' not in self._dbg_windows_positioned:
+            cv2.namedWindow('lavacon_bev', cv2.WINDOW_AUTOSIZE)
+            cv2.moveWindow('lavacon_bev', *DEBUG_WIN_POS_LAVACON)
+            self._dbg_windows_positioned.add('lavacon_bev')
         cv2.imshow('lavacon_bev', bev)
         cv2.waitKey(1)
 
-    # [2-4d] 좌회전 진입 랜드마크 후보 — 체크무늬 게이트 라이다 기둥쌍 검출
+    # [2-4d'] 좌회전 진입 랜드마크 후보 — 체크무늬 게이트 라이다 기둥쌍 검출
     #   입력 self.lidar_ranges → 출력 checker_pillar_left/right_detected, checker_pillar_trigger
     #   perc_lavacon_trigger()와 완전히 동일한 패턴(극좌표→직교좌표, 종방향 ROI, 좌/우
     #   클러스터 탐지)이지만, 좌우 클러스터 간 횡방향 거리가 실측 기둥 간격
-    #   (CHECKER_PILLAR_LAT_TARGET_M)과 일치해야만 확정한다는 조건이 추가됐다 — config.py
-    #   "체크무늬 게이트 라이다 기둥쌍 검출" 절 참고.
+    #   (CHECKER_PILLAR_LAT_TARGET_M) 이상이어야만 확정한다는 조건이 추가됐다 — config.py
+    #   "체크무늬 게이트 라이다 기둥쌍 검출" 절 참고. [2026-08-22b] 검출조건 완화 이력은
+    #   README §1.19 참고.
     def perc_checker_pillar(self):
         if self.lidar_ranges is None:
             self.checker_pillar_left_detected  = False
@@ -1338,7 +1940,7 @@ class TrackDriverNode(Node):
         r = ranges[:m]
         x = r * np.cos(deg)          # 전방(+앞)
         y = r * np.sin(deg)          # 횡방향(+좌/-우)
-        roi = (r > 0.0) & (x > CHECKER_PILLAR_LON_MIN) & (x < CHECKER_PILLAR_LON_MAX) \
+        roi = (r > CHECKER_PILLAR_MIN_RANGE_M) & (x > CHECKER_PILLAR_LON_MIN) & (x < CHECKER_PILLAR_LON_MAX) \
               & (np.abs(y) < CHECKER_PILLAR_LAT_MAX)
 
         def _cluster_center(side_mask):
@@ -1368,12 +1970,96 @@ class TrackDriverNode(Node):
             self.checker_pillar_lat_dist_m = 0.0
         self._checker_pillar_dbg = (left_pts, left_run, right_pts, right_run, self.checker_pillar_lat_dist_m)
 
-        lat_ok = abs(self.checker_pillar_lat_dist_m - CHECKER_PILLAR_LAT_TARGET_M) <= CHECKER_PILLAR_LAT_TOLERANCE_M
+        lat_ok = self.checker_pillar_lat_dist_m >= CHECKER_PILLAR_LAT_TARGET_M
         if self.checker_pillar_left_detected and self.checker_pillar_right_detected and lat_ok:
             self._checker_pillar_trigger_cnt += 1
         else:
             self._checker_pillar_trigger_cnt = 0
         self.checker_pillar_trigger = self._checker_pillar_trigger_cnt >= CHECKER_PILLAR_CONFIRM_FRAMES
+
+        # [2026-08-22j] DEBUG_VIZ_LEFT_TURN 통합창도 이 BEV 프레임을 그대로 넣어 보여주므로
+        # (_debug_viz_left_turn() 참고, 요청 반영: "좌회전 디버깅창에 라이다영상도 추가"),
+        # 독립 창 플래그(DEBUG_VIZ_CHECKER_PILLAR)가 꺼져 있어도 통합창이 켜져 있으면 계속
+        # BEV를 만들어 self._checker_pillar_bev_img에 채워둔다.
+        if DEBUG_VIZ_CHECKER_PILLAR or DEBUG_VIZ_LEFT_TURN:
+            self._draw_checker_pillar_bev(r, x, y, roi, lat_ok,
+                                           left_pts, left_run, right_pts, right_run)
+
+    # [2-4d''] [DEBUG_VIZ_CHECKER_PILLAR] 체크무늬 게이트 라이다 기둥쌍 검출 BEV 시각화
+    #   _draw_lavacon_bev()와 동일 스타일(1/2/3m 거리원, 청록 ROI 박스, 좌=초록/우=주황 점).
+    #   좌우 기둥쌍 사이 실측 횡방향 거리(checker_pillar_lat_dist_m)가 실측 기준값
+    #   (CHECKER_PILLAR_LAT_TARGET_M±TOLERANCE)과 맞는지가 이 게이트만의 추가 확정 조건이라
+    #   화면에 그 비교값도 같이 표시한다.
+    def _draw_checker_pillar_bev(self, r, x, y, roi, lat_ok,
+                                  left_pts, left_run, right_pts, right_run):
+        PPM = 80
+        W, H = 500, 500
+        ORIGIN_EX, ORIGIN_EY = 250, 460
+        bev = np.zeros((H, W, 3), dtype=np.uint8)
+
+        for d in (1, 2, 3):
+            cv2.circle(bev, (ORIGIN_EX, ORIGIN_EY), d * PPM, (50, 50, 50), 1)
+            cv2.putText(bev, f'{d}m', (ORIGIN_EX + 4, ORIGIN_EY - d * PPM + 12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (80, 80, 80), 1)
+
+        def to_px(wx, wy): return (int(ORIGIN_EX - wy * PPM), int(ORIGIN_EY - wx * PPM))
+
+        cv2.rectangle(bev, to_px(CHECKER_PILLAR_LON_MIN, CHECKER_PILLAR_LAT_MAX),
+                      to_px(CHECKER_PILLAR_LON_MAX, -CHECKER_PILLAR_LAT_MAX), (0, 220, 220), 1)
+
+        # [2026-08-22e] 극근접 무시 데드존(CHECKER_PILLAR_MIN_RANGE_M) 시각화 — 이 원
+        # 안쪽 점은 roi 계산에서 이미 제외되지만(위 perc_checker_pillar() 참고), 화면에는
+        # 여전히 회색 점으로 그려지므로(무시=미검출이지 미표시가 아님) 필터가 실제로
+        # 걸리는 범위를 빨간 원으로 눈에 보이게 표시해 "왜 안 사라지지" 오해를 줄인다.
+        cv2.circle(bev, (ORIGIN_EX, ORIGIN_EY), int(CHECKER_PILLAR_MIN_RANGE_M * PPM), (0, 0, 255), 1)
+        cv2.putText(bev, f'ignore<{CHECKER_PILLAR_MIN_RANGE_M:.2f}m',
+                    (ORIGIN_EX + 4, ORIGIN_EY - int(CHECKER_PILLAR_MIN_RANGE_M * PPM) - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1, cv2.LINE_AA)
+
+        left_mask, right_mask = roi & (y > 0.0), roi & (y < 0.0)
+        for i in range(len(r)):
+            if r[i] <= 0.0:
+                continue
+            sx, sy = int(ORIGIN_EX - y[i] * PPM), int(ORIGIN_EY - x[i] * PPM)
+            if not (0 <= sx < W and 0 <= sy < H):
+                continue
+            if left_mask[i]:    col = (0, 255, 0)
+            elif right_mask[i]: col = (0, 140, 255)
+            else:                col = (60, 60, 60)
+            cv2.circle(bev, (sx, sy), 3, col, -1)
+
+        cv2.circle(bev, (ORIGIN_EX, ORIGIN_EY), 6, (255, 220, 0), -1)
+        cv2.line(bev, (ORIGIN_EX, ORIGIN_EY), (ORIGIN_EX, ORIGIN_EY - 18), (255, 220, 0), 2)
+
+        l_col = (0, 255, 0)   if self.checker_pillar_left_detected  else (0, 0, 255)
+        r_col = (0, 140, 255) if self.checker_pillar_right_detected else (0, 0, 255)
+        cv2.putText(bev, f'L pts={left_pts} run={left_run}', (8, 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, l_col, 1, cv2.LINE_AA)
+        cv2.putText(bev, f'R pts={right_pts} run={right_run}', (8, 44),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, r_col, 1, cv2.LINE_AA)
+        dist_col = (0, 255, 0) if lat_ok else (0, 0, 255)
+        cv2.putText(bev, f'lat_dist={self.checker_pillar_lat_dist_m:.2f}m '
+                          f'(target>={CHECKER_PILLAR_LAT_TARGET_M:.2f})',
+                    (8, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.42, dist_col, 1, cv2.LINE_AA)
+        trig_col = (0, 255, 0) if self.checker_pillar_trigger else (200, 200, 200)
+        cv2.putText(bev, f'trigger={self.checker_pillar_trigger} '
+                          f'cnt={self._checker_pillar_trigger_cnt}/{CHECKER_PILLAR_CONFIRM_FRAMES}',
+                    (8, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.45, trig_col, 1, cv2.LINE_AA)
+
+        self._checker_pillar_bev_img = bev  # left_turn_debug 통합창(_debug_viz_left_turn())이 재사용
+
+        if DEBUG_VIZ_CHECKER_PILLAR:
+            if 'checker_pillar_bev' not in self._dbg_windows_positioned:
+                cv2.namedWindow('checker_pillar_bev', cv2.WINDOW_AUTOSIZE)
+                cv2.moveWindow('checker_pillar_bev', *DEBUG_WIN_POS_CHECKER_PILLAR)
+                self._dbg_windows_positioned.add('checker_pillar_bev')
+            # [2026-08-23, 요청 반영: "카메라욜로랑 검출라이다는 크기 완전 작게"] 원본
+            # 500x500(self._checker_pillar_bev_img, left_turn_debug 통합창도 재사용)은
+            # 그대로 두고, 이 독립 창에 띄울 때만 표시용으로 축소한다(정사각형이라 종횡비
+            # 유지 위해 160x160 — 카메라 창 YOLO_신호등의 160x120과 같은 크기 관례).
+            small_bev = cv2.resize(bev, (160, 160), interpolation=cv2.INTER_AREA)
+            cv2.imshow('checker_pillar_bev', small_bev)
+            cv2.waitKey(1)
 
     # [2-4e] 체크무늬 게이트 통과 후 완만한 조향 램프 (_s0_signal() 'left' 커밋 종료 후 사용)
     #   checker_pillar_trigger가 뜬 시점에 호출부(_begin_checker_ramp_turn())가
@@ -1383,13 +2069,17 @@ class TrackDriverNode(Node):
     #   기반 거리적분이라 VESC 죽음에도 안전(무한 램프 없음). 램프가 끝나면(None, angle=
     #   END_ANGLE) 튜플을 반환 — 호출부가 ramp_dist를 None으로 리셋하고 다음 로직(예:
     #   차선인식 복귀)으로 넘어가면 된다.
+    #   [2026-08-22] CHECKER_TURN_RAMP_CURVE='smoothstep'(3t²-2t³)이 기본값 — t=0(램프
+    #   시작)과 t=1(END_ANGLE 고정값으로 넘어가는 지점) 양쪽 다 기울기 0이라 조향이 저크
+    #   없이 부드러운 S자 곡선으로 붙는다. 'linear'는 단순 비례(요청의 "선형" 옵션, 튜닝
+    #   비교용으로 남겨둠).
     def _checker_turn_ramp_angle(self, cmd_speed):
         if self._checker_ramp_dist is None:
             return CHECKER_TURN_RAMP_START_ANGLE, False
 
         t = min(self._checker_ramp_dist / CHECKER_TURN_RAMP_DIST_M, 1.0)
-        if CHECKER_TURN_RAMP_CURVE == 'ease_in':
-            t = t * t   # 초반 완만, 후반 급격 — 2차 이즈인
+        if CHECKER_TURN_RAMP_CURVE == 'smoothstep':
+            t = t * t * (3.0 - 2.0 * t)   # 양끝 기울기 0인 S자 곡선 — 시작/종료 모두 저크 없음
         angle = CHECKER_TURN_RAMP_START_ANGLE + (CHECKER_TURN_RAMP_END_ANGLE - CHECKER_TURN_RAMP_START_ANGLE) * t
 
         done = self._checker_ramp_dist >= CHECKER_TURN_RAMP_DIST_M
@@ -1506,14 +2196,16 @@ class TrackDriverNode(Node):
             self.obstacle_controller.reset()
             self.vehicle_controller.reset()
             self.behavior_state = BehaviorState.B0_NORMAL
+            self._signal_yolo_off = False  # [2026-08-23] 새 바퀴 시작 — 다음 교차로 신호등 YOLO 재개
+            self._signal_off_hold_cnt = None  # [2026-08-23b] 유예 카운터도 같이 리셋(perc_signal() 참고)
             self._b2_passed = False   # [2026-08-15] Phase.OBSTACLE_ZONE 통합 — 완료 추적도 매 바퀴 리셋
             self._b3_passed = False
+            self._obscut_zone_tag = None  # [2026-08-20] da 근접 컷 기반 B2/B3 latch도 매 바퀴 리셋
 
     def run_mission_fsm(self):
         {
             MissionState.S0_SIGNAL      : self._s0_signal,
             MissionState.S1_LANE_FOLLOW : self._s1_lane_follow,
-            MissionState.S3_SHORTCUT    : self._s3_shortcut,
             MissionState.S4_FINISH      : self._s4_finish,
         }[self.mission_state]()
 
@@ -1523,14 +2215,22 @@ class TrackDriverNode(Node):
           - 전환 로그 출력(디버깅 추적용)
           - PID 누적값 초기화: 이전 상태에서 쌓인 적분/미분 잔여가 새 상태로 넘어와 튀는 것을 방지한다.
         모든 상태 전환은 반드시 이 함수를 통해서만 한다(직접 대입 금지).
+
+        [2026-08-23] 예전엔 여기서 ctrl_angle/ctrl_speed를 무조건 0.0/SPEED_STOP으로
+        찍었는데, 그게 그대로 이번 틱 drive()에 발행되면서 "주행 중 전환"(예:
+        _s1_lane_follow()의 좌회전 확정 → S0_SIGNAL 커밋 구간, _do_checker_ramp_turn()
+        완료 → S0_SIGNAL)에서 순항/램프 속도로 달리다가 한 틱만 조향0/급정지 명령이
+        나가는 "뚝 끊김" 현상을 만들었다(실차 확인). 실제로 정지가 필요한 전환
+        (S4_FINISH, S0_SIGNAL의 "정지 대기" 분기)은 각 state 핸들러(_s4_finish(),
+        _s0_signal())가 그 상태로 실행될 때 스스로 0/STOP을 세팅하므로 여기서 미리
+        찍어둘 필요가 없다 — 그래서 제거. 이제 전환 직후 첫 틱은 직전 틱의 ctrl_angle/
+        ctrl_speed가 그대로 유지된 채 발행되고, 새 state 핸들러가 실행되는 시점부터
+        그 값을 이어받거나 필요하면 스스로 정지시킨다.
         """
         self.get_logger().info(f'[전환] {self.mission_state.name} → {new_state.name}')
-        prev_state = self.mission_state
         self.mission_state = new_state
         self._pid_prev_error = 0.0
         self._pid_integral   = 0.0
-        self.ctrl_angle = 0.0
-        self.ctrl_speed = SPEED_STOP
         # S0_SIGNAL 진입 시 신호값 초기화 (색상 확정은 이 state 진입 후부터 새로 시작)
         if new_state == MissionState.S0_SIGNAL:
             self.signal_red_on      = False
@@ -1547,9 +2247,6 @@ class TrackDriverNode(Node):
             # [2026-08-20] S0_SIGNAL 통합 이후 이 state는 출발 때 1번 + 매 바퀴 교차로에서
             # 반복 진입하므로, prev_state만으로는 "진짜 첫 출발"을 구분할 수 없다(항상
             # S0_SIGNAL이라 같음) — self._departed로 직접 추적한다.
-            # 다음 접근에서 신호등 보드를 새로 인식할 수 있도록 리셋(재진입마다 항상).
-            self._sig_board_cnt = 0
-            self.signal_board_confirmed = False
             if not self._departed:
                 self._departed = True
                 # 신호등 오검출 억제 + 바퀴 기준점 리셋은 진짜 출발 시점에만 필요 —
@@ -1558,10 +2255,6 @@ class TrackDriverNode(Node):
                 self._lap_t0 = time.time()
                 self._yaw_accum = 0.0
                 self._prev_yaw_accum_ref = self.imu_yaw
-        # S3 진입 시 탈출 감속 플래그 + 기준 yaw 초기화
-        if new_state == MissionState.S3_SHORTCUT:
-            self._exit_approach_t0 = None
-            self._shortcut_ref_yaw = None
 
     # ── S1: 차선인식 주행 (라바콘·고정장애물·추월 Behavior를 이 상태 안에서 처리) ──
     def _s1_lane_follow(self):
@@ -1571,219 +2264,160 @@ class TrackDriverNode(Node):
             그때마다 _behavior_enabled=True로 Behavior(B1→B2→B3)가 바로 활성화된다
             (README §대회 규정 요약: 라바콘 등은 출발 직후부터 시작). Behavior가 조향/속도를
             전담하는 구간에서는 여기서 PID를 돌리지 않는다(적분 오염 방지) — 아래 조기 return.
-          - [2026-08-20] 정지선이 아니라 "신호등 보드가 인식되는 시점"(signal_board_confirmed,
-            perc_signal() 참고)에 서행 구간 없이 곧장 S0_SIGNAL(교차로 재진입)로 전환한다
-            (요청 반영). 정지선(바닥 흰선) 검출은 신호등 자체를 보는 것과는 다른 신호원이라,
-            정지선 인식이 어긋나면 신호등이 이미 빨간불인데도 계속 차선주행 속도로 접근하는
-            상황이 가능했다 — 신호등 보드 자체를 트리거로 쓰면 그 간극이 없다. 실제 정지는
-            S0_SIGNAL 진입 후 그 상태의 매 프레임 기본 동작(_s0_signal(): 신호 미확정=
-            사실상 빨간불이면 속도 0)이 대신한다 — 신호가 이미 확정돼 있었다면(직전 바퀴의
-            잔상 등) 정지 없이 바로 커밋 구간으로 넘어갈 수도 있는데, _change_state()가
-            S0_SIGNAL 진입 시 signal_*_confirmed를 항상 리셋하므로 그런 오작동은 없다.
+          - [2026-08-22] "신호등 보드가 인식되는 시점"(색상 무관)에 곧장 S0_SIGNAL로
+            전환해 그 안에서 멈춰 서서 색상을 판독하던 방식을 없앴다(요청 반영 — 그 정지
+            구간 동안 속도가 0으로 굳는 문제). 이제 색상이 실제로 확정
+            (signal_straight/left_confirmed, perc_signal() 참고)될 때까지 이 함수(S1
+            차선주행)를 그대로 유지한다.
+            좌회전(지름길) 확정이면 정지 없이 곧장 S0_SIGNAL로 넘어가 커밋 구간
+            (_s2_commit_dist)을 같은 틱에 바로 시작한다 — 아래 _change_state() 직후
+            _s2_commit_dist를 세팅하는 순서 참고(먼저 세팅하면 _change_state()가
+            S0_SIGNAL 진입 처리에서 그 값을 다시 None으로 지운다). 이 커밋 구간은 라이다
+            체크무늬 게이트 검출(checker_pillar_trigger)로 끝나고 그 자리에서 좌회전을
+            시작한다(_s0_signal() 참고) — 정지 이벤트 자체가 없다.
+            [2026-08-22h] 직진 확정이면(요청 반영) 커밋 구간/상태전환 자체가 없다 — 신호가
+            이미 "직진"이라고 확정했으니 물리적 분기까지 저속으로 기다릴 이유가 없고, 그냥
+            S1을 유지한 채 Behavior만 재활성화해 다음 바퀴(라바콘부터)를 바로 준비한다.
         """
+        # [2026-08-23q, 요청 반영] 신호 확정(특히 좌회전) 처리를 아래 B1_LAVACON/장애물회피
+        # 조기 return보다 먼저 본다 — "최상위 조향, 다른 Behavior에 씹히지 않게". 원래는
+        # 이 검사가 함수 맨 끝(_lane_drive() 이후)에 있어서, B1_LAVACON이 조향을 잡고 있거나
+        # (_behavior_enabled and behavior_state==B1_LAVACON) 장애물회피/추월 중이면 함수가
+        # 그 위 가드에서 곧장 return해버려 signal_left_confirmed가 그 틱에 확정돼도 아예
+        # 확인조차 안 되고 넘어갈 수 있었다(다음 틱에 재확인되긴 하지만, 최악의 경우
+        # confirmed 래치가 그 사이 풀리면 좌회전 자체를 놓친다). 좌회전이 확정되는 즉시
+        # mission_state를 S0_SIGNAL로 바꿔버리면, control_loop()의 Behavior 게이트
+        # (mission_state==S1_LANE_FOLLOW 조건)가 그 즉시 꺼져서 이후 B1/B2/B3가 이 조향을
+        # 덮어쓸 수 없다.
+        # TEST_DISABLE_INTERSECTION=True면 아래 조건이 항상 False가 되어 S0_SIGNAL 재진입
+        # 자체가 원천 차단된다.
+        if not (TEST_DISABLE_INTERSECTION or time.time() < self._signal_reentry_cooldown_t):
+            if self.signal_left_confirmed:
+                self._change_state(MissionState.S0_SIGNAL)
+                self._s2_commit_dist = 0.0   # _change_state()가 진입 처리에서 None으로 리셋한 뒤 다시 세팅
+                self._s2_commit_dir  = 'left'
+                return
+            elif self.signal_straight_confirmed:
+                # [2026-08-22h] 요청 반영 — 커밋 구간 없이 곧장 다음 바퀴 준비만 하고 S1 유지.
+                # (_signal_yolo_off는 이제 perc_signal()이 확정되는 순간 바로 세팅한다.)
+                self._behavior_enabled = True
+                self._signal_reentry_cooldown_t = time.time() + SIGNAL_REENTRY_COOLDOWN
+                if TEST_SIGNAL_LOOP:
+                    # [2026-08-23, 요청 반영] 격리 테스트 전용 — 정상 레이스에선 이 phase
+                    # 리셋을 _update_lap()(결승선 통과)이 담당하고 신호 확정 시점엔 아직
+                    # 안 건드리는 게 맞지만(신호 지점~결승선 사이 구간이 남아있어서), 신호
+                    # 판단만 반복 테스트할 땐 결승선까지 안 가고 바로 다음 순서(B1)를 봐야
+                    # 하므로 여기서 직접 리셋한다.
+                    self.phase = Phase.LAVACON
+                    self._b2_passed = False
+                    self._b3_passed = False
+                    self._lavacon_engaged = False
+                    self._lavacon_empty_cnt = 0
+                    self._lavacon_trigger_cnt = 0
+
         # Behavior가 조향을 전담하는 구간에서는 Mission의 차선 PID를 건너뛴다.
-        # phase==LAVACON이어도 좌우 클러스터 동시검출 트리거(_lavacon_engaged)가 확정되기 전까지는
-        # 여기서 안 걸리고 아래 else 분기의 일반 차선주행(_lane_drive)이 계속 돈다.
-        if self._behavior_enabled and self.phase == Phase.LAVACON and self._lavacon_engaged:
+        # [2026-08-22] 요청 반영 — run_behavior_fsm()이 다시 behavior_state=B1_LAVACON을
+        # 세팅하게 되면서(_lavacon_engaged인 동안) 이 가드가 다시 걸린다. B1 구간 조향은
+        # apply_behavior_override()의 _handle_lavacon()(→ _lavacon_steer_da_push())이
+        # 전담하고, 여기 아래 else 분기의 일반 차선주행(_lane_drive)은 그 구간엔 안 돈다.
+        if self._behavior_enabled and self.behavior_state == BehaviorState.B1_LAVACON:
             return
         if self._obstacle_active or self._overtake_active:
             return
 
         self._lane_drive()
-        # TEST_DISABLE_INTERSECTION=True면 신호등 보드를 인식해도 아래 조건이 항상 False가 되어
-        # S0_SIGNAL 재진입 자체가 원천 차단되고 계속 이 함수(_lane_drive)만 반복하며
-        # 차선주행을 이어간다.
-        if (not TEST_DISABLE_INTERSECTION and self.signal_board_confirmed
-                and time.time() >= self._signal_reentry_cooldown_t):  # 보드 인식(쿨다운 지난 뒤만)
-            self._change_state(MissionState.S0_SIGNAL)
 
     # ── S0_SIGNAL: 4구 신호등 판단 — 출발선/교차로 공용 (정지 후 신호로 경로 판단) ──
     def _s0_signal(self):
         """
         4구 신호등 앞에서 정지한 채 판독한다. [2026-08-20] 원래 출발(S0_WAIT_GREEN)과 교차로
         (S2_INTERSECTION)로 나뉘어 있던 걸 하나로 합쳤다 — 둘 다 로직이 완전히 같았기 때문
-        (정지 → 4구 신호 판독 → 직진/좌회전 확정). 이 state는 출발 직후 1번, 이후 매 바퀴
-        트랙 중앙 분기점에서 재진입한다. START_STATE=S0_SIGNAL이라 맨 처음 진입도 이 경로를
-        그대로 타므로, 출발이든 교차로 재진입이든 "신호 미확정=사실상 빨간불이면 정지"가
-        동일하게 적용된다(아래 1번, 별도 "정지" 이벤트/타이머 없이 매 프레임 기본값으로).
-          1. 진입 즉시 정지 (기본값 STOP, 명시적 신호만 출발/재출발)
-          2. 직진 초록(signal_straight_confirmed) → 커밋 구간(S2_COMMIT_DIST_M) 거쳐 S1 복귀
-             + Behavior 활성화(라바콘부터 진행 — README §대회 규정 요약대로 출발 직후에도 매번 켠다)
-             좌회전 신호(signal_left_confirmed) → 커밋 구간 거쳐 좌회전 후 S3(지름길, 3바퀴 중
-             2·3바퀴째에 한 번만 등장)
+        (정지 → 4구 신호 판독 → 직진/좌회전 확정).
+
+        [2026-08-22h] 요청 반영 — 직진 확정(signal_straight_confirmed)은 이제 이 state
+        자체에 들어오지 않는다(_s1_lane_follow() 참고: 확정되는 순간 S1을 유지한 채
+        Behavior만 재활성화하고 끝). 그래서 이 state에 진입하는 경로는 좌회전(지름길)
+        확정 하나뿐이다 — 아래 "1. 진입 즉시 정지" 분기도 좌회전 신호만 본다. 그 분기가
+        실제로 쓰이는 건 (a) START_STATE=S0_SIGNAL로 노드가 맨 처음 시작하는 출발선
+        경우(대회 규정상 심판이 신호를 초록으로 바꾸기 전까지 출발 자체가 금지 — 출발선
+        신호가 직진이면 곧장 S1로 넘어가고 이 state에 남지 않는다) 하나뿐이다 — 아직
+        신호를 못 읽어 정지 대기 중인 경우. [2026-08-23, 08-23q 되돌림] 좌회전 램프
+        완료(_do_checker_ramp_turn())는 이제 여기로 돌아오지 않고 곧장 S1_LANE_FOLLOW로
+        복귀한다 — 이 트랙은 좌회전 직후 바로 차선주행이라 읽을 다음 신호등이 없고,
+        예전처럼 여기로 돌아오면 확정될 리 없는 신호를 영원히 기다리며 속도 0으로
+        굳는 문제가 있었다.
+          1. 진입 즉시 정지 (기본값 STOP, 좌회전 신호만 커밋 구간 시작) — 출발선 전용, 위 참고
+          2. 좌회전 신호(signal_left_confirmed) → 커밋 구간(_s2_commit_dist) 거쳐 좌회전
+             후 S1 복귀(3바퀴 중 2·3바퀴째에 한 번만 등장). 커밋 구간 동안은 S1과 동일한
+             차선주행(_lane_drive())을 유지하고, checker_pillar_trigger(체크무늬 게이트
+             라이다 기둥쌍 검출)로 커밋 종료를 판정한다 — 거리 기반이 아니라 물리적
+             트리거라 신호 확정 지점과 실제 분기 사이에 커브가 있어도 안전하다.
           3. 좌회전 진행 중이면 신호와 무관하게 완료 우선
-          4. 커밋 구간(_s2_commit_dist)에서는 신호와 무관하게 직진만 유지 — 신호가 보이는
-             지점과 실제 도로가 갈라지는 물리적 분기 지점이 떨어져 있고(config.py
-             S2_COMMIT_DIST_M 주석 참고), 그 사이에 _lane_drive()(비전)를 켜면 분기가
-             보이기 시작하는 순간 da가 반대쪽 갈래로 끌려간다(실측 재현됨, 교차로 기준). 신호로
-             이미 확정된 방향이므로 이 구간은 비전을 아예 참조하지 않는다. 커밋 구간 종료
-             판정은 시간이 아니라 VESC 실측(v_mps) 적분 거리로 한다 — 대회 주행 때 APPROACH_SPEED
-             근방 실속도가 튜닝 시점과 달라져도 물리적 분기 지점과 안 어긋나게(config.py
-             S2_COMMIT_DIST_M 주석 참고). 출발 시점에는 이 분기 자체가 없지만 같은 코드경로를
-             타므로 출발 직후에도 짧게(≈S2_COMMIT_DIST_M=1m) 이 구간을 거친다 — 출발선은 직선이라
-             문제는 없을 것으로 보이나 실차 미검증.
         """
         if self._checker_ramp_dist is not None:
             self._do_checker_ramp_turn()
             return
 
-        # [2026-08-21] 진입 좌회전(S2→S3)의 _turn_dist 오픈루프 경로는 위 체크무늬 게이트
-        # 램프로 대체돼 더 이상 이 state에서 도달하지 않는다(_begin_left_turn()이 여기서
-        # 더는 호출 안 됨 — 아래 'left' 커밋 분기가 _begin_checker_ramp_turn()을 씀).
-        # _do_left_turn()/TURN_ANGLE류는 _s3_shortcut()의 진출(S3→S1) 좌회전에서 계속 쓰인다.
-
         if self._s2_commit_dist is not None:
-            self.ctrl_angle = 0.0
-            self.ctrl_speed = APPROACH_SPEED
-            self._s2_commit_dist += self._speed_mps_fallback(APPROACH_SPEED) * 0.05  # 20Hz 제어주기(control_loop) 가정
+            self._lane_drive()
+            self._s2_commit_dist += self._speed_mps_fallback(self.ctrl_speed) * 0.05  # 20Hz 제어주기(control_loop) 가정
 
-            if self._s2_commit_dir == 'left':
-                # [2026-08-21] 커밋 종료 트리거를 거리(S2_COMMIT_DIST_M) 대신 체크무늬 게이트
-                # 라이다 기둥쌍 검출로 대체(요청 반영, config.py "체크무늬 게이트 라이다
-                # 기둥쌍 검출" 절 참고) — 신호확정 후 정지위치 산포에 안 흔들리는 물리적
-                # 트리거. CHECKER_PILLAR_TIMEOUT_DIST_M 넘도록 기둥쌍이 안 잡히면(라이다
-                # 죽음/오검출) 기존 거리기반 방식으로 강제 폴백해 무한 직진을 막는다.
-                timed_out = self._s2_commit_dist >= CHECKER_PILLAR_TIMEOUT_DIST_M
-                if self.checker_pillar_trigger or timed_out:
-                    if timed_out and not self.checker_pillar_trigger:
-                        self.get_logger().warn(
-                            f'체크무늬 게이트 기둥쌍 미검출(거리 {self._s2_commit_dist:.2f}m) '
-                            '— 타임아웃으로 좌회전 램프 강제 시작')
-                    self._s2_commit_dist = None
-                    self._s2_commit_dir  = None
-                    self._begin_checker_ramp_turn()
-                return
-
-            if self._s2_commit_dist >= S2_COMMIT_DIST_M:
-                commit_dir = self._s2_commit_dir
+            # [2026-08-21] 커밋 종료 트리거는 거리가 아니라 체크무늬 게이트 라이다 기둥쌍
+            # 검출(config.py "체크무늬 게이트 라이다 기둥쌍 검출" 절 참고) — 신호확정 후
+            # 정지위치 산포에 안 흔들리는 물리적 트리거. CHECKER_PILLAR_TIMEOUT_DIST_M
+            # 넘도록 기둥쌍이 안 잡히면(라이다 죽음/오검출) 거리기반으로 강제 폴백해 무한
+            # 직진을 막는다.
+            timed_out = (not TEST_DISABLE_CHECKER_PILLAR_TIMEOUT
+                         and self._s2_commit_dist >= CHECKER_PILLAR_TIMEOUT_DIST_M)
+            if self.checker_pillar_trigger or timed_out:
+                if timed_out and not self.checker_pillar_trigger:
+                    self.get_logger().warn(
+                        f'체크무늬 게이트 기둥쌍 미검출(거리 {self._s2_commit_dist:.2f}m) '
+                        '— 타임아웃으로 좌회전 램프 강제 시작')
                 self._s2_commit_dist = None
                 self._s2_commit_dir  = None
-                # commit_dir == 'straight'만 여기 남는다('left'는 위에서 이미 처리하고 return)
-                self._behavior_enabled = True
-                self._signal_reentry_cooldown_t = time.time() + SIGNAL_REENTRY_COOLDOWN
-                self._change_state(MissionState.S1_LANE_FOLLOW)
+                self._begin_checker_ramp_turn()
             return
 
         self.ctrl_angle, self.ctrl_speed = 0.0, SPEED_STOP
 
         if self.signal_straight_confirmed:
-            self._s2_commit_dist = 0.0
-            self._s2_commit_dir  = 'straight'
+            self._behavior_enabled = True
+            self._signal_reentry_cooldown_t = time.time() + SIGNAL_REENTRY_COOLDOWN
+            self._change_state(MissionState.S1_LANE_FOLLOW)
         elif self.signal_left_confirmed:
             self._s2_commit_dist = 0.0
             self._s2_commit_dir  = 'left'
 
-    # ── S3: 지름길 — 직진(+차선소실 대비), 끝에서 좌회전 ──
-    def _s3_shortcut(self):
-        """
-        지름길 직진. 중간 차선소실 구간은 라이다로 딸 것이 없으므로 그냥 직진.
-        끝에 도달하면 신호없이 좌회전으로 S1(차선주행) 복귀 (Behavior는 켜지 않음).
-
-        지름길 출구(본선 합류부)는 신호등이 없어 정지선 검출로만 끝(_shortcut_end())을
-        판단하는데, 합류부는 도로가 서서히 넓어지는 형태라 정지선이 실제로 잡히기 전에
-        da 세그멘테이션이 합류 쪽으로 먼저 끌려가는 문제가 있다(ㅓ교차로와 동일한
-        실패모드, config.py SHORTCUT_VISION_CUTOFF_T 주석 참고). 그래서 정지선 검출을
-        기다리지 않고 SHORTCUT_VISION_CUTOFF_T가 지나면 미리 비전(_lane_drive())을 끄고
-        _shortcut_ref_yaw 기준 헤딩홀드로 직진을 유지한다 — 좌회전 스크립트는 아직
-        시작하지 않고, 정지선이 실제로 잡히거나 SHORTCUT_MAX_T에 도달해 _shortcut_end()가
-        확정된 뒤에야 진출 시퀀스(감속+좌회전)로 넘어간다.
-        """
-        if self._turn_dist is not None:
-            self._do_left_turn(next_state=MissionState.S1_LANE_FOLLOW)
-            return
-
-        if self._shortcut_t0 is None:
-            self._shortcut_t0 = time.time()
-
-        if self._shortcut_ref_yaw is None and (time.time() - self._shortcut_t0) >= 1.0:
-            self._shortcut_ref_yaw = self.imu_yaw
-            self.get_logger().info(f'[S3] 기준 yaw 기록: {math.degrees(self._shortcut_ref_yaw):.1f}°')
-
-        if self._shortcut_end():
-            if self._exit_approach_t0 is None:
-                self._exit_approach_t0 = time.time()
-            elapsed = time.time() - self._exit_approach_t0
-            if elapsed < APPROACH_EXIT_TIME:
-                if self._shortcut_ref_yaw is not None:
-                    yaw_err = self._yaw_delta(self._shortcut_ref_yaw)
-                    self.ctrl_angle = float(np.clip(-yaw_err * 100.0, -30.0, 30.0))
-                else:
-                    self.ctrl_angle = 0.0
-                self.ctrl_speed = APPROACH_EXIT_SPEED
-            else:
-                self._shortcut_t0 = None
-                self._exit_approach_t0 = None
-                self._begin_left_turn()
-            return
-
-        shortcut_elapsed = time.time() - self._shortcut_t0
-        if shortcut_elapsed >= SHORTCUT_VISION_CUTOFF_T and self._shortcut_ref_yaw is not None:
-            # 합류부 근접 구간 — 정지선이 아직 안 잡혔어도 비전을 더는 믿지 않고
-            # 헤딩홀드로 직진 유지(진출 시퀀스는 _shortcut_end() 확정 후에만 시작).
-            yaw_err = self._yaw_delta(self._shortcut_ref_yaw)
-            self.ctrl_angle = float(np.clip(-yaw_err * 100.0, -30.0, 30.0))
-            self.ctrl_speed = SPEED_NORMAL
-            return
-
-        if self.lane_valid:
-            self._lane_drive()
-        else:
-            self.ctrl_angle = 0.0
-            self.ctrl_speed = SPEED_NORMAL
-
-    def _shortcut_end(self):
-        """지름길 끝(탈출 좌회전 지점) 감지."""
-        if self._shortcut_t0 is None:
-            return False
-        elapsed = time.time() - self._shortcut_t0
-        if elapsed < SHORTCUT_MIN_T:
-            return False
-        return self.stopline or elapsed > SHORTCUT_MAX_T
-
     # ── S4: 종료 ──
     def _s4_finish(self):
         self.ctrl_angle, self.ctrl_speed = 0.0, SPEED_STOP
-
-
-
-    # ── 좌회전 공통 (실차 전환: 후진 없이 무난한 좌회전) ──
-    def _begin_left_turn(self):
-        self._turn_dist = 0.0   # 거리 적분 시작(0m부터 목표거리까지)
-        self.get_logger().info('좌회전 시작')
-
-    def _do_left_turn(self, next_state):
-        """무난한(후진 없는) 좌회전 후 next_state로 전환.
-
-        [2026-08-20] 종료 판정을 IMU yaw 실측 기반(closed-loop)에서 실측거리 기반으로
-        되돌렸다(요청 반영, config.py "좌회전 공통" 절 주석 참고). 고정 조향각(trn_ang)을
-        고정 이동거리(trn_dist)만큼 유지하다가 끝낸다 — S2_COMMIT_DIST_M(_s0_signal())과
-        동일한 적분 패턴(_speed_mps_fallback(), VESC 실측 + 명령속도 폴백)이라 IMU 없이도
-        VESC 장애 시 무한 회전 없이 항상 끝난다.
-
-        [2026-08-21] next_state==S3_SHORTCUT 분기(TURN_ANGLE류)는 진입 좌회전이 체크무늬
-        게이트 램프(_do_checker_ramp_turn())로 대체되며 현재 호출부가 없다 — 함수/분기는
-        되돌릴 경우를 대비해 남겨둠. next_state==S1_LANE_FOLLOW(진출, S3→S1)는 계속 사용."""
-        if next_state == MissionState.S3_SHORTCUT:
-            trn_ang, trn_spd, trn_dist = TURN_ANGLE, TURN_SPEED, TURN_DIST_M
-        else:
-            trn_ang, trn_spd, trn_dist = TURN_EXIT_ANGLE, TURN_EXIT_SPEED, TURN_EXIT_DIST_M
-
-        if self._turn_dist < trn_dist:
-            self.ctrl_angle = trn_ang
-            self.ctrl_speed = trn_spd
-            self._turn_dist += self._speed_mps_fallback(trn_spd) * 0.05  # 20Hz 제어주기(control_loop) 가정
-        else:
-            self.get_logger().info('좌회전 완료')
-            self._turn_dist = None
-            if next_state == MissionState.S1_LANE_FOLLOW:
-                self._signal_reentry_cooldown_t = time.time() + SIGNAL_REENTRY_COOLDOWN
-            self._change_state(next_state)
 
     # ── 진입 좌회전 — 체크무늬 게이트 라이다 기둥쌍 트리거 + 완만한 조향 램프 ──
     #   [2026-08-21] _begin_left_turn()/_do_left_turn(next_state=S3_SHORTCUT)을 대체(요청
     #   반영) — S2_COMMIT_DIST_M 거리기반 대신 perc_checker_pillar()의 라이다 기둥쌍
     #   검출로 커밋 종료를 판단하고(_s0_signal() 'left' 분기 참고), 고정각 즉시 진입 대신
     #   CHECKER_TURN_RAMP_START_ANGLE→END_ANGLE로 서서히 조향을 올린다.
+    #   [2026-08-22g] 램프 완료 후 전환할 곳을 MissionState.S3_SHORTCUT(지름길 전용 직진+
+    #   정지선 감지+탈출 좌회전 스크립트)에서 MissionState.S1_LANE_FOLLOW로 바꿨다(요청
+    #   반영) — 지름길 구간도 물리적으로는 그냥 트랙의 일부라 일반 차선주행과 다를 게
+    #   없고(끝에 신호등 없는 갈림길도 아니고, B3 방해차량 회피를 마친 뒤 다음 교차로
+    #   신호등을 기다리며 차선주행하는 상태와 동일), 별도 탈출 스크립트가 필요하다는 전제
+    #   자체가 더 이상 유효하지 않다는 판단(실차 트랙 재확인). S3_SHORTCUT
+    #   전용이던 _s3_shortcut()/_shortcut_end()/_begin_left_turn()/_do_left_turn()과
+    #   MissionState.S3_SHORTCUT enum 값 자체를 삭제했다(README §1.19b 참고) — 되돌릴
+    #   경우 git 이력에서 복원할 것.
+    #   [2026-08-23q] 좌회전 직후 Phase가 아직 LAVACON(이번 바퀴 B1을 아직 안 거친 상태)로
+    #   남아있으면 Behavior가 곧장 켜져 B1이 검증 없이 바로 발동하는 문제가 실차에서
+    #   드러나, 램프 완료 후 곧장 S0_SIGNAL(신호 대기)로 돌아가 "다음 직진 신호"가 확정될
+    #   때까지 정지 대기하도록 바꿨었다. 그런데 이 트랙은 좌회전(지름길) 직후 곧바로
+    #   차선주행 구간으로 이어지고 그 사이엔 읽을 신호등 자체가 없어서, 확정될 리 없는
+    #   신호를 영원히 기다리며 속도 0으로 완전히 굳어버리는 문제로 이어졌다(실차 확인,
+    #   2026-08-23). S1_LANE_FOLLOW+Behavior 즉시 재개로 되돌린다 — 위 08-23q가 우려한
+    #   Phase.LAVACON 상태의 B1 오발동은, 그 사이 유령 라이다 점 마스킹(perc_lavacon.py
+    #   GHOST_POINT_*, 2026-08-22 작업기록 참고)으로 완화됐을 가능성이 있어 실차에서
+    #   재확인할 것 — 다시 문제가 보이면 이 되돌림 대신 좌회전 직후에만 짧게 B1 감지를
+    #   유예하는 방향으로 갈 것.
     def _begin_checker_ramp_turn(self):
         self._checker_ramp_dist = 0.0
         self.get_logger().info('체크무늬 게이트 통과 — 좌회전 램프 시작')
@@ -1795,8 +2429,20 @@ class TrackDriverNode(Node):
         if done:
             self.get_logger().info('체크무늬 게이트 좌회전 램프 완료')
             self._checker_ramp_dist = None
+            self._left_turn_last_done_t = time.time()  # left_turn_debug 창 "실행끝" 표시용
+            # 'straight' 커밋 완료(_s0_signal())와 동일하게 처리 — 좌회전도 별도 지름길
+            # state 없이 곧장 일반 차선주행으로 복귀하고, B1→B2→B3 Behavior를 다시 연다.
+            self._behavior_enabled = True
             self._signal_reentry_cooldown_t = time.time() + SIGNAL_REENTRY_COOLDOWN
-            self._change_state(MissionState.S3_SHORTCUT)
+            if TEST_SIGNAL_LOOP and self.phase == Phase.DONE:
+                # 격리 테스트 전용 — phase가 그대로 Phase.DONE이면(=이 좌회전이 신호 판단
+                # 테스트 대기 상태에서 시작된 것) "아까 상태"로 되돌아가는 것이므로, 다음
+                # 테스트를 위해 신호등 YOLO를 다시 켠다. 정상 레이스에선 이 리셋을
+                # _update_lap()(결승선 통과)만 담당해야 하므로 phase==LAVACON/
+                # OBSTACLE_ZONE(=실제 레이스 중 좌회전)일 땐 안 건드린다.
+                self._signal_yolo_off = False
+                self._signal_off_hold_cnt = None
+            self._change_state(MissionState.S1_LANE_FOLLOW)
 
     def _yaw_delta(self, start):
         """현재 yaw - start (−π~π wrap)"""
@@ -1821,56 +2467,79 @@ class TrackDriverNode(Node):
         다시 넣을 수 있게 된 것.
         """
         if self.phase == Phase.LAVACON:
-            # 좌우 라이다 클러스터가 동시에(디바운스 프레임수만큼) 검출되면 B1_LAVACON 진입을 확정(latch)한다.
-            # 한번 확정된 뒤에는 중간에 한쪽 클러스터가 잠깐 끊겨도(occlusion 등) B0로 되돌아가지 않고
-            # lavacon_done 디바운스(_lavacon_empty_cnt)로 정상 종료될 때까지 유지한다.
+            # [2026-08-20] 요청 반영 — B1은 진입/탈출 두 트리거로 latch를 관리한다.
+            # 진입: 좌우 라이다 클러스터 동시검출(lavacon_trigger)로 self._lavacon_engaged를
+            # latch. 탈출: process_lavacon()이 매 틱 계산해두는 lavacon_done(우측 콘
+            # 연속 미검출)이 LAVACON_DONE_FRAMES만큼 유지되면 확정 — 이 판정은 exit 시점을
+            # 여기 한 곳에서만 확정하고 _handle_lavacon()에서는 중복으로 하지 않는다
+            # (그 함수 docstring 참고).
+            # [2026-08-22] 요청 반영 — behavior_state를 B0_NORMAL로 묶어두던 걸 되돌렸다.
+            # _lavacon_engaged인 동안은 B1_LAVACON으로 세팅해 apply_behavior_override()가
+            # 실제로 _handle_lavacon()(→ _lavacon_steer_da_push(), 콘 침범 시 옆으로 밀기)을
+            # 호출하게 한다 — 그 전까진 검출/진입판정만 돌고 조향은 그냥 일반 S1 차선 PID가
+            # 대신하고 있었다(콘 전용 안전마진 없이 DA가 우연히 피해가는 수준). 그 PID 스킵
+            # 가드(behavior_state==B1_LAVACON 기준, _s1_lane_follow() 참고)가 이제 다시 걸린다.
+            was_engaged = self._lavacon_engaged
             if self.lavacon_trigger:
                 self._lavacon_engaged = True
-            self.behavior_state = (BehaviorState.B1_LAVACON
-                                    if self._lavacon_engaged
-                                    else BehaviorState.B0_NORMAL)
+            if LAVACON_KICK_ENABLED and (not was_engaged) and self._lavacon_engaged:
+                # [2026-08-23, 요청 반영] 진입 확정 상승엣지 — 여기서 딱 한 번만 걸린다
+                # (_lavacon_engaged가 True로 유지되는 동안엔 다시 안 걸림). 프레임수는
+                # 20Hz 고정주기(control_loop() 타이머, 0.05초) 기준 환산 — 이 값을 바꾸려면
+                # LAVACON_KICK_DURATION_S(config.py)만 조정하면 된다.
+                self._lavacon_kick_cnt = int(round(LAVACON_KICK_DURATION_S / 0.05))
+            if self._lavacon_engaged:
+                if self.lavacon_done:
+                    self._lavacon_empty_cnt += 1
+                    if self._lavacon_empty_cnt >= LAVACON_DONE_FRAMES:
+                        self._lavacon_empty_cnt = 0
+                        self._lavacon_engaged = False
+                        self.phase = Phase.OBSTACLE_ZONE
+                        self.get_logger().info(
+                            '[LAVACON] 탈출 트리거 확정 → 장애물 구간')
+                else:
+                    self._lavacon_empty_cnt = 0
+            if self._lavacon_engaged:
+                self.behavior_state = BehaviorState.B1_LAVACON
+            else:
+                self.behavior_state = BehaviorState.B0_NORMAL
+                self._lavacon_push_active = False  # 진입 전/탈출 직후엔 항상 꺼둔다
+                self._lavacon_push_px = 0.0
         elif self.phase == Phase.OBSTACLE_ZONE:
             # TEST_DISABLE_B2_B3=True면 트리거 검사를 아예 안 하고 바로 리턴 — 장애물/방해차량이
-            # 실제로 잡혀도 B2_OBSTACLE/B3_VEHICLE로 안 넘어가고 B0로 고정되어 _s1_lane_follow의
-            # 일반 차선 PID가 계속 돎(placeholder 회피 기동이 실행 안 됨). 이 게이팅은 통합 전과
-            # 동일하게 유지된다 — False로 바꾸면 트리거/디스패치가 예전과 같은 조건으로 그대로
-            # 동작한다(달라진 건 "두 Phase로 미리 나눔" → "한 Phase 안에서 타입으로 나눔"뿐).
+            # 실제로 잡혀도 통과 처리가 안 되어 Phase가 영원히 OBSTACLE_ZONE에 머문다(placeholder
+            # 회피 자체는 ENABLE_OBSTACLE_CUT과 별개 스위치라 계속 돌 수 있음에 주의).
             if TEST_DISABLE_B2_B3:
                 self.behavior_state = BehaviorState.B0_NORMAL
                 return
 
-            # 이미 진행 중인 기동이 있으면 이번 프레임 obstacle_type이 흔들려도 핸들러를
-            # 중간에 바꾸지 않는다(진행 중 스왑은 위험 — 기존 "or self._obstacle_active"/
-            # "or self._overtake_active" 유지 패턴과 동일 원칙, 우선순위만 명시적으로 첫
-            # 분기로 올렸다).
-            if self._obstacle_active:
-                self.behavior_state = BehaviorState.B2_OBSTACLE
-                return
-            if self._overtake_active:
-                self.behavior_state = BehaviorState.B3_VEHICLE
-                return
+            # [2026-08-20] 요청 반영 — B2/B3도 B1(라바콘, 위 Phase.LAVACON 분기)과 같은
+            # 패턴으로 단순화했다. 실제 회피 조향/감속은 behavior_state와 무관하게 상시로
+            # 도는 da 근접 컷(ENABLE_OBSTACLE_CUT — perc_obstacle_cut_trigger()의 라이다+
+            # YOLO(콘 또는 차량) 이중확인 → obstacle_cut_active → _clip_da_by_obstacle()의
+            # da 클리핑 + SPEED_PRE_OBSTACLE_CAP 속도캡(감지 전 구간, _update_speed() 참고),
+            # perception/dl_lane.py)이 이미 처리하므로,
+            # 여기서는 obstacle_cut_active의 진입~탈출을 그대로 B2/B3 신호로 재사용해서
+            # Phase 완료 처리(_mark_behavior_passed)만 담당한다 — B1의 lavacon_trigger/
+            # lavacon_done latch와 완전히 같은 구조. TargetPassing 기반
+            # _handle_fixed_obstacle()/_handle_overtake()는 더 이상 호출되지 않는다(구현은
+            # 나중을 위해 보존, 아래 함수 docstring 참고).
+            if self.obstacle_cut_active and self._obscut_zone_tag is None:
+                # obstacle_cut_type: perc_obstacle_cut_trigger()가 YOLO 콘/차량 이중확인으로
+                # 매 틱 갱신해두는 값을 트리거 활성화 순간 스냅샷 — 'fixed'(고정장애물=B2) 아니면
+                # 'vehicle'(방해차량=B3). 트랙 순서는 "B2 먼저"(§5.2, §5.4에서 잠깐 반대로
+                # 뒤집혔다가 §5.5로 원복) — _b2_passed가 아직 False면 타입이 vehicle로 잡혀도
+                # B2로 취급한다 — 초반 오분류로 B3를 먼저 통과 처리해버리는 사고를 원천 차단.
+                if self.obstacle_cut_type == 'vehicle' and self._b2_passed:
+                    self._obscut_zone_tag = 'B3'
+                else:
+                    self._obscut_zone_tag = 'B2'
 
-            # 새로 트리거를 판단할 때만 obstacle_type으로 B2/B3를 가른다. 두 트리거
-            # (SAFETY_DIST 기반 triggered_fixed, OVERTAKE_TRIGGER+디바운스 기반
-            # perc_vehicle_trigger()의 self.vehicle_trigger)는 원래 서로 다른 Phase에서만
-            # 봐서 겹칠 일이 없었는데, 이제 같은 프레임에 동시에 참일 수 있다 —
-            # obstacle_type=='vehicle'이면 방해차량 쪽을 우선한다(vehicle_trigger가 아직
-            # 디바운스 중이라도 폭이 이미 vehicle로 잡혔으면 B3로 본다). ★알려진 한계★:
-            # 트리거 발동 직후 몇 프레임은 obstacle_type/vehicle_trigger 디바운스 타이밍이
-            # 안 맞아 잠깐 B2로 걸렸다가 B3로 바뀌는 등 짧은 오분류가 있을 수 있다 —
-            # `_obstacle_active`/`_overtake_active` latch가 실제로 걸리기 전(TargetPassing이
-            # 아직 IDLE)에만 해당하는 구간이라 영향은 제한적이라고 판단.
-            triggered_fixed = (self.obstacle_front
-                                and self.obstacle_dist < SAFETY_DIST
-                                and self._maneuver_allowed)
-            triggered_vehicle = self.vehicle_trigger and self._maneuver_allowed
+            if self._obscut_zone_tag is not None and not self.obstacle_cut_active:
+                self._mark_behavior_passed(self._obscut_zone_tag)
+                self._obscut_zone_tag = None
 
-            if triggered_vehicle and self.obstacle_type == 'vehicle':
-                self.behavior_state = BehaviorState.B3_VEHICLE
-            elif triggered_fixed:
-                self.behavior_state = BehaviorState.B2_OBSTACLE
-            else:
-                self.behavior_state = BehaviorState.B0_NORMAL
+            self.behavior_state = BehaviorState.B0_NORMAL
         else:  # Phase.DONE
             self.behavior_state = BehaviorState.B0_NORMAL
 
@@ -1918,9 +2587,38 @@ class TrackDriverNode(Node):
         return max(CORNER_IMU_MIN_SCALE, min(1.0, abs(imu_kappa) / CORNER_IMU_CONFIRM_KAPPA_PX))
 
     def _lane_drive(self):
-        """S1/S3 공통 차선 조향+감속 로직. ctrl_angle·ctrl_speed·_prev_speed·_corner_hold 갱신."""
-        self.ctrl_angle = self._lane_steer()
+        """S1/S3 공통 차선 조향+감속 로직. ctrl_angle·ctrl_speed·_prev_speed·_corner_hold 갱신.
 
+        [2026-08-21] §3.4가 남긴 "알려진 한계"(라바콘 구간을 회피조향 없이 일반 차선 PID로만
+        지나가서, 콘이 차선 폭 안쪽까지 침범하면 충돌 위험) 대응 — `self._lavacon_engaged`
+        (perc_lavacon_trigger()의 라이다 AND YOLO 이중확인으로 이미 확정된 "지금 라바콘
+        구간 안" latch, run_behavior_fsm()의 Phase.LAVACON 분기가 계속 관리)가 True인 동안만
+        `_lavacon_steer_da_push()`(da 경로 + 콘 침범 시 옆으로 밀기)로 바꿔 쓴다.
+        `behavior_state`는 여전히 B0_NORMAL로 유지되므로(§3.4 결정 유지, B2/B3 단독 검증에
+        영향 없음) 이건 `_handle_lavacon()`을 되살리는 게 아니라, 상시로 도는 안전 보정
+        하나를 여기 얹는 것뿐이다(§4.3 da 근접 컷이 behavior_state와 무관하게 상시로 도는
+        것과 같은 패턴).
+
+        [2026-08-22] 속도 계산(코너 감속/가속 램프)은 `_update_speed()`로 분리했다 — B1
+        (`_handle_lavacon()`)도 조향만 라바콘 전용으로 바꿔 쓰고 속도는 이 S1 로직을
+        "똑같이" 그대로 타게 하려는 목적(요청 반영, speed15 프리셋 기준 SPEED_NORMAL=12/
+        SPEED_CORNER_MIN=10로 자연히 그 사이에서 움직임). behavior_state==B1_LAVACON인
+        동안은 `_s1_lane_follow()`가 이 함수 자체를 안 부르므로(가드 참고), 이 함수는
+        여전히 S1(+커밋 구간의 S0_SIGNAL)에서만 실행된다."""
+        if self._lavacon_engaged:
+            self.ctrl_angle = self._lavacon_steer_da_push()
+        else:
+            self.ctrl_angle = self._lane_steer()
+        self._update_speed()
+
+    def _update_speed(self):
+        """`_lane_drive()`(S1)와 `_handle_lavacon()`(B1)이 공유하는 속도 계산 — 코너 감속/
+        가속 램프 로직 자체는 조향 소스(일반 차선 PID든 라바콘 da-push든)와 무관하게
+        self.ctrl_angle 하나만 보고 돌아간다(아래 self._corner_signal 갱신 참고). ctrl_speed·
+        _prev_speed·_corner_hold 갱신. [2026-08-22] _lane_drive()에서 분리 — B1 진입 시
+        속도가 SPEED_LAVACON(2.5 고정)으로 "굳던" 문제(이전 수정으로 일단 "진입 시점 속도
+        유지"로 바꿨었음) 대신, S1과 동일한 동적 속도 로직을 B1에도 그대로 적용하기 위함
+        (요청 반영)."""
         # [2026-08-06, 2026-08-10 복원] 코너 감속 판단은 "지금 순간 조향각이 얼마나 큰가"가
         # 아니라 "최근 한동안 같은 방향으로 얼마나 꺾여 있었는가"를 봐야 한다. pure_pursuit은
         # 구조상 좌우로 조금씩 진동("와리가리")하는데, turn_now를 매 틱 abs(ctrl_angle)로 그대로
@@ -1944,11 +2642,11 @@ class TrackDriverNode(Node):
         # 감속을 거는 걸 막는다.
         imu_corner_scale = self._imu_corner_confirm_scale()
         turn_for_speed = max(turn_now, turn_preview * 0.3) * imu_corner_scale
-        # [2026-08-19] 0.90 → 0.80(요청 반영) — 조향(turn_for_speed)에 따른 감속이 너무 강하게
-        #   느껴진다는 피드백으로 소폭 완화. turn_for_speed=1(최대 코너 신호)일 때 SPEED_NORMAL
-        #   대비 90%가 아니라 80%까지만 깎이도록 함. 실차 재검증 필요 — 여전히 과하면 더 낮출 것.
+        # [2026-08-23] 리터럴 0.80 → SPEED_CORNER_STEER_GAIN(config.py, 요청 반영) — 프리셋별로
+        #   다르게 가져갈 수 있게 이름 있는 상수로 분리. 이력은 config.py 해당 상수 주석 참고
+        #   (0.90 → 0.80, 조향 기반 감속이 너무 강하다는 피드백으로 완화, 실차 재검증 필요).
         target_speed = max(SPEED_CORNER_MIN,
-                           SPEED_NORMAL * (1.0 - 0.80 * turn_for_speed ** 3))
+                           SPEED_NORMAL * (1.0 - SPEED_CORNER_STEER_GAIN * turn_for_speed ** 3))
         # 코너 진입(회전반경 감소) 시 추가 감속 — 기존 turn_for_speed 기반 감속과는 독립적으로
         # 계산해서 더 낮은 쪽을 쓴다(대체가 아니라 추가 안전판).
         corner_radius_scale = self._corner_radius_speed_scale()
@@ -1980,6 +2678,18 @@ class TrackDriverNode(Node):
         # 백엔드엔 이 속성이 없으니 getattr로 조회(다른 DL 전용 속성과 동일 관례).
         if getattr(self.lane_detector, 'near_band_stale', False):
             target_speed = min(target_speed, SPEED_LANE_STALE)
+        # [2026-08-23, 요청 반영 후 취소] 라바콘 탈출 후(Phase.OBSTACLE_ZONE) 장애물 미감지
+        # 구간을 SPEED_PRE_OBSTACLE_CAP(8.0)으로 캡하던 로직을 없앴다 — 요청 반영, 속도 8
+        # 유지는 B1(라바콘 주행) 중에만 적용하고 그 이후(장애물 구간)는 감지 여부와 무관하게
+        # 곧장 일반 코너감속 로직(SPEED_NORMAL 기반)을 탄다. SPEED_PRE_OBSTACLE_CAP(config.py)
+        # 상수 자체는 남겨뒀지만 이제 아무 데서도 참조하지 않는다.
+        # [2026-08-23, 요청 반영] B1(Phase.LAVACON) 중엔 목표속도 상한을 SPEED_LAVACON_CAP으로
+        # 추가 제한 — 과거 SPEED_LAVACON(2.5 고정, 삭제됨)처럼 매 틱 정확한 값으로 강제
+        # 고정하는 게 아니라, 위 코너감속 등과 동일하게 target_speed에 min()으로만 얹는다.
+        # 아래 accel_step 램프가 그대로 적용되므로 급감속/굳는 증상 없이 부드럽게 이 상한까지
+        # 내려간다(위 SPEED_PRE_OBSTACLE_CAP과 동일 패턴, config.py SPEED_LAVACON_CAP 주석 참고).
+        if self.phase == Phase.LAVACON:
+            target_speed = min(target_speed, SPEED_LAVACON_CAP)
         # [2026-08-18] avoid-hold 적용4(SPEED_AVOID_HOLD_BLOCKED 안전판) 삭제 — 실차 테스트에서
         # "속도 5 고정" 증상의 실제 원인으로 확인됨(README §2.43). TEST_DISABLE_B2_B3=True라
         # 실제 회피 기동(옆차선 이동)은 꺼져있는데 이 캡만 무관하게 계속 걸려서, 트리거를
@@ -2069,22 +2779,24 @@ class TrackDriverNode(Node):
         return self._prev_speed
 
     def _speed_mps_fallback(self, cmd_speed):
-        """거리 적분(_s2_commit_dist/_turn_dist)에 쓸 현재 속도(m/s) 추정.
+        """거리 적분(_s2_commit_dist/_checker_ramp_dist)에 쓸 현재 속도(m/s) 추정.
         VESC 실측이 살아있으면(_vesc_live()) 그 값을 그대로 쓴다 — 대회 당일 실속도가
         얼마든 실제 이동거리 기준으로 맞는다. VESC가 죽어있을 때만 그 구간에서 명령
         중인 속도(cmd_speed, 모터단위)를 METERS_PER_SPEED_UNIT으로 환산해 폴백한다 —
         예전 시간 기반(S2_COMMIT_T)이 암묵적으로 가정하던 것과 동일한 근사치라 VESC
         장애 시에도 이전과 같은 동작으로 안전하게 열화되고, 거리 적분 자체가 멈춰
         무한정 그 구간에 머무는(예: 좌회전 조향을 계속 유지하는) 상황이 없다.
-        [2026-08-20] S2_COMMIT_DIST_M 전용이던 _commit_speed_mps()를 일반화 —
-        _do_left_turn()의 거리 기반 좌회전 종료 판정에도 동일 철학으로 재사용한다."""
+        [2026-08-20] S2_COMMIT_DIST_M 전용이던 _commit_speed_mps()를 일반화 — 체크무늬
+        게이트 램프(_checker_turn_ramp_angle())의 거리 기반 종료 판정에도 동일 철학으로
+        재사용한다."""
         if self._vesc_live():
             return abs(self.v_mps)
         return cmd_speed * METERS_PER_SPEED_UNIT
 
-    def _lane_steer(self, path=None, vehicle_x=None):
+    def _lane_steer(self, path=None, vehicle_x=None, vehicle_y_px=None):
         """path(ROI 픽셀좌표 경로, 가까운점→먼점)를 pure_pursuit(controller/pure_pursuit.py)로
-        추종해 조향각(도)을 계산한다. 차량 기준점은 (vehicle_x, path[0]의 y좌표)로 둔다.
+        추종해 조향각(도)을 계산한다. 차량 기준점은 (vehicle_x, vehicle_y_px)로 둔다
+        (vehicle_y_px를 안 주면 path[0]의 y좌표를 그대로 쓴다 — 기존 동작).
 
         인자를 생략하면(기본 호출부인 _lane_drive() 등) 기존과 동일하게 self.lane_path와
         ROI 하단 중앙(roi_w/2)을 쓴다 — path[0].y는 lane_util._fit_and_sample_path()가
@@ -2092,6 +2804,18 @@ class TrackDriverNode(Node):
         [2026-08-11] _handle_lavacon()이 self.lavacon_path/vehicle_x=0.0을 명시적으로
         넘겨 호출한다 — 라바콘 조향 파라미터를 라인주행과 완전히 일치시키기 위해, 별도
         게인을 두지 않고 이 함수를 그대로 재사용하기로 한 결정(perc_lavacon() 주석 참고).
+
+        [2026-08-19] vehicle_y_px — path가 "센서 원점 기준" 좌표계일 때(라바콘의 경우
+        라이다 원점, row 0 = 라이다 자체 위치), path[0]의 행(row)을 차량 위치로 대신
+        쓰는 건 "차량이 대략 첫 웨이포인트 부근에 있다"는 근사일 뿐 실제 차량 위치가
+        아니다 — 실측으로 알아낸 진짜 차량 기준점 행이 있으면(예: 라이다가 차량 맨
+        앞부분보다 LIDAR_TO_VEHICLE_FRONT_M만큼 앞에 있다는 게 확인됨, config.py 참고)
+        path[0]와 무관하게 그 절대값을 직접 넘긴다 — path[0]에 "더하는" 식으로 쓰면 안 됨
+        (path[0]의 행 자체가 BOX_LON_START 등 다른 값에 좌우되는 임의 기준이라, 더하면
+        엉뚱한 위치가 나온다). None(기본값)이면 기존과 완전히 동일하게 path[0][1]을 쓴다
+        (라인주행 등 다른 호출부는 전부 이 값을 안 넘겨서 영향 없음). _handle_lavacon()이
+        LIDAR_TO_VEHICLE_FRONT_M*DL_PIXELS_PER_METER(라이다 원점 기준 차량의 절대 행)를
+        직접 계산해 넘긴다.
 
         경로가 비어있으면(첫 프레임, 혹은 roi_w를 아직 모르는 백엔드) 직전 조향각을
         그대로 유지한다 — pure_pursuit.control()이 내부적으로 이렇게 처리한다.
@@ -2115,13 +2839,35 @@ class TrackDriverNode(Node):
             # 매 틱 갱신하므로 별도 stale 가드 없이 바로 써도 안전하다(_update_avoid_hold()와
             # 동일 근거). AVOID_HOLD_TRIGGER_DIST_M(기존 상수, 1.5m) 재사용 — 별도 상수
             # 안 늘림(요청 반영). pure_pursuit.py _target_point_max_deviation() 참고.
-            near_obstacle = self.obstacle_front and self.obstacle_dist < AVOID_HOLD_TRIGGER_DIST_M
+            # [2026-08-22] 요청 반영 — B1(Phase.LAVACON) 중엔 이 근접회피도 죽인다.
+            # perc_obstacle()의 전방 ROI(5m×1.5m 반폭)가 라바콘 자체를 "고정장애물"로
+            # 잡아 obstacle_front/dist가 갱신되면, B1 진입 트리거(좌우 라이다 클러스터
+            # 동시검출)가 아직 안 걸린 대기 구간에서도 목표점 선택이 _target_point_max_deviation()
+            # 으로 바뀌어 콘 구간 진입 전부터 급조향(=B2 회피처럼 보이는 거동)이 나가는
+            # 문제가 실차에서 확인됨 — perc_obstacle_cut_trigger()/_update_obstacle_cut_hold()에
+            # 이미 걸려있는 것과 동일한 Phase.LAVACON 가드를 여기도 추가한다. Phase.OBSTACLE_ZONE
+            # 진입(=B1 완료) 후에만 실제로 발동한다.
+            near_obstacle = (self.phase != Phase.LAVACON
+                              and self.obstacle_front and self.obstacle_dist < AVOID_HOLD_TRIGGER_DIST_M)
         if not path or vehicle_x is None:
             return self.pure_pursuit.prev_steer_deg
-        vehicle_xy = (vehicle_x, path[0][1])
-        return self.pure_pursuit.control(path, vehicle_xy, speed=self._speed_for_lookahead(),
-                                          imu_curvature_px=self._imu_curvature_px(),
-                                          near_obstacle=near_obstacle)
+        vehicle_xy = (vehicle_x, path[0][1] if vehicle_y_px is None else vehicle_y_px)
+        # [2026-08-21] obstacle_cut 진입 후 PP_CURVATURE_BOOST_SEC 동안만
+        # lookahead_curvature_gain을 PP_CURVATURE_BOOST_GAIN으로 올린다 — pure_pursuit
+        # 인스턴스가 하나뿐이라(__init__ 참고) 매틱 여기서 스위칭해도 다른 호출부
+        # (_handle_lavacon() 등, near_obstacle=False 경로)에도 그대로 적용된다.
+        # _update_obstacle_cut_hold()가 타이머만 세팅, 실제 반영은 여기서.
+        now_t = time.time()
+        vehicle_lookahead_fix = now_t < self._pp_vehicle_lookahead_fix_until_t
+        # lookahead를 고정하는 동안은 curvature 부스트를 겹쳐 걸지 않고 평상시 게인으로 둔다(요청 반영).
+        self.pure_pursuit.lookahead_curvature_gain = (
+            PP_LOOKAHEAD_CURVATURE_GAIN if vehicle_lookahead_fix
+            else PP_CURVATURE_BOOST_GAIN if now_t < self._pp_curvature_boost_until_t
+            else PP_LOOKAHEAD_CURVATURE_GAIN)
+        return self.pure_pursuit.control(
+            path, vehicle_xy, speed=self._speed_for_lookahead(),
+            imu_curvature_px=self._imu_curvature_px(), near_obstacle=near_obstacle,
+            lookahead_override_px=PP_VEHICLE_LOOKAHEAD_FIX_PX if vehicle_lookahead_fix else None)
 
     # [DEBUG_VIZ_STEER] 조향 컨트롤러가 이번 주기에 "새로 계산"했는지(초록/현재값 반영)
     # "직전 조향각을 그대로 유지"했는지(주황/직전값 유지)를 별도 창으로 바로 확인.
@@ -2139,12 +2885,22 @@ class TrackDriverNode(Node):
         status_color = (0, 140, 255) if held else (0, 200, 0)
         status_text = '직전값 유지 (경로 부족/노이즈)' if held else '현재값 반영'
 
+        # [2026-08-23] 조향각(아래) = Pure Pursuit 컨트롤러 자체의 출력, behavior override
+        # (B1 라바콘 등)나 drive()의 ANGLE_MAX/ANGLE_RATE_MAX 클립을 아직 안 거친 값이라
+        # 실제 발행값과 다를 수 있다. 이 창의 호출 시점이 drive() 이후로 옮겨졌으니(호출부
+        # control_loop() 참고) self._prev_angle_out(drive()가 이번 틱에 마지막으로 클립해
+        # 발행한 각도)을 "발행조향"으로 같이 보여줘서 둘이 다를 때 바로 보이게 한다.
+        override_active = self.behavior_state != BehaviorState.B0_NORMAL
+        publish_color = (0, 140, 255) if override_active else (255, 255, 255)
+        publish_suffix = f' [override:{self.behavior_state.name}]' if override_active else ''
         lines = [
             ('컨트롤러: Pure Pursuit', (10, 8), (255, 255, 255), 20, 'Controller: Pure Pursuit'),
             (f'상태: {status_text}', (10, 40), status_color, 20,
              f'Status: {"HOLD (prev)" if held else "LIVE (fresh)"}'),
-            (f'조향각: {controller.prev_steer_deg:+.1f}도', (10, 72), (255, 255, 255), 20,
-             f'Steer: {controller.prev_steer_deg:+.1f}deg'),
+            (f'PP조향각: {controller.prev_steer_deg:+.1f}도', (10, 72), (255, 255, 255), 20,
+             f'PP steer: {controller.prev_steer_deg:+.1f}deg'),
+            (f'발행조향: {self._prev_angle_out:+.1f}도{publish_suffix}', (10, 104), publish_color, 20,
+             f'Published: {self._prev_angle_out:+.1f}deg{publish_suffix}'),
         ]
         # [2026-08-06] IMU curvature damping 보강이 실제로 반영되는지(그냥 코드만
         # 들어가고 IMU/VESC 둘 중 하나가 죽어서 조용히 폴백 중인 건 아닌지) 여기서
@@ -2254,21 +3010,12 @@ class TrackDriverNode(Node):
             ('토픽: /vesc_speed_erpm (std_msgs/Float32, vesc_speed_bridge.py 경유)',
              (10, 108), (180, 180, 180), 12, 'topic: /vesc_speed_erpm'),
         ]
-        # [2026-08-20] 좌회전(_do_left_turn())을 실측거리 기반으로 되돌리며, 진행상황
-        # 표시를 IMU 창(_debug_viz_imu(), 예전 yaw 기반)에서 여기로 옮겼다 — 이제 좌회전
-        # 진행 판정이 VESC 적분(_turn_dist)이라 이 창이 더 맞는 위치.
-        turn_active = self._turn_dist is not None
-        if turn_active:
-            trn_dist_target = (TURN_DIST_M if self.mission_state == MissionState.S0_SIGNAL
-                                else TURN_EXIT_DIST_M)
-            lines.append((
-                f'좌회전 중: {self._turn_dist:.2f}m / {trn_dist_target:.2f}m',
-                (10, 140), (0, 255, 255), 16,
-                f'TURNING: {self._turn_dist:.2f} / {trn_dist_target:.2f} m'))
-        elif self._checker_ramp_dist is not None:
-            # [2026-08-21] 체크무늬 게이트 램프(_do_checker_ramp_turn())도 같은 창에서
-            # 보이게 — _turn_dist가 아니라 _checker_ramp_dist를 쓰므로 위 turn_active만
-            # 보면 "진행 중 아님"으로 오인됨.
+        # [2026-08-20] 좌회전(_do_checker_ramp_turn())의 진행상황 표시를 IMU 창
+        # (_debug_viz_imu(), 예전 yaw 기반)에서 여기로 옮겼다 — 좌회전 진행 판정이 VESC
+        # 적분(_checker_ramp_dist)이라 이 창이 더 맞는 위치. [2026-08-22g] S3_SHORTCUT
+        # 진출 좌회전(_do_left_turn(), 옛 _turn_dist 기반)은 S3 자체를 삭제하며 같이
+        # 없어져 이제 진입 램프 하나만 표시한다.
+        if self._checker_ramp_dist is not None:
             lines.append((
                 f'체크무늬 램프 중: {self._checker_ramp_dist:.2f}m / {CHECKER_TURN_RAMP_DIST_M:.2f}m '
                 f'(angle={self.ctrl_angle:.1f}°)',
@@ -2285,10 +3032,9 @@ class TrackDriverNode(Node):
 
     # [DEBUG_VIZ_IMU] IMU(/imu) 연동이 실제로 살아있는지 + 지금 imu_yaw 값이 얼마인지를
     # 한눈에 보여주는 창(2026-08-18, _debug_viz_vesc()와 동일 패턴). [2026-08-20] 좌회전
-    # (_do_left_turn())을 실측거리 기반으로 되돌리며 좌회전 진행상황 표시는
-    # _debug_viz_vesc()로 옮겼다 — 이제 좌회전이 IMU를 참조하지 않는다. 이 창은 여전히
-    # _s3_shortcut()의 헤딩홀드(_shortcut_ref_yaw)가 IMU를 쓰므로 그 값 확인용으로 남긴다.
-    # control_loop()에서 매 주기 호출.
+    # 진행상황 표시는 _debug_viz_vesc()로 옮겼다 — 좌회전(체크무늬 게이트 램프) 자체는
+    # IMU를 참조하지 않는다. 이 창은 여전히 바퀴카운트(_update_lap()의 _yaw_accum) 등
+    # imu_yaw를 쓰는 다른 로직 확인용으로 남긴다. control_loop()에서 매 주기 호출.
     def _debug_viz_imu(self):
         now = time.time()
         if self._imu_t is None:
@@ -2471,68 +3217,340 @@ class TrackDriverNode(Node):
         cv2.imshow('avoid_hold_debug', canvas)
         cv2.waitKey(1)
 
-    # [DEBUG_VIZ_SIGNAL, 신규 2026-08-18] 신호등 "YOLO+HSV" 결과 창 — traffic_signal.py의
-    # signal4_roi/signal4_board_search(DEBUG_VIZ_SIGNAL_DETAIL, 후보탐색 과정 전체를 보여주는
-    # 상세 창, 평소엔 꺼둠)와 달리, 이 창은 전체 카메라 원본 위에 "지금 어디를 보고 있는지"
-    # (박스, 초록=이번 프레임 성공/빨강=실패)와 "그래서 결론이 뭔지"(순간값 + SIG_CONFIRM_FRAMES
-    # 디바운스를 통과한 확정값)를 한 창에서 같이 보여준다.
-    # [2026-08-19] "YOLO 단독" 결과 창(yolo_signal_state.py, yolo_signal_state_result)과 헷갈리지
-    # 않게 역할을 분리했다 — 이 창은 배경판 위치를 YOLO_SIGNAL_ENABLE에 따라 YOLO 또는 HSV
-    # 자동크롭으로 찾고, 점등 색상 판정은 항상 HSV/circle 기반(circle_brightness 등)인 하이브리드
-    # 결과만 보여준다. YOLO 단독 색상상태 예측과 직접 비교하고 싶으면 두 창을 나란히 띄워 볼 것.
-    # [2026-08-20] perc_signal()이 이제 S1_LANE_FOLLOW 중에도 detect_s2()를 돌리므로(S0_SIGNAL
-    # 진입 트리거를 정지선 대신 "보드 인식"으로 바꾼 것과 연동) control_loop()에서도 S1/S0
-    # 둘 다에서 호출한다. S1 중엔 색상 확정 카운터(_sig_straight_cnt/_sig_left_cnt)가 아직
-    # 안 돌므로(perc_signal() 참고) 그 대신 보드 인식 카운터(_sig_board_cnt)를 보여준다.
-    def _debug_viz_signal_status(self):
-        if self.img_front is None:
-            return
-        sd = self.signal_detector
-        vis = self.img_front.copy()
+    # [DEBUG_VIZ_OBSTACLE_CUT] da 근접 컷(ENABLE_OBSTACLE_CUT) 전용 상태창 —
+    #   avoid_hold_debug와 같은 구조(텍스트 줄로 라이다 raw/YOLO raw/AND확정/유지타이머
+    #   잔여시간/해제카운터를 한곳에 모아 보여줌). 실측 안 된 파라미터도 항상 같이
+    #   띄운다(config.py OBSTACLE_CUT_* 주석 참고).
+    # [2026-08-20] YOLO 차량검출(카메라) + 그 판정에 실제로 쓰인 라이다 ROI를 텍스트
+    # 상태 한 창에 합쳐서 그린다 — 원래는 YOLO 원시 박스가 'yolo_vehicle_result'라는
+    # 별도 창, 라이다 근접 여부는 이 창의 텍스트 한 줄(True/False)로만 나뉘어 있어서
+    # "욜로는 car라는데 라이다는 왜 안 잡히나/그 반대" 같은 AND 불일치 원인을 창 두 개를
+    # 오가며 봐야 했다 — 카메라 박스와 라이다 ROI 안 점을 나란히 놓고 바로 대조할 수 있게
+    # 한 창으로 합침(요청 반영). yolo_vehicle.py는 이제 전용 창을 안 띄우고
+    # get_latest_debug_frame()으로 프레임만 넘긴다(해당 함수 주석 참고).
+    # [2026-08-22, 요청 반영] "지금 B1/B2/B3 중 어느 단계고 뭘 기다리는지"를 터미널 로그
+    # (_print_debug()의 [{mission_state}|{behavior_state}|{phase}] 요약 줄, 상황 대응 중
+    # 알아보기 힘들다는 요청)가 아니라 _debug_viz_obstacle_cut() 창 상단에 한글 한 줄로
+    # 보여주기 위한 헬퍼 — (한글, BGR색, 영문) 튜플을 반환한다. run_behavior_fsm()의
+    # Phase.LAVACON/OBSTACLE_ZONE 분기와 정확히 같은 판단 순서(B1→B2→B3)를 그대로 따라간다.
+    # [2026-08-22h, 요청 반영] 좌회전 진입 램프 중(checker_pillar_trigger를 넘어
+    # _do_checker_ramp_turn()이 도는 구간)도 여기서 최우선으로 걸러 보여준다.
+    def _current_stage_label(self):
+        # [2026-08-22h, 요청 반영] 체크무늬 게이트 라이다 임계값(checker_pillar_trigger)을
+        # 넘어 좌회전 진입 램프(_do_checker_ramp_turn(), -10°→-30° 조향)로 넘어간 순간도
+        # 이 창 헤드라인에서 바로 보이게 — mission_state는 그동안 계속 S0_SIGNAL이라(램프가
+        # 끝나야 S1_LANE_FOLLOW로 전환됨) 아래 S0_SIGNAL 분기보다 먼저 걸러야 한다.
+        if self._checker_ramp_dist is not None:
+            return (f'좌회전 진입 중 (게이트 통과, 조향 {self.ctrl_angle:.1f}°, '
+                     f'{self._checker_ramp_dist:.2f}/{CHECKER_TURN_RAMP_DIST_M:.2f}m)',
+                    (0, 200, 0),
+                    f'LEFT TURN ENTRY (angle={self.ctrl_angle:.1f} deg, '
+                    f'{self._checker_ramp_dist:.2f}/{CHECKER_TURN_RAMP_DIST_M:.2f} m)')
 
-        t, b, l, r = sd.s2_roi_px
-        ok = not sd.s2_reject_reason
-        box_color = (0, 200, 0) if ok else (0, 0, 220)
-        cv2.rectangle(vis, (l, t), (r, b), box_color, 2, cv2.LINE_AA)
+        ms = self.mission_state
+        if ms == MissionState.S0_SIGNAL:
+            return '신호등 판독 대기', (0, 200, 255), 'S0_SIGNAL: waiting for light'
+        if ms == MissionState.S4_FINISH:
+            return '주행 종료', (150, 150, 150), 'S4_FINISH'
 
-        board_src_kr = 'YOLO' if YOLO_SIGNAL_ENABLE else 'HSV자동크롭'
+        if self.phase == Phase.LAVACON:
+            engaged = self._lavacon_engaged
+            state_kr = '진행 중(탈출 대기)' if engaged else '대기 중(좌우 동시검출 트리거 대기)'
+            state_en = 'engaged' if engaged else 'waiting for entry trigger'
+            color = (0, 200, 0) if engaged else (0, 140, 255)
+            return f'B1 라바콘 — {state_kr}', color, f'B1 LAVACON — {state_en}'
 
-        if self.mission_state == MissionState.S1_LANE_FOLLOW:
-            confirm_color = (0, 200, 0) if self.signal_board_confirmed else (0, 140, 255)
-            lines = [
-                (f'{self.mission_state.name}  [배경판:{board_src_kr}] — S0_SIGNAL 진입 대기 중',
-                 (10, 8), (255, 255, 255), 18, f'{self.mission_state.name}  [board:{board_src_kr}]'),
-                (f'이번 프레임 보드 인식: {"O" if ok else "X"}', (10, 40),
-                 (255, 255, 255) if ok else (0, 0, 220), 20, f'Board seen this frame: {"YES" if ok else "NO"}'),
-                (f'확정: {"보드 확정(곧 정지)" if self.signal_board_confirmed else "대기 중"} '
-                 f'({self._sig_board_cnt}/{SIG_CONFIRM_FRAMES})',
-                 (10, 72), confirm_color, 18, f'Confirmed: board={self.signal_board_confirmed}'),
-            ]
+        if self.phase == Phase.OBSTACLE_ZONE:
+            if not self._b2_passed:
+                tag, label_kr, label_en = 'B2', 'B2 고정장애물', 'B2 FIXED OBSTACLE'
+            elif not self._b3_passed:
+                tag, label_kr, label_en = 'B3', 'B3 방해차량', 'B3 VEHICLE'
+            else:
+                return 'OBSTACLE_ZONE 종료 처리 중', (150, 150, 150), 'OBSTACLE_ZONE finishing'
+            active = self._obscut_zone_tag == tag
+            state_kr = '감지됨(회피/통과 중)' if active else '대기 중(감지 안 됨)'
+            state_en = 'detected' if active else 'waiting'
+            color = (0, 200, 0) if active else (0, 140, 255)
+            return f'{label_kr} — {state_kr}', color, f'{label_en} — {state_en}'
+
+        return 'B1/B2/B3 모두 통과 — 다음 교차로 대기', (0, 200, 0), 'ALL PASSED — waiting for next intersection'
+
+    def _debug_viz_obstacle_cut(self):
+        now = time.time()
+        remaining = max(0.0, self._obstacle_cut_until_t - now)
+        active_color = (0, 200, 0) if self.obstacle_cut_active else (110, 110, 110)
+        slide = getattr(self.lane_detector, '_slide', None)
+        col_range = getattr(slide, 'obstacle_cut_col_range', None)
+        UNMEASURED = (60, 160, 255)
+
+        # [2026-08-21] B2(고정장애물=콘)/B3(방해차량) 공용 창 — obstacle_cut 메커니즘 자체가
+        # 라이다 ROI/트리거/유지타이머까지 완전히 공유라(perc_obstacle_cut_trigger() 참고)
+        # 창 대부분은 손 안 대고, 카메라 패널/검출값 텍스트만 지금 활성 스테이지
+        # (_active_yolo_stage(), Phase.OBSTACLE_ZONE에서 _b2_passed 기준 'cone'/'vehicle')에
+        # 맞춰 콘 검출기 ↔ 차량 검출기를 동적으로 바꿔 보여준다.
+        # [2026-08-22, 요청 반영] 상단 헤드라인에 "지금 B1/B2/B3 중 어느 단계고 뭘 기다리는지"
+        # 를 한 줄로 보여준다 — 예전엔 이 정보가 _print_debug()의 터미널 [SIG] 요약 줄로만
+        # 나와서 실시간으로 알아보기 어렵다는 요청 반영(_current_stage_label() 참고).
+        cam_stage = self._active_yolo_stage()
+        if cam_stage == 'vehicle':
+            cam_detector, cam_label = self.yolo_vehicle_cut_detector, 'YOLO VEHICLE CAM'
+            yolo_detected, yolo_flag_label = self.vehicle_detected_yolo_cut, 'car'
+            viz_flag_name = 'DEBUG_VIZ_YOLO_VEHICLE'
         else:
-            state_kr = ('좌회전' if self.signal_left_on else
-                        '직진'   if self.signal_straight_on else
-                        '정지(빨강)' if self.signal_red_on else '미검출')
-            confirmed = self.signal_left_confirmed or self.signal_straight_confirmed
-            confirm_kr = ('좌회전 확정' if self.signal_left_confirmed else
-                           '직진 확정'   if self.signal_straight_confirmed else '대기 중')
-            confirm_color = (0, 200, 0) if confirmed else (0, 140, 255)
-            lines = [
-                (f'{self.mission_state.name}  [배경판:{board_src_kr}+색상:HSV]', (10, 8), (255, 255, 255), 18,
-                 f'{self.mission_state.name}  [board:{board_src_kr}+color:HSV]'),
-                (f'이번 프레임: {state_kr}', (10, 40), (255, 255, 255) if ok else (0, 0, 220), 20,
-                 f'This frame: {state_kr}'),
-                (f'확정: {confirm_kr} (직진 {self._sig_straight_cnt}/{SIG_CONFIRM_FRAMES}  '
-                 f'좌회전 {self._sig_left_cnt}/{SIG_CONFIRM_FRAMES})',
-                 (10, 72), confirm_color, 18, f'Confirmed: {confirm_kr}'),
-            ]
-        if not ok:
-            lines.append((f'실패 사유: {sd.s2_reject_reason}', (10, 100), (0, 0, 220), 16,
-                           f'Fail: {sd.s2_reject_reason}'))
+            cam_detector, cam_label = self.yolo_cone_detector, 'YOLO CONE CAM'
+            yolo_detected, yolo_flag_label = self.cone_detected_yolo, 'cone'
+            viz_flag_name = 'DEBUG_VIZ_YOLO_CONE'
 
-        put_text_kr_multi(vis, lines)
-        cv2.rectangle(vis, (0, 0), (vis.shape[1] - 1, vis.shape[0] - 1), box_color, 3)
+        # --- 상단 카메라(YOLO)/라이다 BEV 패널 레이아웃 -------------------------------
+        CAM_W, CAM_H = 300, 220
+        cam_x0, cam_y0 = 10, 58   # [2026-08-22] 아래 stage 줄 추가로 34→58(+24px)
+        PANEL_W, PANEL_H = 240, CAM_H
+        panel_x0, panel_y0 = cam_x0 + CAM_W + 20, cam_y0
+        text_y0 = cam_y0 + CAM_H + 16
 
-        cv2.imshow('YOLO+HSV_신호등', vis)
+        canvas = np.full((text_y0 + 186, panel_x0 + PANEL_W + 10, 3), 30, dtype=np.uint8)
+
+        stage_kr, stage_color, stage_en = self._current_stage_label()
+        headline = [
+            (f'OBSTACLE-CUT: {"활성" if self.obstacle_cut_active else "대기"}  '
+             f'(남은 {remaining:.2f}s / floor={self._obstacle_cut_hold_sec_min:.2f}s)',
+             (10, 8), active_color, 17,
+             f'OBSTACLE-CUT: {"ACTIVE" if self.obstacle_cut_active else "idle"} '
+             f'({remaining:.2f}s left / floor={self._obstacle_cut_hold_sec_min:.2f}s)'),
+            (f'단계: {stage_kr}', (10, 30), stage_color, 17, f'STAGE: {stage_en}'),
+        ]
+        lines = [
+            (f'직전 해제 사유: {self.obstacle_cut_release_reason or "(아직 없음)"}   '
+             f'장애물 y={self._obstacle_cut_y if self._obstacle_cut_y is not None else "N/A"}',
+             (10, text_y0), (255, 255, 255), 14,
+             f'last release: {self.obstacle_cut_release_reason or "(none)"}'),
+            (f'[{cam_stage or "?"}단계] 트리거 — 라이다 근접={self._obstacle_cut_lidar_near}  '
+             f'YOLO {yolo_flag_label}={yolo_detected}  '
+             f'AND확정={self._obstacle_cut_trigger_cnt}/{OBSTACLE_CUT_TRIGGER_FRAMES}',
+             (10, text_y0 + 28), (255, 255, 255), 13,
+             f'[{cam_stage}] trigger — lidar={self._obstacle_cut_lidar_near} yolo={yolo_detected} '
+             f'confirm={self._obstacle_cut_trigger_cnt}/{OBSTACLE_CUT_TRIGGER_FRAMES}'),
+            (f'해제 진행 — 라이다클리어 {self._obstacle_cut_release_cnt}/{OBSTACLE_CUT_RELEASE_CONFIRM_FRAMES}',
+             (10, text_y0 + 50), (200, 200, 200), 13,
+             f'release progress {self._obstacle_cut_release_cnt}/{OBSTACLE_CUT_RELEASE_CONFIRM_FRAMES}'),
+            (f'좌우 교차검증 — 라이다={self._obstacle_cut_lidar_side} YOLO={self._obstacle_cut_yolo_side} '
+             + ('★불일치→vehicle_seen 취소★' if self._obstacle_cut_side_veto else '(일치 또는 미해당)'),
+             (10, text_y0 + 72), (0, 0, 255) if self._obstacle_cut_side_veto else (180, 180, 180), 13,
+             f'side-check lidar={self._obstacle_cut_lidar_side} yolo={self._obstacle_cut_yolo_side} '
+             f'veto={self._obstacle_cut_side_veto}'),
+            (f'컷 열(px) 범위 = {col_range}  (da BEV 좌표계)',
+             (10, text_y0 + 94), (255, 0, 255), 13, f'cut col range = {col_range}'),
+            (f'YOLO 검출기({cam_stage or "?"}): {"정상" if cam_detector is not None else "초기화실패→라이다단독폴백"}',
+             (10, text_y0 + 116), (255, 255, 255), 12,
+             f'yolo detector({cam_stage}): {"OK" if cam_detector is not None else "FAILED->lidar-only"}'),
+            ('── ★ 전 파라미터 실차 미검증 ★', (10, text_y0 + 140), UNMEASURED, 13,
+             '-- ALL PARAMS UNMEASURED --'),
+            (f'TRIGGER X_MAX={OBSTACLE_CUT_TRIGGER_X_MAX_M}m Y_HALF={OBSTACLE_CUT_TRIGGER_Y_HALF_M}m  '
+             f'NEAR_M={OBSTACLE_CUT_NEAR_M}m  PRE_CUT_SPEED_CAP={SPEED_PRE_OBSTACLE_CAP}(감지 전만)',
+             (10, text_y0 + 162), UNMEASURED, 12,
+             f'trigger_x={OBSTACLE_CUT_TRIGGER_X_MAX_M} y_half={OBSTACLE_CUT_TRIGGER_Y_HALF_M} '
+             f'near={OBSTACLE_CUT_NEAR_M} pre_cut_speed_cap={SPEED_PRE_OBSTACLE_CAP}(pre-detect only)'),
+        ]
+        put_text_kr_multi(canvas, headline + lines)
+
+        # --- 카메라(YOLO 원시 박스) 패널 — cam_stage에 따라 콘/차량 검출기 중 하나 --------
+        cam_vis = cam_detector.get_latest_debug_frame() if cam_detector is not None else None
+        cam_region = canvas[cam_y0:cam_y0 + CAM_H, cam_x0:cam_x0 + CAM_W]
+        if cam_vis is not None:
+            # 종횡비 유지 없이 단순 리사이즈(표시 전용 — yolo_vehicle.py/yolo_cone.py
+            # preprocess()와 동일 관례, "검출 여부"만 보면 되고 좌표 왜곡은 이 창의 목적에
+            # 영향 없음).
+            cam_region[:] = cv2.resize(cam_vis, (CAM_W, CAM_H), interpolation=cv2.INTER_LINEAR)
+        else:
+            reason = (f'{viz_flag_name} 확인' if cam_detector is not None else '검출기 초기화 실패')
+            cv2.putText(cam_region, f'카메라 프레임 없음 ({reason})', (8, CAM_H // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (140, 140, 140), 1, cv2.LINE_AA)
+        cv2.rectangle(canvas, (cam_x0, cam_y0), (cam_x0 + CAM_W - 1, cam_y0 + CAM_H - 1), (80, 80, 80), 1)
+        cv2.putText(canvas, cam_label, (cam_x0, cam_y0 - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1, cv2.LINE_AA)
+
+        # --- 라이다 ROI(트리거에 실제 쓰인 박스) BEV 패널 ---------------------------
+        # [2026-08-23] cv2 기본폰트(Hershey)는 한글을 못 그려 '매틱 갱신' 부분이 '????'로
+        # 깨져 보이던 버그 수정 — 다른 텍스트들과 동일하게 put_text_kr_multi(PIL 기반)로 교체.
+        put_text_kr_multi(canvas, [
+            ('LIDAR TRIGGER ROI (매틱 갱신)', (panel_x0, panel_y0 - 20), (180, 180, 180), 15,
+             'LIDAR TRIGGER ROI (updated every tick)'),
+        ])
+        bev = canvas[panel_y0:panel_y0 + PANEL_H, panel_x0:panel_x0 + PANEL_W]
+        DISP_X_MAX = OBSTACLE_CUT_TRIGGER_X_MAX_M + 1.0
+        DISP_Y_HALF = OBSTACLE_CUT_TRIGGER_Y_HALF_M + 0.45
+        PPM = min(PANEL_H / (DISP_X_MAX + 0.2), PANEL_W / (2 * DISP_Y_HALF + 0.2))
+        EX, EY = PANEL_W // 2, PANEL_H - 8
+
+        def to_px(wx, wy):
+            return (int(EX - wy * PPM), int(EY - wx * PPM))
+
+        for d in (0.5, 1.0, 1.5, 2.0):
+            if d > DISP_X_MAX:
+                break
+            cv2.circle(bev, (EX, EY), int(d * PPM), (55, 55, 55), 1)
+        # 실제 트리거 박스(OBSTACLE_CUT_TRIGGER_X_MAX_M x Y_HALF_M) — "검증범위" 그 자체
+        cv2.rectangle(bev, to_px(0.0, OBSTACLE_CUT_TRIGGER_Y_HALF_M),
+                      to_px(OBSTACLE_CUT_TRIGGER_X_MAX_M, -OBSTACLE_CUT_TRIGGER_Y_HALF_M),
+                      (0, 255, 255), 1)
+
+        bg_x, bg_y = self._obstacle_cut_bg_x, self._obstacle_cut_bg_y
+        for i in range(bg_x.size):
+            px, py = to_px(float(bg_x[i]), float(bg_y[i]))
+            if 0 <= px < PANEL_W and 0 <= py < PANEL_H:
+                cv2.circle(bev, (px, py), 2, (90, 90, 90), -1)   # 표시범위 안 배경점(미트리거, 회색)
+
+        roi_x, roi_y = self._obstacle_cut_roi_x, self._obstacle_cut_roi_y
+        for i in range(roi_x.size):
+            px, py = to_px(float(roi_x[i]), float(roi_y[i]))
+            if 0 <= px < PANEL_W and 0 <= py < PANEL_H:
+                cv2.circle(bev, (px, py), 4, (0, 0, 255), -1)   # 트리거 박스 안(실제 판정에 쓰인 점, 빨강)
+
+        if bg_x.size == 0:
+            # [2026-08-23] 위 패널 제목과 동일한 이유로 '????' 깨짐 수정 — put_text_kr_multi로 교체.
+            put_text_kr_multi(bev, [
+                ('(표시범위 안 점 없음)', (8, PANEL_H - 34), (120, 120, 120), 13,
+                 '(no points in range)'),
+            ])
+
+        cv2.circle(bev, (EX, EY), 5, (255, 220, 0), -1)          # 자차 위치
+        cv2.rectangle(bev, (0, 0), (PANEL_W - 1, PANEL_H - 1), (80, 80, 80), 1)
+
+        cv2.rectangle(canvas, (0, 0), (canvas.shape[1] - 1, canvas.shape[0] - 1), active_color, 3)
+        if 'obstacle_cut_debug' not in self._dbg_windows_positioned:
+            cv2.namedWindow('obstacle_cut_debug', cv2.WINDOW_AUTOSIZE)
+            cv2.moveWindow('obstacle_cut_debug', *DEBUG_WIN_POS_OBSTACLE_CUT)
+            self._dbg_windows_positioned.add('obstacle_cut_debug')
+        cv2.imshow('obstacle_cut_debug', canvas)
+        cv2.waitKey(1)
+
+    # [DEBUG_VIZ_LEFT_TURN] 좌회전(체크무늬 게이트 진입) 전용 통합 디버그 창.
+    #   [2026-08-22i, 요청 반영] "좌회전 관련 실행중/실행끝/발행각도/라이다감지 합친
+    #   디버그창 하나"로 신설 — 예전엔 이 네 가지가 obstacle_cut_debug(_current_stage_label()
+    #   헤드라인)/checker_pillar_bev(라이다 원시 BEV)에 흩어져 있었다. 같은 요청으로 이
+    #   창과 DEBUG_VIZ_DL_LANE(차선인식)만 남기고 나머지 DEBUG_VIZ_*는 다 껐다(config.py 참고).
+    #   [2026-08-22j/k/l, 요청 반영] 상태 텍스트 패널 아래에 전방 카메라(self.img_front)와
+    #   라이다 BEV(self._checker_pillar_bev_img)를 좌우로 나란히 붙여 한 창에서 텍스트+영상을
+    #   같이 본다.
+    def _debug_viz_left_turn(self):
+        running = self._checker_ramp_dist is not None
+        now = time.time()
+        since_done = (now - self._left_turn_last_done_t) if self._left_turn_last_done_t is not None else None
+
+        canvas = np.full((216, 480, 3), 30, dtype=np.uint8)
+
+        run_col = (0, 200, 0) if running else (110, 110, 110)
+        run_txt = f'실행중: {"예 (게이트 통과, 조향 램프 진행 중)" if running else "아니오"}'
+        run_en = f'RUNNING: {running}'
+
+        if since_done is None:
+            done_col, done_txt, done_en = (110, 110, 110), '실행끝: 아직 없음(한 번도 완료 안 됨)', 'FINISHED: never'
+        elif since_done < 3.0:
+            done_col, done_txt, done_en = (0, 255, 255), f'실행끝: 방금 완료 ({since_done:.1f}초 전)', f'FINISHED: {since_done:.1f}s ago'
+        else:
+            done_col, done_txt, done_en = (200, 200, 200), f'실행끝: 마지막 완료 {since_done:.1f}초 전', f'FINISHED: {since_done:.1f}s ago'
+
+        if running:
+            angle_txt = (f'발행각도: {self.ctrl_angle:.1f}°  '
+                         f'({CHECKER_TURN_RAMP_START_ANGLE:.0f}°→{CHECKER_TURN_RAMP_END_ANGLE:.0f}°, '
+                         f'{self._checker_ramp_dist:.2f}/{CHECKER_TURN_RAMP_DIST_M:.2f}m, '
+                         f'{CHECKER_TURN_RAMP_CURVE})')
+            angle_en = (f'ANGLE: {self.ctrl_angle:.1f} deg ({self._checker_ramp_dist:.2f}/'
+                        f'{CHECKER_TURN_RAMP_DIST_M:.2f}m, {CHECKER_TURN_RAMP_CURVE})')
+        else:
+            angle_txt = f'발행각도: {self.ctrl_angle:.1f}° (좌회전 램프 비활성 — 현재 전체 발행값)'
+            angle_en = f'ANGLE: {self.ctrl_angle:.1f} deg (ramp idle — current published value)'
+
+        lidar_col = (0, 200, 0) if self.checker_pillar_trigger else (110, 110, 110)
+        lidar_txt = (f'라이다감지: {self.checker_pillar_trigger}  '
+                     f'(디바운스 {self._checker_pillar_trigger_cnt}/{CHECKER_PILLAR_CONFIRM_FRAMES}, '
+                     f'좌{self.checker_pillar_left_detected} 우{self.checker_pillar_right_detected}, '
+                     f'간격 {self.checker_pillar_lat_dist_m:.2f}m)')
+        lidar_en = (f'LIDAR: trigger={self.checker_pillar_trigger} '
+                    f'cnt={self._checker_pillar_trigger_cnt}/{CHECKER_PILLAR_CONFIRM_FRAMES}')
+
+        # [2026-08-22m, 요청 반영: "욜로 신호등이 어떤 상태로 검출됐는지도 한줄 추가"]
+        # perc_yolo_signal_state()가 매 프레임 갱신하는 원시 점등 상태(signal_red/left/
+        # straight_on)와 perc_signal()이 SIG_CONFIRM_FRAMES 연속 유지로 승격시킨 확정값
+        # (signal_left/straight_confirmed)을 한 줄로 같이 보여준다 — _print_debug()의
+        # 터미널 [SIG] 로그(sig_flags)와 동일한 포맷.
+        sig_col = (0, 200, 0) if (self.signal_left_confirmed or self.signal_straight_confirmed) else (200, 200, 200)
+        sig_txt = (f'신호등(YOLO): R{int(self.signal_red_on)} L{int(self.signal_left_on)} '
+                   f'S{int(self.signal_straight_on)}  확정 L={int(self.signal_left_confirmed)}'
+                   f'({self._sig_left_cnt}/{SIG_CONFIRM_FRAMES}) '
+                   f'S={int(self.signal_straight_confirmed)}({self._sig_straight_cnt}/{SIG_CONFIRM_FRAMES})')
+        sig_en = (f'SIGNAL(YOLO): R={int(self.signal_red_on)} L={int(self.signal_left_on)} '
+                  f'S={int(self.signal_straight_on)} confirmL={int(self.signal_left_confirmed)} '
+                  f'confirmS={int(self.signal_straight_confirmed)}')
+
+        # [2026-08-23c, 요청 반영] "YOLO_신호등 창엔 분명히 찍히는데 여기(확정 L/S)엔 안
+        # 뜬다"는 혼란의 실제 원인은 대부분 _active_yolo_stage()가 이 틱에 'signal'을
+        # 아예 리턴 안 해서(phase가 Phase.LAVACON/OBSTACLE_ZONE으로 넘어가 있으면
+        # perc_yolo_signal_state() 자체가 안 불림) — 그럴 땐 YOLO_신호등 창은 마지막으로
+        # 성공했던 추론 결과가 그대로 얼어붙어 있는 것뿐이다(백그라운드 워커가 새 프레임을
+        # 못 받아 유휴 상태, yolo_signal_state.py _worker() 참고). 한눈에 구분되게
+        # phase/현재 활성 YOLO 스테이지를 별도 줄로 보여준다.
+        yolo_stage = self._active_yolo_stage()
+        stage_col = (0, 200, 0) if yolo_stage == 'signal' else (0, 120, 220)
+        stage_txt = (f'phase={self.phase.name}  활성 YOLO={yolo_stage!r}'
+                     + ('' if yolo_stage == 'signal' else '  ← 신호등 YOLO 꺼짐, 위 확정 안 뜸'))
+        stage_en = f'phase={self.phase.name} active_yolo_stage={yolo_stage!r}'
+
+        put_text_kr_multi(canvas, [
+            ('좌회전 진입 램프 통합 상태', (10, 8), (255, 255, 255), 18, 'LEFT TURN ENTRY STATUS'),
+            (run_txt, (10, 40), run_col, 16, run_en),
+            (done_txt, (10, 66), done_col, 16, done_en),
+            (angle_txt, (10, 96), (0, 255, 255) if running else (200, 200, 200), 15, angle_en),
+            (lidar_txt, (10, 126), lidar_col, 15, lidar_en),
+            (sig_txt, (10, 156), sig_col, 14, sig_en),
+            (stage_txt, (10, 182), stage_col, 14, stage_en),
+        ])
+
+        border_col = (0, 200, 0) if running else (80, 80, 80)
+        cv2.rectangle(canvas, (0, 0), (canvas.shape[1] - 1, canvas.shape[0] - 1), border_col, 3)
+        panel_w = canvas.shape[1]
+
+        # [2026-08-22l, 요청 반영: "카메라 영상부분을 옆으로 붙여줘"] 전방 카메라
+        # (self.img_front, YOLO 오버레이 없는 원본 그대로)와 라이다 BEV
+        # (self._checker_pillar_bev_img)를 상태 패널 아래에 좌우로 나란히 붙인다 — 둘의
+        # 종횡비가 서로 달라 자연 크기로는 나란히 맞추기 어려우므로, obstacle_cut_debug
+        # 카메라 패널과 동일 관례(종횡비 무시 단순 리사이즈 — "표시 전용, 좌표 왜곡은 이
+        # 창의 목적에 영향 없음")로 각각을 고정 박스에 맞춘다.
+        # [2026-08-23] 이 안의 두 패널을 잠깐 축소했다가(요청 오해) 원복 — "카메라욜로랑
+        # 검출라이다 크기 줄여줘"는 이 통합창 안의 패널이 아니라 독립 창인 'YOLO_신호등'
+        # (perception/yolo_signal_state.py)과 'checker_pillar_bev'(DEBUG_VIZ_CHECKER_PILLAR
+        # 단독 창) 얘기였다 — 그쪽에서 축소 처리.
+        half_w = panel_w // 2
+        HALF_H = 220
+
+        if self.img_front is not None:
+            cam_panel = cv2.resize(self.img_front, (half_w, HALF_H), interpolation=cv2.INTER_AREA)
+        else:
+            cam_panel = np.full((HALF_H, half_w, 3), 30, dtype=np.uint8)
+            cv2.putText(cam_panel, 'no frame yet', (10, HALF_H // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (110, 110, 110), 1, cv2.LINE_AA)
+        cv2.putText(cam_panel, 'FRONT CAM', (8, 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+
+        if self._checker_pillar_bev_img is not None:
+            bev_panel = cv2.resize(self._checker_pillar_bev_img, (panel_w - half_w, HALF_H),
+                                    interpolation=cv2.INTER_AREA)
+        else:
+            bev_panel = np.full((HALF_H, panel_w - half_w, 3), 30, dtype=np.uint8)
+            cv2.putText(bev_panel, 'no frame yet', (10, HALF_H // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (110, 110, 110), 1, cv2.LINE_AA)
+        cv2.putText(bev_panel, 'LIDAR BEV', (8, 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+
+        cam_row = np.hstack([cam_panel, bev_panel])
+        cv2.line(cam_row, (half_w, 0), (half_w, HALF_H - 1), (80, 80, 80), 1)
+
+        combined = np.vstack([canvas, cam_row])
+        if 'left_turn_debug' not in self._dbg_windows_positioned:
+            cv2.namedWindow('left_turn_debug', cv2.WINDOW_AUTOSIZE)
+            cv2.moveWindow('left_turn_debug', *DEBUG_WIN_POS_LEFT_TURN)
+            self._dbg_windows_positioned.add('left_turn_debug')
+        cv2.imshow('left_turn_debug', combined)
         cv2.waitKey(1)
 
     def _lane_pid(self, offset, deadzone=LANE_DEADZONE):
@@ -2594,37 +3612,136 @@ class TrackDriverNode(Node):
                 f'보임(추정 속도={target_speed_est:+.2f}m/s) — 오검출/오판 의심',
                 throttle_duration_sec=1.0)
 
-    # ── B1-라바콘: 좌우 콘 클러스터 중앙 경로 추종([2026-08-19] 보로노이에서 교체) ──
+    # ── B1-라바콘: 박스 스택 페어링 경로 추종([2026-08-19] 보로노이 → 클러스터 매칭 → 박스 스택으로 교체) ──
     def _handle_lavacon(self):
         """
-        Phase.LAVACON 동안 항상 활성(트리거 조건 없음).
+        [2026-08-22] 요청 반영 — run_behavior_fsm()이 다시 behavior_state=B1_LAVACON을
+        세팅하게 되면서(_lavacon_engaged인 동안) 이 함수가 다시 호출된다. exit(구간 종료)
+        판정은 여전히 run_behavior_fsm()의 Phase.LAVACON 분기가 전담하므로 여기서는
+        중복으로 하지 않는다(아래 함수 끝 주석 참고).
+
+        (아래는 실제 회피 조향 로직 자체 설명)
         우측 콘이 연속 LAVACON_DONE_FRAMES 프레임 미검출되면 고정장애물 구간으로 전환.
 
         [2026-08-11] 조향은 라바콘 전용 P게인(LAVACON_KP, 폐기) 대신 _lane_steer()를
         그대로 재사용한다 — 라인주행(_lane_drive())과 조향 파라미터(self.pure_pursuit
         인스턴스, PP_* 게인, ANGLE_MAX/ANGLE_RATE_MAX)를 완전히 일치시키기로 한 결정.
         self.lavacon_path는 perc_lavacon()이 라이다 미터 좌표를
-        self.lane_path와 같은 px 스케일로 변환해둔 것이고, 차량 기준점은 그 변환의
-        원점인 (0.0, path[0].y)다.
-        """
-        self.ctrl_angle = self._lane_steer(path=self.lavacon_path, vehicle_x=0.0)
-        self.ctrl_speed = SPEED_LAVACON
+        self.lane_path와 같은 px 스케일로 변환해둔 것이고(row 0 = 라이다 원점), 차량
+        기준점은 그 변환의 원점에서 LIDAR_TO_VEHICLE_FRONT_M만큼 뒤로 민 지점이다.
 
-        if self.lavacon_done:
-            self._lavacon_empty_cnt += 1
-            if self._lavacon_empty_cnt >= LAVACON_DONE_FRAMES:
-                self._lavacon_empty_cnt = 0
-                self._pid_prev_error = 0.0
-                self._pid_integral   = 0.0
-                self._lavacon_engaged = False   # B1 진입 latch 해제 (구간 재진입 대비)
-                self.phase = Phase.OBSTACLE_ZONE
-                self.get_logger().info('[LAVACON] 구간 통과 완료 → 장애물 구간')
+        [2026-08-19] vehicle_x=0.0은 여전히 라이다의 좌우 중심(라이다가 차량에 좌우로는
+        정렬돼 있다고 가정)과 같지만, 종방향(전후)은 라이다가 차량 맨 앞부분보다 실측
+        LIDAR_TO_VEHICLE_FRONT_M(config.py, lavacon_bev 디버그창에서 자차 마커를 실측
+        물체와 맞춰 확인)만큼 앞에 있다는 게 확인돼서, _lane_steer()의 vehicle_y_px에
+        "라이다 원점(row 0) 기준 차량의 절대 행" = +LIDAR_TO_VEHICLE_FRONT_M*
+        DL_PIXELS_PER_METER(전방=y감소 관례라 양수=뒤쪽)를 직접 넘긴다 — path[0]의 행에
+        더하는 게 아니라 완전히 대체하는 것에 주의(path[0]은 BOX_LON_START 등 다른
+        값에 좌우되는 별개 기준이라 더하면 틀린 값이 나온다, _lane_steer() 주석 참고).
+        안 넘기면(구 동작) 차량이 실제보다 LIDAR_TO_VEHICLE_FRONT_M만큼 앞서 있다고
+        착각해 Pure Pursuit lookahead 거리가 그만큼씩 짧게 계산된다. 실차 재검증
+        필요(2026-08-19, 코드 리뷰 수준 반영).
+
+        [2026-08-19] LAVACON_STEER_MODE_DA_PUSH=True면 위 박스 스택 경로(self.lavacon_path)
+        대신 _lavacon_steer_da_push()(da 경로 + 콘 침범 시 옆으로 밀기)를 쓴다. 기본
+        False라 안 켜면 이 함수의 나머지 동작은 전과 100% 동일 — self.lavacon_done 기반
+        구간 종료 판정도 두 모드에서 공유한다(perc_lavacon()이 매 틱 그대로 계산해두므로).
+        """
+        if LAVACON_KICK_ENABLED and self._lavacon_kick_cnt > 0:
+            # [2026-08-23, 요청 반영] 실험용 킥 구간 — push/차선 조향 계산을 건너뛰고 고정
+            # 조향각을 강제. 디버그창(push 표시)이 이번 틱엔 "안 밀림"으로 보이도록 push
+            # 플래그도 같이 꺼둔다. 속도는 손대지 않음 — 아래 _update_speed()가 그대로 돎.
+            self._lavacon_kick_cnt -= 1
+            self.ctrl_angle = LAVACON_KICK_ANGLE_DEG
+            self._lavacon_push_active = False
+            self._lavacon_push_px = 0.0
+        elif LAVACON_STEER_MODE_DA_PUSH:
+            self.ctrl_angle = self._lavacon_steer_da_push()
         else:
-            self._lavacon_empty_cnt = 0
+            self.ctrl_angle = self._lane_steer(
+                path=self.lavacon_path, vehicle_x=0.0,
+                vehicle_y_px=LIDAR_TO_VEHICLE_FRONT_M * DL_PIXELS_PER_METER)
+        # [2026-08-22] SPEED_LAVACON(2.5 고정) 삭제(요청 반영) — 여기서 매 틱 고정속도로
+        # 덮어써서 B1 진입 즉시 그 값에 "굳는" 증상이 실차에서 확인됐다. 이후(같은 날
+        # 재요청) "S1 주행하던 대로 똑같이"로 다시 바뀌어, 진입 시점 속도를 얼려두는 대신
+        # _update_speed()(_lane_drive()와 공유하는 코너 감속/가속 램프 로직, speed15
+        # 프리셋 기준 SPEED_NORMAL=12/SPEED_CORNER_MIN=10 사이에서 동적으로 움직임)를
+        # 그대로 재사용한다 — self.ctrl_angle만 위에서 이미 라바콘 조향으로 바뀐 상태라
+        # _update_speed()는 조향 소스를 몰라도(코너 신호는 ctrl_angle 하나만 봄) 동일하게
+        # 동작한다.
+        self._update_speed()
+        # exit(구간 종료) 판정은 run_behavior_fsm()의 Phase.LAVACON 분기로 옮겨졌다 —
+        # 이 함수가 다시 불리게 되는 시점에도 여기서 중복으로 하지 않는다(위 docstring 참고).
+
+    # ── B1-라바콘 대안 조향: da 경로 + 콘 침범 시 옆으로 밀기 (LAVACON_STEER_MODE_DA_PUSH) ──
+    #   [2026-08-19] 라이다 박스 스택 페어링이 실차에서 계속 듬성한 검출/노이즈에 시달려서
+    #   (요청 반영) 아예 다른 축으로 전환. da(주행가능영역) 경로(self.lane_path, S1/S3
+    #   차선주행과 완전히 같은 신호)를 그대로 신뢰하고 조향하되, YOLO로 재확인된 콘이
+    #   안전마진(LAVACON_PUSH_SAFETY_MARGIN_M) 안으로 들어왔을 때만 그만큼 반대쪽으로
+    #   self.lane_path 전체를 옆으로 밀어서 _lane_steer()에 넘긴다. "정밀한 경로 재구성"
+    #   대신 "위험할 때만 미는" 훨씬 단순하고 견고한 신호라, 라이다가 콘 1점만 듬성하게
+    #   봐도(박스 스택이 실차에서 계속 시달린 문제) 바로 동작한다. da 단독으로도 라바콘
+    #   구간을 그럭저럭 지나간다는 게 실차로 이미 확인됨(사용자, 2026-08-19).
+    def _lavacon_steer_da_push(self):
+        """[2026-08-19, 최초 도입] push는 원래 self.cone_detected_yolo(그 프레임에 카메라로도
+        콘이 실제 보일 때)로만 켰다 — perc_lavacon_trigger()가 진입 판정에 라이다 단독 대신
+        YOLO AND 라이다를 쓰는 것과 같은 이유(라이다 단독 클러스터는 벽 모서리 등에서 오검출
+        여지가 있음).
+
+        [2026-08-21, 요청 반영] 그 매 프레임 카메라 재확인 게이트를 뺐다 — 실차에서 라이다
+        클러스터는 선명하게 잡히는데도 YOLO가 그 프레임에 콘을 놓쳐(카메라 각도/거리/조도 등)
+        push 자체가 안 걸리는 문제가 있었다(사용자 실측). 이 함수는 이제 `_lane_drive()`에서
+        `self._lavacon_engaged`가 True일 때만 불린다 — 그 latch 자체가 이미
+        perc_lavacon_trigger()의 라이다 AND YOLO 이중확인을 거쳐 확정된 것이므로("지금
+        라바콘 구간 안"이라는 전제가 이미 보장됨), 매 프레임 카메라 재확인 없이 라이다
+        근접만으로 push를 켜도 진입 오검출 문제와는 별개다(진입 자체는 여전히 이중확인 그대로).
+
+        push_m 부호: nearest_cone_lateral()의 y는 좌측+ — 좌측 콘이 안전마진을 침범하면
+        그만큼 우측(+px)으로, 우측 콘이 침범하면 그만큼 좌측(-px)으로 민다. 두 콘이 동시에
+        침범하면(통로 자체가 마진의 2배보다 좁음) 서로 상쇄돼 순 push가 줄어드는데, 이건
+        "이미 중앙에 있으면 그대로 두는" 게 맞는 동작이라 의도된 결과다.
+
+        vehicle_x는 밀지 않는다 — path만 밀어야 "차량이 경로 대비 반대쪽으로 치우쳤다"고
+        Pure Pursuit이 해석해 실제로 옆으로 붙는 조향이 나온다. vehicle_x도 같이 밀면
+        상대위치가 그대로라 아무 효과가 없다.
+        """
+        left_y, right_y = nearest_cone_lateral(
+            self.lidar_ranges, LAVACON_PUSH_LON_MIN, LAVACON_PUSH_LON_MAX,
+            LAVACON_PUSH_LAT_LIMIT)
+        push_m = 0.0
+        if left_y is not None and left_y < LAVACON_PUSH_SAFETY_MARGIN_L_M:
+            push_m += LAVACON_PUSH_SAFETY_MARGIN_L_M - left_y        # 좌측 콘 침범 → 우측(+)으로
+        if right_y is not None and -right_y < LAVACON_PUSH_SAFETY_MARGIN_R_M:
+            push_m -= LAVACON_PUSH_SAFETY_MARGIN_R_M - (-right_y)    # 우측 콘 침범 → 좌측(-)으로
+        push_m *= LAVACON_PUSH_GAIN  # [2026-08-22b] 요청 반영 — 미는 세기 2배
+        push_px = push_m * DL_PIXELS_PER_METER
+        # [2026-08-22] 요청 반영 — 이번 틱에 실제로 밀렸는지(lavacon_bev의 push ROI/
+        # 자홍 박스가 콘 침범을 잡아 push_m이 0이 아닌 경우)를 DA 디버그창에도 반영한다
+        # (perc_lane()의 set_lavacon_push() 참고, lane_util.py draw_path()가 소비).
+        # push_px(실제 밀린 양)도 같이 넘겨서, 디버그창이 밀리기 전(보라) 원본과 밀린 뒤
+        # (주황) 경로를 나란히 그릴 수 있게 한다 — 게인 튜닝 시 밀림 정도를 눈으로 참고.
+        self._lavacon_push_active = (push_m != 0.0)
+        self._lavacon_push_px = push_px
+
+        shifted_path = [(x + push_px, y) for x, y in self.lane_path]
+
+        # [2026-08-17] _lane_steer()의 path=None 기본분기와 동일한 vehicle_x 산출(그대로
+        # 복붙) — 여기선 path를 명시로 넘기므로 그 분기를 안 타 자동 계산이 안 된다.
+        roi_w = getattr(self.lane_detector, 'roi_w', 0) or 0
+        vehicle_x = getattr(self.lane_detector, 'vehicle_center_x', None)
+        if vehicle_x is None:
+            vehicle_x = roi_w / 2.0
+
+        return self._lane_steer(path=shifted_path, vehicle_x=vehicle_x)
 
     # ── B2-고정장애물 회피 ──
     #   차선 2개 + 넘어도 되는 노란 중앙선 구조라, 방향은 '반대편 차선' 하나로 정해진다.
     #   좌우 선택 로직은 ObstacleAvoidance.decide_lane() 이 lane_side 로 처리한다.
+    #   [2026-08-20] 요청 반영 — B2 실제 회피가 da 근접 컷(obstacle_cut_active)으로
+    #   바뀌면서(run_behavior_fsm()의 Phase.OBSTACLE_ZONE 분기 참고) behavior_state가
+    #   B2_OBSTACLE이 되는 경로 자체가 없어졌다 — 이 함수는 지금 호출되지 않는다.
+    #   TargetPassing 기반 회피를 다시 쓰려면 그 분기에서 behavior_state를 B2_OBSTACLE로
+    #   되돌리면 된다.
     def _handle_fixed_obstacle(self):
         if not self._da_avoidance_failed():
             # da 기반 경로(Mission의 lane-follow 출력)가 알아서 피하고 있다고 신뢰 —
@@ -2660,6 +3777,11 @@ class TrackDriverNode(Node):
     # target_lane 반영 수정
     # 회피 후 복귀하는 로직 추가 : idle -> avoid -> idle+B2/B3 완료 => idel -> avoid -> return -> idle
     # (2026-08-15: Phase.VEHICLE는 Phase.OBSTACLE_ZONE 통합으로 없어짐 — _mark_behavior_passed() 참고)
+    # [2026-08-20] 요청 반영 — B3 실제 회피가 da 근접 컷(obstacle_cut_active, YOLO 차량+
+    # 라이다 AND 트리거)으로 옮겨가면서(run_behavior_fsm()의 Phase.OBSTACLE_ZONE 분기 참고)
+    # behavior_state가 B3_VEHICLE이 되는 경로 자체가 없어졌다 — 이 함수는 지금 호출되지
+    # 않는다. TargetPassing 기반 추월을 다시 쓰려면 그 분기에서 behavior_state를
+    # B3_VEHICLE으로 되돌리면 된다.
     def _handle_overtake(self):
         """방해차량 추월. 규정상 '방해차량이 주행하지 않는 차선'으로 지나가야 하고,
         그 차량이 1·2차선을 오가므로 매 프레임 타겟 횡위치를 다시 보고 필요하면
@@ -2887,18 +4009,18 @@ class TrackDriverNode(Node):
         self._update_lap()                  #    바퀴 카운트(누적 yaw + 정지선)
         self.run_mission_fsm()              # 2. 판단(Mission)
 
-        if DEBUG_VIZ_STEER:
-            # behavior override 이전 시점 — 차선 조향 컨트롤러 자체의 상태를 보여준다
-            # (_debug_viz_steer() 상단 주석 참고).
-            self._debug_viz_steer()
+        # [2026-08-23] DEBUG_VIZ_STEER는 여기 있었으나 behavior override/drive()의 각도
+        # 클립(ANGLE_MAX, ANGLE_RATE_MAX) 이전 시점이라 "조향각" 줄이 실제 발행값과
+        # 다를 수 있었다(디버그창엔 찍히는데 실제로는 다른 각도가 나가는 것처럼 보이는
+        # 원인) — DEBUG_VIZ_LEFT_TURN과 동일하게 drive() 이후로 옮겼다(아래 참고).
         if DEBUG_VIZ_VESC:
             self._debug_viz_vesc()
         if DEBUG_VIZ_IMU:
             self._debug_viz_imu()
         if DEBUG_VIZ_AVOID_HOLD:
             self._debug_viz_avoid_hold()
-        if DEBUG_VIZ_SIGNAL and self.mission_state in (MissionState.S1_LANE_FOLLOW, MissionState.S0_SIGNAL):
-            self._debug_viz_signal_status()
+        if DEBUG_VIZ_OBSTACLE_CUT:
+            self._debug_viz_obstacle_cut()
 
         if ENABLE_BEHAVIOR and self.mission_state == MissionState.S1_LANE_FOLLOW and self._behavior_enabled:
             self.run_behavior_fsm()         #    Behavior 상태 결정
@@ -2912,6 +4034,17 @@ class TrackDriverNode(Node):
         self.pose_estimator.update(self.v_mps, math.radians(self.ctrl_angle), 0.05)
 
         self.drive(self.ctrl_angle, self.ctrl_speed)   # 4. 발행
+        if DEBUG_VIZ_STEER:
+            # [2026-08-23] behavior override + drive()의 각도 클립(ANGLE_MAX,
+            # ANGLE_RATE_MAX)까지 다 반영된 뒤(=이번 틱에 실제로 발행된 값)에 그린다.
+            # _debug_viz_steer() 안의 "발행조향" 줄이 self._prev_angle_out(drive()가
+            # 방금 갱신한 최종 클립값)을 쓰는 이유.
+            self._debug_viz_steer()
+        if DEBUG_VIZ_LEFT_TURN:
+            # [2026-08-22i] "발행각도"가 이번 틱에 실제로 발행된 값이어야 하므로
+            # drive() 이후에 그린다(위 VESC/IMU/OBSTACLE_CUT 창들은 behavior
+            # override 이전 시점이라 이 창과 달리 최종 발행값과 어긋날 수 있음).
+            self._debug_viz_left_turn()
         if DEBUG_LOG:                                    # 5. 디버그
             self._print_debug()
 
@@ -2919,6 +4052,30 @@ class TrackDriverNode(Node):
     # #########################################################
     # [6] 유틸/디버그
     # #########################################################
+    # [2026-08-22, 요청 반영] _print_debug() 맨 앞 [mission|behavior|phase] 요약 줄의 가운데
+    # 칸이 실제로는 거의 항상 "B0_NORMAL"로 고정돼 있어(§5.5 위 주석 — 실제 회피는
+    # behavior_state가 아니라 obstacle_cut_active가 담당, run_behavior_fsm() 참고) 그 자리만
+    # 보고는 지금 B1/B2/B3 중 어디에 있는지 알 수 없었다. self.behavior_state 자체를 바꾸면
+    # apply_behavior_override()가 옛 TargetPassing 핸들러(_handle_lavacon()/
+    # _handle_fixed_obstacle()/_handle_overtake())를 다시 불러버려 실제 주행이 깨지므로
+    # (그래서 run_behavior_fsm()이 항상 B0_NORMAL로 고정해둔 것), 이 태그는 표시 전용이고
+    # self.behavior_state는 건드리지 않는다 — run_behavior_fsm()과 동일한 판단 순서
+    # (B1→B2→B3)를 그대로 따라간다. 뒤에 '+'가 붙으면 그 단계가 지금 실제로 감지/진행
+    # 중이라는 뜻(대기 중이면 안 붙음) — obstacle_cut_debug 창의 _current_stage_label()과
+    # 같은 근거(_lavacon_engaged/_b2_passed/_b3_passed/_obscut_zone_tag)를 쓴다.
+    def _behavior_progress_tag(self):
+        if self.mission_state != MissionState.S1_LANE_FOLLOW:
+            return self.behavior_state.name
+        if self.phase == Phase.LAVACON:
+            return 'B1_LAVACON' + ('+' if self._lavacon_engaged else '')
+        if self.phase == Phase.OBSTACLE_ZONE:
+            pending = 'B2' if not self._b2_passed else ('B3' if not self._b3_passed else None)
+            if pending is None:
+                return 'B0_NORMAL'
+            name = 'B2_OBSTACLE' if pending == 'B2' else 'B3_VEHICLE'
+            return name + ('+' if self._obscut_zone_tag == pending else '')
+        return 'B0_NORMAL'  # Phase.DONE — B1/B2/B3 모두 통과, 다음 교차로 대기
+
     def _print_debug(self):
         """0.5초마다 여러 줄로 상태 덤프. 별도 터미널(rqt/topic echo) 없이 이 로그만으로
         센서 원시상태(카메라 살아있는지·신호색·라이다 포인트수)부터 트리거 카운터까지 확인 가능하게 함.
@@ -2930,7 +4087,7 @@ class TrackDriverNode(Node):
           [LANE] 차선편차px(검출여부) stale=LANE_STALE_SEC 이상 새 추론결과 없음(1) 여부
                  (SPEED_LANE_STALE로 강제감속 중이라는 뜻 — 코너 아닌데 감속되면 이거 확인)
                  / obs = 라이다 전방장애물(거리m,좌우,타입)
-          lava   = 라바콘 좌우 클러스터 중앙 편차(구간종료 판정)
+          lava   = 라바콘 박스 스택 페어링 중앙 편차(디버그/로깅용, 조향엔 미사용)
           trigL  = 라바콘 진입: 본선카운트/기준 (좌클러스터,우클러스터 검출여부)
           trigV  = 차량 진입:   본선카운트/기준
           [LAVA-ROI] 라바콘 트리거 ROI(전방0.3~3.0m,좌우2.0m) 안에 잡힌 점 개수(pts)와
@@ -2967,21 +4124,22 @@ class TrackDriverNode(Node):
         masked_pts, masked_min = self._lavacon_mask_dbg
         masked_min_s = f'{masked_min:.2f}m' if masked_min >= 0 else 'N/A'
 
-        sig_line = ''
-        if self.mission_state == MissionState.S0_SIGNAL:
-            sd = self.signal_detector
-            reason = sd.s2_reject_reason or 'OK'
-            sig_line = (
-                f'\n  [SIG] roi={sd.s2_roi_px} circles={sd.s2_circle_count} '
-                f'reason={reason} bright={sd.s2_brightness}'
-            )
-
         sig_flags = (f'R{int(self.signal_red_on)}L{int(self.signal_left_on)}S{int(self.signal_straight_on)} '
                      f'confirmS{int(self.signal_straight_confirmed)}({self._sig_straight_cnt}/{SIG_CONFIRM_FRAMES})'
                      f'L{int(self.signal_left_confirmed)}({self._sig_left_cnt}/{SIG_CONFIRM_FRAMES})')
+        # [2026-08-21] B2/B3 실제 회피는 behavior_state(override 여부)가 아니라 da 근접 컷
+        # (obstacle_cut_active)으로 이뤄져서 이 상태에선 behavior_state가 항상 B0_NORMAL로
+        # 고정돼(run_behavior_fsm() Phase.OBSTACLE_ZONE 분기 참고) 로그만 보면 회피 중인지
+        # 구분이 안 됐다 — obstacle_cut_debug(cv2 창)를 못 볼 때도 터미널에서 바로 보이게
+        # 요약 줄에 추가.
+        cut_desc = (f'{"ON" if self.obstacle_cut_active else "off"}'
+                    f'({self.obstacle_cut_type})' if self.obstacle_cut_type != 'none'
+                    else ("ON" if self.obstacle_cut_active else "off"))
+        # [2026-08-22, 요청 반영] 가운데 칸을 self.behavior_state.name(거의 항상 B0_NORMAL)
+        # 대신 _behavior_progress_tag()로 바꿔 B1→B2→B3 진행이 이 한 줄에서 바로 보이게 함.
         self.get_logger().info(
-            f'[{self.mission_state.name}|{self.behavior_state.name}|{self.phase.name}] '
-            f'ang={self.ctrl_angle:+.1f} spd={self.ctrl_speed:.1f}\n'
+            f'[{self.mission_state.name}|{self._behavior_progress_tag()}|{self.phase.name}] '
+            f'ang={self.ctrl_angle:+.1f} spd={self.ctrl_speed:.1f} cut={cut_desc}\n'
             f'  [LAP] {self.lap}/{TOTAL_LAPS} 바퀴 '
             f'누적={math.degrees(self._yaw_accum):+.0f}도/{math.degrees(LAP_YAW_FULL):.0f} '
             f'경과={time.time() - self._lap_t0:.0f}s\n'
@@ -2996,52 +4154,7 @@ class TrackDriverNode(Node):
             f'trigV={self._vehicle_trigger_cnt}/{VEHICLE_TRIGGER_FRAMES}\n'
             f'  [LAVA-ROI] L pts={lava_lp} run={lava_lrun}(need>=2) '
             f'R pts={lava_rp} run={lava_rrun}(need>=2) '
-            f'masked_raw_pts={masked_pts} masked_min={masked_min_s}'
-            f'{sig_line}')
-
-    def _log_signal_debug(self):
-        """DEBUG_LOG_SIGNAL 전용 상세 로그. 전역 DEBUG_LOG의 [SIG] 요약 줄(0.5초 주기, roi/circles/
-        reason/bright만 나열)과 달리, 신호등이 "왜" 안 잡히는지 단계별 원인 + 대응 힌트를 붙여서
-        찍는다 — DEBUG_LOG를 꺼둔 채로 신호등만 디버깅하고 싶을 때 이것만 켜면 됨.
-        perc_signal()에서 S1_LANE_FOLLOW/S0_SIGNAL 상태일 때만 호출된다(그 외 상태는
-        detect_s2() 자체를 안 돌림, [2026-08-20] S1 확장 — perc_signal() 참고).
-        0.2초 스로틀(대략 4~5프레임당 1번, 20Hz 기준) — 매 프레임 찍으면 터미널이 너무 빨리
-        흘러가서 오히려 못 읽는다."""
-        sd = self.signal_detector
-        reason = sd.s2_reject_reason or 'OK'
-
-        if reason == 'no_circles':
-            hint = 'ROI 안에 원이 아예 안 잡힘 → 신호등이 ROI 밖이거나 노출/대비 문제 (SIG4_ROI_*)'
-        elif 'too noisy' in reason:
-            hint = '원이 너무 많이 잡힘(MAX_CANDIDATES 초과) → 반사광 등 잡음, ROI를 좁히는 것 고려'
-        elif '(<4)' in reason:
-            hint = '원이 4개 미만 → 가림/블러 또는 반지름 범위 밖 (SIG4_MIN/MAX_RADIUS)'
-        elif 'vert_spread' in reason:
-            hint = '찾은 4개가 세로로 너무 퍼짐 → 오검출이 섞였거나 카메라 각도 틀어짐 의심'
-        elif 'horiz_spread' in reason:
-            hint = '찾은 4개가 가로로 너무 퍼짐 → 오검출이 섞임 의심'
-        elif 'gap[' in reason:
-            hint = '인접한 두 원 사이 간격이 너무 좁음 → 반사광 등이 신호등 원 사이에 끼어듦'
-        elif 'no_valid_4subset' in reason:
-            hint = '원 5개 이상 중 배치조건을 만족하는 4개 조합이 없음 → 오검출 비율이 높음'
-        else:
-            hint = '배치검사 통과 — 아래 bright/lit이 실제 밝기 대비 판정 결과(정상 동작)'
-
-        state_kr = ('좌회전' if self.signal_left_on else
-                    '직진'   if self.signal_straight_on else
-                    '정지(빨강)' if self.signal_red_on else '미검출')
-
-        self.get_logger().info(
-            f'[SIG-DEBUG] {self.mission_state.name} state={state_kr}\n'
-            f'  roi(px)=(t={sd.s2_roi_px[0]},b={sd.s2_roi_px[1]},l={sd.s2_roi_px[2]},r={sd.s2_roi_px[3]}) '
-            f'radius={SIG4_MIN_RADIUS}~{SIG4_MAX_RADIUS}px circles_found={sd.s2_circle_count}\n'
-            f'  reason={reason}\n'
-            f'  → {hint}\n'
-            f'  bright(빨강,노랑,좌회전,직진)={sd.s2_brightness} margin={SIG4_BRIGHT_MARGIN} '
-            f'lit={[int(v) for v in sd.s2_lit]}\n'
-            f'  confirm: 직진={self._sig_straight_cnt}/{SIG_CONFIRM_FRAMES} '
-            f'좌회전={self._sig_left_cnt}/{SIG_CONFIRM_FRAMES}',
-            throttle_duration_sec=0.2)
+            f'masked_raw_pts={masked_pts} masked_min={masked_min_s}')
 
 
 # #############################################################

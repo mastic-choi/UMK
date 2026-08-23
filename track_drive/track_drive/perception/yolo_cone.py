@@ -10,12 +10,9 @@
 # (1,N,6)=[x1,y1,x2,y2,conf,cls])을 신뢰도 임계값으로 거르기만 하면 된다(직접
 # NMS/좌표 디코딩 불필요).
 #
-# perc_lavacon_trigger()의 진입 조건("YOLO 콘 검출 AND 라이다 클러스터 검출")에서는
-# 화면에 콘이 있는지 없는지 이진값만 필요하지만, [2026-08-22] 조향 반영 실험(카메라
-# BEV로 콘 좌/우 위치 추정, perc_lavacon.py process_lavacon_camera() 참고)을 위해
-# detections를 원본 프레임(640x480) 절대 픽셀 스케일로 되돌려서 내보낸다 — letterbox
-# 없는 단순 리사이즈라 모델 입력(640x640)과 원본이 종횡비가 다르므로, x/y를 각각
-# 다른 배율로 되돌려야 한다(scale_x = 원본W/640, scale_y = 원본H/640).
+# perc_lavacon_trigger()의 진입 조건("YOLO 콘 검출 AND 라이다 클러스터 검출")에서
+# 화면에 콘이 있는지 없는지 이진값만 필요하므로, 좌표를 원본 프레임 스케일로
+# 되돌리는 등의 후처리는 하지 않는다(신뢰도만 보면 됨).
 #
 # dl_lane.py와 동일하게 추론을 별도 데몬 스레드에서 자기 페이스로 돌리고,
 # detect()는 논블로킹으로 최신 결과를 반환한다. cv2.imshow()는 메인 스레드에서만
@@ -43,7 +40,7 @@ except ImportError:
 
 from ..config import (
     YOLO_CONE_INPUT_SIZE, YOLO_CONE_CONF_THRESHOLD, YOLO_CONE_MODEL_PATH,
-    DEBUG_VIZ_YOLO_CONE, FPS_LOG_PERIOD_SEC,
+    DEBUG_VIZ_YOLO_CONE, DEBUG_WIN_POS_YOLO_CONE, FPS_LOG_PERIOD_SEC,
 )
 
 
@@ -154,10 +151,10 @@ class YoloConeEngine:
     def infer(self, bgr_frame):
         """입력 : 임의 크기(H,W) BGR 프레임
         출력 : (cone_detected, detections) — detections는 [(x1,y1,x2,y2,conf), ...]
-               ★원본 프레임(bgr_frame) 절대 픽셀 스케일★로 되돌린 좌표. 모델 입력은
-               640x640(letterbox 없는 단순 리사이즈)이라 원본과 종횡비가 다르면 x/y가
-               서로 다른 배율로 눌려있다 — scale_x=원본W/640, scale_y=원본H/640을 각각
-               곱해 되돌린다(가로/세로 한 배율로 뭉뚱그리면 안 됨).
+               (640x640 입력 스케일 좌표, 640 letterbox 없이 단순 리사이즈라 원본
+               프레임과 종횡비가 다르면 좌표가 뒤틀릴 수 있음 — 지금은 "검출 여부"만
+               쓰므로 원본 스케일로 되돌리지 않는다. 나중에 좌/우 위치까지 쓰게 되면
+               반드시 리스케일 로직을 추가할 것).
         모델이 nms=True로 export돼 output0에 이미 NMS 적용된 [x1,y1,x2,y2,conf,cls]가
         나온다 — 여기서는 conf 임계값 필터링만 한다(클래스는 cone 하나뿐이라 필터 불필요).
         """
@@ -167,16 +164,12 @@ class YoloConeEngine:
         dt = time.perf_counter() - t0
         self._latency_ema = dt if self._latency_ema is None else 0.8 * self._latency_ema + 0.2 * dt
 
-        scale_x = bgr_frame.shape[1] / YOLO_CONE_INPUT_SIZE
-        scale_y = bgr_frame.shape[0] / YOLO_CONE_INPUT_SIZE
-
         # outputs shape: (1, N, 6) — N은 이번 프레임 검출 수(패딩된 0행 포함 가능)
         dets = outputs[0]
         detections = []
         for x1, y1, x2, y2, conf, _cls in dets:
             if conf >= YOLO_CONE_CONF_THRESHOLD:
-                detections.append((float(x1) * scale_x, float(y1) * scale_y,
-                                    float(x2) * scale_x, float(y2) * scale_y, float(conf)))
+                detections.append((float(x1), float(y1), float(x2), float(y2), float(conf)))
 
         return (len(detections) > 0), detections
 
@@ -199,8 +192,13 @@ class YoloConeDetector:
         self._latest_frame = None
         self._latest_result = (False, [])          # (cone_detected, detections)
         self._latest_debug = None                    # 시각화용 vis 프레임
+        # [2026-08-23] 'yolo_cone_result' 창을 처음 띄울 때만 cv2.moveWindow로 위치를 잡기
+        #   위한 1회성 가드(DEBUG_WIN_POS_YOLO_CONE 참고, yolo_signal_state.py의 동일 패턴).
+        self._dbg_win_positioned = False
         self._stopped = False
         self._last_fps_log_t = time.time()
+        self._logged_infer_error = False  # [2026-08-20] 추론 예외를 매 프레임 로그하면 로그창이
+                                           #   그걸로 도배돼(요청 반영) 최초 1회만 찍고 이후는 조용히 스킵
 
         self._thread = threading.Thread(target=self._worker, name='yolo_cone_infer', daemon=True)
         self._thread.start()
@@ -224,19 +222,21 @@ class YoloConeDetector:
                 if DEBUG_VIZ_YOLO_CONE:
                     # 그리기만 여기서(스레드 세이프하지 않은 imshow/waitKey는 절대 호출 안 함
                     # — dl_lane.py DLSlideWindow.visualize() 주석과 동일한 이유).
-                    # detections는 이미 engine.infer()에서 원본 프레임 스케일로 되돌려져
-                    # 나오므로(위 infer() 주석 참고) 여기서 다시 스케일링하지 않는다.
+                    scale_x = frame.shape[1] / YOLO_CONE_INPUT_SIZE
+                    scale_y = frame.shape[0] / YOLO_CONE_INPUT_SIZE
                     vis = frame.copy()
                     for x1, y1, x2, y2, conf in detections:
-                        p1 = (int(x1), int(y1))
-                        p2 = (int(x2), int(y2))
+                        p1 = (int(x1 * scale_x), int(y1 * scale_y))
+                        p2 = (int(x2 * scale_x), int(y2 * scale_y))
                         cv2.rectangle(vis, p1, p2, (0, 255, 0), 2)
                         cv2.putText(vis, f'cone {conf:.2f}', (p1[0], max(0, p1[1] - 6)),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
                     cv2.putText(vis, f'detected={cone_detected} n={len(detections)}',
                                 (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
             except Exception as e:
-                self._log(f'추론 실패, 이번 프레임 스킵: {e}')
+                if not self._logged_infer_error:
+                    self._log(f'추론 실패(이후 반복 로그는 생략, 이번 프레임부터 계속 스킵): {e}')
+                    self._logged_infer_error = True
                 continue
 
             with self._lock:
@@ -244,8 +244,11 @@ class YoloConeDetector:
                 self._latest_debug = vis
 
             now = time.time()
-            if now - self._last_fps_log_t >= FPS_LOG_PERIOD_SEC:
-                self._log(f'YOLO 콘 추론 FPS≈{self.engine.fps:.1f} (provider={self.engine.active_provider})')
+            # [2026-08-20] 검출 안 될 때도 몇 초마다 FPS 로그가 계속 찍혀 로그창을 채우던 것을
+            # "실제로 뭔가 검출됐을 때만" 찍히도록 변경(요청 반영).
+            if cone_detected and now - self._last_fps_log_t >= FPS_LOG_PERIOD_SEC:
+                self._log(f'YOLO 콘 검출됨 n={len(detections)} FPS≈{self.engine.fps:.1f} '
+                          f'(provider={self.engine.active_provider})')
                 self._last_fps_log_t = now
 
     def detect(self, frame):
@@ -258,14 +261,16 @@ class YoloConeDetector:
             cone_detected, _detections = self._latest_result
         return cone_detected
 
-    def get_detections(self):
-        """[2026-08-22] 조향 반영 실험용 — detect()와 달리 새 프레임을 큐에 올리지 않고
-        (detect()가 이미 매 틱 올리고 있으므로 중복 불필요), 최신 검출 박스 리스트만
-        읽어온다. 출력 : [(x1,y1,x2,y2,conf), ...], 원본 프레임(640x480) 절대 픽셀
-        스케일(engine.infer() 참고)."""
+    def get_latest_debug_frame(self):
+        """[2026-08-21] 최신 시각화 프레임(카메라 원본 + 검출 박스)을 스레드 세이프하게
+        반환만 한다(cv2.imshow는 호출하지 않음) — yolo_vehicle.py get_latest_debug_frame()과
+        동일 패턴. track_drive.py _debug_viz_obstacle_cut()이 B2(고정장애물=콘) 검증 중엔
+        이 프레임을, B3(방해차량) 검증 중엔 yolo_vehicle의 프레임을 같은 라이다 BEV 패널
+        옆에 합쳐서 그린다(_active_yolo_stage()로 어느 쪽이 활성인지 판단). show_debug_windows()
+        가 띄우는 'yolo_cone_result' 창과는 별개로, DEBUG_VIZ_YOLO_CONE=True일 때만 vis가
+        만들어지므로(위 _worker() 참고) 꺼져 있으면 항상 None."""
         with self._lock:
-            _cone_detected, detections = self._latest_result
-        return detections
+            return self._latest_debug
 
     def show_debug_windows(self):
         """★ 반드시 메인 스레드에서만 호출할 것 ★ (dl_lane.py와 동일한 이유)."""
@@ -275,7 +280,15 @@ class YoloConeDetector:
             vis = self._latest_debug
         if vis is None:
             return
-        cv2.imshow('yolo_cone_result', vis)
+        # [2026-08-21, 요청 반영] 화면을 너무 많이 차지해서 표시 직전에만 아주 작게 축소한다
+        # (원본 해상도 vis 자체·get_latest_debug_frame()이 돌려주는 프레임·검출 좌표 계산에는
+        # 영향 없음 — 순전히 이 창의 표시 크기만 줄이는 것).
+        small = cv2.resize(vis, (160, 120), interpolation=cv2.INTER_AREA)
+        if not self._dbg_win_positioned:
+            cv2.namedWindow('yolo_cone_result', cv2.WINDOW_AUTOSIZE)
+            cv2.moveWindow('yolo_cone_result', *DEBUG_WIN_POS_YOLO_CONE)
+            self._dbg_win_positioned = True
+        cv2.imshow('yolo_cone_result', small)
         cv2.waitKey(1)
 
     def stop(self):

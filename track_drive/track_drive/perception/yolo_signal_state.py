@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #=============================================
-# yolo_signal_state.py — YOLOv8n(ONNX Runtime) 기반 신호등 색상상태 검출.
+# yolo_signal_state.py — YOLOv8n(ONNX Runtime) 기반 신호등 위치+색상상태 검출.
 #
-# perception/yolo_signal.py("신호등 배경판 위치 탐지" 하이브리드, YOLO_SIGNAL_* config)와는
-# 별개 모델/별개 목적이다 — 그쪽은 배경판 "위치"만 찾아 기존 HSV 자동크롭(_board_candidates())
-# 대신 traffic_signal.py에 넘겨주고, 점등 색상 판정 자체는 여전히 classical CV
-# (circle_brightness/shape_ok/pick_best_4)가 한다. 이 모듈은 배경판 위치와 무관하게
-# "지금 어떤 색이 켜져 있는지" 자체를 단일 스테이지 YOLO로 직접 예측한다. 이름이 겹치지
-# 않게 클래스/설정 전부 *State* 접두어를 쓴다(YOLO_SIGNAL_STATE_*, config.py 참고).
+# [2026-08-21] 신호등 인식의 유일한 경로다 — 배경판 "위치"를 먼저 찾고 원 4개의 밝기로
+# 색을 판정하던 이전 HSV/Hough Circle 경로(traffic_signal.py/frst.py)와 배경판 위치
+# 전용 YOLO(yolo_signal.py)는 전부 삭제했다(README §1.18). 이 모듈은 "지금 어떤 색이
+# 켜져 있는지"를 단일 스테이지 YOLO로 직접 예측한다.
 #
 # signal_state_best_n.pt(yolo_ros/, YOLOv8n 파인튜닝, 클래스: {0: 'red',
 # 1: 'green_straight', 2: 'green_left'} — datasets/signal_state/classes.txt와 순서 동일)를
@@ -17,13 +15,9 @@
 # nms=True export라 output0=(1,N,6)=[x1,y1,x2,y2,conf,cls]에 이미 NMS가 적용돼 있어,
 # 여기서는 클래스별로 신뢰도 임계값을 넘는 것 중 최댓값만 고르면 된다.
 #
-# traffic_signal.py의 SignalDetector.detect_s2()(Hough Circle 방식)와 반환 시그니처를
-# (red_on, straight_on, left_on)로 맞췄다 — 다만 perc_signal()의 실제 주행 판단(FSM 전환)에는
-# 아직 연결하지 않았다. track_drive.py는 이 결과를 self.signal_*_on_yolo에 별도로 저장해
-# _debug_viz_signal_status() 창에서 기존 Hough 결과와 나란히 보여주기만 한다 — 실차에서
-# 정확도를 충분히 확인한 뒤에 perc_signal()의 판단 소스를 교체할지 결정할 것
-# (config.py "da 블롭 선택" 항목과 같은 이유: 새 인식기를 실측 검증 없이 바로 주행 판단에
-# 연결하지 않는다).
+# track_drive.py는 detect()의 반환값(red_on, straight_on, left_on)을 self.signal_red/
+# straight/left_on에 그대로 저장하고, perc_signal()이 SIG_CONFIRM_FRAMES 연속 유지로
+# 디바운스만 적용한다(track_drive.py perc_signal()/perc_yolo_signal_state() 참고).
 #
 # dl_lane.py/yolo_cone.py와 동일하게 추론을 별도 데몬 스레드에서 자기 페이스로 돌리고,
 # detect()는 논블로킹으로 최신 결과를 반환한다. cv2.imshow()는 메인 스레드에서만 호출해야
@@ -46,8 +40,8 @@ else:
 
 from ..config import (
     YOLO_SIGNAL_STATE_INPUT_SIZE, YOLO_SIGNAL_STATE_CONF_THRESHOLD, YOLO_SIGNAL_STATE_MODEL_PATH,
-    YOLO_SIGNAL_STATE_CLASS_NAMES, YOLO_SIGNAL_STATE_MIN_BOX_HEIGHT_PX, DEBUG_VIZ_YOLO_SIGNAL_STATE,
-    FPS_LOG_PERIOD_SEC,
+    YOLO_SIGNAL_STATE_CLASS_NAMES, DEBUG_VIZ_YOLO_SIGNAL_STATE, FPS_LOG_PERIOD_SEC,
+    DEBUG_WIN_POS_YOLO_SIGNAL_STATE,
 )
 
 
@@ -147,10 +141,7 @@ class YoloSignalStateEngine:
             (640 입력 스케일 좌표, letterbox 없이 단순 리사이즈라 원본과 종횡비가 다르면
             좌표가 뒤틀릴 수 있음 — yolo_cone.py와 동일한 제약).
         모델이 nms=True로 export돼 output0에 이미 NMS 적용된 [x1,y1,x2,y2,conf,cls]가
-        나온다 — 여기서는 conf 임계값 필터링 + 클래스별 최댓값 선택만 한다.
-        원거리 오검출 억제를 위해 bbox 높이가 YOLO_SIGNAL_STATE_MIN_BOX_HEIGHT_PX 미만인
-        검출은 conf와 무관하게 버린다(2026-08-23, config.py 해당 상수 주석 참고 — ROI 크롭
-        대신 탐지 후 필터링을 택한 이유)."""
+        나온다 — 여기서는 conf 임계값 필터링 + 클래스별 최댓값 선택만 한다."""
         t0 = time.perf_counter()
         blob = self.preprocess(bgr_frame)
         outputs = self.session.run([self._output_name], {self._input_name: blob})[0]
@@ -163,8 +154,6 @@ class YoloSignalStateEngine:
         best_by_class = {name: (False, 0.0) for name in YOLO_SIGNAL_STATE_CLASS_NAMES}
         for x1, y1, x2, y2, conf, cls in dets:
             if conf < YOLO_SIGNAL_STATE_CONF_THRESHOLD:
-                continue
-            if (y2 - y1) < YOLO_SIGNAL_STATE_MIN_BOX_HEIGHT_PX:
                 continue
             cls_idx = int(round(cls))
             if not (0 <= cls_idx < len(YOLO_SIGNAL_STATE_CLASS_NAMES)):
@@ -196,8 +185,14 @@ class YoloSignalStateDetector:
         self._latest_state = {name: (False, 0.0) for name in YOLO_SIGNAL_STATE_CLASS_NAMES}
         self._latest_detections = []
         self._latest_debug = None                    # 시각화용 vis 프레임
+        # [2026-08-23] 'YOLO_신호등' 창을 처음 띄울 때만 cv2.moveWindow로 위치를 잡기 위한
+        #   1회성 가드(DEBUG_WIN_POS_YOLO_SIGNAL_STATE 참고, track_drive.py/dl_lane.py의
+        #   같은 패턴과 동일 이유).
+        self._dbg_win_positioned = False
         self._stopped = False
         self._last_fps_log_t = time.time()
+        self._logged_infer_error = False  # [2026-08-20] 추론 예외를 매 프레임 로그하면 로그창이
+                                           #   그걸로 도배돼(요청 반영) 최초 1회만 찍고 이후는 조용히 스킵
 
         self._thread = threading.Thread(target=self._worker, name='yolo_signal_state_infer', daemon=True)
         self._thread.start()
@@ -231,11 +226,17 @@ class YoloSignalStateDetector:
                         cv2.rectangle(vis, p1, p2, color, 2)
                         cv2.putText(vis, f'{name} {conf:.2f}', (p1[0], max(0, p1[1] - 6)),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
-                    summary = ' '.join(f'{n}={"O" if p else "-"}' for n, (p, _c) in state.items())
+                    # [2026-08-23, 요청 반영: "YOLO 색상검출 신뢰도도 추가"] 기존엔 O/-로
+                    # 점등 여부만 보여줘 임계값(YOLO_SIGNAL_STATE_CONF_THRESHOLD) 근처에서
+                    # 얼마나 아슬아슬하게 통과/실패했는지 알 수 없었다 — 클래스별 최댓값
+                    # 신뢰도(state[name][1], 미검출이면 0.0)를 괄호로 덧붙인다.
+                    summary = ' '.join(f'{n}={"O" if p else "-"}({c:.2f})' for n, (p, c) in state.items())
                     cv2.putText(vis, summary, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                                 (255, 255, 255), 2, cv2.LINE_AA)
             except Exception as e:
-                self._log(f'추론 실패, 이번 프레임 스킵: {e}')
+                if not self._logged_infer_error:
+                    self._log(f'추론 실패(이후 반복 로그는 생략, 이번 프레임부터 계속 스킵): {e}')
+                    self._logged_infer_error = True
                 continue
 
             with self._lock:
@@ -244,16 +245,19 @@ class YoloSignalStateDetector:
                 self._latest_debug = vis
 
             now = time.time()
-            if now - self._last_fps_log_t >= FPS_LOG_PERIOD_SEC:
-                self._log(f'YOLO 신호등 색상상태 추론 FPS≈{self.engine.fps:.1f} (provider={self.engine.active_provider})')
+            # [2026-08-20] 검출 안 될 때도 몇 초마다 FPS 로그가 계속 찍혀 로그창을 채우던 것을
+            # "실제로 뭔가 검출됐을 때만" 찍히도록 변경(요청 반영).
+            state_detected = any(present for present, _conf in state.values())
+            if state_detected and now - self._last_fps_log_t >= FPS_LOG_PERIOD_SEC:
+                summary = ' '.join(f'{n}={"O" if p else "-"}' for n, (p, _c) in state.items())
+                self._log(f'YOLO 신호등 색상상태 검출됨 {summary} FPS≈{self.engine.fps:.1f} '
+                          f'(provider={self.engine.active_provider})')
                 self._last_fps_log_t = now
 
     def detect(self, frame):
         """논블로킹: 최신 프레임을 추론 큐에 올리고, 지금까지 계산된 최신 결과를 즉시 반환.
-        출력 : (red_on, straight_on, left_on) — traffic_signal.SignalDetector.detect_s2()와
-          동일한 우선순위(좌회전 > 직진 > 빨강)로 배타 처리한다(§ config.py
-          red_lit/straight_lit/left_lit 주석과 동일한 이유 — 동시에 여러 클래스가 잡히는
-          오검출을 대비)."""
+        출력 : (red_on, straight_on, left_on) — 좌회전 > 직진 > 빨강 우선순위로 배타
+          처리한다(동시에 여러 클래스가 잡히는 오검출 대비)."""
         if frame is not None:
             with self._lock:
                 self._latest_frame = frame
@@ -273,7 +277,20 @@ class YoloSignalStateDetector:
             vis = self._latest_debug
         if vis is None:
             return
-        cv2.imshow('YOLO_신호등', vis)
+        if not self._dbg_win_positioned:
+            cv2.namedWindow('YOLO_신호등', cv2.WINDOW_AUTOSIZE)
+            cv2.moveWindow('YOLO_신호등', *DEBUG_WIN_POS_YOLO_SIGNAL_STATE)
+            self._dbg_win_positioned = True
+        # [2026-08-23, 요청 반영: "카메라욜로랑 검출라이다는 크기 완전 작게"] 원본
+        # 640x480(YOLO_SIGNAL_STATE_INPUT_SIZE 기반 프레임)을 화면 표시용으로만 리사이즈 —
+        # 검출/판단에 쓰이는 vis 자체는 그대로 두고 imshow 직전에만 리사이즈한다.
+        # [2026-08-23d, 요청 반영] 160x120은 좌회전/직진 판단 검증 중 박스가 너무 작아 안
+        # 보인다는 재요청으로 600x450(4:3 비율 유지)으로 다시 키움 — DEBUG_WIN_POS_YOLO_
+        # SIGNAL_STATE=(0,0)에서 이 크기로 떠도 오른쪽 checker_pillar_bev(650,0 시작)와는
+        # 50px 여유가 있고, 아래쪽 left_turn_debug(0,650 시작)와도 겹치지 않는다
+        # (config.py DEBUG_WIN_POS_YOLO_SIGNAL_STATE 주석 참고).
+        small_vis = cv2.resize(vis, (600, 450), interpolation=cv2.INTER_AREA)
+        cv2.imshow('YOLO_신호등', small_vis)
         cv2.waitKey(1)
 
     def stop(self):
