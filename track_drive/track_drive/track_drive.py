@@ -460,6 +460,7 @@ class TrackDriverNode(Node):
         self._pid_integral   = 0.0
         self._s2_commit_dist = None   # 좌회전 커밋 구간(체크무늬 게이트까지) 누적 이동거리(m, None=미진입)
         self._s2_commit_dir  = None   # [2026-08-22h] 직진은 커밋 구간 자체가 없어져 이제 'left'만 들어온다
+        self._s2_commit_start_t = None  # [2026-08-24] 커밋 구간 진입 time.time() — CHECKER_PILLAR_LIDAR_TIMEOUT_SEC 초 경과 판정용
         self._prev_speed     = 0.0    # 가속 속도제한용(직전 출력 속도)
         self._corner_hold    = 0.0    # 코너 활성도(감쇠 peak-hold)
         self._corner_signal  = 0.0    # 코너 감속 판단용 조향각 signed EMA(부호 유지, _lane_drive() 참고)
@@ -2333,6 +2334,7 @@ class TrackDriverNode(Node):
             self._sig_left_cnt     = 0
             self._s2_commit_dist = None
             self._s2_commit_dir  = None
+            self._s2_commit_start_t = None
         # S1 진입 시 처리
         if new_state == MissionState.S1_LANE_FOLLOW:
             # [2026-08-20] S0_SIGNAL 통합 이후 이 state는 출발 때 1번 + 매 바퀴 교차로에서
@@ -2387,6 +2389,7 @@ class TrackDriverNode(Node):
                 self._change_state(MissionState.S0_SIGNAL)
                 self._s2_commit_dist = 0.0   # _change_state()가 진입 처리에서 None으로 리셋한 뒤 다시 세팅
                 self._s2_commit_dir  = 'left'
+                self._s2_commit_start_t = time.time()
                 return
             elif self.signal_straight_confirmed:
                 # [2026-08-22h] 요청 반영 — 커밋 구간 없이 곧장 다음 바퀴 준비만 하고 S1 유지.
@@ -2455,21 +2458,38 @@ class TrackDriverNode(Node):
             self._lane_drive()
             self._s2_commit_dist += self._speed_mps_fallback(self.ctrl_speed) * 0.05  # 20Hz 제어주기(control_loop) 가정
 
-            # [2026-08-21] 커밋 종료 트리거는 거리가 아니라 체크무늬 게이트 라이다 기둥쌍
-            # 검출(config.py "체크무늬 게이트 라이다 기둥쌍 검출" 절 참고) — 신호확정 후
-            # 정지위치 산포에 안 흔들리는 물리적 트리거. CHECKER_PILLAR_TIMEOUT_DIST_M
-            # 넘도록 기둥쌍이 안 잡히면(라이다 죽음/오검출) 거리기반으로 강제 폴백해 무한
-            # 직진을 막는다.
-            timed_out = (not TEST_DISABLE_CHECKER_PILLAR_TIMEOUT
-                         and self._s2_commit_dist >= CHECKER_PILLAR_TIMEOUT_DIST_M)
-            if self.checker_pillar_trigger or timed_out:
-                if timed_out and not self.checker_pillar_trigger:
-                    self.get_logger().warn(
-                        f'체크무늬 게이트 기둥쌍 미검출(거리 {self._s2_commit_dist:.2f}m) '
-                        '— 타임아웃으로 좌회전 램프 강제 시작')
+            # [2026-08-24] 커밋 종료 트리거는 체크무늬 게이트 라이다 기둥쌍 검출
+            # (config.py "체크무늬 게이트 라이다 기둥쌍 검출" 절 참고). 좌우 기둥쌍이
+            # CHECKER_PILLAR_LIDAR_TIMEOUT_SEC초 넘도록 안 잡히면(라이다 죽음/오검출)
+            # 더 이상 좌회전을 강제하지 않는다 — 직진 신호를 받았을 때와 완전히 동일한
+            # 경로(S1_LANE_FOLLOW 유지 + Behavior 재무장, _s1_lane_follow()의
+            # signal_straight_confirmed 분기 참고)로 넘어가 정상 차선주행을 이어간다.
+            if self.checker_pillar_trigger:
                 self._s2_commit_dist = None
                 self._s2_commit_dir  = None
+                self._s2_commit_start_t = None
                 self._begin_checker_ramp_turn()
+                return
+
+            timed_out = (not TEST_DISABLE_CHECKER_PILLAR_TIMEOUT
+                         and self._s2_commit_start_t is not None
+                         and time.time() - self._s2_commit_start_t >= CHECKER_PILLAR_LIDAR_TIMEOUT_SEC)
+            if timed_out:
+                self.get_logger().warn(
+                    f'좌회전 커밋 {CHECKER_PILLAR_LIDAR_TIMEOUT_SEC:.0f}초 경과했는데 '
+                    '체크무늬 게이트 기둥쌍 미검출 — 좌회전 포기, 직진 신호와 동일하게 처리')
+                self._s2_commit_dist = None
+                self._s2_commit_dir  = None
+                self._s2_commit_start_t = None
+                self._behavior_enabled = True
+                self._signal_reentry_cooldown_t = time.time() + SIGNAL_REENTRY_COOLDOWN
+                self._change_state(MissionState.S1_LANE_FOLLOW)
+                self.phase = Phase.LAVACON
+                self._b2_passed = False
+                self._b3_passed = False
+                self._lavacon_engaged = False
+                self._lavacon_empty_cnt = 0
+                self._lavacon_trigger_cnt = 0
             return
 
         self.ctrl_angle, self.ctrl_speed = 0.0, SPEED_STOP
@@ -2481,6 +2501,7 @@ class TrackDriverNode(Node):
         elif self.signal_left_confirmed:
             self._s2_commit_dist = 0.0
             self._s2_commit_dir  = 'left'
+            self._s2_commit_start_t = time.time()
 
     # ── S4: 종료 ──
     def _s4_finish(self):

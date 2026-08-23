@@ -1012,11 +1012,13 @@ CHECKER_PILLAR_LAT_TARGET_M = 0.98   # 좌우 기둥 사이 최소 횡방향 간
 # 안정적이라, 상한까지 좁게 걸면 실제 기둥쌍인데도 근소하게 밀려나 놓칠 위험이 더 크다고
 # 판단(실차 미검증, perc_checker_pillar()의 lat_ok 참고).
 CHECKER_PILLAR_CONFIRM_FRAMES = 2   # 연속 이 프레임 이상 좌우+간격 조건을 만족해야 확정(디바운스)
-CHECKER_PILLAR_TIMEOUT_DIST_M = 2.0  # [안전장치] 커밋 시작 후 이 거리(m)까지 기둥쌍이 안 잡히면
-                                      #   (라이다 죽음/오검출 등) _s0_signal()이 기존 S2_COMMIT_DIST_M
-                                      #   방식(고정거리)으로 강제 폴백 — 기둥쌍을 영원히 기다리다 차선을
-                                      #   놓치고 계속 직진하는 사고를 막는다. S2_COMMIT_DIST_M(1.0m)보다
-                                      #   넉넉히 크게 잡아 기둥 검출에 시간을 준다. 실차 미검증 초기값.
+CHECKER_PILLAR_LIDAR_TIMEOUT_SEC = 5.0  # [안전장치] 좌회전 커밋 시작 후 이 시간(초)까지 좌우
+                                      #   기둥쌍이 안 잡히면(라이다 죽음/오검출 등) 좌회전 자체를
+                                      #   포기한다 — [2026-08-24] 요청 반영, 예전처럼 거리기반으로
+                                      #   좌회전을 "강제 시작"하지 않고, 직진 신호를 받았을 때와
+                                      #   완전히 동일한 경로(S1_LANE_FOLLOW 유지 + Behavior
+                                      #   재무장, track_drive.py _s0_signal() 참고)로 넘어가
+                                      #   정상 차선주행을 그대로 이어간다. 실차 미검증 초기값.
 
 # ── 좌회전 진입 — 체크무늬 게이트 통과 후 완만한 조향 램프 ──
 #   [2026-08-21] 위 라이다 기둥쌍 트리거가 확정되는 순간부터, 고정 조향각을 즉시 걸지
@@ -1028,8 +1030,8 @@ CHECKER_PILLAR_TIMEOUT_DIST_M = 2.0  # [안전장치] 커밋 시작 후 이 거�
 #   속도가 바뀌어도(SPEED_NORMAL 3→10 등) 같은 거리 기준이면 게이트를 통과하는 물리적
 #   곡선 모양이 그대로 유지된다 — 반대로 시간 기준이면 속도가 오를수록 곡선이 늘어져
 #   버려 궤적이 달라진다. _s0_signal()의 'left' 커밋 구간 종료 트리거로 연결됨(요청 반영,
-#   S2_COMMIT_DIST_M 거리기반 대신 기둥쌍 검출로 대체) — CHECKER_PILLAR_TIMEOUT_DIST_M
-#   초과 시엔 기존 거리기반으로 안전 폴백.
+#   S2_COMMIT_DIST_M 거리기반 대신 기둥쌍 검출로 대체) — CHECKER_PILLAR_LIDAR_TIMEOUT_SEC
+#   초과 시엔 좌회전 자체를 포기하고 직진 신호와 동일하게 처리(안전 폴백).
 #   [2026-08-22] SPEED_NORMAL 3→10 상향 이후 0.5m가 실차에서 약 3프레임 만에 끝나버려
 #   (README §"speed10 변경" 참고) 2.0으로 상향 — 20Hz·TURN_SPEED 기준 대략 십수 프레임
 #   구간으로 늘어남. 실차 미검증 초기값이라 재검증 필요. CHECKER_TURN_RAMP_CURVE는
@@ -1623,16 +1625,16 @@ TEST_FORCE_LEFT_TURN_SIGNAL = False
 #   기반 판단으로 돌아간다(다른 곳 되돌릴 필요 없음).
 
 # [2026-08-23q, 요청 반영] True→False로 원복 — 좌회전 로직 단독 테스트 종료, 타임아웃
-#   안전장치(CHECKER_PILLAR_TIMEOUT_DIST_M)를 다시 켠다.
+#   안전장치(CHECKER_PILLAR_LIDAR_TIMEOUT_SEC)를 다시 켠다.
 TEST_DISABLE_CHECKER_PILLAR_TIMEOUT = False
-#   순전히 테스트 목적 — CHECKER_PILLAR_TIMEOUT_DIST_M(위) 안전장치를 꺼서, S0_SIGNAL
-#   'left' 커밋 구간이 기둥쌍 미검출을 이유로 거리기반 강제 폴백을 타지 않고 무조건
+#   순전히 테스트 목적 — CHECKER_PILLAR_LIDAR_TIMEOUT_SEC(위) 안전장치를 꺼서, S0_SIGNAL
+#   'left' 커밋 구간이 기둥쌍 미검출을 이유로 좌회전을 포기하지 않고 무조건
 #   checker_pillar_trigger(실제 라이다 기둥쌍 검출)만 기다리게 한다(track_drive.py의
 #   _s0_signal() 참고) — 타임아웃 폴백이 실제 미검출 상황을 가려서 "왜 안 잡히는지"
 #   디버깅이 안 되는 문제를 피하려는 스위치.
 #   ⚠️⚠️⚠️ 검증 끝나면 반드시 False로 되돌릴 것 — 실제 레이스에서 이게 켜진 채로 있으면
-#   라이다가 기둥쌍을 영원히 못 잡을 때(죽음/오검출) 커밋 구간을 벗어나지 못하고 차선을
-#   놓친 채 계속 직진하는 사고로 이어진다.
+#   라이다가 기둥쌍을 영원히 못 잡을 때(죽음/오검출) 좌회전 커밋 구간에서 영원히 못
+#   벗어나고 차선을 놓친 채 계속 직진하는 사고로 이어진다.
 
 # ── 바퀴(Lap) 카운트 — 트랙은 닫힌 곡선이라 한 바퀴 돌면 누적 yaw가 정확히 360도 ──
 TOTAL_LAPS = 3
