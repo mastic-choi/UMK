@@ -1426,10 +1426,14 @@ DEBUG_VIZ_YOLO_CONE  = True   # 콘 원시검출 창('yolo_cone_result', yolo_co
 # [2026-08-21] 신호등 위치+색상 판정을 YOLO 단독(yolo_signal_state.py) 하나로 정리하면서
 #   (README §1.18) 이게 유일한 신호등 결과 창이 됐다 — 실차에서 지금 뭘 보고 판단 중인지
 #   눈으로 확인하기 위함.
-DEBUG_VIZ_YOLO_SIGNAL_STATE = False  # 신호등 위치+색상상태 YOLO 검출 박스 디버그 창 (perception/yolo_signal_state.py, 창 이름 'YOLO_신호등')
+DEBUG_VIZ_YOLO_SIGNAL_STATE = True   # 신호등 위치+색상상태 YOLO 검출 박스 디버그 창 (perception/yolo_signal_state.py, 창 이름 'YOLO_신호등')
                                       # [2026-08-22h] 요청 반영으로 껐다가, [2026-08-23] B3 통과 후
                                       #   S0_SIGNAL 대기 검증(아래 "6. 미션 State" override) 위해 다시 켰다가,
-                                      #   [2026-08-23b] 요청 반영으로 다시 끔.
+                                      #   [2026-08-23b] 요청 반영으로 다시 끔, [2026-08-23r] 요청 반영(주행용
+                                      #   실차 검증 — S0_SIGNAL 직진/좌회전 판독을 눈으로 확인)으로 다시 켬.
+                                      #   창 위치는 DEBUG_WIN_POS_YOLO_SIGNAL_STATE=(0,0), 600x450 —
+                                      #   DL_LANE(600,0~)/LAVACON·YOLO_CONE(y=650~)과 안 겹치게 이미
+                                      #   맞춰져 있다(config.py "디버그 창 위치" 절 참고).
 # [2026-08-15] avoid-hold(§2.32) 전용 상태창 — 지금 유예가 걸려있는지/왜 걸렸는지/방향
 #   힌트/조기해제 진행상황을 한곳에 모아 보여주고, 실측 안 된 파라미터 값도 항상 같이
 #   띄워서 "이 숫자 아직 지어낸 값"이라는 걸 상기시킨다(track_drive.py
@@ -1442,22 +1446,29 @@ DEBUG_VIZ_AVOID_HOLD = False
 # [2026-08-20] da 근접 컷(obstacle-cut, ENABLE_OBSTACLE_CUT 주석 참고) 전용 상태창 —
 #   라이다 raw/YOLO raw/AND확정/유지타이머 잔여시간/해제카운터를 avoid_hold_debug와
 #   같은 구조로 한곳에 모아 보여준다(track_drive.py _debug_viz_obstacle_cut()).
-DEBUG_VIZ_OBSTACLE_CUT = True     # [2026-08-22i] 요청 반영으로 껐다가, [2026-08-22m] 회피(da 근접 컷)
+DEBUG_VIZ_OBSTACLE_CUT = False    # [2026-08-22i] 요청 반영으로 껐다가, [2026-08-22m] 회피(da 근접 컷)
 #   검출범위 확인용으로 다시 켰다가, [2026-08-23a] 요청 반영으로 다시 끔, [2026-08-23b] B1/B2/B3
 #   회피 전체 흐름 검증 시작하며 다시 켬 — dl_lane(da) 창과 같이 켜서 "라이다가 왜 지금
 #   잡았는지"와 "그래서 경로가 실제로 밀렸는지"를 두 창에서 나란히 확인.
+#   [2026-08-23r] 요청 반영으로 다시 끔 — 대신 DEBUG_VIZ_YOLO_SIGNAL_STATE를 켜서 주행 중
+#   신호등 판독(직진/좌회전)을 확인하는 쪽으로 전환. 이 창의 자리(DEBUG_WIN_POS_OBSTACLE_CUT
+#   =(0,450))는 비므로 겹칠 걱정 없음.
 
 
 # #############################################################
 # 6. 미션 State / 실차 테스트 범위 제한
 # #############################################################
-# [2026-08-23] 요청 반영 — "초록불을 이미 받은 이후" 상황부터 바로 검증하고 싶다는
-#   요청으로, S0_SIGNAL(신호 대기) 자체는 건너뛰고 START_STATE를 S1_LANE_FOLLOW로 다시
-#   맞춘다. Phase.LAVACON/_b2_passed=_b3_passed=False(track_drive.py __init__)는 그대로
-#   둬서 B1(라바콘)→B2(고정장애물)→B3(이동장애물) 순서로 진행한다 — 짝으로 아래
-#   TEST_FORCE_BEHAVIOR도 True로 켰다(S0를 안 지나면 _behavior_enabled를 True로 켜주는
-#   경로 자체가 없어서 이게 없으면 B1/B2/B3가 영원히 발동을 안 함, 아래 주석 참고).
-START_STATE     = MissionState.S1_LANE_FOLLOW
+# [2026-08-23p, 요청 반영] START_STATE를 다시 S0_SIGNAL(신호 대기)로 되돌림 — 위
+#   2026-08-23 항목처럼 "초록불을 이미 받은 이후"부터 강제로 스킵해 검증하던 걸 그만두고,
+#   출발선에서 실제로 정지→4구 신호 판독→직진/좌회전 확정까지 정상 경로로 검증하고 싶다는
+#   요청. 아래 두 TEST_* 강제 스위치도 짝으로 원복했다(안 그러면 S0_SIGNAL에 서 있어도
+#   Behavior가 이미 켜져 있거나 신호등 YOLO가 cone으로 안 넘어가는 등 정상 전환 경로를
+#   가려버림):
+#   - _s1_lane_follow()에서 signal_straight_confirmed → _behavior_enabled=True로 S1 유지
+#     (지금 켜둔 Phase.LAVACON/_b2_passed=_b3_passed=False B1 테스트 세팅 그대로 이어짐).
+#   - _s1_lane_follow()에서 signal_left_confirmed → S0_SIGNAL 커밋구간 →
+#     _begin_checker_ramp_turn()/_do_checker_ramp_turn()으로 좌회전 조향 램프 실행.
+START_STATE     = MissionState.S0_SIGNAL
 ENABLE_BEHAVIOR = True  # S1에서 라바콘/장애물/추월 Behavior를 켤지 여부(최상위 스위치)
 
 # ── 실차 테스트 범위 제한 ──
@@ -1471,14 +1482,16 @@ TEST_DISABLE_B2_B3 = False
 #         이중으로 걸어 B2/B3가 어떤 경로로도 안 켜지게 한다(안전판).
 #   False: 원래대로 SAFETY_DIST/OVERTAKE_TRIGGER 트리거 검사해서 B2/B3 정상 발동 —
 #         이번 B3 검증이 보고 싶은 게 바로 이 발동이라 False.
-TEST_FORCE_BEHAVIOR = True
+TEST_FORCE_BEHAVIOR = False
 #   True: _behavior_enabled를 시작부터 강제 True로 켜서, START_STATE=S1_LANE_FOLLOW로
 #         S0/S2를 건너뛴 채로도 B1→B2→B3가 정상 발동한다(그렇지 않으면 _behavior_enabled가
 #         S0_SIGNAL 직진 확정 시에만 True가 되는데 그 경로 자체를 안 타므로 계속 False로
-#         남아 Behavior가 영원히 안 켜짐). [2026-08-23] 위 START_STATE=S1_LANE_FOLLOW(초록불
-#         받은 이후 상황부터 검증)와 짝으로 True로 켰다 — 이게 없으면 B1/B2/B3 회피를
-#         전혀 못 본다.
+#         남아 Behavior가 영원히 안 켜짐).
 #   False: 원래대로 S0_SIGNAL 직진 신호 확정 시에만 Behavior가 켜짐(정상 레이스 동작).
+#         [2026-08-23p, 요청 반영] 위 START_STATE=S0_SIGNAL(신호 대기부터 시작) 원복과
+#         짝으로 다시 False로 — 이제 정상 경로(_s0_signal()의 직진 확정 분기)로
+#         _behavior_enabled가 켜지므로 강제 스위치가 필요 없다. 켜둔 채로 두면 신호를
+#         아직 못 받았는데도 Behavior가 이미 활성 상태로 보여 검증 의미가 없어진다.
 TEST_SIGNAL_LOOP = False  # [2026-08-23] 요청 반영으로 원복 — 이제 B1/B2/B3 전체 흐름을 보므로
                            #   신호 판단 반복 격리 테스트는 종료.
 #   [2026-08-23, 요청 반영] "주행 중 신호등 만났을 때 좌회전/직진 판단"만 반복 격리
@@ -1494,10 +1507,12 @@ TEST_SIGNAL_LOOP = False  # [2026-08-23] 요청 반영으로 원복 — 이제 B
 #         동작 — 한 바퀴에 신호 판단은 한 번뿐이라 좌회전 직후 바로 다시 켤 이유가 없음).
 #         검증 끝나면 반드시 False로 되돌릴 것(안 그러면 실제 레이스에서 신호 확정
 #         시점에 phase가 조기 리셋돼 버림).
-TEST_FORCE_SIGNAL_YOLO = True  # [2026-08-23e, 요청 반영] YOLO_신호등 디버그창(신뢰도+상태)이
-                                  # FSM 단계와 무관하게 항상 뜨도록 다시 켬 — 이 스위치가 True인 동안은
-                                  #   cone/vehicle YOLO 스테이지가 전혀 안 켜져 B1/B2/B3 검증과
-                                  #   동시에 못 쓴다(아래 주석 참고).
+TEST_FORCE_SIGNAL_YOLO = False  # [2026-08-23p, 요청 반영] True→False로 원복 — 이 스위치가
+                                  #   True면 _active_yolo_stage()가 mission_state/phase와 무관하게
+                                  #   항상 'signal'만 반환해서, S0_SIGNAL 직진 확정 후 Phase.LAVACON
+                                  #   진입 시 켜져야 할 cone YOLO 스테이지가 절대 안 켜진다 — B1
+                                  #   라바콘 트리거(perc_lavacon_trigger()의 cone_confirmed_cam)가
+                                  #   영원히 못 켜지므로, 신호→S1→B1 정상 전환 검증엔 반드시 꺼둘 것.
 #   [2026-08-23, 요청 반영] "욜로 안 끊기게 띄워서 검출만 테스트" 전용 — True면
 #   _active_yolo_stage()가 mission_state/phase/_signal_yolo_off 등 FSM 상태와 완전히
 #   무관하게 항상 'signal'을 리턴해 신호등 YOLO가 절대 안 꺼진다. TEST_SIGNAL_LOOP의
@@ -1681,8 +1696,10 @@ LAVACON_STEER_MODE_DA_PUSH = True
 #   아이디어를 실차로 빠르게 테스트해보기 위한 스위치 — 효과 없거나 오히려 나쁘면
 #   LAVACON_KICK_ENABLED만 False로 되돌리면 이 블록 전체가 비활성화된다(실차 미검증).
 LAVACON_KICK_ENABLED    = True
-LAVACON_KICK_DURATION_S = 0.2    # 이 시간(초) 동안 고정 조향각 유지 — CONTROL_HZ(20Hz)로 환산해 프레임수로 씀
-LAVACON_KICK_ANGLE_DEG  = -20.0  # 강제 조향각(도) — 부호규약은 ctrl_angle과 동일(우측 콘 쪽으로 짐작, 실차에서 방향 확인 필요)
+LAVACON_KICK_DURATION_S = 0.4    # 이 시간(초) 동안 고정 조향각 유지 — CONTROL_HZ(20Hz)로 환산해 프레임수로 씀
+                                  # [2026-08-23] 0.2 → 0.4(요청 반영)
+LAVACON_KICK_ANGLE_DEG  = -30.0  # 강제 조향각(도) — 부호규약은 ctrl_angle과 동일(우측 콘 쪽으로 짐작, 실차에서 방향 확인 필요)
+                                  # [2026-08-23] -20.0 → -30.0(요청 반영)
 
 # [2026-08-19] 안전마진(m) — 이 값보다 콘이 차량 중심에 가깝게 들어오면 그만큼 반대쪽으로
 #   민다. VEHICLE_WIDTH_M(0.31, 실측)/2=0.155(차량 반폭) + DL_DA_SIDE_MARGIN_M(0.1, B2/B3
@@ -1804,13 +1821,17 @@ DEBUG_VIZ_YOLO_VEHICLE = False      # [2026-08-22i] 요청 반영으로 끔 — 
 #   "YOLO 단독 vs YOLO+HSV 하이브리드" 판단 소스 스위치(SIGNAL_USE_YOLO_STATE_FOR_DECISION)를
 #   전부 삭제했다(README §1.18) — 이제 신호등 인식은 이 YOLO 모델 하나뿐이다.
 YOLO_SIGNAL_STATE_INPUT_SIZE = 640     # signal_state_best_n.onnx export 시 imgsz와 반드시 일치시킬 것
-YOLO_SIGNAL_STATE_CONF_THRESHOLD = 0.5 # 이 신뢰도 이상인 검출만 인정(모델이 nms=True로 export돼 좌표 디코딩은 불필요)
+YOLO_SIGNAL_STATE_CONF_THRESHOLD = 0.7 # 이 신뢰도 이상인 검출만 인정(모델이 nms=True로 export돼 좌표 디코딩은 불필요)
 # [2026-08-23] 0.5→0.8(요청 반영). [2026-08-23e, 요청 반영] 0.8→0.5로 다시 원복 —
 #   green_left가 green_straight보다 평균 신뢰도가 낮게 나오는 것으로 보여, 0.8에서는
 #   green_left만 유독 문턱을 못 넘어 못 잡히고 green_straight/red만 통과하는 쪽으로
 #   편향됐다는 게 실차에서 의심됨(SIG_CONFIRM_FRAMES 재상향과 같이 묶어서 결정,
 #   README §1.19k 참고). 단발 오검출 방어는 이제 여기(신뢰도)가 아니라 아래
 #   SIG_CONFIRM_FRAMES(여러 프레임 연속 확인)가 전담한다.
+# [2026-08-23s, 요청 반영] 0.5→0.8로 다시 올림 — ★위 §1.19k에서 green_left가 이 값에서
+#   편향돼 안 잡혔던 이력이 있으니, 실차에서 좌회전 신호만 유독 안 잡히면(직진만 계속
+#   확정되고 좌회전은 안 뜨면) 이게 원인일 가능성이 높다 — 그때는 다시 0.5로 낮추거나,
+#   클래스별로 다른 문턱을 두는 방향을 고려할 것.
 # [2026-08-20 §2.59] target_vehicle과 같은 문제(ultralytics nms=True가 CoreML 전용이라
 # DetectionModel ONNX export엔 안 먹힘)가 여기서도 재현돼 v1.2.0으로 교체 — 가중치는
 # v1.1.0과 완전히 동일, export만 NMS 내장 커스텀 스크립트로 바뀜(output0 [1,N,6] 유지,

@@ -1607,7 +1607,12 @@ class TrackDriverNode(Node):
         #   없어졌다 — 이번엔 트리거 박스(LAT_MAX)만 단독으로 조정. CONE_LAT_LIMIT은 여전히
         #   0.5로 남아있고(perc_lavacon.py, cone 후보 필터링용), 필요하면 별도로 바꿀 것.
         LAT_MAX           = 0.75       # 트리거 ROI 횡방향 한계(m)
-        CLUSTER_MIN_PTS   = 2          # 클러스터로 인정할 최소 연속 포인트 수(단일 반사점 노이즈 배제)
+        # [2026-08-23p, 요청 반영] 2 → 1(최소치) — B1 라바콘 진입 트리거가 너무 늦게/안
+        #   걸린다는 판단으로 라이다 클러스터 인정 기준을 완화. CHECKER_PILLAR_CLUSTER_MIN_PTS
+        #   =1(config.py, 체크무늬 게이트 기둥쌍 검출)에서 이미 쓰던 것과 동일한 완화 —
+        #   사이드당 1포인트만 잡혀도 클러스터로 인정한다. 노이즈(단일 반사점)에 더 민감해질
+        #   여지가 있으니, 실차에서 유령 트리거(콘이 없는데 B1 진입)가 보이면 되돌릴 것.
+        CLUSTER_MIN_PTS   = 1          # 클러스터로 인정할 최소 연속 포인트 수(단일 반사점 노이즈 배제)
         CLUSTER_MAX_GAP   = 0.35       # 같은 클러스터로 볼 최대 거리편차(m) — 콘 지름 근사
         BODY_LO, BODY_HI  = 215, 305   # 차체 자기가림 구간 (perc_obstacle과 동일, 최종 확정 2026-07-22)
 
@@ -2266,6 +2271,42 @@ class TrackDriverNode(Node):
             이미 "직진"이라고 확정했으니 물리적 분기까지 저속으로 기다릴 이유가 없고, 그냥
             S1을 유지한 채 Behavior만 재활성화해 다음 바퀴(라바콘부터)를 바로 준비한다.
         """
+        # [2026-08-23q, 요청 반영] 신호 확정(특히 좌회전) 처리를 아래 B1_LAVACON/장애물회피
+        # 조기 return보다 먼저 본다 — "최상위 조향, 다른 Behavior에 씹히지 않게". 원래는
+        # 이 검사가 함수 맨 끝(_lane_drive() 이후)에 있어서, B1_LAVACON이 조향을 잡고 있거나
+        # (_behavior_enabled and behavior_state==B1_LAVACON) 장애물회피/추월 중이면 함수가
+        # 그 위 가드에서 곧장 return해버려 signal_left_confirmed가 그 틱에 확정돼도 아예
+        # 확인조차 안 되고 넘어갈 수 있었다(다음 틱에 재확인되긴 하지만, 최악의 경우
+        # confirmed 래치가 그 사이 풀리면 좌회전 자체를 놓친다). 좌회전이 확정되는 즉시
+        # mission_state를 S0_SIGNAL로 바꿔버리면, control_loop()의 Behavior 게이트
+        # (mission_state==S1_LANE_FOLLOW 조건)가 그 즉시 꺼져서 이후 B1/B2/B3가 이 조향을
+        # 덮어쓸 수 없다.
+        # TEST_DISABLE_INTERSECTION=True면 아래 조건이 항상 False가 되어 S0_SIGNAL 재진입
+        # 자체가 원천 차단된다.
+        if not (TEST_DISABLE_INTERSECTION or time.time() < self._signal_reentry_cooldown_t):
+            if self.signal_left_confirmed:
+                self._change_state(MissionState.S0_SIGNAL)
+                self._s2_commit_dist = 0.0   # _change_state()가 진입 처리에서 None으로 리셋한 뒤 다시 세팅
+                self._s2_commit_dir  = 'left'
+                return
+            elif self.signal_straight_confirmed:
+                # [2026-08-22h] 요청 반영 — 커밋 구간 없이 곧장 다음 바퀴 준비만 하고 S1 유지.
+                # (_signal_yolo_off는 이제 perc_signal()이 확정되는 순간 바로 세팅한다.)
+                self._behavior_enabled = True
+                self._signal_reentry_cooldown_t = time.time() + SIGNAL_REENTRY_COOLDOWN
+                if TEST_SIGNAL_LOOP:
+                    # [2026-08-23, 요청 반영] 격리 테스트 전용 — 정상 레이스에선 이 phase
+                    # 리셋을 _update_lap()(결승선 통과)이 담당하고 신호 확정 시점엔 아직
+                    # 안 건드리는 게 맞지만(신호 지점~결승선 사이 구간이 남아있어서), 신호
+                    # 판단만 반복 테스트할 땐 결승선까지 안 가고 바로 다음 순서(B1)를 봐야
+                    # 하므로 여기서 직접 리셋한다.
+                    self.phase = Phase.LAVACON
+                    self._b2_passed = False
+                    self._b3_passed = False
+                    self._lavacon_engaged = False
+                    self._lavacon_empty_cnt = 0
+                    self._lavacon_trigger_cnt = 0
+
         # Behavior가 조향을 전담하는 구간에서는 Mission의 차선 PID를 건너뛴다.
         # [2026-08-22] 요청 반영 — run_behavior_fsm()이 다시 behavior_state=B1_LAVACON을
         # 세팅하게 되면서(_lavacon_engaged인 동안) 이 가드가 다시 걸린다. B1 구간 조향은
@@ -2277,32 +2318,6 @@ class TrackDriverNode(Node):
             return
 
         self._lane_drive()
-        # TEST_DISABLE_INTERSECTION=True면 색상이 확정돼도 아래 조건이 항상 False가 되어
-        # S0_SIGNAL 재진입 자체가 원천 차단되고 계속 이 함수(_lane_drive)만 반복하며
-        # 차선주행을 이어간다.
-        if TEST_DISABLE_INTERSECTION or time.time() < self._signal_reentry_cooldown_t:
-            return
-        if self.signal_left_confirmed:
-            self._change_state(MissionState.S0_SIGNAL)
-            self._s2_commit_dist = 0.0   # _change_state()가 진입 처리에서 None으로 리셋한 뒤 다시 세팅
-            self._s2_commit_dir  = 'left'
-        elif self.signal_straight_confirmed:
-            # [2026-08-22h] 요청 반영 — 커밋 구간 없이 곧장 다음 바퀴 준비만 하고 S1 유지.
-            # (_signal_yolo_off는 이제 perc_signal()이 확정되는 순간 바로 세팅한다.)
-            self._behavior_enabled = True
-            self._signal_reentry_cooldown_t = time.time() + SIGNAL_REENTRY_COOLDOWN
-            if TEST_SIGNAL_LOOP:
-                # [2026-08-23, 요청 반영] 격리 테스트 전용 — 정상 레이스에선 이 phase
-                # 리셋을 _update_lap()(결승선 통과)이 담당하고 신호 확정 시점엔 아직
-                # 안 건드리는 게 맞지만(신호 지점~결승선 사이 구간이 남아있어서), 신호
-                # 판단만 반복 테스트할 땐 결승선까지 안 가고 바로 다음 순서(B1)를 봐야
-                # 하므로 여기서 직접 리셋한다.
-                self.phase = Phase.LAVACON
-                self._b2_passed = False
-                self._b3_passed = False
-                self._lavacon_engaged = False
-                self._lavacon_empty_cnt = 0
-                self._lavacon_trigger_cnt = 0
 
     # ── S0_SIGNAL: 4구 신호등 판단 — 출발선/교차로 공용 (정지 후 신호로 경로 판단) ──
     def _s0_signal(self):
@@ -2315,9 +2330,11 @@ class TrackDriverNode(Node):
         자체에 들어오지 않는다(_s1_lane_follow() 참고: 확정되는 순간 S1을 유지한 채
         Behavior만 재활성화하고 끝). 그래서 이 state에 진입하는 경로는 좌회전(지름길)
         확정 하나뿐이다 — 아래 "1. 진입 즉시 정지" 분기도 좌회전 신호만 본다. 그 분기가
-        실제로 쓰이는 건 START_STATE=S0_SIGNAL로 노드가 맨 처음 시작하는 출발선 경우뿐
-        이다(대회 규정상 심판이 신호를 초록으로 바꾸기 전까지 출발 자체가 금지 — 출발선
-        신호가 직진이면 곧장 S1로 넘어가고 이 state에 남지 않는다).
+        실제로 쓰이는 건 (a) START_STATE=S0_SIGNAL로 노드가 맨 처음 시작하는 출발선
+        경우(대회 규정상 심판이 신호를 초록으로 바꾸기 전까지 출발 자체가 금지 — 출발선
+        신호가 직진이면 곧장 S1로 넘어가고 이 state에 남지 않는다), (b) [2026-08-23q]
+        좌회전 램프 완료 후(_do_checker_ramp_turn()) 다시 여기로 돌아와 다음 신호를
+        기다리는 경우 — 둘 다 아직 신호를 못 읽어 정지 대기 중이라는 점은 동일하다.
           1. 진입 즉시 정지 (기본값 STOP, 좌회전 신호만 커밋 구간 시작) — 출발선 전용, 위 참고
           2. 좌회전 신호(signal_left_confirmed) → 커밋 구간(_s2_commit_dist) 거쳐 좌회전
              후 S1 복귀(3바퀴 중 2·3바퀴째에 한 번만 등장). 커밋 구간 동안은 S1과 동일한
@@ -2379,6 +2396,12 @@ class TrackDriverNode(Node):
     #   전용이던 _s3_shortcut()/_shortcut_end()/_begin_left_turn()/_do_left_turn()과
     #   MissionState.S3_SHORTCUT enum 값 자체를 삭제했다(README §1.19b 참고) — 되돌릴
     #   경우 git 이력에서 복원할 것.
+    #   [2026-08-23q, 요청 반영] 위 S1_LANE_FOLLOW+Behavior 즉시 재개를 다시 뒤집었다 —
+    #   램프 완료 후 곧장 S0_SIGNAL(신호 대기)로 돌아가고, Behavior(B1 라바콘 포함)는
+    #   그 다음 직진이 확정될 때만 켠다(_do_checker_ramp_turn() 본문 참고). "좌회전 후
+    #   바로 정상 주행 재개"라는 원래 전제가, 좌회전 직후에도 Phase가 아직 LAVACON로
+    #   남아있는 상황(예: 이번 바퀴 B1을 아직 안 거친 채로 좌회전만 먼저 확정된 경우)에서
+    #   B1이 검증 없이 곧장 발동해버리는 문제를 실차에서 드러냈다.
     def _begin_checker_ramp_turn(self):
         self._checker_ramp_dist = 0.0
         self.get_logger().info('체크무늬 게이트 통과 — 좌회전 램프 시작')
@@ -2391,19 +2414,18 @@ class TrackDriverNode(Node):
             self.get_logger().info('체크무늬 게이트 좌회전 램프 완료')
             self._checker_ramp_dist = None
             self._left_turn_last_done_t = time.time()  # left_turn_debug 창 "실행끝" 표시용
-            # 'straight' 커밋 완료(_s0_signal())와 동일하게 처리 — 좌회전도 별도 지름길
-            # state 없이 곧장 일반 차선주행으로 복귀하고, B1→B2→B3 Behavior를 다시 연다.
-            self._behavior_enabled = True
-            self._signal_reentry_cooldown_t = time.time() + SIGNAL_REENTRY_COOLDOWN
-            if TEST_SIGNAL_LOOP and self.phase == Phase.DONE:
-                # [2026-08-23, 요청 반영] 격리 테스트 전용 — phase가 그대로 Phase.DONE이면
-                # (=이 좌회전이 신호 판단 테스트 대기 상태에서 시작된 것) "아까 상태"로
-                # 되돌아가는 것이므로, 다음 테스트를 위해 신호등 YOLO를 다시 켠다. 정상
-                # 레이스에선 이 리셋을 _update_lap()(결승선 통과)만 담당해야 하므로
-                # phase==LAVACON/OBSTACLE_ZONE(=실제 레이스 중 좌회전)일 땐 안 건드린다.
-                self._signal_yolo_off = False
-                self._signal_off_hold_cnt = None  # [2026-08-23b] 유예 카운터도 같이 리셋
-            self._change_state(MissionState.S1_LANE_FOLLOW)
+            # [2026-08-23q, 요청 반영] 좌회전 완료 직후 곧장 S1+Behavior 재개하던 걸
+            # 그만두고, 다시 S0_SIGNAL(신호 대기)로 돌아가 다음 신호를 기다린다 — 라바콘
+            # (B1)은 오직 "직진"을 받은 뒤에만 들어가야 한다는 요청 반영(좌회전 직후
+            # Phase가 아직 LAVACON인 채로 남아있으면 Behavior가 곧장 켜져 B1이 바로
+            # 트리거되는 문제가 실차에서 확인됨). Behavior 재활성화(_behavior_enabled=True)는
+            # 이제 _s0_signal()의 직진 확정 분기가 전담하므로 여기서는 세팅하지 않는다.
+            # _signal_yolo_off/_signal_off_hold_cnt는 좌회전 확정 때 이미 True로 굳어있으므로,
+            # 새로 진입하는 S0_SIGNAL이 신호를 다시 읽을 수 있도록 여기서 직접 푼다(예전엔
+            # TEST_SIGNAL_LOOP 테스트 모드에서만 하던 걸 기본 동작으로 승격).
+            self._signal_yolo_off = False
+            self._signal_off_hold_cnt = None
+            self._change_state(MissionState.S0_SIGNAL)
 
     def _yaw_delta(self, start):
         """현재 yaw - start (−π~π wrap)"""
