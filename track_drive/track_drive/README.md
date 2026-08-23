@@ -1612,6 +1612,50 @@ yolo_signal_state.py 상단 주석)라, 이 게이트도 실주행 판단이 아
 
 ---
 
+### 1.19l 정리 — "좌회전 신호 검출실패" 디버깅 세션에서 기억해둘 것 (2026-08-23)
+
+§1.19g~k에 걸쳐 세션 하나에서 계속 파고든 이슈라, 다음에 다시 손댈 때 바로 감을
+잡을 수 있게 핵심만 따로 정리해둔다. 개별 변경 이력/근거는 위 §1.19g~k 참고.
+
+**지금 실제 코드 상태(2026-08-23 기준, 값 재확인은 `config.py`에서):**
+- `SIG_CONFIRM_FRAMES = 100`(20Hz 기준 5초) — 원래 3이었다가 이 세션에서
+  1→3→10→200→100으로 계속 조정된 값. **연속** 프레임 기준이라 한 프레임이라도
+  신호가 끊기면 카운트가 0으로 리셋된다(`perc_signal()`) — 확정까지 체감이 꽤
+  오래 걸릴 수 있다는 뜻. "확정이 안 된다"는 보고가 다시 들어오면 이 값과 카운트
+  리셋 방식(연속 vs sliding-window)부터 의심할 것.
+- `YOLO_SIGNAL_STATE_CONF_THRESHOLD = 0.5`(원래 값 — 한때 0.8이었다가 원복).
+- `TEST_SIGNAL_LOOP = True`, `START_STATE = MissionState.S1_LANE_FOLLOW`,
+  `track_drive.py __init__`의 `phase = Phase.DONE`/`_b2_passed = _b3_passed = True`
+  — **실차 레이스용이 아니라 신호 판단(직진/좌회전) 반복 격리 테스트 전용 상태다.**
+  이 상태로 실제 3바퀴 레이스를 뛰면 안 된다(§1.19h "알려진 한계" 참고) — 검증
+  끝나면 `START_STATE=S0_SIGNAL`/`phase=Phase.LAVACON`/`_b2_passed=_b3_passed=False`/
+  `TEST_SIGNAL_LOOP=False`로 반드시 되돌릴 것.
+- `TEST_FORCE_SIGNAL_YOLO = True` — 신호등 YOLO를 FSM 상태와 무관하게 항상 켜서
+  검출 단독 테스트하는 플래그. 이것도 켜진 채로 레이스 뛰면 cone/vehicle YOLO가
+  전혀 안 돈다(B1/B2/B3 검증 불가) — 검증 끝나면 `False`로.
+
+**증상과 진짜 원인이 어긋났던 지점들(다음에 비슷한 보고가 오면 먼저 의심할 것):**
+1. "욜로창엔 찍혔는데 확정이 안 뜬다" → 대부분 `_change_state()`가 S0_SIGNAL 진입
+   시 `signal_left_confirmed`/`_sig_left_cnt`를 그 자리에서 리셋해버려 생기는
+   **디버그 표시상의 착시**였다. FSM 반응 자체는 확정되는 그 틱에 이미 끝나 있다.
+2. "좌회전을 보여줘도 반응이 없다" → `TEST_SIGNAL_LOOP` 모드에서 `phase`가 한 번
+   `Phase.LAVACON`으로 넘어가면(직진 오검출 단 1프레임으로도 가능) 그 세션 안에서
+   되돌아올 방법이 없어(`_active_yolo_stage()`가 `'cone'`만 리턴) 신호등 YOLO
+   자체가 죽어버린다. **`left_turn_debug`의 `phase=... 활성 YOLO=...` 줄부터
+   확인** — `phase != DONE`이면 노드 재시작 외엔 답이 없다.
+3. "욜로창이 얼어붙어서 옛날 프레임만 보여준다" → 위 2번과 같은 원인. YOLO
+   백그라운드 워커는 `detect()`가 안 불리면 그냥 유휴 상태로 대기만 하고 마지막
+   프레임을 그대로 들고 있는다(`yolo_signal_state.py` `_worker()`).
+4. **근본 원인은 결국 모델의 프레임 단위 불안정성이었다** — `green_left`가
+   `green_straight`보다 평균 신뢰도가 낮고, 순간 프레임만 끊어보면 둘이 동시에
+   뜨기도 하며, 연속으로 몇 초 관찰하면 안정된다는 게 실차로 확인됨. 로직 버그가
+   아니라 **디바운스(SIG_CONFIRM_FRAMES)로 시간을 들여 걸러내야 하는 종류의
+   문제**라 계속 값을 올리는 방향으로 대응했다 — 모델 자체를 재학습/교체하기
+   전까지는 이 트레이드오프(확정까지 오래 걸림 vs 오검출 방지)가 근본적인
+   한계로 남는다.
+
+---
+
 ## 2. 라인트래킹 (차선주행, S1)
 
 **수정할 곳:** `START_STATE=S1_LANE_FOLLOW`, `TEST_FORCE_BEHAVIOR=False`.
