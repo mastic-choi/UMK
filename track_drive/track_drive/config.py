@@ -1844,6 +1844,12 @@ YOLO_CONE_MODEL_PATH = None    # None이면 yolo_ros/cone_best_n.onnx(형제 디
 #   B1=5000.0, B2=2500.0으로 확정(placeholder 아님).
 YOLO_CONE_MIN_BOX_AREA_PX_B1 = 5000.0   # B1(라바콘 진입 트리거) 전용 — 실차 실측 확정치
 YOLO_CONE_MIN_BOX_AREA_PX_B2 = 2500.0   # B2(고정장애물 obstacle_cut) 전용 — 실차 실측 확정치
+# [2026-08-24, 요청 반영] 면적게이트 자체가 1프레임짜리 순간 오검출로도 통과되는 문제 —
+#   B1/B2/B3 모두 면적게이트 통과가 연속 N프레임 유지돼야 확정으로 친다(각자 독립 카운터,
+#   track_drive.py의 _cone_area_b1_cnt/_cone_area_b2_cnt/_vehicle_area_b3_cnt).
+#   20Hz 고정주기 기준 5프레임=0.25초. 라이다와 합쳐지는 하위 디바운스(LAVACON_TRIGGER_FRAMES/
+#   OBSTACLE_CUT_TRIGGER_FRAMES)와는 별개로 YOLO 조건 자체에 거는 게이트.
+YOLO_AREA_CONFIRM_FRAMES = 5
 
 # ── [2026-08-20] 방해차량 카메라 이중확인 (perception/yolo_vehicle.py, YOLOv8n ONNX) ──
 #   da 근접 컷(ENABLE_OBSTACLE_CUT, 위 참고) 전용. 최초 이식(fix/da-corridor-near-band-margin

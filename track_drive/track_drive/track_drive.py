@@ -262,6 +262,8 @@ class TrackDriverNode(Node):
                                               #   면적 게이트(YOLO_CONE_MIN_BOX_AREA_PX_B1/_B2)는
                                               #   perc_lavacon_trigger()/perc_obstacle_cut_trigger()가 각자 건다.
         self.cone_max_box_area      = 0.0    # [2026-08-23] 이번 프레임 콘 검출 박스 중 최대 면적(px², 위 게이트/디버그 표시용)
+        self._cone_area_b1_cnt      = 0      # [2026-08-24] 면적게이트(_B1) 통과 연속 프레임 수 — YOLO_AREA_CONFIRM_FRAMES 참고
+        self._cone_area_b2_cnt      = 0      # [2026-08-24] 면적게이트(_B2) 통과 연속 프레임 수
         self.lavacon_trigger        = False  # (YOLO 검출 AND 좌우 라이다 동시검출)이 디바운스 프레임수만큼 유지되면 True
         self._lavacon_trigger_cnt   = 0      # 동시검출 연속 프레임 수(디바운스 카운터)
         self._lavacon_dbg = (0, 0, 0, 0)     # 디버그용 (좌ROI점수, 좌최대연속묶음, 우ROI점수, 우최대연속묶음)
@@ -292,6 +294,7 @@ class TrackDriverNode(Node):
                                                   #   면적 게이트(YOLO_VEHICLE_MIN_BOX_AREA_PX_B3)는
                                                   #   perc_obstacle_cut_trigger()(B3)가 건다.
         self.vehicle_max_box_area_cut  = 0.0     # [2026-08-23] 이번 프레임 차량 검출 박스 중 최대 면적(px², 위 게이트/디버그 표시용)
+        self._vehicle_area_b3_cnt      = 0       # [2026-08-24] 면적게이트(_B3) 통과 연속 프레임 수 — YOLO_AREA_CONFIRM_FRAMES 참고
         self._obstacle_cut_trigger_cnt = 0       # (라이다 근접 AND YOLO(콘 또는 차량)) 연속확인 프레임 수(디바운스)
         self.obstacle_cut_trigger      = False   # 위 디바운스가 OBSTACLE_CUT_TRIGGER_FRAMES 넘겨 확정됐는지
         # [2026-08-20] 요청 반영 — 이 트리거를 B2(고정장애물=라바콘 1개)/B3(방해차량) 공용으로
@@ -1480,10 +1483,17 @@ class TrackDriverNode(Node):
         # [2026-08-23] 요청 반영 — B2(콘)/B3(차량) 각자 다른 임계값(YOLO_CONE_MIN_BOX_AREA_PX_B2/
         # YOLO_VEHICLE_MIN_BOX_AREA_PX_B3)으로 "가장 큰 검출 박스 면적" 게이트를 건다. B1은
         # perc_lavacon_trigger()가 별도 임계값(_B1)으로 독립적으로 건다(config.py 참고).
-        cone_seen    = (self.cone_detected_yolo
+        # [2026-08-24] 요청 반영 — 면적게이트 통과가 1프레임 순간값이면 안 믿고, YOLO_AREA_CONFIRM_FRAMES
+        # 연속 유지돼야 cone_seen/vehicle_seen을 True로 친다(하나라도 빠지면 즉시 0 리셋).
+        cone_area_ok_now = (self.cone_detected_yolo
                         and self.cone_max_box_area >= YOLO_CONE_MIN_BOX_AREA_PX_B2) if self.yolo_cone_detector is not None else False
-        vehicle_seen = (self.vehicle_detected_yolo_cut
+        self._cone_area_b2_cnt = self._cone_area_b2_cnt + 1 if cone_area_ok_now else 0
+        cone_seen    = self._cone_area_b2_cnt >= YOLO_AREA_CONFIRM_FRAMES
+
+        vehicle_area_ok_now = (self.vehicle_detected_yolo_cut
                         and self.vehicle_max_box_area_cut >= YOLO_VEHICLE_MIN_BOX_AREA_PX_B3) if self.yolo_vehicle_cut_detector is not None else False
+        self._vehicle_area_b3_cnt = self._vehicle_area_b3_cnt + 1 if vehicle_area_ok_now else 0
+        vehicle_seen = self._vehicle_area_b3_cnt >= YOLO_AREA_CONFIRM_FRAMES
         # [2026-08-21] 방해차량(vehicle) 오검출 방지 — 라이다/YOLO가 각각 판단한 좌우가
         # 일치할 때만 vehicle_seen을 신뢰한다. 라이다·카메라가 "이번 틱에 뭔가 있다"까지는
         # 둘 다 맞아도 서로 다른 위치(예: 라이다는 우측 근접 장애물, YOLO는 좌측 배경
@@ -1754,9 +1764,16 @@ class TrackDriverNode(Node):
         # 다른 임계값(YOLO_CONE_MIN_BOX_AREA_PX_B1)으로 "가장 큰 검출 박스 면적"을 따로
         # 건다(config.py 해당 상수 주석 참고) — 같은 콘 검출기를 공유하지만 진입 전(B1)과
         # 이미 진입해 지나치는 중(B2)은 콘까지의 거리 감이 달라질 수 있어서 분리했다.
-        cone_confirmed_cam = (
-            self.cone_detected_yolo and self.cone_max_box_area >= YOLO_CONE_MIN_BOX_AREA_PX_B1
-        ) if self.yolo_cone_detector is not None else True
+        # [2026-08-24] 요청 반영 — 면적게이트(_B1)도 YOLO_AREA_CONFIRM_FRAMES 연속 통과해야
+        # cone_confirmed_cam=True (B2/B3와 동일 패턴, 카운터는 _cone_area_b1_cnt로 별도).
+        if self.yolo_cone_detector is not None:
+            cone_area_ok_now = (
+                self.cone_detected_yolo and self.cone_max_box_area >= YOLO_CONE_MIN_BOX_AREA_PX_B1
+            )
+            self._cone_area_b1_cnt = self._cone_area_b1_cnt + 1 if cone_area_ok_now else 0
+            cone_confirmed_cam = self._cone_area_b1_cnt >= YOLO_AREA_CONFIRM_FRAMES
+        else:
+            cone_confirmed_cam = True
         if cone_confirmed_cam and self.lavacon_left_detected and self.lavacon_right_detected:
             self._lavacon_trigger_cnt += 1
         else:
