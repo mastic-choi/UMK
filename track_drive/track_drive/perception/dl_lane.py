@@ -2822,6 +2822,8 @@ class DLLaneDetector:
             cv2.namedWindow('dl_lane', cv2.WINDOW_AUTOSIZE)
             cv2.moveWindow('dl_lane', *DEBUG_WIN_POS_DL_LANE)
             self._dbg_win_positioned = True
+        # [2026-08-23g, 요청 반영: "아까사이즈로돌려"] 표시 직전 축소(DEBUG_WIN_DISP_SIZE_DL_LANE)가
+        # 종횡비를 무시하고 강제 리사이즈해서 화면비율이 깨졌다 — 원래 크기(vis 원본)로 되돌림.
         cv2.imshow('dl_lane', vis)
         cv2.waitKey(1)
 

@@ -40,7 +40,7 @@ except ImportError:
 
 from ..config import (
     YOLO_CONE_INPUT_SIZE, YOLO_CONE_CONF_THRESHOLD, YOLO_CONE_MODEL_PATH,
-    DEBUG_VIZ_YOLO_CONE, FPS_LOG_PERIOD_SEC,
+    DEBUG_VIZ_YOLO_CONE, DEBUG_WIN_POS_YOLO_CONE, FPS_LOG_PERIOD_SEC,
 )
 
 
@@ -192,6 +192,9 @@ class YoloConeDetector:
         self._latest_frame = None
         self._latest_result = (False, [])          # (cone_detected, detections)
         self._latest_debug = None                    # 시각화용 vis 프레임
+        # [2026-08-23] 'yolo_cone_result' 창을 처음 띄울 때만 cv2.moveWindow로 위치를 잡기
+        #   위한 1회성 가드(DEBUG_WIN_POS_YOLO_CONE 참고, yolo_signal_state.py의 동일 패턴).
+        self._dbg_win_positioned = False
         self._stopped = False
         self._last_fps_log_t = time.time()
         self._logged_infer_error = False  # [2026-08-20] 추론 예외를 매 프레임 로그하면 로그창이
@@ -281,6 +284,10 @@ class YoloConeDetector:
         # (원본 해상도 vis 자체·get_latest_debug_frame()이 돌려주는 프레임·검출 좌표 계산에는
         # 영향 없음 — 순전히 이 창의 표시 크기만 줄이는 것).
         small = cv2.resize(vis, (160, 120), interpolation=cv2.INTER_AREA)
+        if not self._dbg_win_positioned:
+            cv2.namedWindow('yolo_cone_result', cv2.WINDOW_AUTOSIZE)
+            cv2.moveWindow('yolo_cone_result', *DEBUG_WIN_POS_YOLO_CONE)
+            self._dbg_win_positioned = True
         cv2.imshow('yolo_cone_result', small)
         cv2.waitKey(1)
 

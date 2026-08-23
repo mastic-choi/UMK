@@ -377,13 +377,10 @@ class TrackDriverNode(Node):
         # ── 판단/제어 상태 ──
         self.mission_state  = START_STATE
         self.behavior_state = BehaviorState.B0_NORMAL
-        # [2026-08-23] "B3 통과 후 다음 교차로 신호등 대기" 단독 검증용 override를 다시
-        # 건다(요청 반영, TEST_SIGNAL_LOOP와 짝 — config.py "6. 미션 State" 절 참고) —
-        # 신호등 판단(직진/좌회전)만 실차에서 반복 테스트하려는 목적이라, B1/B2/B3를
-        # 전부 "이미 통과한 것"으로 놓고 곧장 다음 교차로 신호등 대기 상태로 시작한다.
-        # 검증 끝나면 Phase.LAVACON/False/False로 되돌리고 config.py TEST_SIGNAL_LOOP도
-        # False로 같이 되돌릴 것(9c4371e 좌회전 단독 검증 때와 같은 패턴).
-        self.phase          = Phase.DONE
+        # [2026-08-23] 위 "B3 통과 후 신호등 판단만" 격리 검증 끝나서 원복(요청 반영,
+        # config.py START_STATE/TEST_SIGNAL_LOOP와 짝) — 이제 출발선에서 초록불 대기부터
+        # B1(라바콘)→B2(고정장애물)→B3(이동장애물) 전체 흐름을 정상대로 시작한다.
+        self.phase          = Phase.LAVACON
         # [2026-08-15] Phase.OBSTACLE_ZONE 통합(da_based_b2b3_proposal.md B안) —
         # B2/B3 각각 최소 한 번 완료됐는지 추적. 둘 다 True가 돼야 Phase.DONE으로
         # 넘어간다(_mark_behavior_passed() 참고).
@@ -391,10 +388,10 @@ class TrackDriverNode(Node):
         # 확정된 순서다(§5.2) — §5.4에서 잠깐 반대로 뒤집었다가(요청 반영), [2026-08-22]
         # 요청으로 다시 "B2 먼저"로 되돌렸다(README §5.5). run_behavior_fsm()에서 B3 트리거를
         # self._b2_passed가 True일 때만 받아들이도록 순서를 강제한다(아래 참고).
-        # [2026-08-23] 위 Phase.DONE 시작과 짝 — Phase.DONE 진입 조건(_mark_behavior_passed())
-        # 이 원래 요구하는 값(둘 다 True)을 시작부터 맞춰둔다.
-        self._b2_passed = True
-        self._b3_passed = True
+        # [2026-08-23] 위 Phase.LAVACON 원복과 짝 — B2/B3 둘 다 아직 안 지났으므로 False로
+        # 시작(원래 정상 레이스 시작값).
+        self._b2_passed = False
+        self._b3_passed = False
         # [2026-08-20] 요청 반영 — B2/B3 실제 처리를 da 근접 컷(obstacle_cut_active) 기반으로
         # 바꾸면서 추가. obstacle_cut_active 진입 순간 'B2'/'B3' 중 하나를 latch해뒀다가,
         # obstacle_cut_active가 다시 꺼지는 순간(탈출) 그 태그로 _mark_behavior_passed()를
@@ -402,8 +399,9 @@ class TrackDriverNode(Node):
         # 동일한 진입~탈출 latch 패턴.
         self._obscut_zone_tag = None
         self._behavior_enabled = TEST_FORCE_BEHAVIOR  # 원래 S0_SIGNAL "직진" 확정 시에만 True
-                                                       #   (TEST_FORCE_BEHAVIOR=False — Phase.DONE 시작이라 강제 ON 불필요,
-                                                       #    직진 신호 확정 분기가 그때 가서 직접 켠다)
+                                                       #   (TEST_FORCE_BEHAVIOR=False — S0_SIGNAL부터
+                                                       #    정상 시작이라 강제 ON 불필요, 직진 신호
+                                                       #    확정 분기가 그때 가서 직접 켠다)
         # [2026-08-20] S0_SIGNAL 통합(S0_WAIT_GREEN+S2_INTERSECTION → 하나)으로 같은 state를
         # 출발 때와 매 바퀴 교차로에서 반복 재진입하게 됐다 — "이번이 진짜 첫 출발인지"는
         # prev_state 비교로 더 이상 구분이 안 되므로(둘 다 같은 state) 이 플래그로 직접
@@ -934,6 +932,15 @@ class TrackDriverNode(Node):
         self._sig_left_cnt     = self._sig_left_cnt + 1 if self.signal_left_on else 0
         self.signal_straight_confirmed = self._sig_straight_cnt >= SIG_CONFIRM_FRAMES
         self.signal_left_confirmed     = self._sig_left_cnt >= SIG_CONFIRM_FRAMES
+        # ★★★ [2026-08-23j, 요청 반영, 중대 임시 스위치 — 반드시 원복!] ★★★
+        # TEST_FORCE_LEFT_TURN_SIGNAL=True면 실제 YOLO 판독 결과를 완전히 무시하고
+        # "좌회전 신호를 이미 받은 것"으로 강제한다 — 좌회전 로직(커밋 구간 →
+        # perc_checker_pillar() 좌우 라이다 기둥쌍 검출 → 조향 램프)만 신호등 인식과
+        # 분리해서 단독 검증하려는 목적(config.py TEST_FORCE_LEFT_TURN_SIGNAL 주석 참고).
+        # ⚠️ 검증 끝나면 config.py에서 False로 되돌릴 것 — 실차 레이스 중 켜진 채로
+        # 있으면 신호와 무관하게 항상 좌회전으로 우겨서 코스를 이탈한다.
+        if TEST_FORCE_LEFT_TURN_SIGNAL:
+            self.signal_left_confirmed = True
         # [2026-08-23] 직진/좌회전 둘 중 하나라도 확정되면 신호등 YOLO 추론을 끈다 —
         # 색상이 이미 확정된 이상 더 볼 필요가 없다(다음 바퀴 리셋까지, _update_lap()
         # RESET_PHASE_EACH_LAP 분기 참고). 예전엔 직진 확정 분기(_s1_lane_follow())에서만
@@ -1214,6 +1221,13 @@ class TrackDriverNode(Node):
                         (8, 84), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                         (0, 255, 0) if (self.left_clear_confirmed or self.right_clear_confirmed) else (0, 0, 255),
                         1, cv2.LINE_AA)
+            # [2026-08-23] 'lidar_bev' 창만 다른 디버그 창들과 달리 moveWindow가 아예 없어서
+            #   OS 기본 위치(대개 화면 좌상단)에 떠 다른 창(YOLO_신호등 등)과 겹쳤다(요청 반영
+            #   — "디버깅창 뜰때 안겹치게") — 나머지 창과 동일한 1회성 가드 패턴 적용.
+            if 'lidar_bev' not in self._dbg_windows_positioned:
+                cv2.namedWindow('lidar_bev', cv2.WINDOW_AUTOSIZE)
+                cv2.moveWindow('lidar_bev', *DEBUG_WIN_POS_LIDAR)
+                self._dbg_windows_positioned.add('lidar_bev')
             cv2.imshow('lidar_bev', bev)
             cv2.waitKey(1)
 
@@ -2325,7 +2339,8 @@ class TrackDriverNode(Node):
             # 정지위치 산포에 안 흔들리는 물리적 트리거. CHECKER_PILLAR_TIMEOUT_DIST_M
             # 넘도록 기둥쌍이 안 잡히면(라이다 죽음/오검출) 거리기반으로 강제 폴백해 무한
             # 직진을 막는다.
-            timed_out = self._s2_commit_dist >= CHECKER_PILLAR_TIMEOUT_DIST_M
+            timed_out = (not TEST_DISABLE_CHECKER_PILLAR_TIMEOUT
+                         and self._s2_commit_dist >= CHECKER_PILLAR_TIMEOUT_DIST_M)
             if self.checker_pillar_trigger or timed_out:
                 if timed_out and not self.checker_pillar_trigger:
                     self.get_logger().warn(
@@ -3301,8 +3316,12 @@ class TrackDriverNode(Node):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1, cv2.LINE_AA)
 
         # --- 라이다 ROI(트리거에 실제 쓰인 박스) BEV 패널 ---------------------------
-        cv2.putText(canvas, 'LIDAR TRIGGER ROI (매틱 갱신)', (panel_x0, panel_y0 - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1, cv2.LINE_AA)
+        # [2026-08-23] cv2 기본폰트(Hershey)는 한글을 못 그려 '매틱 갱신' 부분이 '????'로
+        # 깨져 보이던 버그 수정 — 다른 텍스트들과 동일하게 put_text_kr_multi(PIL 기반)로 교체.
+        put_text_kr_multi(canvas, [
+            ('LIDAR TRIGGER ROI (매틱 갱신)', (panel_x0, panel_y0 - 20), (180, 180, 180), 15,
+             'LIDAR TRIGGER ROI (updated every tick)'),
+        ])
         bev = canvas[panel_y0:panel_y0 + PANEL_H, panel_x0:panel_x0 + PANEL_W]
         DISP_X_MAX = OBSTACLE_CUT_TRIGGER_X_MAX_M + 1.0
         DISP_Y_HALF = OBSTACLE_CUT_TRIGGER_Y_HALF_M + 0.45
@@ -3334,8 +3353,11 @@ class TrackDriverNode(Node):
                 cv2.circle(bev, (px, py), 4, (0, 0, 255), -1)   # 트리거 박스 안(실제 판정에 쓰인 점, 빨강)
 
         if bg_x.size == 0:
-            cv2.putText(bev, '(표시범위 안 점 없음)', (8, PANEL_H - 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1, cv2.LINE_AA)
+            # [2026-08-23] 위 패널 제목과 동일한 이유로 '????' 깨짐 수정 — put_text_kr_multi로 교체.
+            put_text_kr_multi(bev, [
+                ('(표시범위 안 점 없음)', (8, PANEL_H - 34), (120, 120, 120), 13,
+                 '(no points in range)'),
+            ])
 
         cv2.circle(bev, (EX, EY), 5, (255, 220, 0), -1)          # 자차 위치
         cv2.rectangle(bev, (0, 0), (PANEL_W - 1, PANEL_H - 1), (80, 80, 80), 1)
