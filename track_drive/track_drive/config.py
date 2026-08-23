@@ -707,6 +707,14 @@ OBSTACLE_CUT_RELEASE_CONFIRM_FRAMES = 4   # 해제 디바운스 — AVOID_HOLD_R
 #   시간이 늘어 램프업 여유가 커진다 — 실차 미검증, 물리적 여유 실측 후 재조정 필요.
 SPEED_OBSTACLE_CUT = 12.0  # [2026-08-20] 8.0 → 12.0(요청 반영, 사실상 무영향 수준으로 완화)
 
+# [2026-08-23, 요청 반영] B1(Phase.LAVACON) 중 목표속도 상한 — track_drive.py
+#   `_update_speed()`가 SPEED_OBSTACLE_CUT과 동일한 방식(target_speed에 min()으로만
+#   얹음)으로 적용한다. 과거 SPEED_LAVACON(2.5 고정, §2.22/§0.5.11 이력)처럼 매 틱
+#   정확한 값으로 강제 고정해 "굳는" 증상을 일으켰던 방식이 아니라, accel_step 램프가
+#   그대로 적용된 채로만 상한을 낮추므로 그 문제가 재현되지 않을 것으로 예상 —
+#   실차 미검증, 라바콘 구간에서 급감속/정지처럼 느껴지면 값을 올릴 것.
+SPEED_LAVACON_CAP = 9.0
+
 # [2026-08-10] DL_CENTER_MODE='ll' 내부에서 실제 밴드 중심 계산 알고리즘을 고르는
 #   2차 스위치 — 같은 날 두 사람이 독립적으로 서로 다른 재설계를 했다(origin/main
 #   병합 시 두 구현이 정면으로 겹쳐 병합 커밋에서 "둘 다 남기고 전환 가능하게" 하기로
@@ -1426,7 +1434,7 @@ DEBUG_VIZ_YOLO_CONE  = True   # 콘 원시검출 창('yolo_cone_result', yolo_co
 # [2026-08-21] 신호등 위치+색상 판정을 YOLO 단독(yolo_signal_state.py) 하나로 정리하면서
 #   (README §1.18) 이게 유일한 신호등 결과 창이 됐다 — 실차에서 지금 뭘 보고 판단 중인지
 #   눈으로 확인하기 위함.
-DEBUG_VIZ_YOLO_SIGNAL_STATE = True   # 신호등 위치+색상상태 YOLO 검출 박스 디버그 창 (perception/yolo_signal_state.py, 창 이름 'YOLO_신호등')
+DEBUG_VIZ_YOLO_SIGNAL_STATE = False   # 신호등 위치+색상상태 YOLO 검출 박스 디버그 창 (perception/yolo_signal_state.py, 창 이름 'YOLO_신호등')
                                       # [2026-08-22h] 요청 반영으로 껐다가, [2026-08-23] B3 통과 후
                                       #   S0_SIGNAL 대기 검증(아래 "6. 미션 State" override) 위해 다시 켰다가,
                                       #   [2026-08-23b] 요청 반영으로 다시 끔, [2026-08-23r] 요청 반영(주행용
@@ -1446,7 +1454,7 @@ DEBUG_VIZ_AVOID_HOLD = False
 # [2026-08-20] da 근접 컷(obstacle-cut, ENABLE_OBSTACLE_CUT 주석 참고) 전용 상태창 —
 #   라이다 raw/YOLO raw/AND확정/유지타이머 잔여시간/해제카운터를 avoid_hold_debug와
 #   같은 구조로 한곳에 모아 보여준다(track_drive.py _debug_viz_obstacle_cut()).
-DEBUG_VIZ_OBSTACLE_CUT = False    # [2026-08-22i] 요청 반영으로 껐다가, [2026-08-22m] 회피(da 근접 컷)
+DEBUG_VIZ_OBSTACLE_CUT = True    # [2026-08-22i] 요청 반영으로 껐다가, [2026-08-22m] 회피(da 근접 컷)
 #   검출범위 확인용으로 다시 켰다가, [2026-08-23a] 요청 반영으로 다시 끔, [2026-08-23b] B1/B2/B3
 #   회피 전체 흐름 검증 시작하며 다시 켬 — dl_lane(da) 창과 같이 켜서 "라이다가 왜 지금
 #   잡았는지"와 "그래서 경로가 실제로 밀렸는지"를 두 창에서 나란히 확인.
@@ -1468,7 +1476,7 @@ DEBUG_VIZ_OBSTACLE_CUT = False    # [2026-08-22i] 요청 반영으로 껐다가,
 #     (지금 켜둔 Phase.LAVACON/_b2_passed=_b3_passed=False B1 테스트 세팅 그대로 이어짐).
 #   - _s1_lane_follow()에서 signal_left_confirmed → S0_SIGNAL 커밋구간 →
 #     _begin_checker_ramp_turn()/_do_checker_ramp_turn()으로 좌회전 조향 램프 실행.
-START_STATE     = MissionState.S0_SIGNAL
+START_STATE     = MissionState.S1_LANE_FOLLOW
 ENABLE_BEHAVIOR = True  # S1에서 라바콘/장애물/추월 Behavior를 켤지 여부(최상위 스위치)
 
 # ── 실차 테스트 범위 제한 ──
@@ -1482,7 +1490,7 @@ TEST_DISABLE_B2_B3 = False
 #         이중으로 걸어 B2/B3가 어떤 경로로도 안 켜지게 한다(안전판).
 #   False: 원래대로 SAFETY_DIST/OVERTAKE_TRIGGER 트리거 검사해서 B2/B3 정상 발동 —
 #         이번 B3 검증이 보고 싶은 게 바로 이 발동이라 False.
-TEST_FORCE_BEHAVIOR = False
+TEST_FORCE_BEHAVIOR = True
 #   True: _behavior_enabled를 시작부터 강제 True로 켜서, START_STATE=S1_LANE_FOLLOW로
 #         S0/S2를 건너뛴 채로도 B1→B2→B3가 정상 발동한다(그렇지 않으면 _behavior_enabled가
 #         S0_SIGNAL 직진 확정 시에만 True가 되는데 그 경로 자체를 안 타므로 계속 False로
@@ -1696,10 +1704,10 @@ LAVACON_STEER_MODE_DA_PUSH = True
 #   아이디어를 실차로 빠르게 테스트해보기 위한 스위치 — 효과 없거나 오히려 나쁘면
 #   LAVACON_KICK_ENABLED만 False로 되돌리면 이 블록 전체가 비활성화된다(실차 미검증).
 LAVACON_KICK_ENABLED    = True
-LAVACON_KICK_DURATION_S = 0.4    # 이 시간(초) 동안 고정 조향각 유지 — CONTROL_HZ(20Hz)로 환산해 프레임수로 씀
-                                  # [2026-08-23] 0.2 → 0.4(요청 반영)
-LAVACON_KICK_ANGLE_DEG  = -30.0  # 강제 조향각(도) — 부호규약은 ctrl_angle과 동일(우측 콘 쪽으로 짐작, 실차에서 방향 확인 필요)
-                                  # [2026-08-23] -20.0 → -30.0(요청 반영)
+LAVACON_KICK_DURATION_S = 0.2    # 이 시간(초) 동안 고정 조향각 유지 — CONTROL_HZ(20Hz)로 환산해 프레임수로 씀
+                                  # [2026-08-23] 0.2 → 0.4 → 0.2 → 0.0 → 0.2(요청 반영)
+LAVACON_KICK_ANGLE_DEG  = -20.0  # 강제 조향각(도) — 부호규약은 ctrl_angle과 동일(우측 콘 쪽으로 짐작, 실차에서 방향 확인 필요)
+                                  # [2026-08-23] -20.0 → -30.0 → 0.0 → -20.0(요청 반영)
 
 # [2026-08-19] 안전마진(m) — 이 값보다 콘이 차량 중심에 가깝게 들어오면 그만큼 반대쪽으로
 #   민다. VEHICLE_WIDTH_M(0.31, 실측)/2=0.155(차량 반폭) + DL_DA_SIDE_MARGIN_M(0.1, B2/B3
@@ -1722,7 +1730,7 @@ LAVACON_PUSH_SAFETY_MARGIN_R_M = 0.25
 #   곱해 실제로 미는 세기를 정한다. margin을 넓힌 것과는 별개로 "밀리는 정도 자체"도
 #   2배로 키워달라는 요청 반영(실차 미검증) — track_drive.py `_lavacon_steer_da_push()`와
 #   lavacon_bev 디버그 표시(둘 다 같은 부호규약) 양쪽에 동일하게 곱한다.
-LAVACON_PUSH_GAIN = 1.3
+LAVACON_PUSH_GAIN = 1.2 #1.13
 
 # [2026-08-19] push 신호 전용 ROI — 박스 스택의 CONE_LON_MAX(4.0m, 구간 전체) 대신 훨씬
 #   가까운 범위만 본다. "지금 당장 스칠 위험이 있는 콘"만 반응해야 하므로, 멀리 있는
@@ -1743,7 +1751,7 @@ LAVACON_PUSH_GAIN = 1.3
 #   perc_lavacon_trigger()의 LON_MIN/LON_MAX)도 같은 이유로 뒤이어 -0.1~0.3으로 맞췄다 —
 #   두 ROI는 항상 같이 바꿀 것, 하나만 바꾸면 lavacon_bev에서 둘의 시작점이 다시 어긋나 보인다.
 LAVACON_PUSH_LON_MIN     = -0.1  # 차량(자차 마커) 기준 전방 0.3m(=라이다 원점 기준 -0.1m)부터
-LAVACON_PUSH_LON_MAX     = 0.25  # 이 거리보다 먼 콘은 아직 안 민다
+LAVACON_PUSH_LON_MAX     = 0.3  # 이 거리보다 먼 콘은 아직 안 민다
 LAVACON_PUSH_LAT_LIMIT   = 1.0   # 횡방향 탐색 한계 — CONE_LAT_LIMIT(perc_lavacon.py)와 동일값으로 시작
 
 # [2026-08-19] 박스 안 후보점의 좌/우 배정을 y부호(차량 헤딩 기준 고정 중앙선, y>0=좌/

@@ -2668,6 +2668,13 @@ class TrackDriverNode(Node):
         # 구조가 아니다.
         if self.obstacle_cut_active:
             target_speed = min(target_speed, SPEED_OBSTACLE_CUT)
+        # [2026-08-23, 요청 반영] B1(Phase.LAVACON) 중엔 목표속도 상한을 SPEED_LAVACON_CAP으로
+        # 추가 제한 — 과거 SPEED_LAVACON(2.5 고정, 삭제됨)처럼 매 틱 정확한 값으로 강제
+        # 고정하는 게 아니라, 위 코너감속 등과 동일하게 target_speed에 min()으로만 얹는다.
+        # 아래 accel_step 램프가 그대로 적용되므로 급감속/굳는 증상 없이 부드럽게 이 상한까지
+        # 내려간다(SPEED_OBSTACLE_CUT과 동일 패턴, config.py SPEED_LAVACON_CAP 주석 참고).
+        if self.phase == Phase.LAVACON:
+            target_speed = min(target_speed, SPEED_LAVACON_CAP)
         # [2026-08-18] avoid-hold 적용4(SPEED_AVOID_HOLD_BLOCKED 안전판) 삭제 — 실차 테스트에서
         # "속도 5 고정" 증상의 실제 원인으로 확인됨(README §2.43). TEST_DISABLE_B2_B3=True라
         # 실제 회피 기동(옆차선 이동)은 꺼져있는데 이 캡만 무관하게 계속 걸려서, 트리거를
