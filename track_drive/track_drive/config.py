@@ -285,9 +285,12 @@ DL_PIXELS_PER_METER = 200.0   # 설계값(실측 아님) — 목적 캔버스를
 #   값들은 그대로 두고 "이미 정확하게 아는 좌표계에서 먼 부분을 그냥 안 본다"는 크롭일
 #   뿐이라 스케일 왜곡이 없다. 반대로 이 숫자를 바꾼다고 카메라가 실제로 보는 물리적 거리가
 #   바뀌는 것도 아니다(그건 DL_BEV_SRC_PX_RAW 4점의 실측 재측정이 필요 — README §6.3 참고).
-#   1.0 → 0.7로 낮춤(요청 반영) — 실차 미검증, DEBUG_VIZ_DL_LANE에서 크롭 경계가 원하는
-#   위치에 오는지 확인할 것.
-DL_BEV_FAR_LIMIT_M = 0.7
+#   1.0 → 0.7로 낮췄다가(§2.2 S자 커브 ll 두께 과다검출 대응), [2026-08-24] 속도 상향을
+#   위해 lookahead 물리 상한을 늘리려고 다시 0.7 → 1.0으로 되돌림(요청 반영) — 실차
+#   미검증, 특히 S자 커브에서 §2.2 문제(원거리 blur로 ll이 두껍게 과다검출)가 재현되는지
+#   DEBUG_VIZ_DL_LANE으로 반드시 재확인할 것. 재현되면 DL_LL_FG_THRESHOLD 상향 등으로
+#   대응하거나 이 값을 다시 낮출 것.
+DL_BEV_FAR_LIMIT_M = 1.0
 
 # ── 세그멘테이션 결과에서 좌/우 차선 중심을 뽑을 관심영역 (원본 480행 기준 절대 픽셀, 실차 실측값) ──
 DL_ROI_Y0 = 250
@@ -422,7 +425,7 @@ DL_DA_BAND_ANCHOR_ALPHA = 0.35      # 밴드별 탐색창 중심 계산 시 "직
 #   cx를 vehicle_center_x 쪽으로 블렌드(_da_slice_centers_windowed() 참고). 실차 미검증 —
 #   비율/블렌드폭 둘 다 실측 필요.
 DL_DA_NEAR_WIDTH_MIN_RATIO = 0.7
-DL_DA_NEAR_WIDTH_BLEND_MAX = 0.5
+DL_DA_NEAR_WIDTH_BLEND_MAX = 0.7
 
 # [2026-08-18] DL_LL_SANITY_MIN_RATIO(ll sanity check) 삭제 — lane_valid/path_ok 모두
 #   da 중심점 유무로만 판정하도록 바꿈(perception/dl_lane.py 참고, ll 미사용 확정에 따른
@@ -1534,7 +1537,14 @@ DEBUG_VIZ_OBSTACLE_CUT = True    # [2026-08-22i] 요청 반영으로 껐다가, 
 #     (지금 켜둔 Phase.LAVACON/_b2_passed=_b3_passed=False B1 테스트 세팅 그대로 이어짐).
 #   - _s1_lane_follow()에서 signal_left_confirmed → S0_SIGNAL 커밋구간 →
 #     _begin_checker_ramp_turn()/_do_checker_ramp_turn()으로 좌회전 조향 램프 실행.
-START_STATE     = MissionState.S0_SIGNAL
+START_STATE     = MissionState.S1_LANE_FOLLOW
+# [2026-08-24b, 요청 반영] 조향 튜닝(DL_BEV_FAR_LIMIT_M 1.0 확장 검증 포함) 동안 S0(신호
+#   대기)를 매번 안 타도 되게 S1 시작으로 임시 오버라이드. TEST_FORCE_BEHAVIOR는 그대로
+#   False로 둬서 self._behavior_enabled=False → behavior_state는 B0_NORMAL 고정(B1/B2/B3
+#   전부 비활성) — S1+B0 상태로만 주행. self.phase는 기본값 Phase.LAVACON 그대로라(behavior
+#   꺼져있어 실제로 안 쓰임) 별도 변경 불필요. 조향 튜닝 끝나면 반드시 S0_SIGNAL로 원복할
+#   것 — [[project_track_drive_test_start_b2_wait]]와 동일한 함정(원복 안 하면 이후 전체
+#   바퀴 검증에서 "다음 상태로 안 넘어간다"는 혼란 재현).
 # [2026-08-24, 요청 반영] B2 대기 단독 테스트용 오버라이드(S1_LANE_FOLLOW 시작) 원복 —
 #   전체 바퀴/신호 흐름(S0_SIGNAL→B1→B2→B3) 검증으로 다시 전환. 아래 TEST_FORCE_BEHAVIOR,
 #   track_drive.py __init__의 phase=Phase.OBSTACLE_ZONE도 짝으로 원복.
@@ -2164,17 +2174,19 @@ PP_TUNE_PRESETS = {
         #   숫자만 다시 계산: 구 BASE_PX(110.38) + GAIN(3.01)*ANCHOR(12.0) = 146.50.
         #   즉 speed=SPEED_NORMAL(12)일 때 speed_lookahead_px는 여전히 146.5로 그리드서치
         #   원값과 동일 — PP_LOOKAHEAD_SPEED_ANCHOR를 12.0으로 같이 지정해야 이 등가성이 성립한다.
-        PP_LOOKAHEAD_BASE_PX=180, PP_LOOKAHEAD_SPEED_GAIN=3.01, PP_LOOKAHEAD_MAX_PX=265.4,
+        PP_LOOKAHEAD_BASE_PX=205, PP_LOOKAHEAD_SPEED_GAIN=3.01, PP_LOOKAHEAD_MAX_PX=265.4,
         PP_LOOKAHEAD_SPEED_ANCHOR=12.0,
-        PP_WHEELBASE_PX=20, PP_ALPHA=0.9, PP_LD_FLOOR_PX=120.19, PP_DX_DEADZONE_PX=5,
+        PP_WHEELBASE_PX=45, PP_ALPHA=0.9, PP_LD_FLOOR_PX=120.19, PP_DX_DEADZONE_PX=7,
 
-        PP_LOOKAHEAD_CURVATURE_GAIN=120, PP_LOOKAHEAD_MIN_PX=80,
+        PP_LOOKAHEAD_CURVATURE_GAIN=40, PP_LOOKAHEAD_MIN_PX=160,
         SPEED_CORNER_MIN=10.0, CORNER_SIGN_EMA_ALPHA=0.15, LANE_LOOKAHEAD_REF=220.0,
-        SPEED_CORNER_STEER_GAIN=0.50,
+        SPEED_CORNER_STEER_GAIN=0.30,
         SPEED_ACCEL_STEP=0.8, CORNER_HOLD_DECAY_LO=0.92, CORNER_HOLD_DECAY_HI=0.97,
         CORNER_MIN_RADIUS_PX=250.0, CORNER_MIN_SPEED_SCALE=0.35,
         PATH_EMA_ALPHA=0.7, DL_STABLE_FRAME_MIN=1, DL_STABLE_JUMP_MAX=37.44,
-        SPEED_NORMAL=12.0, #직진 잘한 상태
+        SPEED_NORMAL=12.0, #[과거 시점] 직진 잘한 상태 — 이후 코너 재튜닝(BASE_PX/WHEELBASE_PX/
+        # CURVATURE_GAIN/MIN_PX/STEER_GAIN 변경, README §2.62)으로 2026-08-24 실차 재검증 시
+        # 직진 불가로 회귀 확인. 코너는 개선됨 — 직진 회귀 원인 미분석, 다음 테스트에서 조사할 것.
         # [2026-08-19] 조향각 wheelbase 부스트(요청 반영) — "speed15 프리셋일 때만 적용"이라
         # 여기(=speed15 프리셋)에만 켜서(ENABLE=True) 넣는다. 다른 프리셋으로 바꾸면 이 키가
         # 아예 없어서 top-level 기본값(ENABLE=False)이 그대로 남아 자동으로 꺼진다.
