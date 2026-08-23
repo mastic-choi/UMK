@@ -1524,7 +1524,11 @@ DEBUG_VIZ_OBSTACLE_CUT = True    # [2026-08-22i] 요청 반영으로 껐다가, 
 #     (지금 켜둔 Phase.LAVACON/_b2_passed=_b3_passed=False B1 테스트 세팅 그대로 이어짐).
 #   - _s1_lane_follow()에서 signal_left_confirmed → S0_SIGNAL 커밋구간 →
 #     _begin_checker_ramp_turn()/_do_checker_ramp_turn()으로 좌회전 조향 램프 실행.
-START_STATE     = MissionState.S0_SIGNAL
+START_STATE     = MissionState.S1_LANE_FOLLOW
+# [2026-08-24, 요청 반영] S0_SIGNAL → S1_LANE_FOLLOW — B2(고정장애물) 대기 상태부터 바로
+#   시작하는 테스트 모드. TEST_FORCE_BEHAVIOR=True(아래)와 짝, track_drive.py __init__의
+#   phase=Phase.OBSTACLE_ZONE/_b2_passed=False와도 짝. 정상 레이스 시작으로 되돌릴 땐
+#   START_STATE=MissionState.S0_SIGNAL로 되돌리고 아래 TEST_FORCE_BEHAVIOR도 False로.
 ENABLE_BEHAVIOR = True  # S1에서 라바콘/장애물/추월 Behavior를 켤지 여부(최상위 스위치)
 
 # ── 실차 테스트 범위 제한 ──
@@ -1698,7 +1702,8 @@ STABLE_JUMP_MAX = 15   # 이 이상(px) 차이나면 "같은 흐름"이 아닌 �
 PATH_EMA_ALPHA = 0.25   # 새 프레임에 줄 가중치(작을수록 더 부드럽고, 더 느리게 반응)
 
 # ── 라바콘/장애물/방해차량/신호등 트리거 ──
-LAVACON_DONE_FRAMES = 20      # [2026-08-22, 요청 반영] 40(≈2초)→20 — 종료판정 ROI를
+LAVACON_DONE_FRAMES = 40      # [2026-08-24, 요청 반영] 20→40(≈2초) — 종료가 너무 민감해서 복귀
+# [2026-08-22, 요청 반영] 40(≈2초)→20 — 종료판정 ROI를
                                #   perc_lavacon_trigger() 트리거 박스와 동일 크기로 축소한
                                #   것과 함께, "그 박스에 1초 이상 아무것도 안 찍히면 종료"로
                                #   조건을 바꿨다(20Hz 고정주기 기준 20프레임=1초,

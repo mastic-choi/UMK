@@ -393,10 +393,9 @@ class TrackDriverNode(Node):
         # ── 판단/제어 상태 ──
         self.mission_state  = START_STATE
         self.behavior_state = BehaviorState.B0_NORMAL
-        # [2026-08-23] 위 "B3 통과 후 신호등 판단만" 격리 검증 끝나서 원복(요청 반영,
-        # config.py START_STATE/TEST_SIGNAL_LOOP와 짝) — 이제 출발선에서 초록불 대기부터
-        # B1(라바콘)→B2(고정장애물)→B3(이동장애물) 전체 흐름을 정상대로 시작한다.
-        self.phase          = Phase.LAVACON
+        # [2026-08-24, 요청 반영] Phase.LAVACON → Phase.OBSTACLE_ZONE — B2 대기 상태부터
+        # 바로 시작(config.py START_STATE=S1_LANE_FOLLOW/TEST_FORCE_BEHAVIOR=True와 짝).
+        self.phase          = Phase.OBSTACLE_ZONE
         # [2026-08-15] Phase.OBSTACLE_ZONE 통합(da_based_b2b3_proposal.md B안) —
         # B2/B3 각각 최소 한 번 완료됐는지 추적. 둘 다 True가 돼야 Phase.DONE으로
         # 넘어간다(_mark_behavior_passed() 참고).
@@ -2733,7 +2732,12 @@ class TrackDriverNode(Node):
         # 고정하는 게 아니라, 위 코너감속 등과 동일하게 target_speed에 min()으로만 얹는다.
         # 아래 accel_step 램프가 그대로 적용되므로 급감속/굳는 증상 없이 부드럽게 이 상한까지
         # 내려간다(위 SPEED_PRE_OBSTACLE_CAP과 동일 패턴, config.py SPEED_LAVACON_CAP 주석 참고).
-        if self.phase == Phase.LAVACON and self.cone_detected_yolo:
+        # [2026-08-24, 요청 반영] `and self.cone_detected_yolo` 제거 — 그 값은 YOLO 원시
+        # 프레임 검출(perc_yolo_cone(), 박스 1개 이상)이라 B1 구간 안에서도 그 틱에 카메라가
+        # 콘을 놓치면 캡이 안 걸려 SPEED_NORMAL(=12) 쪽으로 튀는 게 실차에서 확인됨(요청).
+        # Phase.LAVACON은 이미 라이다+YOLO 이중확인을 거쳐 확정된 latch이므로(위
+        # _lavacon_steer_da_push() 주석 참고) 매 틱 원시 검출 재확인 없이 phase만으로 캡을 건다.
+        if self.phase == Phase.LAVACON:
             target_speed = min(target_speed, SPEED_LAVACON_CAP)
         # [2026-08-18] avoid-hold 적용4(SPEED_AVOID_HOLD_BLOCKED 안전판) 삭제 — 실차 테스트에서
         # "속도 5 고정" 증상의 실제 원인으로 확인됨(README §2.43). TEST_DISABLE_B2_B3=True라
