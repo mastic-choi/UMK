@@ -14,13 +14,22 @@
 `green_left`뿐이라 자동 split에 맡기지 않고, 기존 train:val ≈ 80:20 비율을 그대로
 적용해 새 82장도 66/16으로 나눠 합쳤다):
 
-- `train/`: 132장 (기존 66 + 신규 66) — class 분포 red 11 / green_straight 35 / green_left 86
-- `valid/`: 32장 (기존 16 + 신규 16) — class 분포 red 5 / green_straight 8 / green_left 19
+- `train/`: 149장 — class 분포 red 11 / green_straight 35 / green_left 103
+- `valid/`: 36장 — class 분포 red 5 / green_straight 8 / green_left 23
 - `data.yaml`: `nc: 3`, `names: ['red', 'green_straight', 'green_left']`
+
+**추가 배치(2026-08-23, 2차):** 첫 재학습(82장 배치)이 런타임 끊김으로 `best.pt`를
+날려서 재현하기 전에, 현재 모델을 `좌회전파인튜닝1/2/3`(원본 캡처 6349장, 5장 중 1장
+샘플링) 전체에 돌려 `green_left` confidence가 애매하거나(0 < conf < 0.5) 다른 클래스로
+오검출한 프레임 155장을 추출했다. 이 중 21장을 실제로 라벨링(전부 `green_left`로
+확인됨 — 오검출 의심이었던 것도 실제로는 맞는 검출이었고 모델이 과소확신했던 것)해
+위 수치에 반영했다. 나머지 134장은 아직 라벨링 안 됨(향후 배치 후보).
 
 **알려진 한계:** `red`/`green_straight`는 여전히 표본이 적다(train 11/35장) — 이번
 파인튜닝은 `green_left` 보강이 목적이므로 의도된 불균형이지만, 학습 후 §4에서
-`red`/`green_straight` recall이 떨어지지 않았는지 반드시 확인할 것.
+`red`/`green_straight` recall이 떨어지지 않았는지 반드시 확인할 것. 추가 배치 21장은
+모델 자신의 예측을 참고해서 "애매한 프레임"만 선별한 것이라(사람이 최종 라벨은
+확정했지만) 표본 선정 자체에 모델 편향이 섞여 있을 수 있음.
 
 ## 1. Drive 마운트 + 환경 준비
 
