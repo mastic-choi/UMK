@@ -207,6 +207,8 @@ from ..config import (
     # [2026-08-12] DL_CENTER_MODE='da' 밴드 중심 탐색창(prior)+속도예측+앵커링 — README §2.27
     DL_DA_SEARCH_HALF_WIDTH_PX, DL_DA_SEARCH_WIDEN_STEP_PX, DL_DA_SEARCH_WIDEN_MAX_PX,
     DL_DA_VELOCITY_EMA_ALPHA, DL_DA_VELOCITY_MAX_PX, DL_DA_BAND_ANCHOR_ALPHA,
+    # [2026-08-24] 근접 밴드 모서리 사각지대 비대칭 편향 보정 — TODO_da_near_band_bias.md
+    DL_DA_NEAR_WIDTH_MIN_RATIO, DL_DA_NEAR_WIDTH_BLEND_MAX,
     DL_LL_CLIP_MARGIN_PX,
     DL_LL_DECAY_ALPHA, DL_LL_DECAY_MIN_VALUE,
     DL_CENTER_MODE, DL_LL_ALGO, DL_LL_SIDE_MIN_PIXELS, DL_DA_SKIP_LL_CLIP,
@@ -502,6 +504,7 @@ class DLSlideWindow(SlideWindow):
         # detect()/_reject_outliers() 주석, config.py DL_NEAR_HOLD_MAX_FRAMES 참고.
         self._near_hold_streak = [0] * self.n_slices
         self.near_band_held = [False] * self.n_slices   # 이 프레임 그 근접 밴드가 hold로 채워졌는지 — visualize() 구분용
+        self.da_near_width_corrected = [False] * self.n_slices  # [2026-08-24] 근접 밴드 폭편향 보정 적용 여부 — visualize() 구분용
         self.near_band_stale = False   # 근접 밴드가 DL_NEAR_HOLD_MAX_FRAMES 넘게 안 잡혀 hold도 포기했는지 — track_drive.py가 SPEED_LANE_STALE 캡에 씀
         self._white_yellow_gap_px = DL_LL_YELLOW_GAP_INIT_PX  # [2026-08-10] 노란 중앙선-흰색 경계선 간격 러닝 추정치(px, DL_LL_ALGO='yw' 전용) — 둘 다 찾은 밴드에서 EMA 갱신, 한쪽만 찾았을 때 반대쪽 위치 추정에 씀(_ll_yellow_white_centers() 참고).
         # [2026-08-12] _ll_yellow_white_centers()(DL_LL_ALGO='yw') 밴드 간 속도예측 +
@@ -811,6 +814,7 @@ class DLSlideWindow(SlideWindow):
         h, w = da_mask.shape
         slice_h = h // self.n_slices
         centers = [None] * self.n_slices
+        self.da_near_width_corrected = [False] * self.n_slices
 
         cur_x = ref_x
         base_win = DL_DA_SEARCH_HALF_WIDTH_PX
@@ -835,6 +839,21 @@ class DLSlideWindow(SlideWindow):
                 M = cv2.moments(da_mask[y_low:y_high, x0:x1], binaryImage=True)
                 if M['m00'] >= self.min_pixels:
                     cx = x0 + M['m10'] / M['m00']
+
+            # [2026-08-24, 요청 반영] TODO_da_near_band_bias.md — BEV 근접 밴드 모서리
+            # 사각지대가 da를 비대칭으로 잘라내 cx가 한쪽으로 쏠리는 문제. 근접 밴드
+            # (i < near_slices)만, 탐색창과 무관한 전체 행의 visible 폭을 기대
+            # 차선폭(LANE_WIDTH_M*DL_PIXELS_PER_METER)과 비교해 비정상적으로 좁으면
+            # vehicle_center_x 쪽으로 블렌드 보정한다.
+            if cx is not None and i < self.near_slices:
+                row_cols = np.nonzero(np.any(da_mask[y_low:y_high, :] > 0, axis=0))[0]
+                if len(row_cols) >= 2:
+                    visible_w_px = float(row_cols[-1] - row_cols[0])
+                    min_w_px = LANE_WIDTH_M * DL_PIXELS_PER_METER * DL_DA_NEAR_WIDTH_MIN_RATIO
+                    if visible_w_px < min_w_px:
+                        bw = min(1.0 - visible_w_px / min_w_px, 1.0) * DL_DA_NEAR_WIDTH_BLEND_MAX
+                        cx = cx * (1.0 - bw) + self.vehicle_center_x * bw
+                        self.da_near_width_corrected[i] = True
 
             if cx is not None:
                 if last_i is not None and i > last_i:
@@ -2068,6 +2087,7 @@ class DLSlideWindow(SlideWindow):
                         self.near_band_stale = True
         else:
             self.near_band_held = [False] * self.n_slices
+            self.da_near_width_corrected = [False] * self.n_slices
             self.near_band_stale = False
 
         # 중앙 노란 점선의 밴드별 무게중심 — 탐색창 없는 stateless 방식(_slice_centers(),
@@ -2410,6 +2430,10 @@ class DLSlideWindow(SlideWindow):
             pt = (int(np.clip(cx, 0, self.roi_w - 1)), int(y))
             ll_used = i < len(self.ll_band_used) and self.ll_band_used[i]
             cv2.circle(self.vis, pt, 4, (255, 255, 255) if ll_used else (0, 140, 255), -1)
+            # [2026-08-24] 근접 밴드 폭편향 보정(모서리 사각지대) 적용된 밴드는 자홍색
+            # 링으로 표시 — TODO_da_near_band_bias.md.
+            if i < len(self.da_near_width_corrected) and self.da_near_width_corrected[i]:
+                cv2.circle(self.vis, pt, 8, (255, 0, 255), 2)
             # [2026-08-10] "지금 SW가 3분기(2W/1W/LOST) 중 뭘로 주행중인지" 실차에서
             # 바로 보이게, 밴드별 분기 태그(_ll_yellow_white_centers() 참고)를 점 옆에
             # 그린다. DL_CENTER_MODE='ll'&&DL_LL_ALGO='yw'에서만 의미 있는 값이라 그때만
@@ -2455,6 +2479,8 @@ class DLSlideWindow(SlideWindow):
             tags += ' [NEAR_HELD]'
         if self.near_band_stale:
             tags += ' [NEAR_STALE]'
+        if any(self.da_near_width_corrected[:self.near_slices]):
+            tags += ' [WIDTH_CORR]'
         # 모드마다 밴드 카운트가 뜻하는 바가 달라서 라벨/부가정보를 따로 붙인다 —
         # 'll_da'(corridor)는 corridor로 채택된 밴드 수, 'll'은 DL_LL_ALGO에 따라 서로
         # 다른 부가정보(아래), 'da'는 항상 0(ll 미사용, 기존 방식과 동일 표시).

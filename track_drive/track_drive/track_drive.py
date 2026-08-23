@@ -2968,6 +2968,13 @@ class TrackDriverNode(Node):
             PP_LOOKAHEAD_CURVATURE_GAIN if vehicle_lookahead_fix
             else PP_CURVATURE_BOOST_GAIN if now_t < self._pp_curvature_boost_until_t
             else PP_LOOKAHEAD_CURVATURE_GAIN)
+        # [2026-08-24] B1(라바콘) 중엔 lookahead 상한을 PP_LOOKAHEAD_MAX_PX_LAVACON으로
+        # 낮춘다 — SPEED_LAVACON_CAP 조건(2026-08-24b)과 동일하게 self._lavacon_engaged로
+        # 좁혀 진짜 B1 구간에서만 적용(대기 구간은 일반 상한 유지).
+        self.pure_pursuit.lookahead_max_px = (
+            PP_LOOKAHEAD_MAX_PX_LAVACON
+            if self.phase == Phase.LAVACON and self._lavacon_engaged
+            else PP_LOOKAHEAD_MAX_PX)
         return self.pure_pursuit.control(
             path, vehicle_xy, speed=self._speed_for_lookahead(),
             imu_curvature_px=self._imu_curvature_px(), near_obstacle=near_obstacle,

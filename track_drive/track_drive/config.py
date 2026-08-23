@@ -417,6 +417,13 @@ DL_DA_VELOCITY_EMA_ALPHA = 0.3      # 밴드 간 이동 속도(px/밴드) EMA �
 DL_DA_VELOCITY_MAX_PX = 40.0        # 예측 이동량 클램프
 DL_DA_BAND_ANCHOR_ALPHA = 0.35      # 밴드별 탐색창 중심 계산 시 "직전 프레임 그 밴드 위치"에 주는 가중치
 
+# [2026-08-24] TODO_da_near_band_bias.md — BEV 근접 밴드 모서리 사각지대 비대칭 편향 보정.
+#   근접 밴드(near_slices)에서 그 행의 visible da 폭이 기대 차선폭*비율보다 좁으면
+#   cx를 vehicle_center_x 쪽으로 블렌드(_da_slice_centers_windowed() 참고). 실차 미검증 —
+#   비율/블렌드폭 둘 다 실측 필요.
+DL_DA_NEAR_WIDTH_MIN_RATIO = 0.7
+DL_DA_NEAR_WIDTH_BLEND_MAX = 0.5
+
 # [2026-08-18] DL_LL_SANITY_MIN_RATIO(ll sanity check) 삭제 — lane_valid/path_ok 모두
 #   da 중심점 유무로만 판정하도록 바꿈(perception/dl_lane.py 참고, ll 미사용 확정에 따른
 #   정리, README §2.42 연장선).
@@ -1096,6 +1103,9 @@ PP_LOOKAHEAD_SPEED_GAIN = 3.305    # 속도가 오를수록 lookahead를 늘리�
 # [2026-08-17h] 위 PP_LOOKAHEAD_BASE_PX/SPEED_GAIN 주석 참고 — 이제부터는 공식이 아니라
 #   그리드서치 독립 샘플값이라 90+4*15와 무관하게 180.7로 교체.
 PP_LOOKAHEAD_MAX_PX = 180.7        # lookahead 상한 — 150.0→180.7(그리드서치)
+# [2026-08-24] B1(라바콘) 전용 lookahead 상한 — track_drive.py _lane_steer()가
+# self.phase==Phase.LAVACON일 때만 이 값으로 스위칭(그 외엔 PP_LOOKAHEAD_MAX_PX).
+PP_LOOKAHEAD_MAX_PX_LAVACON = 140.0
 PP_LOOKAHEAD_CURVATURE_GAIN = 224.8  # 직전 프레임 curvature가 클수록(코너) lookahead를 줄이는 게인 — 100.0→224.8(그리드서치)
 PP_LOOKAHEAD_MIN_PX = 62.61        # 코너에서 lookahead가 줄어들 수 있는 하한 — 40.0→62.61(그리드서치)
 
