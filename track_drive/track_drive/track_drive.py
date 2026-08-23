@@ -299,7 +299,18 @@ class TrackDriverNode(Node):
         # perc_obstacle_cut_trigger() 참고, run_behavior_fsm()의 Phase.OBSTACLE_ZONE 분기가
         # 진입 순간 이 값을 스냅샷해 B2/B3 중 어느 쪽을 통과 중인지 결정한다.
         self.obstacle_cut_type         = 'none'
-        self._obstacle_cut_y           = None    # 트리거 확정 순간의 장애물 횡위치(m, +좌측) — set_obstacle()에 넘길 값
+        self._obstacle_cut_y           = None    # 매틱 갱신되는 라이다 최근접점 횡위치(m, +좌측) — 아래 _obstacle_cut_y_locked의 원본 소스
+        # [2026-08-24, 요청 반영] 활성 유지 중 실제로 set_obstacle()에 넘기는 값 — 진입
+        # 확정 순간 self._obstacle_cut_y를 스냅샷해 고정한다(_update_obstacle_cut_hold()
+        # 참고). 방해차량(B3)처럼 차체가 라이다에 넓게 걸치면 매틱 최근접점이 좌우로
+        # 넘나들어 self._obstacle_cut_y 부호가 바뀔 수 있는데, 그걸 그대로 매틱
+        # _clip_da_by_obstacle()에 넘기면 컷 방향이 한 회피 안에서 좌→우로 뒤집혀
+        # "cut이 좌우로 2번 뜨는" 증상으로 보였다(실차 확인) — 그래서 기본은 고정.
+        # [2026-08-24b, 요청 반영] 완전 고정 대신, B3(vehicle)에 한해 이번 틱 라이다·YOLO
+        # 좌우가 실제로 일치(교차검증 통과)하면 갱신을 허용한다 — 라이다 단독 노이즈로는
+        # 안 바뀌고, 카메라도 같은 방향을 확인해줄 때만 넘어간다(_update_obstacle_cut_hold()
+        # 의 새 진입 아닌 분기 참고). B2(cone)는 좌우 교차검증 자체가 없어 계속 완전 고정.
+        self._obstacle_cut_y_locked    = None
         # [2026-08-23r] 이번 틱 트리거 ROI에 실제로 쓰인 횡방향 반폭(m) — B2/B3 공용값
         # (OBSTACLE_CUT_TRIGGER_Y_HALF_M) 또는 B3 전용값(_VEHICLE) 중 perc_obstacle_cut_trigger()가
         # 그때그때 고른 값. _debug_viz_obstacle_cut()이 박스를 그릴 때 그대로 읽는다.
@@ -393,9 +404,9 @@ class TrackDriverNode(Node):
         # ── 판단/제어 상태 ──
         self.mission_state  = START_STATE
         self.behavior_state = BehaviorState.B0_NORMAL
-        # [2026-08-24, 요청 반영] Phase.LAVACON → Phase.OBSTACLE_ZONE — B2 대기 상태부터
-        # 바로 시작(config.py START_STATE=S1_LANE_FOLLOW/TEST_FORCE_BEHAVIOR=True와 짝).
-        self.phase          = Phase.OBSTACLE_ZONE
+        # [2026-08-24, 요청 반영] B2 대기 단독 테스트용 오버라이드(Phase.OBSTACLE_ZONE 시작)
+        # 원복 — 전체 바퀴/신호 흐름(S0_SIGNAL→B1→B2→B3) 검증으로 다시 전환.
+        self.phase          = Phase.LAVACON
         # [2026-08-15] Phase.OBSTACLE_ZONE 통합(da_based_b2b3_proposal.md B안) —
         # B2/B3 각각 최소 한 번 완료됐는지 추적. 둘 다 True가 돼야 Phase.DONE으로
         # 넘어간다(_mark_behavior_passed() 참고).
@@ -810,8 +821,13 @@ class TrackDriverNode(Node):
         # 트리거 전) _clip_da_by_obstacle()이 그대로 통과시키므로 영향 없다.
         # [2026-08-23] obstacle_cut_type('fixed'/'vehicle')도 같이 넘긴다 — B2/B3 컷
         # 좌우폭을 다르게 쓰기 위함(config.py OBSTACLE_CUT_LANE_HALF_WIDTH_PX_* 참고).
+        # [2026-08-24, 요청 반영] 활성 유지 중엔 self._obstacle_cut_y_locked(진입 확정
+        # 순간 고정값)을 넘긴다 — 매틱 갱신되는 self._obstacle_cut_y를 그대로 넘기면
+        # 컷 방향이 회피 도중 좌우로 뒤집힐 수 있었다(위 self._obstacle_cut_y_locked
+        # 주석 참고).
         getattr(self.lane_detector, 'set_obstacle', lambda *_a, **_k: None)(
-            self._obstacle_cut_y, self.obstacle_cut_active, self.obstacle_cut_type)
+            self._obstacle_cut_y_locked if self.obstacle_cut_active else self._obstacle_cut_y,
+            self.obstacle_cut_active, self.obstacle_cut_type)
         # [2026-08-22] B1 콘 침범 push(_lavacon_steer_da_push()) 상태도 같이 넘긴다 —
         # set_obstacle()과 동일한 1틱 지연 허용(위 주석 참고). DA 디버그창 경로 색
         # (자홍/보라/주황, lane_util.py draw_path())과, 밀리기 전/후 두 경로를 나란히
@@ -1558,6 +1574,20 @@ class TrackDriverNode(Node):
                 # 보고 반대쪽 라이다 상황과 무관하게 판단하게 한다.
                 self._obstacle_cut_trigger_side = (
                     'L' if self._obstacle_cut_y is not None and self._obstacle_cut_y > 0.0 else 'R')
+                self._obstacle_cut_y_locked = self._obstacle_cut_y
+            elif (self.obstacle_cut_type == 'vehicle' and self._obstacle_cut_yolo_side is not None
+                  and not self._obstacle_cut_side_veto and self._obstacle_cut_y is not None):
+                # [2026-08-24, 요청 반영] 유지 중(진입 아님)에도 방향 갱신을 허용하되, 이번 틱
+                # 라이다·YOLO 좌우가 실제로 일치(perc_obstacle_cut_trigger()의 교차검증 통과 —
+                # self._obstacle_cut_yolo_side가 None이 아니고 veto도 안 걸렸다는 뜻)할 때만.
+                # 라이다 최근접점 단독 흔들림(노이즈)만으론 안 바뀌고, 카메라도 같은 쪽을
+                # 확인해줄 때만 컷 방향이 실제로 넘어간다 — 그래야 B3처럼 차체가 라이다에
+                # 넓게 걸쳐 최근접점이 순간적으로 반대쪽으로 튀는 경우와, 차량이 실제로
+                # 이동해 컷 방향이 바뀌어야 하는 경우를 구분할 수 있다. B2(cone)는 이
+                # 좌우 교차검증 자체가 없어(perc_obstacle_cut_trigger() 참고) 적용 안 됨 —
+                # 진입 시 고정값 그대로 유지.
+                self._obstacle_cut_trigger_side = self._obstacle_cut_yolo_side
+                self._obstacle_cut_y_locked = self._obstacle_cut_y
             self._obstacle_cut_until_t = now + self._obstacle_cut_hold_sec_min
             self._obstacle_cut_release_cnt = 0
         else:
@@ -2226,9 +2256,9 @@ class TrackDriverNode(Node):
         self._lap_stopline_used = (cause == 'stopline')
         self._lap_yaw_over_cnt = 0
 
-        if self.lap > TOTAL_LAPS:
-            self._change_state(MissionState.S4_FINISH)
-            return
+        # [2026-08-24, 요청 반영] TOTAL_LAPS 기반 레이스 종료 판정(S4_FINISH 전환) 삭제 —
+        # yaw/정지선 바퀴 판정 자체를 신뢰하지 않기로 함(요청). 이제 이 함수는 바퀴 수
+        # 표시(디버그용 self.lap)만 하고 정지를 유발하지 않는다.
 
         if RESET_PHASE_EACH_LAP:
             # 장애물은 트랙에 그대로 있으므로 매 바퀴 처음부터 다시 만난다.
@@ -2346,18 +2376,20 @@ class TrackDriverNode(Node):
                 # (_signal_yolo_off는 이제 perc_signal()이 확정되는 순간 바로 세팅한다.)
                 self._behavior_enabled = True
                 self._signal_reentry_cooldown_t = time.time() + SIGNAL_REENTRY_COOLDOWN
-                if TEST_SIGNAL_LOOP:
-                    # [2026-08-23, 요청 반영] 격리 테스트 전용 — 정상 레이스에선 이 phase
-                    # 리셋을 _update_lap()(결승선 통과)이 담당하고 신호 확정 시점엔 아직
-                    # 안 건드리는 게 맞지만(신호 지점~결승선 사이 구간이 남아있어서), 신호
-                    # 판단만 반복 테스트할 땐 결승선까지 안 가고 바로 다음 순서(B1)를 봐야
-                    # 하므로 여기서 직접 리셋한다.
-                    self.phase = Phase.LAVACON
-                    self._b2_passed = False
-                    self._b3_passed = False
-                    self._lavacon_engaged = False
-                    self._lavacon_empty_cnt = 0
-                    self._lavacon_trigger_cnt = 0
+                # [2026-08-24, 요청 반영] TEST_SIGNAL_LOOP 조건 제거 — B1/B2/B3 재무장을
+                # _update_lap()(IMU yaw 누적/정지선 기반 바퀴 완주)이 아니라 신호등 직진
+                # 확정 하나로 통일한다. 신호등을 다시 받는 것 자체가 "다음 구간 시작"이라는
+                # 판단(요청) — 더 이상 테스트 전용이 아니라 정상 레이스 경로에서도 항상 동작.
+                # _update_lap()/_begin_new_lap()의 바퀴 카운트(self.lap, 디버그 표시용)는
+                # 그대로 유지하되, 이제 그쪽 phase 리셋과 TOTAL_LAPS 기반 종료 판정
+                # (S4_FINISH 전환)은 삭제됐다(요청 반영, 아래 _begin_new_lap() 참고) — 재무장은
+                # 여기(신호등) 하나로만 결정된다.
+                self.phase = Phase.LAVACON
+                self._b2_passed = False
+                self._b3_passed = False
+                self._lavacon_engaged = False
+                self._lavacon_empty_cnt = 0
+                self._lavacon_trigger_cnt = 0
 
         # Behavior가 조향을 전담하는 구간에서는 Mission의 차선 PID를 건너뛴다.
         # [2026-08-22] 요청 반영 — run_behavior_fsm()이 다시 behavior_state=B1_LAVACON을
@@ -2735,9 +2767,15 @@ class TrackDriverNode(Node):
         # [2026-08-24, 요청 반영] `and self.cone_detected_yolo` 제거 — 그 값은 YOLO 원시
         # 프레임 검출(perc_yolo_cone(), 박스 1개 이상)이라 B1 구간 안에서도 그 틱에 카메라가
         # 콘을 놓치면 캡이 안 걸려 SPEED_NORMAL(=12) 쪽으로 튀는 게 실차에서 확인됨(요청).
-        # Phase.LAVACON은 이미 라이다+YOLO 이중확인을 거쳐 확정된 latch이므로(위
-        # _lavacon_steer_da_push() 주석 참고) 매 틱 원시 검출 재확인 없이 phase만으로 캡을 건다.
-        if self.phase == Phase.LAVACON:
+        # [2026-08-24b, 요청 반영] `self.phase == Phase.LAVACON` 단독 조건 버그 수정 —
+        # Phase.LAVACON은 B1 진입 전(아직 콘 게이트를 못 만나 그냥 S1 차선주행 중인)
+        # 대기 구간도 포함한다(_active_yolo_stage()의 Phase.LAVACON 분기 참고, 'cone' 스테이지
+        # if not self._lavacon_engaged). 그래서 위 수정 직후엔 신호 확정→S1 진입 직후부터
+        # 실제 콘 게이트를 만나기 전까지도 계속 8로 캡이 걸려 "라바콘 진입 전인데 속도가
+        # 8로 굳어있다"는 증상으로 나타났다(실차 확인). B1 진입 확정 latch
+        # self._lavacon_engaged(실제로 콘 사이를 통과 주행 중인지)로 조건을 좁혀 진짜 B1
+        # 구간에서만 캡이 걸리게 한다.
+        if self.phase == Phase.LAVACON and self._lavacon_engaged:
             target_speed = min(target_speed, SPEED_LAVACON_CAP)
         # [2026-08-18] avoid-hold 적용4(SPEED_AVOID_HOLD_BLOCKED 안전판) 삭제 — 실차 테스트에서
         # "속도 5 고정" 증상의 실제 원인으로 확인됨(README §2.43). TEST_DISABLE_B2_B3=True라

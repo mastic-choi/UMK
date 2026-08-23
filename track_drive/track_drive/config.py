@@ -1524,11 +1524,10 @@ DEBUG_VIZ_OBSTACLE_CUT = True    # [2026-08-22i] 요청 반영으로 껐다가, 
 #     (지금 켜둔 Phase.LAVACON/_b2_passed=_b3_passed=False B1 테스트 세팅 그대로 이어짐).
 #   - _s1_lane_follow()에서 signal_left_confirmed → S0_SIGNAL 커밋구간 →
 #     _begin_checker_ramp_turn()/_do_checker_ramp_turn()으로 좌회전 조향 램프 실행.
-START_STATE     = MissionState.S1_LANE_FOLLOW
-# [2026-08-24, 요청 반영] S0_SIGNAL → S1_LANE_FOLLOW — B2(고정장애물) 대기 상태부터 바로
-#   시작하는 테스트 모드. TEST_FORCE_BEHAVIOR=True(아래)와 짝, track_drive.py __init__의
-#   phase=Phase.OBSTACLE_ZONE/_b2_passed=False와도 짝. 정상 레이스 시작으로 되돌릴 땐
-#   START_STATE=MissionState.S0_SIGNAL로 되돌리고 아래 TEST_FORCE_BEHAVIOR도 False로.
+START_STATE     = MissionState.S0_SIGNAL
+# [2026-08-24, 요청 반영] B2 대기 단독 테스트용 오버라이드(S1_LANE_FOLLOW 시작) 원복 —
+#   전체 바퀴/신호 흐름(S0_SIGNAL→B1→B2→B3) 검증으로 다시 전환. 아래 TEST_FORCE_BEHAVIOR,
+#   track_drive.py __init__의 phase=Phase.OBSTACLE_ZONE도 짝으로 원복.
 ENABLE_BEHAVIOR = True  # S1에서 라바콘/장애물/추월 Behavior를 켤지 여부(최상위 스위치)
 
 # ── 실차 테스트 범위 제한 ──
@@ -1542,7 +1541,7 @@ TEST_DISABLE_B2_B3 = False
 #         이중으로 걸어 B2/B3가 어떤 경로로도 안 켜지게 한다(안전판).
 #   False: 원래대로 SAFETY_DIST/OVERTAKE_TRIGGER 트리거 검사해서 B2/B3 정상 발동 —
 #         이번 B3 검증이 보고 싶은 게 바로 이 발동이라 False.
-TEST_FORCE_BEHAVIOR = True
+TEST_FORCE_BEHAVIOR = False
 #   True: _behavior_enabled를 시작부터 강제 True로 켜서, START_STATE=S1_LANE_FOLLOW로
 #         S0/S2를 건너뛴 채로도 B1→B2→B3가 정상 발동한다(그렇지 않으면 _behavior_enabled가
 #         S0_SIGNAL 직진 확정 시에만 True가 되는데 그 경로 자체를 안 타므로 계속 False로
@@ -1552,21 +1551,16 @@ TEST_FORCE_BEHAVIOR = True
 #         짝으로 다시 False로 — 이제 정상 경로(_s0_signal()의 직진 확정 분기)로
 #         _behavior_enabled가 켜지므로 강제 스위치가 필요 없다. 켜둔 채로 두면 신호를
 #         아직 못 받았는데도 Behavior가 이미 활성 상태로 보여 검증 의미가 없어진다.
-TEST_SIGNAL_LOOP = False  # [2026-08-23] 요청 반영으로 원복 — 이제 B1/B2/B3 전체 흐름을 보므로
-                           #   신호 판단 반복 격리 테스트는 종료.
-#   [2026-08-23, 요청 반영] "주행 중 신호등 만났을 때 좌회전/직진 판단"만 반복 격리
-#   테스트하기 위한 모드 — START_STATE=S1_LANE_FOLLOW + track_drive.py __init__의
-#   Phase.DONE/_b2_passed=_b3_passed=True(위 6절 주석)와 짝으로 켠다.
-#   True: _s1_lane_follow()의 직진 확정 분기가 phase=Phase.LAVACON/_b2_passed=
-#         _b3_passed=False로 즉시 리셋해 B1이 바로 다음 순서로 대기하게 하고,
-#         _do_checker_ramp_turn() 완료 시(phase==Phase.DONE일 때만) _signal_yolo_off를
-#         다시 False로 풀어 신호등 YOLO를 재개한다 — 좌회전(지름길) 테스트를 반복할 때마다
-#         "아까 그 대기 상태"로 돌아가 다시 신호를 읽을 수 있어야 하기 때문.
-#   False: 원래대로 phase 리셋은 오직 _update_lap()(결승선 통과)만 담당하고,
-#         _signal_yolo_off는 그 다음 바퀴 리셋 전까지 계속 꺼진 채로 남는다(정상 레이스
-#         동작 — 한 바퀴에 신호 판단은 한 번뿐이라 좌회전 직후 바로 다시 켤 이유가 없음).
-#         검증 끝나면 반드시 False로 되돌릴 것(안 그러면 실제 레이스에서 신호 확정
-#         시점에 phase가 조기 리셋돼 버림).
+TEST_SIGNAL_LOOP = False
+#   [2026-08-24, 요청 반영] B1/B2/B3 phase 리셋(_s1_lane_follow() 직진 확정 분기)이
+#   이 스위치와 무관하게 항상 동작하도록 바뀌면서(신호등 직진 확정을 재무장의 유일한
+#   기준으로 통일, _update_lap() 바퀴완주는 더 이상 phase 리셋을 담당하지 않음) 이 플래그의
+#   역할이 좁아졌다 — 이제 아래 True 항목 중 "phase=Phase.LAVACON/... 리셋" 부분은 이미
+#   상시 동작이라 무관하고, `_do_checker_ramp_turn()`의 "phase==Phase.DONE일 때만
+#   _signal_yolo_off를 다시 푸는" 좌회전 반복 테스트 전용 분기에만 영향을 준다.
+#   True: 좌회전(지름길) 램프 완료 시점에 phase가 Phase.DONE이면(=신호판단 격리 테스트
+#         상태에서 시작된 좌회전) 신호등 YOLO를 즉시 재개 — 좌회전 반복 테스트 편의용.
+#   False: 원래대로 그 재개를 다음 바퀴 리셋에 맡긴다(정상 레이스 동작).
 TEST_FORCE_SIGNAL_YOLO = False  # [2026-08-23p, 요청 반영] True→False로 원복 — 이 스위치가
                                   #   True면 _active_yolo_stage()가 mission_state/phase와 무관하게
                                   #   항상 'signal'만 반환해서, S0_SIGNAL 직진 확정 후 Phase.LAVACON
