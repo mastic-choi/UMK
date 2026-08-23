@@ -190,7 +190,12 @@ class YoloConeDetector:
 
         self._lock = threading.Lock()
         self._latest_frame = None
-        self._latest_result = (False, [])          # (cone_detected, detections)
+        self._latest_result = (False, [])          # (cone_detected, detections) — cone_detected는 박스가
+                                                     #   하나라도 있으면 True인 원시값(면적 게이트 전).
+                                                     #   면적 임계값은 이 검출기가 아니라 호출부
+                                                     #   (track_drive.py, B1/B2 각자)가 건다.
+        self._latest_max_area = 0.0                 # [2026-08-23] 이번 프레임 검출 박스 중 최대 면적(px²,
+                                                     #   640 입력 스케일) — get_latest_max_area() 참고
         self._latest_debug = None                    # 시각화용 vis 프레임
         # [2026-08-23] 'yolo_cone_result' 창을 처음 띄울 때만 cv2.moveWindow로 위치를 잡기
         #   위한 1회성 가드(DEBUG_WIN_POS_YOLO_CONE 참고, yolo_signal_state.py의 동일 패턴).
@@ -218,6 +223,13 @@ class YoloConeDetector:
 
             try:
                 cone_detected, detections = self.engine.infer(frame)
+                # [2026-08-23] 검출 박스 중 최대 면적(px², 640 입력 스케일)만 여기서 계산해
+                # 넘긴다 — "면적이 임계값 이상이어야 검출 인정"이라는 최종 판단은 B1/B2가
+                # 서로 다른 임계값(config.py YOLO_CONE_MIN_BOX_AREA_PX_B1/_B2)을 쓸 수 있어야
+                # 해서 이 검출기 레벨(여기는 어느 단계가 부르는지 모름)이 아니라 그 값을 아는
+                # track_drive.py perc_lavacon_trigger()/perc_obstacle_cut_trigger()가 각자 건다.
+                max_area = max(((x2 - x1) * (y2 - y1) for x1, y1, x2, y2, _c in detections),
+                                default=0.0)
                 vis = None
                 if DEBUG_VIZ_YOLO_CONE:
                     # 그리기만 여기서(스레드 세이프하지 않은 imshow/waitKey는 절대 호출 안 함
@@ -241,6 +253,7 @@ class YoloConeDetector:
 
             with self._lock:
                 self._latest_result = (cone_detected, detections)
+                self._latest_max_area = max_area
                 self._latest_debug = vis
 
             now = time.time()
@@ -260,6 +273,15 @@ class YoloConeDetector:
         with self._lock:
             cone_detected, _detections = self._latest_result
         return cone_detected
+
+    def get_latest_max_area(self):
+        """[2026-08-23] 이번 프레임 검출 박스 중 최대 면적(px², 640 입력 스케일) — 검출이
+        하나도 없었으면 0.0. track_drive.py의 perc_lavacon_trigger()(B1)/
+        perc_obstacle_cut_trigger()(B2)가 각자의 YOLO_CONE_MIN_BOX_AREA_PX_B1/_B2 임계값과
+        비교해 최종 검출 인정 여부를 정하고, _debug_viz_obstacle_cut()이 그 값을 그대로
+        띄워 실차에서 임계값을 조정할 때 참고하게 한다."""
+        with self._lock:
+            return self._latest_max_area
 
     def get_latest_debug_frame(self):
         """[2026-08-21] 최신 시각화 프레임(카메라 원본 + 검출 박스)을 스레드 세이프하게

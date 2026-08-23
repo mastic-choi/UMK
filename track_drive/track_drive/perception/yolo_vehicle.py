@@ -181,7 +181,12 @@ class YoloVehicleDetector:
 
         self._lock = threading.Lock()
         self._latest_frame = None
-        self._latest_result = (False, [])          # (vehicle_detected, detections)
+        self._latest_result = (False, [])          # (vehicle_detected, detections) — vehicle_detected는
+                                                     #   박스가 하나라도 있으면 True인 원시값(면적 게이트 전).
+                                                     #   면적 임계값은 이 검출기가 아니라 호출부
+                                                     #   (track_drive.py perc_obstacle_cut_trigger(), B3)가 건다.
+        self._latest_max_area = 0.0                 # [2026-08-23] 이번 프레임 검출 박스 중 최대 면적(px²,
+                                                     #   640 입력 스케일) — get_latest_max_area() 참고
         self._latest_side = None                      # [2026-08-21] 'L'/'R'/None — get_latest_side() 참고
         self._latest_debug = None                    # 시각화용 vis 프레임
         self._stopped = False
@@ -207,6 +212,12 @@ class YoloVehicleDetector:
 
             try:
                 vehicle_detected, detections = self.engine.infer(frame)
+                # [2026-08-23] 검출 박스 중 최대 면적(px², 640 입력 스케일)만 여기서 계산해
+                # 넘긴다 — "면적이 임계값 이상이어야 검출 인정"이라는 최종 판단은 그 임계값
+                # (config.py YOLO_VEHICLE_MIN_BOX_AREA_PX_B3)을 아는 track_drive.py
+                # perc_obstacle_cut_trigger()가 건다(B1/B2 콘 쪽과 동일 관례).
+                max_area = max(((x2 - x1) * (y2 - y1) for x1, y1, x2, y2, _c in detections),
+                                default=0.0)
                 # [2026-08-21] 라이다-YOLO 좌우 교차검증(perc_obstacle_cut_trigger() 오검출
                 # 방지 로직)용 — 가장 신뢰도 높은 박스의 중심 x가 프레임 가로 중앙(=
                 # YOLO_VEHICLE_INPUT_SIZE/2, letterbox 없는 단순 리사이즈라 원본 중앙과
@@ -241,6 +252,7 @@ class YoloVehicleDetector:
 
             with self._lock:
                 self._latest_result = (vehicle_detected, detections)
+                self._latest_max_area = max_area
                 self._latest_side = side
                 self._latest_debug = vis
 
@@ -262,6 +274,15 @@ class YoloVehicleDetector:
         with self._lock:
             vehicle_detected, _detections = self._latest_result
         return vehicle_detected
+
+    def get_latest_max_area(self):
+        """[2026-08-23] 이번 프레임 검출 박스 중 최대 면적(px², 640 입력 스케일) — 검출이
+        하나도 없었으면 0.0. track_drive.py perc_obstacle_cut_trigger()(B3)가
+        YOLO_VEHICLE_MIN_BOX_AREA_PX_B3 임계값과 비교해 최종 검출 인정 여부를 정하고,
+        _debug_viz_obstacle_cut()이 그 값을 그대로 띄워 실차에서 임계값을 조정할 때
+        참고하게 한다."""
+        with self._lock:
+            return self._latest_max_area
 
     def get_latest_side(self):
         """[2026-08-21] 최신 프레임에서 검출된(최고 신뢰도) target_vehicle 박스의 좌우

@@ -3338,6 +3338,145 @@ avoid_hold의 실제 조향 개입인 `_clip_da_by_ll()`의 방향 힌트는 현
 이번 변경으로 더 이상 반영되지 않는다 — 회피 기동 중 불안정하면 이 속도캡을 되살리기보다
 회피 조향 로직(da 근접 컷) 자체의 여유(`OBSTACLE_CUT_TRIGGER_X_MAX_M` 등)를 먼저 볼 것.
 
+### 5.14 `_clip_da_by_obstacle()` 컷 좌우폭을 B2/B3 타입별로 분리 — B2만 10%↓ (2026-08-23, 요청 반영)
+
+**요청 배경:** 실차 체감상 B2(고정장애물)/B3(방해차량) 회피 조향이 너무 크다는 피드백 —
+우선 B2 컷 좌우폭만 10% 줄이고, B3는 아직 실차 미검증 상태 그대로 유지해달라는 요청
+(둘을 따로 튜닝할 수 있어야 한다는 전제도 같이 반영).
+
+**이전 동작:** §2.51에서 만든 `_clip_da_by_obstacle()`은 `OBSTACLE_CUT_LANE_HALF_WIDTH_PX`
+단일 상수(`None`이면 `LANE_WIDTH_M(0.4m)*DL_PIXELS_PER_METER(200px/m)=80px`)로 B2/B3
+구분 없이 동일한 컷 좌우폭을 썼다.
+
+**수정:** `config.py` — `OBSTACLE_CUT_LANE_HALF_WIDTH_PX`를
+`OBSTACLE_CUT_LANE_HALF_WIDTH_PX_FIXED`(B2)/`OBSTACLE_CUT_LANE_HALF_WIDTH_PX_VEHICLE`(B3)
+둘로 분리(둘 다 `None`이 기본값)하고, `OBSTACLE_CUT_HALF_WIDTH_SCALE_FIXED=0.9`를 신설해
+B2가 `None`일 때 `80px * 0.9 = 72px`을 쓰도록 했다. B3는 배율 없이 기존과 동일한 80px 유지.
+`track_drive.py`의 `perc_obstacle_cut_trigger()`가 이미 판정해 두는 `self.obstacle_cut_type`
+('fixed'/'vehicle')을 `set_obstacle()` 호출부에 실어 `DLLaneDetector.set_obstacle()` →
+`_worker()` → `DLSlideWindow.detect()` → `_clip_da_by_obstacle()`까지 그대로 흘려보내는
+방식으로 배선했다(`set_avoid_hold()`/`set_speed()`와 동일한 "락으로 최신값만 스냅샷" 관례).
+`cut_type='vehicle'`이면 B3 폭, 그 외('fixed' 및 미분류 'none' 폴백)는 B2 폭을 쓴다.
+
+**알려진 한계:** 실차 미검증. 10%라는 배율 자체가 체감 기반 추정치라 실차에서 여전히
+크면 `OBSTACLE_CUT_HALF_WIDTH_SCALE_FIXED`를 더 낮추거나, 확실한 값을 알면
+`OBSTACLE_CUT_LANE_HALF_WIDTH_PX_FIXED`에 px 절대값을 직접 지정할 것. B3(방해차량) 쪽
+조향도 크다면 `OBSTACLE_CUT_LANE_HALF_WIDTH_PX_VEHICLE`을 같은 방식으로 낮추면 되지만,
+이번 요청 범위에서는 의도적으로 보류.
+
+---
+
+### 5.15 YOLO 카메라 검출조건 — "박스 존재"에서 "최대 박스면적 ≥ 임계값"으로 강화 (2026-08-23, 요청 반영)
+
+**요청 배경:** B1(라바콘)/B2(고정장애물)/B3(방해차량)의 YOLO 카메라 이중확인이 지금까지
+"이번 프레임에 박스가 하나라도 찍히면 검출"이었는데, 멀리서 작게(또는 배경 오탐으로)
+찍힌 박스까지 그대로 검출로 인정돼버리는 게 문제라는 지적 — 라이다 AND 조건은 그대로
+두고, YOLO 쪽만 "이번 프레임 검출된 박스들 중 가장 큰 것의 면적이 일정 값 이상"으로
+조건을 걸어달라는 요청. 판정에 쓰인 최대 면적값을 `obstacle_cut_debug` 창에서 실시간으로
+볼 수 있게 해달라는 요청도 함께 반영.
+
+**수정:**
+- `perception/yolo_cone.py`/`perception/yolo_vehicle.py` — 각 `_worker()`가 매 프레임
+  `engine.infer()`가 돌려주는 검출 박스 리스트에서 `max((x2-x1)*(y2-y1) for ...)`로
+  최대 면적(px², 640 입력 스케일)을 계산해, 엔진의 원시 `*_detected_raw`(박스 1개 이상)와
+  `max_area >= YOLO_CONE_MIN_BOX_AREA_PX`/`YOLO_VEHICLE_MIN_BOX_AREA_PX`(config.py 신설)를
+  AND로 묶은 값을 `detect()`가 반환하는 최종 검출값으로 바꿨다. 새 `get_latest_max_area()`
+  getter로 이 면적값도 스레드 세이프하게 꺼내올 수 있게 함.
+- `cone_detected_yolo`/`vehicle_detected_yolo_cut`(둘 다 `detect()`를 그대로 호출)이
+  B1(`perc_lavacon_trigger()`)·B2/B3(`perc_obstacle_cut_trigger()`)의 카메라 확인
+  변수라 코드 수정 없이 세 구간 모두에 새 조건이 자동 적용된다(라이다와의 AND 결합
+  구조 자체는 그대로).
+- `track_drive.py` — `self.cone_max_box_area`/`self.vehicle_max_box_area_cut`을 신설해
+  `perc_yolo_cone()`/`perc_yolo_vehicle_cut()`이 매 틱 `get_latest_max_area()`로 채운다.
+  `_debug_viz_obstacle_cut()`에 `YOLO {cone|car} 최대 박스면적=...px² (임계값 ...px² 이상)`
+  줄을 추가(임계값 충족 시 초록, 아니면 회색) — 현재 활성 스테이지(`_active_yolo_stage()`,
+  B2면 콘, B3면 차량)에 맞는 값을 자동으로 보여준다.
+
+**알려진 한계:** 최초 버전은 `YOLO_CONE_MIN_BOX_AREA_PX`/`YOLO_VEHICLE_MIN_BOX_AREA_PX`
+단일 상수를 B1/B2가 공유했다 — 바로 아래 §5.16에서 B1/B2/B3 셋으로 분리됨.
+`obstacle_cut_debug` 창은 현재 활성 스테이지(콘 또는 차량) 하나만 보여주므로, B1(라바콘)
+진입 전 트리거 단계에서 콘 면적값을 확인하려면 `_active_yolo_stage()`가 `'cone'`을
+반환하는 구간(`Phase.LAVACON` 진입 확정 전, §3.10)에서 봐야 한다.
+
+### 5.16 §5.15의 면적 임계값을 B1/B2/B3 각자 다른 변수로 분리 (2026-08-23, 요청 반영)
+
+**요청 배경:** §5.15에서 콘 검출 면적 임계값(`YOLO_CONE_MIN_BOX_AREA_PX`)을 B1(라바콘
+진입 트리거)·B2(고정장애물)가 공유했는데, "그 크기값을 B1/B2/B3마다 다른 변수로 보도록"
+해달라는 요청 — 같은 콘 검출기를 공유하더라도 B1(아직 진입 전, 먼 거리에서부터 판단)과
+B2(이미 진입해 지나치는 중, 가까운 거리)는 콘까지의 체감 거리가 달라 임계값도 따로
+튜닝할 수 있어야 한다는 취지.
+
+**수정:**
+- `config.py` — `YOLO_CONE_MIN_BOX_AREA_PX`를 `YOLO_CONE_MIN_BOX_AREA_PX_B1`(라바콘 진입
+  트리거)/`YOLO_CONE_MIN_BOX_AREA_PX_B2`(고정장애물)로 분리하고, `YOLO_VEHICLE_MIN_BOX_AREA_PX`는
+  `YOLO_VEHICLE_MIN_BOX_AREA_PX_B3`로 이름만 맞춰 정렬(B3 전용이라 나눌 필요는 없음).
+  셋 다 기존과 동일하게 2500px²(=50x50px 상당)에서 시작 — 값 자체는 안 바뀜.
+- `perception/yolo_cone.py`/`perception/yolo_vehicle.py` — 면적 게이트를 검출기
+  내부(`_worker()`)에서 다시 빼냈다. 검출기는 "지금 몇 개가 어떤 크기로 찍혔는지"만 알고
+  "이게 B1 문의인지 B2 문의인지"는 모르므로(같은 인스턴스를 두 곳이 공유), 임계값 비교를
+  검출기가 아니라 그 문맥을 아는 호출부로 옮겼다 — `detect()`는 다시 §5.15 이전과 동일한
+  "박스 1개 이상이면 True" 원시값을 반환하고, `get_latest_max_area()`로 면적만 별도로
+  꺼내가게 한다.
+- `track_drive.py` — 실제 게이트는 이제 호출부 두 곳에서 각자 건다:
+  `perc_lavacon_trigger()`(B1)의 `cone_confirmed_cam`이
+  `self.cone_detected_yolo and self.cone_max_box_area >= YOLO_CONE_MIN_BOX_AREA_PX_B1`로,
+  `perc_obstacle_cut_trigger()`(B2/B3)의 `cone_seen`/`vehicle_seen`이 각각
+  `YOLO_CONE_MIN_BOX_AREA_PX_B2`/`YOLO_VEHICLE_MIN_BOX_AREA_PX_B3`로 게이트한다.
+  `_debug_viz_obstacle_cut()`도 콘 스테이지일 때 `self.phase`로 B1/B2를 구분해(`Phase.LAVACON`
+  이면 B1, 아니면 B2) 맞는 임계값을 보여주고, 면적 줄 앞에 `[B1]`/`[B2]`/`[B3]` 태그를 붙여
+  지금 어느 임계값이 적용 중인지 바로 보이게 했다.
+
+**알려진 한계 → [2026-08-23 밤, §5.17 실측 창으로 실차 실측 완료] 해소:** 셋 다 서로 다른
+값으로 실측 확정됨 — `YOLO_CONE_MIN_BOX_AREA_PX_B1=5000.0`,
+`YOLO_CONE_MIN_BOX_AREA_PX_B2=2500.0`, `YOLO_VEHICLE_MIN_BOX_AREA_PX_B3=4500.0`
+(placeholder 아님, 실차 실측치).
+
+### 5.17 B1/B2/B3 박스면적 실측 전용 디버그 창 3개 신설 (2026-08-23, 요청 반영, ★실측 후 삭제 예정★)
+
+**요청 배경:** §5.16까지로 면적 게이트 구조는 갖춰졌으니, `YOLO_CONE_MIN_BOX_AREA_PX_B1`/
+`_B2`, `YOLO_VEHICLE_MIN_BOX_AREA_PX_B3` 값을 실차에서 실측해야 하는 단계 — "카메라 화면 +
+그 순간 가장 크게 찍히는 박스 면적 숫자"를 한 창에서 보여주는 B1/B2/B3 전용 디버그 창
+3개를 만들어달라는 요청. 노드를 실행하면(Phase 등 FSM 상태와 무관하게) 항상 돌아가야
+하지만, 셋을 동시에 켜면 카메라 프레임 렌더링이 겹쳐 랙이 걸린다는 실측 피드백으로 기본은
+전부 꺼두고 한 번에 하나씩만 켜서 보는 것으로 함.
+
+**수정 (`track_drive.py`):**
+- 공용 헬퍼 `_debug_viz_box_area_cam_window(win_name, win_pos, title_kr, title_en, cam_frame,
+  max_area, min_area, threshold_name)` — 320x240 카메라 프레임(검출기의
+  `get_latest_debug_frame()`, 박스 그려진 것) 위에 아래쪽 텍스트로 `최대 박스면적 = ...px²`
+  (임계값 이상이면 초록, 미만이면 주황)와 임계값 상수명+값을 보여준다. 카메라 프레임이
+  아직 없으면(해당 단계가 아직 한 번도 활성인 적 없음/검출기 초기화 실패) 안내 문구만 표시.
+- `_debug_viz_b1_cone_area()`/`_debug_viz_b2_cone_area()`(둘 다 `yolo_cone_detector` 재사용,
+  각자 `YOLO_CONE_MIN_BOX_AREA_PX_B1`/`_B2`로 표시)/`_debug_viz_b3_vehicle_area()`
+  (`yolo_vehicle_cut_detector`, `YOLO_VEHICLE_MIN_BOX_AREA_PX_B3`) 세 메서드가 각각 위
+  헬퍼를 호출. §5.15 이전 버전(§5.17 첫 시도, 이후 삭제됨)과 달리 `Phase` 기준
+  "활성/대기" 구분이 없다 — 플래그가 켜져 있으면 무조건 그린다. 다만 카메라 프레임/면적값
+  자체는 `_active_yolo_stage()`가 해당 스테이지를 가리킬 때만
+  `perc_yolo_cone()`/`perc_yolo_vehicle_cut()`이 돌아 갱신되므로(`perceive_all()` 참고),
+  그 외 구간에선 마지막 값에 멈춰 있다.
+- `control_loop()`에 `DEBUG_VIZ_B1_CONE_AREA`/`_B2_CONE_AREA`/`_B3_VEHICLE_AREA` 플래그로
+  게이트한 호출 3줄 추가.
+- `config.py` — 위 세 플래그(기본값 **전부 False** — 동시에 켜지 말 것)와 `DEBUG_WIN_POS_
+  B1_CONE_AREA`/`_B2_CONE_AREA`/`_B3_VEHICLE_AREA`(가로로 나란히 `(0,0)`/`(340,0)`/
+  `(680,0)`) 신설.
+
+**사용법:** 지금 튜닝하려는 단계 하나만 `config.py`에서 해당 플래그를 `True`로 켜고(예:
+B1 실측 중이면 `DEBUG_VIZ_B1_CONE_AREA = True`, 나머지 둘은 `False` 유지), 노드를 켠 채로
+그 단계에 실제로 진입시켜(라바콘/고정장애물/방해차량을 실제 거리에 두고) 창에 뜨는 카메라
+화면과 면적 숫자를 보면서 "이 정도 거리에서 이 정도 면적이면 검출로 인정해야겠다" 싶은
+값을 그대로 해당 `YOLO_*_MIN_BOX_AREA_PX_B*` 상수에 넣으면 된다.
+
+**[2026-08-23 밤, 요청 반영] 실측 완료 후 삭제됨:** B1=5000.0/B2=2500.0/B3=4500.0px²로
+실측 확정(§5.16 참고) 후, 이 절에서 추가했던 코드(공용 헬퍼 + 세 메서드 +
+`control_loop()` 호출 3줄, `config.py`의 플래그/좌표 6줄)를 예고대로 전부 삭제했다 —
+지금은 코드에 없음, 이 절은 그 도구가 왜/어떻게 있었는지의 기록으로만 남긴다.
+
+### 5.18 B3 통과 직후 신호등 YOLO 안 켜지던 버그 수정 (2026-08-23 밤)
+
+`_signal_yolo_off`가 `_begin_new_lap()`(한 바퀴 완주 판정) 때까지 안 풀려서 `Phase.DONE`
+진입 후에도 신호등 YOLO가 계속 꺼져있던 버그. `_mark_behavior_passed()`에서 `Phase.DONE`
+진입 시 신호 상태를 즉시 리셋하도록 수정. **실차 미검증.**
+
 ---
 
 ## 6. 실측값 기록 (캘리브레이션)

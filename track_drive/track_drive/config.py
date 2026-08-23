@@ -677,9 +677,20 @@ ENABLE_OBSTACLE_CUT = True    # [2026-08-21, 임시] B3(방해차량) 회피 실
 #   보다 살짝 여유를 둔 값 — 디바운스(OBSTACLE_CUT_TRIGGER_FRAMES)가 끝나는 시점이
 #   da가 실제로 컷을 보여줄 수 있는 경계(0.7m) 바로 앞에 오도록 확정했다(더 멀리
 #   보는 것 자체는 의미 없음 — da가 0.7m보다 먼 거리를 표현 못 해서 어차피 컷의
-#   "먼 경계"는 항상 캔버스 끝으로 클램프된다).
+#   "먼 경계"는 항상 캔버스 끝으로 클램프된다). B2(고정장애물)/일반 기본값.
 OBSTACLE_CUT_TRIGGER_X_MAX_M  = 1.0   # 실차 미검증(2026-08-20 논의로 확정)
+# [2026-08-23r2, 요청 반영] "B3 검출범위 좌우 0.75m, 전방 2.5m로 확대" — B3(방해차량)는
+#   위 DL_BEV_FAR_LIMIT_M=0.7m 캡보다 훨씬 멀리 본다(트리거만 먼저 잡고, 실제 컷 지오메트리는
+#   여전히 da가 보이는 범위로 클램프됨 — OBSTACLE_CUT_NEAR_M/da 캔버스 한계 참고). 즉 트리거가
+#   da로 시각 확인되기 전에 먼저 울릴 수 있음 — 실차 미검증, 오검출 잦으면 다시 좁힐 것.
+OBSTACLE_CUT_TRIGGER_X_MAX_M_VEHICLE = 2.5   # B3(방해차량) 전용 전방 트리거 거리(m)
 OBSTACLE_CUT_TRIGGER_Y_HALF_M = 0.55  # 횡방향 반폭 — LANE_WIDTH_M(0.4m) 기준 한 차선+여유, 실차 미검증 추정치
+                                       #   B2(고정장애물=콘)/일반 기본값. B3(방해차량)는 아래
+                                       #   OBSTACLE_CUT_TRIGGER_Y_HALF_M_VEHICLE로 별도 사용
+                                       #   (perc_obstacle_cut_trigger()가 self._b2_passed로 분기).
+# [2026-08-23r2, 요청 반영] "B3 검출범위 좌우 0.75m로 확대" — 기존 0.8배 축소(0.44m)에서
+#   변경. 실차 미검증 — 너무 넓어 인접 차선 물체까지 잡히면 다시 좁힐 것.
+OBSTACLE_CUT_TRIGGER_Y_HALF_M_VEHICLE = 0.75  # m (2026-08-23r2 변경: 0.44m → 0.75m)
 OBSTACLE_CUT_TRIGGER_FRAMES   = 2     # [2026-08-23, 요청 반영] 3→2 — 더 빨리 감지(디바운스 완화). 라이다 AND YOLO 연속확인 프레임 수(디바운스) — 실차 미검증
                                        #   ★값을 더 낮출수록(1까지) 반응은 빨라지지만 노이즈(순간 오검출) 하나로도 트리거가 걸릴 위험이 커진다 — 실차에서 오검출 잦으면 다시 3으로.
 
@@ -688,7 +699,14 @@ OBSTACLE_CUT_TRIGGER_FRAMES   = 2     # [2026-08-23, 요청 반영] 3→2 — �
 #   이므로 컷의 먼 경계를 obstacle_dist로 계산하지 않는다 — "지금 보이는 da 전체
 #   깊이"를 그대로 먼 경계로 쓰고, 가까운 경계만 아래 OBSTACLE_CUT_NEAR_M로 고정한다.
 OBSTACLE_CUT_NEAR_M = 0.1                 # 컷의 차량쪽 고정 경계(m) — 차량 뒤 더 넓은 범위 차단(기존 0.3→0.1, 2026-08-20)
-OBSTACLE_CUT_LANE_HALF_WIDTH_PX = None    # None이면 LANE_WIDTH_M*DL_PIXELS_PER_METER로 초기화 시 계산(정적값 — _ll_active_half_width() 등 다른 서브시스템 상태에 안 엮음)
+# [2026-08-23, 요청 반영] B2(고정장애물)/B3(방해차량)가 컷 좌우폭을 따로 가지도록 분리 —
+#   기존 단일 OBSTACLE_CUT_LANE_HALF_WIDTH_PX를 타입별 두 상수로 나눴다(둘 다 None이면
+#   기존과 동일하게 LANE_WIDTH_M*DL_PIXELS_PER_METER로 계산, _clip_da_by_obstacle() 참고).
+#   B2는 "조향이 너무 크다"는 실차 체감 피드백으로 좌우폭 10%↓(OBSTACLE_CUT_HALF_WIDTH_SCALE_FIXED).
+#   B3는 아직 실차 미검증 상태 그대로 유지 — 추후 별도 조정 예정.
+OBSTACLE_CUT_LANE_HALF_WIDTH_PX_FIXED   = None   # B2(고정장애물) 전용
+OBSTACLE_CUT_LANE_HALF_WIDTH_PX_VEHICLE = None   # B3(방해차량) 전용 — 기존 동작과 동일(배율 없음)
+OBSTACLE_CUT_HALF_WIDTH_SCALE_FIXED = 0.9        # B2 전용 배율 — LANE_WIDTH_M*DL_PIXELS_PER_METER(80px) 대비 10%↓(→72px), 실차 미검증
 OBSTACLE_CUT_MIN_REMAIN_PX = 25.0         # [2026-08-20] 클리핑 후 밴드에 이 폭(px) 미만만 남으면 그 밴드는 컷을 건너뛴다 (40→25로 낮춤)
                                            #   — da가 완전히 비면 pure_pursuit.control()의 "path 없으면 직전값 유지(held)"
                                            #   폴백이 걸려 회피가 가장 필요한 순간 조향이 얼어붙는 위험(초기 세션에서
@@ -1373,7 +1391,11 @@ DEBUG_VIZ_LIDAR    = False  # 라이다 BEV 장애물 감지 디버그 창 (trac
 #   것 — 위 DEBUG_VIZ_LIDAR 주석 참고). 처음엔 DEBUG_VIZ_LIDAR(B2/B3 전용)와 같이 켰다가,
 #   지금은 라바콘 검출 확인이 목적이라 위 DEBUG_VIZ_LIDAR를 다시 False로 끄고 이 창만 남김
 #   (요청 반영).
-DEBUG_VIZ_LAVACON  = True   # 라바콘 트리거 ROI + push ROI(지금 실제 조향에 쓰이는 좌우 최근접
+# [2026-08-23, 요청 반영] True → False — B1 박스면적 테스트 창(DEBUG_VIZ_B1_CONE_AREA)만
+#   보기 위한 임시 비활성화. 복원 시 True로.
+DEBUG_VIZ_LAVACON  = True   # [2026-08-23 밤, 요청 반영] False→True — B1/B2/B3 면적 실측
+                             #   임시 비활성화 종료, 원래 상태로 복원.
+                             # 라바콘 트리거 ROI + push ROI(지금 실제 조향에 쓰이는 좌우 최근접
                              #   콘 검출) 통합 BEV 디버그 창 (track_drive.py _draw_lavacon_bev())
                              #   — 콘 침범 시 경로를 옆으로 미는 push(margin/gain/lat) 표시.
                              # [2026-08-23] False → True(요청 반영) — 라이다 창 대신 B1 콘 push
@@ -1394,7 +1416,11 @@ DEBUG_VIZ_IMU      = False  # IMU(/imu) 연동 상태 + 현재 yaw값 디버그 
                              # [2026-08-22] 요청 반영으로 끔 — 아래 "차선인식/좌회전 통합
                              #   창만 남기고 나머지 다 끄기" 일괄 정리, 필요하면 다시 True로.
 
-DEBUG_VIZ_DL_LANE    = True   # 차선 — 기본 백엔드('dl') 디버그 창 (perception/dl_lane.py),
+# [2026-08-23, 요청 반영] True → False — B1 박스면적 테스트 창만 보기 위한 임시 비활성화.
+#   복원 시 True로.
+DEBUG_VIZ_DL_LANE    = True   # [2026-08-23 밤, 요청 반영] False→True — B1/B2/B3 면적 실측
+                               #   임시 비활성화 종료, 원래 상태로 복원.
+                               # 차선 — 기본 백엔드('dl') 디버그 창 (perception/dl_lane.py),
                                # da(주행가능영역) 오버레이+경로가 찍히는 'dl_lane' 창
                                # [2026-08-23] False → True(요청 반영) — B1/B2/B3(고정·이동장애물
                                #   회피) 검증 시작하며 da 창 다시 켬.
@@ -1450,7 +1476,11 @@ DEBUG_VIZ_YOLO_CONE  = True   # 콘 원시검출 창('yolo_cone_result', yolo_co
 # [2026-08-21] 신호등 위치+색상 판정을 YOLO 단독(yolo_signal_state.py) 하나로 정리하면서
 #   (README §1.18) 이게 유일한 신호등 결과 창이 됐다 — 실차에서 지금 뭘 보고 판단 중인지
 #   눈으로 확인하기 위함.
-DEBUG_VIZ_YOLO_SIGNAL_STATE = False   # 신호등 위치+색상상태 YOLO 검출 박스 디버그 창 (perception/yolo_signal_state.py, 창 이름 'YOLO_신호등')
+# [2026-08-23, 요청 반영] True → False — B1 박스면적 테스트 창만 보기 위한 임시 비활성화.
+#   복원 시 True로.
+DEBUG_VIZ_YOLO_SIGNAL_STATE = True    # [2026-08-23 밤, 요청 반영] False→True — B1/B2/B3 면적
+                                      #   실측 임시 비활성화 종료, 원래 상태로 복원.
+                                      # 신호등 위치+색상상태 YOLO 검출 박스 디버그 창 (perception/yolo_signal_state.py, 창 이름 'YOLO_신호등')
                                       # [2026-08-22h] 요청 반영으로 껐다가, [2026-08-23] B3 통과 후
                                       #   S0_SIGNAL 대기 검증(아래 "6. 미션 State" override) 위해 다시 켰다가,
                                       #   [2026-08-23b] 요청 반영으로 다시 끔, [2026-08-23r] 요청 반영(주행용
@@ -1470,6 +1500,8 @@ DEBUG_VIZ_AVOID_HOLD = False
 # [2026-08-20] da 근접 컷(obstacle-cut, ENABLE_OBSTACLE_CUT 주석 참고) 전용 상태창 —
 #   라이다 raw/YOLO raw/AND확정/유지타이머 잔여시간/해제카운터를 avoid_hold_debug와
 #   같은 구조로 한곳에 모아 보여준다(track_drive.py _debug_viz_obstacle_cut()).
+# [2026-08-23] False → True — B1/B2/B3 최대 박스면적(B1/B2/B3 태그 포함)을 이 창에서도
+#   보고 싶다는 요청으로 다시 켬.
 DEBUG_VIZ_OBSTACLE_CUT = True    # [2026-08-22i] 요청 반영으로 껐다가, [2026-08-22m] 회피(da 근접 컷)
 #   검출범위 확인용으로 다시 켰다가, [2026-08-23a] 요청 반영으로 다시 끔, [2026-08-23b] B1/B2/B3
 #   회피 전체 흐름 검증 시작하며 다시 켬 — dl_lane(da) 창과 같이 켜서 "라이다가 왜 지금
@@ -1572,9 +1604,9 @@ TEST_FORCE_LEFT_TURN_SIGNAL = False
 #   되돌리면 track_drive.py의 override 코드가 자동으로 비활성화되고 원래 신호등 YOLO
 #   기반 판단으로 돌아간다(다른 곳 되돌릴 필요 없음).
 
-# ★★★★★ [2026-08-23k, 요청 반영] 임시 디버그 스위치 — 좌회전 로직 단독 테스트 중,
-#   반드시 나중에 원복! ★★★★★
-TEST_DISABLE_CHECKER_PILLAR_TIMEOUT = True
+# [2026-08-23q, 요청 반영] True→False로 원복 — 좌회전 로직 단독 테스트 종료, 타임아웃
+#   안전장치(CHECKER_PILLAR_TIMEOUT_DIST_M)를 다시 켠다.
+TEST_DISABLE_CHECKER_PILLAR_TIMEOUT = False
 #   순전히 테스트 목적 — CHECKER_PILLAR_TIMEOUT_DIST_M(위) 안전장치를 꺼서, S0_SIGNAL
 #   'left' 커밋 구간이 기둥쌍 미검출을 이유로 거리기반 강제 폴백을 타지 않고 무조건
 #   checker_pillar_trigger(실제 라이다 기둥쌍 검출)만 기다리게 한다(track_drive.py의
@@ -1800,6 +1832,19 @@ YOLO_CONE_ENABLE = True
 YOLO_CONE_INPUT_SIZE = 640     # cone_best_n.onnx export 시 imgsz와 반드시 일치시킬 것
 YOLO_CONE_CONF_THRESHOLD = 0.5 # 이 신뢰도 이상인 검출만 인정(모델이 nms=True로 export돼 좌표 디코딩은 불필요)
 YOLO_CONE_MODEL_PATH = None    # None이면 yolo_ros/cone_best_n.onnx(형제 디렉터리)를 자동으로 찾음(perception/yolo_cone.py 참고)
+# [2026-08-23] 요청 반영 — "화면에 콘이 찍힌다"만으로 검출 인정하지 않고, 이번 프레임
+#   검출된 박스들 중 "가장 큰" 것의 면적(YOLO_CONE_INPUT_SIZE=640 스케일 기준 px²)이
+#   이 값 이상일 때만 검출로 인정한다. perception/yolo_cone.py는 원시 검출 여부와
+#   최대 박스면적(get_latest_max_area())만 돌려주고, 실제 면적 게이트는
+#   track_drive.py가 B1(perc_lavacon_trigger())/B2(perc_obstacle_cut_trigger()) 각
+#   호출부에서 건다 — 같은 콘 검출기를 공유하지만 B1/B2가 처한 상황(진입 트리거 vs
+#   이미 진입해 지나치는 중)이 달라 멀리서 작게 찍힌 걸 걸러낼 기준도 다를 수 있다는
+#   요청 반영(2026-08-23, "그 크기값을 b1/b2/b3마다 다른 변수로")으로 아래 두 값으로
+#   분리했다.
+#   [2026-08-23 밤, 요청 반영] b1_cone_area_debug/b2_cone_area_debug 창으로 실차 실측 완료 —
+#   B1=5000.0, B2=2500.0으로 확정(placeholder 아님).
+YOLO_CONE_MIN_BOX_AREA_PX_B1 = 5000.0   # B1(라바콘 진입 트리거) 전용 — 실차 실측 확정치
+YOLO_CONE_MIN_BOX_AREA_PX_B2 = 2500.0   # B2(고정장애물 obstacle_cut) 전용 — 실차 실측 확정치
 
 # ── [2026-08-20] 방해차량 카메라 이중확인 (perception/yolo_vehicle.py, YOLOv8n ONNX) ──
 #   da 근접 컷(ENABLE_OBSTACLE_CUT, 위 참고) 전용. 최초 이식(fix/da-corridor-near-band-margin
@@ -1834,7 +1879,21 @@ YOLO_VEHICLE_MODEL_PATH = None     # None이면 yolo_ros/target_vehicle_best.onn
                                     # v1.1.0(seed+round2 6,041장, mAP50-95=0.985) →
                                     # [2026-08-20 §2.59] v1.2.0(가중치는 v1.1.0과 동일,
                                     # nms 내장 export로 교체)으로 갱신.
-DEBUG_VIZ_YOLO_VEHICLE = False      # [2026-08-22i] 요청 반영으로 끔 — 카메라가 실제로 target_vehicle을 보는지 원시 박스로 확인용, 필요하면 다시 True로
+# [2026-08-23] 요청 반영 — YOLO_CONE_MIN_BOX_AREA_PX_B1/_B2와 동일한 목적/패턴. 이번
+#   프레임 검출된 target_vehicle 박스들 중 가장 큰 것의 면적(YOLO_VEHICLE_INPUT_SIZE=640
+#   스케일 기준 px²)이 이 값 이상일 때만 검출로 인정 — track_drive.py
+#   perc_obstacle_cut_trigger()(B3)가 self.vehicle_detected_yolo_cut/vehicle_max_box_area_cut을
+#   가지고 이 값으로 게이트를 건다. B3 전용이라 콘 쪽처럼 나눌 필요는 없어 하나만 둠.
+#   [2026-08-23 밤, 요청 반영] b3_vehicle_area_debug 창으로 실차 실측 완료 — 4500.0으로
+#   확정(placeholder 아님).
+YOLO_VEHICLE_MIN_BOX_AREA_PX_B3 = 4500.0   # B3(방해차량 obstacle_cut) 전용 — 실차 실측 확정치
+# [2026-08-23s, 요청 반영] False → True — B3 박스면적 실측 창(b3_vehicle_area_debug)에
+#   카메라 화면이 안 보이는(면적 숫자는 찍히는데 프레임이 빈 칸) 문제 확인 후 복원.
+DEBUG_VIZ_YOLO_VEHICLE = True       # [2026-08-23r, 요청 반영] False→True — 끈 채로 두면
+                                     # _debug_viz_obstacle_cut()의 카메라 패널이 B3(방해차량)
+                                     # 단계에서 get_latest_debug_frame()이 항상 None을 반환해
+                                     # 빈 칸으로만 보이는 문제(yolo_vehicle.py _worker() 참고,
+                                     # DEBUG_VIZ_YOLO_VEHICLE=False면 vis 자체를 안 만듦).
 
 # ── 신호등 위치+색상상태 YOLO (perception/yolo_signal_state.py, YOLOv8n ONNX) ──
 #   [2026-08-19] datasets/signal_state/(라벨링 워크플로는 그쪽 README 참고)로 파인튜닝한

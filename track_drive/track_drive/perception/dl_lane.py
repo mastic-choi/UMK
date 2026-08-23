@@ -226,7 +226,10 @@ from ..config import (
     # 프레임 NameError로 dl_lane 창이 아예 안 뜨는 문제로 나타났다("디버깅 창이 안 뜬다"
     # 요청 반영).
     ENABLE_OBSTACLE_CUT,
-    LANE_WIDTH_M, OBSTACLE_CUT_NEAR_M, OBSTACLE_CUT_LANE_HALF_WIDTH_PX, OBSTACLE_CUT_MIN_REMAIN_PX,
+    LANE_WIDTH_M, OBSTACLE_CUT_NEAR_M, OBSTACLE_CUT_MIN_REMAIN_PX,
+    # [2026-08-23] B2/B3 컷 좌우폭 분리(config.py 위 OBSTACLE_CUT_LANE_HALF_WIDTH_PX_* 주석 참고)
+    OBSTACLE_CUT_LANE_HALF_WIDTH_PX_FIXED, OBSTACLE_CUT_LANE_HALF_WIDTH_PX_VEHICLE,
+    OBSTACLE_CUT_HALF_WIDTH_SCALE_FIXED,
     # DL_LL_ALGO='yw'(팀원 작성, main 기본) 전용
     DL_LL_YELLOW_GAP_INIT_PX, DL_LL_YELLOW_GAP_EMA_ALPHA,
     DL_LL_YELLOW_GAP_MIN_PX, DL_LL_YELLOW_GAP_MAX_PX,
@@ -975,7 +978,7 @@ class DLSlideWindow(SlideWindow):
 
         return clipped, virtual_used
 
-    def _clip_da_by_obstacle(self, da_mask, obstacle_y_m, confirmed):
+    def _clip_da_by_obstacle(self, da_mask, obstacle_y_m, confirmed, cut_type='none'):
         """[2026-08-20] da 근접 컷(ENABLE_OBSTACLE_CUT) — `_clip_da_by_ll()`(위)의
         가상경계(②)와 `_apply_vehicle_margin()`에 이은 이 파일의 세 번째 "근거(픽셀)
         없이 강제로 da를 클리핑"하는 함수. 다만 여기서는 근거가 픽셀이 아니라
@@ -1011,6 +1014,10 @@ class DLSlideWindow(SlideWindow):
                obstacle_y_m — 장애물 횡위치(m, +좌측). None이면 컷 안 함.
                confirmed — 위 트리거(라이다 AND YOLO, 디바운스 통과)가 True로
                            확정했는지. False면 그대로 반환(컷 없음).
+               cut_type — [2026-08-23] 'fixed'(B2)/'vehicle'(B3)/'none'. 컷 좌우폭을
+                           타입별로 다르게 쓰기 위해 track_drive.py의 obstacle_cut_type을
+                           set_obstacle()을 거쳐 그대로 받는다 — 'fixed'/미분류는 B2 폭,
+                           'vehicle'만 B3 폭을 쓴다(아래 half_width_px 계산 참고).
         출력 : clipped da_mask(원본과 shape 동일). 부수효과로 self.obstacle_cut_active/
                self.obstacle_cut_col_range를 이번 프레임 상태로 갱신(visualize() 디버그용).
         """
@@ -1021,8 +1028,14 @@ class DLSlideWindow(SlideWindow):
 
         h, w = da_mask.shape
         vehicle_x = self.vehicle_center_x
-        half_width_px = (OBSTACLE_CUT_LANE_HALF_WIDTH_PX if OBSTACLE_CUT_LANE_HALF_WIDTH_PX is not None
-                          else LANE_WIDTH_M * DL_PIXELS_PER_METER)
+        base_half_width_px = LANE_WIDTH_M * DL_PIXELS_PER_METER
+        if cut_type == 'vehicle':
+            half_width_px = (OBSTACLE_CUT_LANE_HALF_WIDTH_PX_VEHICLE
+                              if OBSTACLE_CUT_LANE_HALF_WIDTH_PX_VEHICLE is not None else base_half_width_px)
+        else:   # 'fixed'(B2) 및 미분류('none') 폴백 — perc_obstacle_cut_trigger()의 기본값과 동일 원칙
+            half_width_px = (OBSTACLE_CUT_LANE_HALF_WIDTH_PX_FIXED
+                              if OBSTACLE_CUT_LANE_HALF_WIDTH_PX_FIXED is not None
+                              else base_half_width_px * OBSTACLE_CUT_HALF_WIDTH_SCALE_FIXED)
         near_row_px = int(np.clip(h - OBSTACLE_CUT_NEAR_M * DL_PIXELS_PER_METER, 0, h))
 
         if obstacle_y_m > 0:   # 장애물 좌측(라이다 +y=좌측) → 좌측(작은 x) 절반 클리핑
@@ -1742,8 +1755,8 @@ class DLSlideWindow(SlideWindow):
         return self._path_ok_confirmed
 
     def detect(self, raw_bgr, da_prob, ll_prob, yellow_mask, avoid_hold=False, direction_hint=0, v_mps=0.0,
-               obstacle_y_m=None, obstacle_cut_confirmed=False, lavacon_push_active=False,
-               lavacon_push_px=0.0):
+               obstacle_y_m=None, obstacle_cut_confirmed=False, obstacle_cut_type='none',
+               lavacon_push_active=False, lavacon_push_px=0.0):
         """입력 : raw_bgr — 원본 카메라 프레임 그대로의 (H,W,3) BGR(크롭/리사이즈 없음)
                  da_prob, ll_prob — 위와 같은 (H,W) float32 foreground 확률(모델은 360행
                    고정이지만 TwinLiteNetEngine.infer_raw()가 이미 원본 크기로 업샘플링해서 줌)
@@ -1764,6 +1777,9 @@ class DLSlideWindow(SlideWindow):
                    (_clip_da_by_obstacle(), ENABLE_OBSTACLE_CUT). track_drive.py의
                    perc_obstacle_cut_trigger()가 라이다 AND YOLO로 확정한 값을
                    set_obstacle()을 거쳐 넘겨준다. DL_CENTER_MODE=='da' 전용.
+                 obstacle_cut_type — [2026-08-23] 'fixed'(B2)/'vehicle'(B3)/'none'.
+                   위와 동일하게 set_obstacle()을 거쳐 넘어오며, B2/B3 컷 좌우폭을
+                   다르게 쓰는 데만 쓰인다(_clip_da_by_obstacle() 참고).
                  lavacon_push_active — [2026-08-22] B1 콘 침범 push(_lavacon_steer_da_push())가
                    이번 틱에 실제로 경로를 밀었는지. set_lavacon_push()를 거쳐 넘어오며,
                    DA 클리핑엔 관여하지 않고 draw_path() 경로 색/이중 경로 표시에만 쓰인다.
@@ -2002,7 +2018,7 @@ class DLSlideWindow(SlideWindow):
                 # 적용한다(_apply_vehicle_margin()이 그 위에 다시 침식을 걸어주므로 레이어
                 # 순서가 자연스럽게 쌓인다). ENABLE_OBSTACLE_CUT=False면 obstacle_cut_confirmed가
                 # 항상 False라 여기서 사실상 아무 일도 안 한다(그대로 반환).
-                da_mask = self._clip_da_by_obstacle(da_mask, obstacle_y_m, obstacle_cut_confirmed)
+                da_mask = self._clip_da_by_obstacle(da_mask, obstacle_y_m, obstacle_cut_confirmed, obstacle_cut_type)
 
                 # [2026-08-14] 중심선 계산에만 안전마진을 적용한다 — self.da_mask_roi(아래,
                 # 디버그 시각화용)는 침식 전 원본을 그대로 담아야 "da가 실제로 어디까지
@@ -2610,6 +2626,7 @@ class DLLaneDetector:
         # 같이 읽어 DLSlideWindow.detect()에 넘긴다.
         self._latest_obstacle_y = None
         self._latest_obstacle_cut_confirmed = False
+        self._latest_obstacle_cut_type = 'none'   # [2026-08-23] B2/B3 컷 좌우폭 분리용, set_obstacle() 참고
         # [2026-08-22] B1 콘 침범 push(_lavacon_steer_da_push()) 상태 — set_obstacle()과
         # 동일한 관례로 track_drive.py가 매 틱 set_lavacon_push()로 갱신하면 _worker()가
         # 다음 추론 때 같은 락으로 같이 읽어 DLSlideWindow.detect()에 넘긴다.
@@ -2659,14 +2676,17 @@ class DLLaneDetector:
         with self._lock:
             self._latest_v_mps = float(v_mps)
 
-    def set_obstacle(self, y_m, confirmed):
+    def set_obstacle(self, y_m, confirmed, cut_type='none'):
         """[2026-08-20] track_drive.py의 perc_lane()이 매 틱 호출 — da 근접 컷
         (_clip_da_by_obstacle(), ENABLE_OBSTACLE_CUT) 트리거 상태를 다음 추론에
         반영한다(set_avoid_hold()/set_speed()와 동일 관례). 단순 대입이라 별도 검증
-        없이 저장한다. y_m=None이면 장애물 횡위치 정보 없음(confirmed도 무시됨)."""
+        없이 저장한다. y_m=None이면 장애물 횡위치 정보 없음(confirmed도 무시됨).
+        cut_type — [2026-08-23] 'fixed'(B2)/'vehicle'(B3)/'none', B2/B3 컷 좌우폭을
+        다르게 쓰는 데만 쓰인다(_clip_da_by_obstacle() 참고)."""
         with self._lock:
             self._latest_obstacle_y = None if y_m is None else float(y_m)
             self._latest_obstacle_cut_confirmed = bool(confirmed)
+            self._latest_obstacle_cut_type = cut_type
 
     def set_lavacon_push(self, active, push_px=0.0):
         """[2026-08-22] track_drive.py의 perc_lane()이 매 틱 호출 — B1 콘 침범 push
@@ -2694,6 +2714,7 @@ class DLLaneDetector:
                 v_mps = self._latest_v_mps
                 obstacle_y = self._latest_obstacle_y
                 obstacle_cut_confirmed = self._latest_obstacle_cut_confirmed
+                obstacle_cut_type = self._latest_obstacle_cut_type
                 lavacon_push_active = self._latest_lavacon_push_active
                 lavacon_push_px = self._latest_lavacon_push_px
             if frame is None:
@@ -2709,6 +2730,7 @@ class DLLaneDetector:
                     raw_bgr, da_prob, ll_prob, yellow_mask,
                     avoid_hold=avoid_hold, direction_hint=avoid_hold_side, v_mps=v_mps,
                     obstacle_y_m=obstacle_y, obstacle_cut_confirmed=obstacle_cut_confirmed,
+                    obstacle_cut_type=obstacle_cut_type,
                     lavacon_push_active=lavacon_push_active, lavacon_push_px=lavacon_push_px,
                 )
                 debug_img = self._slide.vis
