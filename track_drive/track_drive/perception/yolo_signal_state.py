@@ -40,8 +40,8 @@ else:
 
 from ..config import (
     YOLO_SIGNAL_STATE_INPUT_SIZE, YOLO_SIGNAL_STATE_CONF_THRESHOLD, YOLO_SIGNAL_STATE_MODEL_PATH,
-    YOLO_SIGNAL_STATE_CLASS_NAMES, DEBUG_VIZ_YOLO_SIGNAL_STATE, FPS_LOG_PERIOD_SEC,
-    DEBUG_WIN_POS_YOLO_SIGNAL_STATE,
+    YOLO_SIGNAL_STATE_CLASS_NAMES, YOLO_SIGNAL_STATE_MIN_BOX_HEIGHT_PX, DEBUG_VIZ_YOLO_SIGNAL_STATE,
+    FPS_LOG_PERIOD_SEC, DEBUG_WIN_POS_YOLO_SIGNAL_STATE,
 )
 
 
@@ -141,7 +141,10 @@ class YoloSignalStateEngine:
             (640 입력 스케일 좌표, letterbox 없이 단순 리사이즈라 원본과 종횡비가 다르면
             좌표가 뒤틀릴 수 있음 — yolo_cone.py와 동일한 제약).
         모델이 nms=True로 export돼 output0에 이미 NMS 적용된 [x1,y1,x2,y2,conf,cls]가
-        나온다 — 여기서는 conf 임계값 필터링 + 클래스별 최댓값 선택만 한다."""
+        나온다 — 여기서는 conf 임계값 필터링 + 클래스별 최댓값 선택만 한다.
+        원거리 오검출 억제를 위해 bbox 높이가 YOLO_SIGNAL_STATE_MIN_BOX_HEIGHT_PX 미만인
+        검출은 conf와 무관하게 버린다(2026-08-23, config.py 해당 상수 주석 참고 — ROI 크롭
+        대신 탐지 후 필터링을 택한 이유)."""
         t0 = time.perf_counter()
         blob = self.preprocess(bgr_frame)
         outputs = self.session.run([self._output_name], {self._input_name: blob})[0]
@@ -154,6 +157,8 @@ class YoloSignalStateEngine:
         best_by_class = {name: (False, 0.0) for name in YOLO_SIGNAL_STATE_CLASS_NAMES}
         for x1, y1, x2, y2, conf, cls in dets:
             if conf < YOLO_SIGNAL_STATE_CONF_THRESHOLD:
+                continue
+            if (y2 - y1) < YOLO_SIGNAL_STATE_MIN_BOX_HEIGHT_PX:
                 continue
             cls_idx = int(round(cls))
             if not (0 <= cls_idx < len(YOLO_SIGNAL_STATE_CLASS_NAMES)):

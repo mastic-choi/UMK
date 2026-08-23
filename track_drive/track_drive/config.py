@@ -1763,6 +1763,13 @@ YOLO_SIGNAL_STATE_CONF_THRESHOLD = 0.5 # 이 신뢰도 이상인 검출만 인�
 # 이 파일의 파싱 코드는 원래부터 그 형식 전제라 변경 없음).
 YOLO_SIGNAL_STATE_MODEL_PATH = None    # None이면 yolo_ros/signal_state_best_n.onnx(형제 디렉터리)를 자동으로 찾음(perception/yolo_signal_state.py 참고)
 YOLO_SIGNAL_STATE_CLASS_NAMES = ('red', 'green_straight', 'green_left')  # class id(0/1/2) 순서 — datasets/signal_state/classes.txt와 반드시 일치시킬 것
+#   [2026-08-23] 원거리에서 오검출(신호등이 작게 잡힐 때 신뢰도는 넘기는데 오탐)이 잦다는
+#   실차 관찰 반영 — ROI를 잘라 카메라가 원거리 자체를 못 보게 하는 대신(학습 데이터와
+#   추론 입력 분포가 달라져 오히려 판단이 이상해질 위험), 탐지 후 bbox 높이로 걸러낸다.
+#   좌표는 letterbox 없이 640x640으로 단순 리사이즈된 스케일(yolo_signal_state.py 참고) —
+#   원본 종횡비(640x480)와 다르므로 실제 물리 거리와 정확히 비례하진 않지만, 멀어질수록
+#   bbox가 작아지는 방향성은 유효. 실차 미검증 기본값 — 오검출/미검출 사례 보며 재조정할 것.
+YOLO_SIGNAL_STATE_MIN_BOX_HEIGHT_PX = 40
 
 SAFETY_DIST      = 5.0        # B2(고정장애물) 발동 거리(m)
 OVERTAKE_TRIGGER = 6.5        # B3(방해차량) 발동 거리(m)
