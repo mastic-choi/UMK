@@ -41,7 +41,7 @@ else:
 from ..config import (
     YOLO_SIGNAL_STATE_INPUT_SIZE, YOLO_SIGNAL_STATE_CONF_THRESHOLD, YOLO_SIGNAL_STATE_MODEL_PATH,
     YOLO_SIGNAL_STATE_CLASS_NAMES, DEBUG_VIZ_YOLO_SIGNAL_STATE, FPS_LOG_PERIOD_SEC,
-    DEBUG_WIN_POS_YOLO_SIGNAL_STATE,
+    DEBUG_WIN_POS_YOLO_SIGNAL_STATE, YOLO_SIGNAL_MIN_BOX_AREA_PX,
 )
 
 
@@ -135,8 +135,10 @@ class YoloSignalStateEngine:
     def infer(self, bgr_frame):
         """입력 : 임의 크기(H,W) BGR 프레임
         출력 : (state_dict, detections)
-          state_dict — {'red': (present, conf), 'green_straight': (...), 'green_left': (...)},
-            클래스별 신뢰도 임계값 이상 검출 중 최댓값만 남긴 것(없으면 (False, 0.0)).
+          state_dict — {'red': (present, conf, area), 'green_straight': (...), 'green_left': (...)},
+            클래스별 신뢰도 임계값 이상 검출 중 최댓값만 남긴 것(없으면 (False, 0.0, 0.0)).
+            area는 그 최고신뢰도 박스의 면적(px², 640 입력 스케일) — detect()가
+            YOLO_SIGNAL_MIN_BOX_AREA_PX 게이트에 쓴다.
           detections — [(x1,y1,x2,y2,conf,class_name), ...] 시각화용
             (640 입력 스케일 좌표, letterbox 없이 단순 리사이즈라 원본과 종횡비가 다르면
             좌표가 뒤틀릴 수 있음 — yolo_cone.py와 동일한 제약).
@@ -151,7 +153,7 @@ class YoloSignalStateEngine:
         # outputs shape: (1, N, 6) — N은 이번 프레임 검출 수(패딩된 0행 포함 가능)
         dets = outputs[0]
         detections = []
-        best_by_class = {name: (False, 0.0) for name in YOLO_SIGNAL_STATE_CLASS_NAMES}
+        best_by_class = {name: (False, 0.0, 0.0) for name in YOLO_SIGNAL_STATE_CLASS_NAMES}
         for x1, y1, x2, y2, conf, cls in dets:
             if conf < YOLO_SIGNAL_STATE_CONF_THRESHOLD:
                 continue
@@ -161,7 +163,8 @@ class YoloSignalStateEngine:
             name = YOLO_SIGNAL_STATE_CLASS_NAMES[cls_idx]
             detections.append((float(x1), float(y1), float(x2), float(y2), float(conf), name))
             if conf > best_by_class[name][1]:
-                best_by_class[name] = (True, float(conf))
+                area = (x2 - x1) * (y2 - y1)
+                best_by_class[name] = (True, float(conf), float(area))
 
         return best_by_class, detections
 
@@ -182,7 +185,7 @@ class YoloSignalStateDetector:
 
         self._lock = threading.Lock()
         self._latest_frame = None
-        self._latest_state = {name: (False, 0.0) for name in YOLO_SIGNAL_STATE_CLASS_NAMES}
+        self._latest_state = {name: (False, 0.0, 0.0) for name in YOLO_SIGNAL_STATE_CLASS_NAMES}
         self._latest_detections = []
         self._latest_debug = None                    # 시각화용 vis 프레임
         # [2026-08-23] 'YOLO_신호등' 창을 처음 띄울 때만 cv2.moveWindow로 위치를 잡기 위한
@@ -230,9 +233,17 @@ class YoloSignalStateDetector:
                     # 점등 여부만 보여줘 임계값(YOLO_SIGNAL_STATE_CONF_THRESHOLD) 근처에서
                     # 얼마나 아슬아슬하게 통과/실패했는지 알 수 없었다 — 클래스별 최댓값
                     # 신뢰도(state[name][1], 미검출이면 0.0)를 괄호로 덧붙인다.
-                    summary = ' '.join(f'{n}={"O" if p else "-"}({c:.2f})' for n, (p, c) in state.items())
+                    summary = ' '.join(f'{n}={"O" if p else "-"}({c:.2f})' for n, (p, c, _a) in state.items())
                     cv2.putText(vis, summary, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                                 (255, 255, 255), 2, cv2.LINE_AA)
+                    # [2026-08-24] 면적 게이트(YOLO_SIGNAL_MIN_BOX_AREA_PX) 도입 — state의
+                    # 최고신뢰도 박스 면적(area, engine.infer()가 이미 계산)을 그대로 보여준다
+                    # (예전엔 여기서 detections를 다시 훑어 중복 계산했음).
+                    area_summary = ' '.join(f'{n}={state[n][2]:.0f}px²'
+                                             for n in YOLO_SIGNAL_STATE_CLASS_NAMES)
+                    cv2.putText(vis, f'{area_summary}  (gate>{YOLO_SIGNAL_MIN_BOX_AREA_PX:.0f}px²)',
+                                (8, vis.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.5, (0, 255, 255), 1, cv2.LINE_AA)
             except Exception as e:
                 if not self._logged_infer_error:
                     self._log(f'추론 실패(이후 반복 로그는 생략, 이번 프레임부터 계속 스킵): {e}')
@@ -247,9 +258,9 @@ class YoloSignalStateDetector:
             now = time.time()
             # [2026-08-20] 검출 안 될 때도 몇 초마다 FPS 로그가 계속 찍혀 로그창을 채우던 것을
             # "실제로 뭔가 검출됐을 때만" 찍히도록 변경(요청 반영).
-            state_detected = any(present for present, _conf in state.values())
+            state_detected = any(present for present, _conf, _area in state.values())
             if state_detected and now - self._last_fps_log_t >= FPS_LOG_PERIOD_SEC:
-                summary = ' '.join(f'{n}={"O" if p else "-"}' for n, (p, _c) in state.items())
+                summary = ' '.join(f'{n}={"O" if p else "-"}' for n, (p, _c, _a) in state.items())
                 self._log(f'YOLO 신호등 색상상태 검출됨 {summary} FPS≈{self.engine.fps:.1f} '
                           f'(provider={self.engine.active_provider})')
                 self._last_fps_log_t = now
@@ -264,9 +275,15 @@ class YoloSignalStateDetector:
         with self._lock:
             state = self._latest_state
 
-        left_on = state['green_left'][0]
-        straight_on = state['green_straight'][0] and not left_on
-        red_on = state['red'][0] and not (straight_on or left_on)
+        def _present(name):
+            # [2026-08-24] conf 통과만으론 부족 — 최고신뢰도 박스 면적도
+            # YOLO_SIGNAL_MIN_BOX_AREA_PX 초과여야 검출로 인정(B1/B2/B3와 동일 원칙).
+            present, _conf, area = state[name]
+            return present and area > YOLO_SIGNAL_MIN_BOX_AREA_PX
+
+        left_on = _present('green_left')
+        straight_on = _present('green_straight') and not left_on
+        red_on = _present('red') and not (straight_on or left_on)
         return red_on, straight_on, left_on
 
     def show_debug_windows(self):

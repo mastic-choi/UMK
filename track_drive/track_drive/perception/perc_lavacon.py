@@ -201,7 +201,7 @@ def _lidar_to_xy(lidar_ranges):
     return x, y, ranges
 
 
-def nearest_cone_lateral(lidar_ranges, lon_min, lon_max, lat_limit, return_range=False):
+def nearest_cone_lateral(lidar_ranges, lon_min, lon_max, lat_limit, return_range=False, lon_max_l=None):
     """[2026-08-19] da(주행가능영역) 경로를 그대로 조향에 쓰고, 콘이 안전마진 안으로
     들어왔을 때만 그만큼 옆으로 미는 방식(track_drive.py `_lavacon_steer_da_push` 참고)
     전용 — 박스 스택 페어링(`_pick_boxed_sides`/`_build_path`)처럼 좌우 콘을 짝짓거나
@@ -226,9 +226,12 @@ def nearest_cone_lateral(lidar_ranges, lon_min, lon_max, lat_limit, return_range
     if x is None:
         return (None, None, None, None, None, None) if return_range else (None, None)
 
-    roi = (ranges > 0.0) & (x > lon_min) & (x < lon_max) & (np.abs(y) < lat_limit)
-    left_idx = np.where(roi & (y > 0.0))[0]
-    right_idx = np.where(roi & (y < 0.0))[0]
+    # [2026-08-24, 테스트] lon_max_l — 좌측만 전방 ROI를 다르게 주고 싶을 때(config.py
+    # LAVACON_PUSH_LON_MAX_L 참고). None이면 lon_max와 동일해 기존과 100% 동일 동작.
+    roi_common = (ranges > 0.0) & (x > lon_min) & (np.abs(y) < lat_limit)
+    left_lon_max = lon_max if lon_max_l is None else lon_max_l
+    left_idx = np.where(roi_common & (x < left_lon_max) & (y > 0.0))[0]
+    right_idx = np.where(roi_common & (x < lon_max) & (y < 0.0))[0]
     left_i = left_idx[int(np.argmin(ranges[left_idx]))] if left_idx.size > 0 else None
     right_i = right_idx[int(np.argmin(ranges[right_idx]))] if right_idx.size > 0 else None
     left_y = float(y[left_i]) if left_i is not None else None
