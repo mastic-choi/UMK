@@ -540,19 +540,68 @@ class SlideWindow:
             cv2.line(self.vis, p1, p2, color, 2)
 
     def draw_path(self, path):
-        """피팅된 명시적 경로(웨이포인트)를 자홍색 폴리라인으로 시각화.
+        """피팅된 명시적 경로(웨이포인트)를 폴리라인으로 시각화.
         left/right/yellow_centers(노란/청록 점)와 색을 겹치지 않게 구분해서,
-        "슬라이스별 원본 관측점"과 "그걸 피팅해 만든 최종 경로"를 한눈에 대조할 수 있게 한다."""
+        "슬라이스별 원본 관측점"과 "그걸 피팅해 만든 최종 경로"를 한눈에 대조할 수 있게 한다.
+        [2026-08-22] obstacle_cut_active(da 근접 컷, DLSlideWindow 전용 속성 —
+        _clip_da_by_obstacle() 참고)가 True인 프레임, 즉 "지금 이 경로가 라이다 근접
+        판정으로 밀린 경로"일 때는 평소 자홍색 대신 주황(da_fallback_used/가상경계 클리핑과
+        같은 계열 색 — 이 저장소에서 주황=차선책/정상아님 관례, visualize() 주석 참고)으로
+        그려서, DA 디버그창만 보고도 지금 추종 중인 경로가 밀린 상태인지 바로 구분할 수
+        있게 한다. obstacle_cut_active는 da 마스크 자체를 자른 뒤 피팅한 결과라 `path`
+        (=self.path)에 이미 밀린 좌표가 그대로 들어있어 원본과 비교할 방법이 없다 — 그냥
+        단일 선을 주황으로만 표시한다.
+        [2026-08-22] lavacon_push_active(B1 콘 침범 push, track_drive.py
+        _lavacon_steer_da_push() — set_lavacon_push()/lavacon_push_px 참고)는 반대로
+        `path` 자체는 밀리기 전 원본 그대로고(_lavacon_steer_da_push()가 별도 복사본만
+        밀어서 조향에 씀), 실제 밀린 양(px)만 lavacon_push_px로 같이 넘어온다. 게인
+        튜닝 시 "어느 정도 밀었는지"를 직접 비교할 수 있게, 이 경우엔 원본을 보라
+        (238,130,238)로, push_px만큼 x를 옮긴 경로를 주황으로 나란히 그린다 — 두 선의
+        가로 간격이 곧 push_px다. 일반 SlideWindow(비-DL)는 두 속성 다 없어 getattr로
+        기본 False 처리."""
         if not path:
             return
+        orange = (0, 140, 255)
         pts = [
             (int(np.clip(x, 0, self.roi_w - 1)), int(np.clip(y, 0, self.roi_h - 1)))
             for x, y in path
         ]
+
+        lavacon_push = getattr(self, 'lavacon_push_active', False)
+        push_px = getattr(self, 'lavacon_push_px', 0.0)
+        if lavacon_push and push_px:
+            violet = (238, 130, 238)
+            for p1, p2 in zip(pts, pts[1:]):
+                cv2.line(self.vis, p1, p2, violet, 2)
+            for p in pts:
+                cv2.circle(self.vis, p, 3, violet, -1)
+
+            shifted_pts = [
+                (int(np.clip(x + push_px, 0, self.roi_w - 1)), int(np.clip(y, 0, self.roi_h - 1)))
+                for x, y in path
+            ]
+            for p1, p2 in zip(shifted_pts, shifted_pts[1:]):
+                cv2.line(self.vis, p1, p2, orange, 2)
+            for p in shifted_pts:
+                cv2.circle(self.vis, p, 3, orange, -1)
+            # [2026-08-22] "보라(원본) 대비 주황(밀린 경로)이 화면 어느 쪽으로 갔는지"를
+            # 매 프레임 눈으로 직접 대조해야 했던 문제 — 사다리꼴 BEV라 원근 때문에 좌/우
+            # 판단이 헷갈리기 쉬워서, push_px 부호를 텍스트로 못박아 바로 읽게 한다(캔버스
+            # x가 클수록 화면 오른쪽=물리적 우측이라는 가정 자체가 실차 미검증이라 §5.8
+            # 참고 요청으로 추가 — 이 가정이 맞는지 이 라벨과 실제 콘 위치를 대조해서
+            # 확인할 것).
+            direction = 'RIGHT ->' if push_px > 0 else '<- LEFT'
+            cv2.putText(self.vis, f'PUSH {direction} {abs(push_px):.0f}px',
+                        (shifted_pts[0][0] + 8, shifted_pts[0][1] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, orange, 2, cv2.LINE_AA)
+            return
+
+        pushed = getattr(self, 'obstacle_cut_active', False) or lavacon_push
+        color = orange if pushed else (255, 0, 255)
         for p1, p2 in zip(pts, pts[1:]):
-            cv2.line(self.vis, p1, p2, (255, 0, 255), 2)
+            cv2.line(self.vis, p1, p2, color, 2)
         for p in pts:
-            cv2.circle(self.vis, p, 3, (255, 0, 255), -1)
+            cv2.circle(self.vis, p, 3, color, -1)
 
     def visualize(self, offset):
         self.draw_centers(self.left_centers, (0,255,255))

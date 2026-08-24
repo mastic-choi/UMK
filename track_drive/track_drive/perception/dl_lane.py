@@ -242,6 +242,7 @@ from ..config import (
     DL_LL_YELLOW_VOTE_RATIO, DL_LL_YELLOW_MIN_AREA,
     DEBUG_VIZ_DL_LANE, YELLOW_LOWER, YELLOW_UPPER, FPS_LOG_PERIOD_SEC,
     DL_DEBUG_HISTORY_LEN,
+    DEBUG_WIN_POS_DL_LANE,
 )
 
 # ── [2026-08-14] da 안전마진(차량 폭) 침식 커널 — README §2.30 "da 안전마진 설계 논의" ──
@@ -580,6 +581,13 @@ class DLSlideWindow(SlideWindow):
         # 디버그 창(_debug_viz_obstacle_cut())이 getattr(self.lane_detector._slide, ...)로 조회.
         self.obstacle_cut_active = False
         self.obstacle_cut_col_range = None
+
+        # [2026-08-22] B1 콘 침범 push(_lavacon_steer_da_push(), track_drive.py) 상태 —
+        # obstacle_cut_active와 동일한 관례로 draw_path()가 조회해 경로 색(자홍/보라/주황)에
+        # 반영. push_px(실제 밀린 량)도 같이 둬 첫 detect() 전에 visualize()가 불려도
+        # getattr 기본값 없이 안전하게 0으로 시작한다.
+        self.lavacon_push_active = False
+        self.lavacon_push_px = 0.0
 
         # [2026-08-10] 최근 DL_DEBUG_HISTORY_LEN 프레임의 offset(디바운스 이후 최종값)을
         # 들고 있다가 [2026-08-11] 'dl_lane' 창 맨 아래에 스파크라인으로 그린다(예전엔
@@ -1734,7 +1742,8 @@ class DLSlideWindow(SlideWindow):
         return self._path_ok_confirmed
 
     def detect(self, raw_bgr, da_prob, ll_prob, yellow_mask, avoid_hold=False, direction_hint=0, v_mps=0.0,
-               obstacle_y_m=None, obstacle_cut_confirmed=False):
+               obstacle_y_m=None, obstacle_cut_confirmed=False, lavacon_push_active=False,
+               lavacon_push_px=0.0):
         """입력 : raw_bgr — 원본 카메라 프레임 그대로의 (H,W,3) BGR(크롭/리사이즈 없음)
                  da_prob, ll_prob — 위와 같은 (H,W) float32 foreground 확률(모델은 360행
                    고정이지만 TwinLiteNetEngine.infer_raw()가 이미 원본 크기로 업샘플링해서 줌)
@@ -1755,12 +1764,20 @@ class DLSlideWindow(SlideWindow):
                    (_clip_da_by_obstacle(), ENABLE_OBSTACLE_CUT). track_drive.py의
                    perc_obstacle_cut_trigger()가 라이다 AND YOLO로 확정한 값을
                    set_obstacle()을 거쳐 넘겨준다. DL_CENTER_MODE=='da' 전용.
+                 lavacon_push_active — [2026-08-22] B1 콘 침범 push(_lavacon_steer_da_push())가
+                   이번 틱에 실제로 경로를 밀었는지. set_lavacon_push()를 거쳐 넘어오며,
+                   DA 클리핑엔 관여하지 않고 draw_path() 경로 색/이중 경로 표시에만 쓰인다.
+                 lavacon_push_px — [2026-08-22] 위와 같이 넘어오는 실제 push량(px, +면
+                   우측). DA 클리핑엔 역시 관여하지 않고, draw_path()가 밀리기 전(보라)
+                   원본과 밀린 뒤(주황) 경로를 나란히 그리는 데만 쓴다(게인 튜닝 참고용).
           출력 : lane_valid, offset, lookahead, lane_center, path — 기존 SlideWindow.calc_center()와
                  동일한 계약(같은 4-tuple+path 형태)이지만, 계산은 da 중심선 기준으로 직접 한다.
           내부에서 DL_ROI_Y0:DL_ROI_Y1(원본 프레임 절대 픽셀)만 잘라서 da 중심선을 뽑는다.
         """
         self.avoid_hold_active = bool(avoid_hold)
         self.avoid_hold_dir_hint = int(direction_hint)
+        self.lavacon_push_active = bool(lavacon_push_active)
+        self.lavacon_push_px = float(lavacon_push_px)
         h, _ = ll_prob.shape
         y0 = max(0, min(DL_ROI_Y0, h))
         y1 = max(y0, min(DL_ROI_Y1, h))
@@ -2174,13 +2191,19 @@ class DLSlideWindow(SlideWindow):
             # 별도로 그린다. 컷이 안 걸린 프레임에도(꺼짐/트리거 전) 좌상단에 "OBSTACLE
             # CUT: enabled/off" 한 줄은 항상 띄워, 기능 자체가 켜져 있는지부터 확인할 수
             # 있게 한다.
-            # [2026-08-20 색 변경] 원래 마젠타였는데 draw_path()의 최종 경로(자홍색,
-            # lane_util.py DRAW_PATH_COLOR=(255,0,255))와 정확히 같은 색이라, 컷 영역
-            # 안을 지나는 경로선이 반투명 채움에 묻혀 안 보이는 문제가 있었다("way가 어떻게
-            # 찍히는지 안 보인다" 요청 반영) — 팔레트에서 안 쓰던 빨강으로 바꿔서 경로선이
-            # 항상 위에 또렷하게 보이게 했다. draw_path()가 이 함수보다 나중에 호출되므로
-            # (visualize() 흐름상 컷 사각형이 먼저 그려지고 경로가 그 위에 덧그려짐)
-            # 색만 구분되면 항상 경로가 컷 위에 보인다.
+            # [2026-08-20 색 변경] 원래 마젠타였는데 draw_path()의 최종 경로(당시 항상
+            # 자홍색 고정)와 정확히 같은 색이라, 컷 영역 안을 지나는 경로선이 반투명
+            # 채움에 묻혀 안 보이는 문제가 있었다("way가 어떻게 찍히는지 안 보인다" 요청
+            # 반영) — 팔레트에서 안 쓰던 빨강으로 바꿔서 경로선이 항상 위에 또렷하게
+            # 보이게 했다. draw_path()가 이 함수보다 나중에 호출되므로(visualize() 흐름상
+            # 컷 사각형이 먼저 그려지고 경로가 그 위에 덧그려짐) 색만 구분되면 항상 경로가
+            # 컷 위에 보인다.
+            # [2026-08-22, 요청 반영] "지금 추종 중인 경로가 라이다 근접 판정으로 밀린
+            # 경로인지"를 이 창만 보고 바로 구분하고 싶다는 요청 — draw_path()
+            # (lane_util.py)가 self.obstacle_cut_active를 직접 보고, 밀린 프레임엔 경로
+            # 색을 자홍색 대신 주황(da_fallback_used와 같은 "차선책/정상아님" 계열 색)으로
+            # 바꿔 그린다. 컷 사각형(빨강)과는 색이 달라 위 문단의 가독성 수정과 계속
+            # 호환된다.
             cut_status = 'enabled(대기)' if ENABLE_OBSTACLE_CUT else 'off'
             cv2.putText(self.vis, f'OBSTACLE CUT: {cut_status}', (8, self.roi_h - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 200), 1, cv2.LINE_AA)
@@ -2381,7 +2404,7 @@ class DLSlideWindow(SlideWindow):
                     self.vis, self.ll_band_case[i], (pt[0] + 6, pt[1] - 6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 140, 255) if not ll_used else (255, 255, 255), 1
                 )
-        self.draw_path(self.path)  # 피팅된 최종 경로(자홍색)
+        self.draw_path(self.path)  # 피팅된 최종 경로(자홍색, obstacle_cut_active면 주황)
 
         # [2026-08-17] 이 빨간 세로선은 단순 "화면 중앙"이 아니다 — track_drive.py
         # _lane_steer()가 pure_pursuit에 넘기는 vehicle_x 기본값(self.vehicle_center_x,
@@ -2541,6 +2564,9 @@ class DLLaneDetector:
         self.engine = TwinLiteNetEngine(model_path=model_path, providers=providers, logger=logger)
         self._slide = DLSlideWindow()
         self._logger = logger
+        # [2026-08-22] 'dl_lane' 창을 처음 띄울 때만 cv2.moveWindow로 위치를 잡기 위한
+        #   1회성 가드(DEBUG_WIN_POS_DL_LANE 참고, track_drive.py의 같은 패턴과 동일 이유).
+        self._dbg_win_positioned = False
 
         # [2026-08-17] 첫 프레임 처리 전까지만 쓰이는 초기 플레이스홀더 — _worker()가 매
         # 추론마다 self._slide.roi_w(실제 da_mask/path 좌표계 폭)로 덮어쓴다. 예전엔 이
@@ -2584,6 +2610,13 @@ class DLLaneDetector:
         # 같이 읽어 DLSlideWindow.detect()에 넘긴다.
         self._latest_obstacle_y = None
         self._latest_obstacle_cut_confirmed = False
+        # [2026-08-22] B1 콘 침범 push(_lavacon_steer_da_push()) 상태 — set_obstacle()과
+        # 동일한 관례로 track_drive.py가 매 틱 set_lavacon_push()로 갱신하면 _worker()가
+        # 다음 추론 때 같은 락으로 같이 읽어 DLSlideWindow.detect()에 넘긴다.
+        self._latest_lavacon_push_active = False
+        # [2026-08-22] 위 플래그와 같이 넘어오는 실제 push량(px) — draw_path()가 밀리기
+        # 전(보라) 원본과 밀린 뒤(주황) 경로를 나란히 그리는 데 쓴다.
+        self._latest_lavacon_push_px = 0.0
         self._latest_result = (False, 0.0, 0.0, default_center, [], None)
         # 디버그 창에 띄울 최근 프레임(초록/빨강 오버레이가 이미 그려진 vis, da/ll 원본 마스크).
         # 워커 스레드가 여기 값만 갱신하고, 실제 cv2.imshow()는 show_debug_windows()가
@@ -2635,6 +2668,16 @@ class DLLaneDetector:
             self._latest_obstacle_y = None if y_m is None else float(y_m)
             self._latest_obstacle_cut_confirmed = bool(confirmed)
 
+    def set_lavacon_push(self, active, push_px=0.0):
+        """[2026-08-22] track_drive.py의 perc_lane()이 매 틱 호출 — B1 콘 침범 push
+        (_lavacon_steer_da_push()) 상태를 다음 추론에 반영한다(set_obstacle()과 동일
+        관례). DA 클리핑엔 관여하지 않고 DA 디버그창 경로 색/이중 경로 표시에만 쓰인다.
+        push_px(실제 밀린 픽셀량)도 같이 받아, draw_path()가 밀리기 전(보라) 원본과
+        밀린 뒤(주황) 경로를 나란히 그릴 수 있게 한다 — 게인 튜닝 시 참고용."""
+        with self._lock:
+            self._latest_lavacon_push_active = bool(active)
+            self._latest_lavacon_push_px = float(push_px)
+
     def _worker(self):
         """추론 워커 — 이 스레드 안에서는 절대 cv2.imshow()/cv2.waitKey()를 호출하지 않는다.
         OpenCV HighGUI(GTK 백엔드)가 스레드 세이프하지 않아서, 메인 스레드(다른 디버그
@@ -2651,6 +2694,8 @@ class DLLaneDetector:
                 v_mps = self._latest_v_mps
                 obstacle_y = self._latest_obstacle_y
                 obstacle_cut_confirmed = self._latest_obstacle_cut_confirmed
+                lavacon_push_active = self._latest_lavacon_push_active
+                lavacon_push_px = self._latest_lavacon_push_px
             if frame is None:
                 time.sleep(0.005)
                 continue
@@ -2664,6 +2709,7 @@ class DLLaneDetector:
                     raw_bgr, da_prob, ll_prob, yellow_mask,
                     avoid_hold=avoid_hold, direction_hint=avoid_hold_side, v_mps=v_mps,
                     obstacle_y_m=obstacle_y, obstacle_cut_confirmed=obstacle_cut_confirmed,
+                    lavacon_push_active=lavacon_push_active, lavacon_push_px=lavacon_push_px,
                 )
                 debug_img = self._slide.vis
             except Exception as e:
@@ -2772,6 +2818,12 @@ class DLLaneDetector:
             speed_text = f'발행 speed: {ctrl_speed:+.2f}'
             put_text_kr(vis, speed_text, (5, vis.shape[0] - 24), font_size=18, color_bgr=(255, 255, 255),
                         fallback=f'pub speed:{ctrl_speed:+.2f}')
+        if not self._dbg_win_positioned:
+            cv2.namedWindow('dl_lane', cv2.WINDOW_AUTOSIZE)
+            cv2.moveWindow('dl_lane', *DEBUG_WIN_POS_DL_LANE)
+            self._dbg_win_positioned = True
+        # [2026-08-23g, 요청 반영: "아까사이즈로돌려"] 표시 직전 축소(DEBUG_WIN_DISP_SIZE_DL_LANE)가
+        # 종횡비를 무시하고 강제 리사이즈해서 화면비율이 깨졌다 — 원래 크기(vis 원본)로 되돌림.
         cv2.imshow('dl_lane', vis)
         cv2.waitKey(1)
 

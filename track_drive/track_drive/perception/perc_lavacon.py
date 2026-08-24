@@ -118,11 +118,28 @@ BODY_LO, BODY_HI = 215, 305     # 차체 가림 인덱스 구간 [215, 304] 마�
                                  #  들고 있는 게 이 프로젝트의 기존 관례라 그대로 따름)
 LON_MIN          = 0.0          # 콘 후보 점의 전방 최소거리 (m) — 차체 바로 앞 반사 배제
 CONE_LON_MAX     = 4.0          # 콘 후보 점의 전방 최대거리 (m) — 벽/원거리 잡음 배제
-CONE_LAT_LIMIT   = 1.0          # 콘 후보 점의 횡방향 한계 (m) — [2026-08-19] 2.5→1.8→1.0로 축소(요청 반영).
+CONE_LAT_LIMIT   = 0.5          # 콘 후보 점의 횡방향 한계 (m) — [2026-08-19] 2.5→1.8→1.0로 축소.
+                                 # [2026-08-22k] 1.0→0.5(요청 반영) — track_drive.py
+                                 #   perc_lavacon_trigger()의 트리거 ROI LAT_MAX와 같은 값으로
+                                 #   맞춤(두 값은 항상 같이 바꿀 것). 트리거 박스(청록)와 이 값
+                                 #   기준 검출 박스(초록/주황, lavacon_bev 창) 사이에 남던 빈
+                                 #   공간을 없애기 위함.
                                  # track_drive.py _draw_lavacon_bev()가 이 값을 그대로 import해서
                                  # lavacon_bev 창에 좌우 경계선(흰 선)으로 그린다 — 값을 또 바꾸면 그 선도 같이 움직인다.
 OFFSET_CLAMP     = 0.8          # 편차 물리한계 (m) — 콘 사이 폭 초과값은 오검출로 간주
 OFFSET_GAIN      = 1.0          # y평균 → offset 스케일 계수 (제어팀 LAVACON_KP와 별도, 여기선 1:1)
+
+# [2026-08-22] 종료 판정 ROI — 요청 반영, track_drive.py perc_lavacon_trigger()의 진입
+#   트리거 박스(LON_MIN/LON_MAX/LAT_MAX)와 동일 크기로 축소. 예전엔 CONE_LON_MAX/
+#   CONE_LAT_LIMIT(4.0m×±0.5m, 구간 전체를 넓게 보는 종료판정용 ROI)를 그대로 썼으나,
+#   "진입 때 본 것과 같은 크기의 박스에 1개도 안 찍히면 종료"로 판정 기준을 바꿔달라는
+#   요청으로 전용 상수를 새로 둔다 — CONE_LON_MAX/CONE_LAT_LIMIT는 박스 스택 경로(path_m)
+#   탐색 범위로 계속 쓰이므로 그대로 둔다(용도가 다름). 값은 perc_lavacon_trigger()의
+#   LON_MIN/LON_MAX/LAT_MAX(-0.1~0.3m, ±0.75m)를 복사(두 값은 항상 같이 바꿀 것 — 위
+#   BODY_LO/HI 주석과 동일 관례).
+EXIT_LON_MIN     = -0.1
+EXIT_LON_MAX     = 0.3
+EXIT_LAT_LIMIT   = 0.75
 
 # [2026-08-19] 박스 스택 페어링 파라미터 — track_drive.py perc_lavacon_trigger()의 진입
 #   트리거 박스와 반드시 같은 폭을 유지할 것(BOX_LON_START=LON_MIN, BOX_LON_WIDTH=
@@ -138,6 +155,22 @@ BOX_LON_START    = 0.3          # 첫 박스 시작 지점(전방, m) — 차체
 #   완화된다. lavacon_bev/lavacon_ema_bev의 파란 격자도 이 값을 그대로 따라간다
 #   (track_drive.py가 이 상수를 LAVACON_BOX_LON_WIDTH로 import).
 BOX_LON_WIDTH    = 0.4          # 박스 1개의 종방향 폭(m)
+
+# [2026-08-22] 특정 물리 위치(우측 아주 가까운 지점)에서 반복적으로 유령 라이다 점이 찍히는
+#   문제 — 실차 스크린샷(lavacon_bev)으로 대략 위치 추정(x≈0.08/y≈-0.075) 후, lavacon_bev에
+#   빨간 GHOST MASK 원 + 정확한 좌표 텍스트를 띄워 사용자가 직접 실측 좌표로 보정
+#   (X_M -0.05로 수정, 2026-08-22 22:5x경) — **실차에서 이 위치의 유령 점(노이즈)이 완전히
+#   가려지는 것을 사용자가 확인함**. 사용자가 차체를 들어보면 이 점이 사라지는 것도 확인
+#   → 차량 자체(마운트 등) 반사가 원인. 신호등 검증 때도 같은 지점에서 문제가 됐다고 함.
+#   근본 원인 조사(README/작업기록 "다음 작업" — 각도 오프셋 재측정, 자기가림 경계,
+#   멀티패스 순으로 확인)는 여전히 미해결 — 이건 그 증상의 임시 완화일 뿐, 이 좌표 근처의
+#   좁은 원형 구역 안의 라이다 점만 무효 처리한다. 반경을 넓게 잡으면 그 근처의 진짜
+#   라바콘까지 같이 지워버릴 수 있으니 최소한(6cm)만 잡았다 — 다른 위치에서도 유령 점이
+#   재발하면 이 방식(좌표+반경 추가)을 그대로 반복하기보다 위 "다음 작업"의 근본 원인부터
+#   확인할 것. ※ 코드만 고쳐서는 실행 중이던 노드에 반영 안 됨 — 재시작 후에 확인할 것.
+GHOST_POINT_X_M      = -0.05
+GHOST_POINT_Y_M      = -0.075
+GHOST_POINT_RADIUS_M = 0.06
 
 
 def _lidar_to_xy(lidar_ranges):
@@ -161,10 +194,14 @@ def _lidar_to_xy(lidar_ranges):
     deg = np.linspace(0.0, 2.0 * math.pi, n, endpoint=False) - math.radians(LIDAR_ANGLE_OFFSET_DEG)
     x = ranges * np.cos(deg)    # 종방향(전방거리) 성분
     y = ranges * np.sin(deg)    # 횡방향 성분 — y > 0 좌측, y < 0 우측
+
+    ghost_mask = (x - GHOST_POINT_X_M) ** 2 + (y - GHOST_POINT_Y_M) ** 2 < GHOST_POINT_RADIUS_M ** 2
+    ranges[ghost_mask] = 0.0    # 유령 점 무효화 — 위 GHOST_POINT_* 주석 참고
+
     return x, y, ranges
 
 
-def nearest_cone_lateral(lidar_ranges, lon_min, lon_max, lat_limit):
+def nearest_cone_lateral(lidar_ranges, lon_min, lon_max, lat_limit, return_range=False):
     """[2026-08-19] da(주행가능영역) 경로를 그대로 조향에 쓰고, 콘이 안전마진 안으로
     들어왔을 때만 그만큼 옆으로 미는 방식(track_drive.py `_lavacon_steer_da_push` 참고)
     전용 — 박스 스택 페어링(`_pick_boxed_sides`/`_build_path`)처럼 좌우 콘을 짝짓거나
@@ -174,18 +211,35 @@ def nearest_cone_lateral(lidar_ranges, lon_min, lon_max, lat_limit):
     듬성하게/노이즈 섞여 검출돼도(박스 스택이 실차에서 계속 시달린 문제) 한 점만 있으면
     바로 동작한다.
 
+    [2026-08-22] return_range — 좌우 각각 "실측거리(range) 기준 최근접점"의 y만 보고는
+    "그 점이 실제로 차량에서 얼마나 가까운지"(range)도, "화면에서 정확히 어디 찍히는지"
+    (x, 종방향)도 알 수 없어서, lavacon_bev 디버그창에서 이 y값을 만든 실제 점이 어디
+    있는지 눈으로 못 짚어내겠다는 문제 제기로 추가 — push 판정(margin과 비교하는 대상은
+    여전히 y, 라인 침범 여부라 range/x가 아님) 자체는 그대로 두고, 순수 표시용으로만
+    range와 x를 같이 반환한다. True면 (left_y, right_y, left_range, right_range,
+    left_x, right_x) 6-튜플, False(기본, 기존 호출부 전부 이 경로)면 기존과 동일하게
+    2-튜플만 반환해 하위호환 유지.
+
     출력 : (left_y, right_y) — 각각 없으면 None, 있으면 라이다 미터 좌표(좌측+).
     """
     x, y, ranges = _lidar_to_xy(lidar_ranges)
     if x is None:
-        return None, None
+        return (None, None, None, None, None, None) if return_range else (None, None)
 
     roi = (ranges > 0.0) & (x > lon_min) & (x < lon_max) & (np.abs(y) < lat_limit)
     left_idx = np.where(roi & (y > 0.0))[0]
     right_idx = np.where(roi & (y < 0.0))[0]
-    left_y = float(y[left_idx[int(np.argmin(ranges[left_idx]))]]) if left_idx.size > 0 else None
-    right_y = float(y[right_idx[int(np.argmin(ranges[right_idx]))]]) if right_idx.size > 0 else None
-    return left_y, right_y
+    left_i = left_idx[int(np.argmin(ranges[left_idx]))] if left_idx.size > 0 else None
+    right_i = right_idx[int(np.argmin(ranges[right_idx]))] if right_idx.size > 0 else None
+    left_y = float(y[left_i]) if left_i is not None else None
+    right_y = float(y[right_i]) if right_i is not None else None
+    if not return_range:
+        return left_y, right_y
+    left_range = float(ranges[left_i]) if left_i is not None else None
+    right_range = float(ranges[right_i]) if right_i is not None else None
+    left_x = float(x[left_i]) if left_i is not None else None
+    right_x = float(x[right_i]) if right_i is not None else None
+    return left_y, right_y, left_range, right_range, left_x, right_x
 
 
 def _assign_by_continuity(box_idx, x, y, ranges, prev_left_xy, prev_right_xy, max_jump_m):
@@ -406,18 +460,19 @@ def process_lavacon(lidar_ranges, prev_boxes=None):
     if x is None:
         return (0.0, True, [], None)
 
-    # ── 3) 종료 판정용 콘 후보 필터링 : 전방 넓은 ROI 안의 유효 점만 남김 ──
-    # 벽·원거리 구조물처럼 트랙과 무관한 점을 배제하기 위해 콘이 존재할 수 있는 영역으로
-    # 제한한다. 아래 5)의 박스 스택 탐색과는 별개 — 종료 판정은 넓은 범위로 봐야
-    # 콘 간격이 벌어진 순간에 "아직 구간 안"인데도 종료로 오판하지 않는다.
-    cone_mask = (ranges > 0.0) & (x > LON_MIN) & (x < CONE_LON_MAX) & (np.abs(y) < CONE_LAT_LIMIT)
+    # ── 3) 종료 판정용 콘 후보 필터링 : 진입 트리거와 동일 크기 ROI 안의 유효 점만 남김 ──
+    # [2026-08-22] 요청 반영 — 예전엔 CONE_LON_MAX/CONE_LAT_LIMIT(4.0m×±0.5m)로 넓게 봤으나,
+    # "진입 때 본 것과 같은 크기의 박스에 1개도 안 찍히면 종료"로 바꿔 EXIT_LON_MIN/MAX/
+    # LAT_LIMIT(perc_lavacon_trigger() 트리거 박스와 동일 크기, 위 상수 선언부 주석 참고)를 쓴다.
+    cone_mask = (ranges > 0.0) & (x > EXIT_LON_MIN) & (x < EXIT_LON_MAX) & (np.abs(y) < EXIT_LAT_LIMIT)
     py_cone = y[cone_mask]
 
     # ── 4) 종료 판정 : 좌·우 어느 쪽에도 콘이 없어야 라바콘 구간 끝 ──
     # 구 로직은 "우측(y<0) 콘 소멸"만 봤는데, 콘 간격이 유동적인 코스에서는
     # 우측에 넓은 틈이 하나만 있어도 곧바로 '구간 끝'으로 오판한다.
     # 한쪽 줄이라도 보이면 아직 구간 안이라고 보는 편이 안전하다.
-    # (디바운스는 상위 FSM(_handle_lavacon)의 LAVACON_DONE_FRAMES에서 수행)
+    # (디바운스는 상위 FSM(_handle_lavacon)의 LAVACON_DONE_FRAMES에서 수행 — 1초 이상 연속
+    # 유지돼야 확정, config.py LAVACON_DONE_FRAMES 주석 참고)
     has_left  = bool(np.any(py_cone > 0.0))
     has_right = bool(np.any(py_cone < 0.0))
     lavacon_done = not (has_left or has_right)

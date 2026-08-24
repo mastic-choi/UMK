@@ -49,7 +49,8 @@ VESC거리 기반 좌회전)가 실차에서 각 구간별로 실제로 도는�
 - 좌우 라이다 클러스터 동시검출로 `B1` 진입(latch)되는지, 우측 콘 연속 미검출로
   정상 종료돼 `Phase.OBSTACLE_ZONE`으로 넘어가는지.
 
-**디버그창:** `DEBUG_VIZ_LAVACON=True`, 필요시 `DEBUG_VIZ_LAVACON_SHOW_PATH=True`,
+**디버그창:** `DEBUG_VIZ_LAVACON=True`(트리거 ROI + push ROI 통합 창, 2026-08-22k부터
+`DEBUG_VIZ_LAVACON_SHOW_PATH`는 삭제됨 — 안 쓰는 박스 스택 경로선이었음),
 `DEBUG_VIZ_YOLO_CONE=True`(YOLO 콘 이중확인 확인용).
 
 ☐ 결과:
