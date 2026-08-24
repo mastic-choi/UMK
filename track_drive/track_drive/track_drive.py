@@ -433,6 +433,18 @@ class TrackDriverNode(Node):
         # 시작(원래 정상 레이스 시작값).
         self._b2_passed = False
         self._b3_passed = False
+        # [2026-08-25, 요청 반영] B2 통과 확정 시각 — B2_TO_B3_DELAY_SEC(config.py)만큼
+        # 지나야 B3 관련 판정을 켠다(_b3_armed() 참고). _b2_passed와 함께 매 바퀴/재무장
+        # 시점에 리셋된다.
+        self._b2_passed_t = 0.0
+        # [2026-08-25, 요청 반영] "새 튜닝(FINAL)" 구간 플래그 — True인 동안 _lane_steer()가
+        # self.pure_pursuit의 lookahead/wheelbase/부스트 게인을 PP_*_FINAL(config.py)로
+        # 덮어쓰고, perc_lane()이 dl_lane BEV 원거리 크롭도 DL_BEV_FAR_LIMIT_M_FINAL(1.0)로
+        # 바꾼다. ON: 직진신호 확정 직후 / 체크무늬 게이트 좌회전 램프 완료 직후 / B3 통과
+        # 확정 직후. OFF: B1 진입 트리거(_lavacon_engaged) 확정 순간 / 다음 신호등 확정 시점
+        # (매 바퀴·재무장 리셋과 동일 지점들). 그 외 구간(B1/B2/B3 관여 중)은 계속 False —
+        # self.pure_pursuit는 기본값(=9e59bbf 값)을 그대로 쓴다.
+        self._new_tuning_active = False
         # [2026-08-20] 요청 반영 — B2/B3 실제 처리를 da 근접 컷(obstacle_cut_active) 기반으로
         # 바꾸면서 추가. obstacle_cut_active 진입 순간 'B2'/'B3' 중 하나를 latch해뒀다가,
         # obstacle_cut_active가 다시 꺼지는 순간(탈출) 그 태그로 _mark_behavior_passed()를
@@ -743,7 +755,9 @@ class TrackDriverNode(Node):
                 # 자동으로 다시 'cone'을 켠다.
                 return 'cone' if not self._lavacon_engaged else None
             if self.phase == Phase.OBSTACLE_ZONE:
-                return 'cone' if not self._b2_passed else 'vehicle'
+                # [2026-08-25, 요청 반영] B2 종료 직후 곧장 vehicle로 안 넘어가고
+                # B2_TO_B3_DELAY_SEC만큼은 계속 cone(B2)으로 취급 — _b3_armed() 참고.
+                return 'cone' if not self._b3_armed() else 'vehicle'
             # Phase.DONE — 다음 교차로 신호등 보드 대기. 단, 이번 바퀴 신호등을 이미
             # 직진/좌회전 어느 쪽으로든 확정했다면(_signal_yolo_off) 다음 바퀴 리셋
             # 전까지 추론 자체를 끈다.
@@ -880,11 +894,12 @@ class TrackDriverNode(Node):
         # 그리기 위한 실제 push량(px)에 쓰인다.
         getattr(self.lane_detector, 'set_lavacon_push', lambda *_a, **_k: None)(
             self._lavacon_push_active, self._lavacon_push_px)
-        # [2026-08-24, 테스트] BEV 원거리 크롭 모드 — B1_LAVACON일 때만 0.7m, 그 외(S1,
-        #   B2/B3 컷 중 포함) 전부 1.0m. B2/B3 컷의 먼 경계는 캔버스 끝을 그대로 쓰므로
-        #   (_clip_da_by_obstacle()), 캔버스가 길어지면 컷도 같이 길어진다 — 요청 반영.
+        # [2026-08-25, 요청 반영] BEV 원거리 크롭 모드 — self._new_tuning_active(위 PP_*_FINAL
+        #   전환과 동일 조건)일 때만 1.0m, 그 외 전 구간(B1 관여/B2/B3 회피 포함)은 0.7m로
+        #   9e59bbf와 동일하게 유지. B2/B3 컷의 먼 경계는 캔버스 끝을 그대로 쓰므로
+        #   (_clip_da_by_obstacle()), "새 튜닝" 구간이 아닌 이상 컷 범위도 옛 커밋과 동일.
         getattr(self.lane_detector, 'set_bev_mode', lambda *_a, **_k: None)(
-            self.behavior_state == BehaviorState.B1_LAVACON)
+            self._new_tuning_active)
 
         # hough_lane.py의 HoughLaneDetector를 사용하여 차선 인식 수행
         valid, offset, lookahead, lane_center, path, debug_img = self.lane_detector.detect(self.img_front)
@@ -1495,15 +1510,17 @@ class TrackDriverNode(Node):
         r = ranges[:m]
         x = r * np.cos(deg)          # 전방(+앞)
         y = r * np.sin(deg)          # 횡방향(+좌/-우, perc_lavacon_trigger()와 동일 규약)
-        # [2026-08-23r, 요청 반영] B3(방해차량, self._b2_passed==True → _active_yolo_stage()가
+        # [2026-08-23r, 요청 반영] B3(방해차량, self._b3_armed()==True → _active_yolo_stage()가
         # 'vehicle') 단계에서는 트리거 ROI 횡방향 반폭을 OBSTACLE_CUT_TRIGGER_Y_HALF_M_VEHICLE로
         # 좁힌다 — _debug_viz_obstacle_cut()도 이 값을 그대로 읽어 박스를 그리도록
         # self._obstacle_cut_y_half에 저장.
         # [2026-08-23r2, 요청 반영] B3는 전방 트리거 거리도 OBSTACLE_CUT_TRIGGER_X_MAX_M_VEHICLE로
-        # 별도 확장(y_half와 동일하게 self._b2_passed로 분기).
-        y_half = (OBSTACLE_CUT_TRIGGER_Y_HALF_M_VEHICLE if self._b2_passed
+        # 별도 확장(y_half와 동일하게 분기).
+        # [2026-08-25, 요청 반영] self._b2_passed → self._b3_armed()로 교체 — B2 종료 후
+        # B2_TO_B3_DELAY_SEC(config.py) 동안은 계속 B2(fixed) ROI를 쓴다.
+        y_half = (OBSTACLE_CUT_TRIGGER_Y_HALF_M_VEHICLE if self._b3_armed()
                   else OBSTACLE_CUT_TRIGGER_Y_HALF_M)
-        x_max = (OBSTACLE_CUT_TRIGGER_X_MAX_M_VEHICLE if self._b2_passed
+        x_max = (OBSTACLE_CUT_TRIGGER_X_MAX_M_VEHICLE if self._b3_armed()
                  else OBSTACLE_CUT_TRIGGER_X_MAX_M)
         self._obstacle_cut_y_half = y_half
         self._obstacle_cut_x_max = x_max
@@ -2343,7 +2360,9 @@ class TrackDriverNode(Node):
             self._signal_yolo_off = False  # [2026-08-23] 새 바퀴 시작 — 다음 교차로 신호등 YOLO 재개
             self._signal_off_hold_cnt = None  # [2026-08-23b] 유예 카운터도 같이 리셋(perc_signal() 참고)
             self._b2_passed = False   # [2026-08-15] Phase.OBSTACLE_ZONE 통합 — 완료 추적도 매 바퀴 리셋
+            self._b2_passed_t = 0.0
             self._b3_passed = False
+            self._new_tuning_active = False  # [2026-08-25, 요청 반영] 새 바퀴 시작 — 새 튜닝 플래그도 리셋
             self._obscut_zone_tag = None  # [2026-08-20] da 근접 컷 기반 B2/B3 latch도 매 바퀴 리셋
 
     def run_mission_fsm(self):
@@ -2456,6 +2475,9 @@ class TrackDriverNode(Node):
         # 자체가 원천 차단된다.
         if not (TEST_DISABLE_INTERSECTION or time.time() < self._signal_reentry_cooldown_t):
             if self.signal_left_confirmed:
+                # [2026-08-25, 요청 반영] 다음 신호등을 확정지은 시점 — B3 통과/좌회전 램프
+                # 완료로 켜져 있었을 수 있는 "새 튜닝" 구간을 여기서 끈다.
+                self._new_tuning_active = False
                 self._change_state(MissionState.S0_SIGNAL)
                 self._s2_commit_dist = 0.0   # _change_state()가 진입 처리에서 None으로 리셋한 뒤 다시 세팅
                 self._s2_commit_dir  = 'left'
@@ -2466,6 +2488,10 @@ class TrackDriverNode(Node):
                 # (_signal_yolo_off는 이제 perc_signal()이 확정되는 순간 바로 세팅한다.)
                 self._behavior_enabled = True
                 self._signal_reentry_cooldown_t = time.time() + SIGNAL_REENTRY_COOLDOWN
+                # [2026-08-25, 요청 반영] 직진 신호 확정 직후 ~ B1 진입 트리거 전까지 "새 튜닝"
+                # 구간 시작 — run_behavior_fsm()의 Phase.LAVACON 분기가 _lavacon_engaged로
+                # 바뀌는 상승엣지에서 다시 끈다.
+                self._new_tuning_active = True
                 # [2026-08-24, 요청 반영] TEST_SIGNAL_LOOP 조건 제거 — B1/B2/B3 재무장을
                 # _update_lap()(IMU yaw 누적/정지선 기반 바퀴 완주)이 아니라 신호등 직진
                 # 확정 하나로 통일한다. 신호등을 다시 받는 것 자체가 "다음 구간 시작"이라는
@@ -2476,6 +2502,7 @@ class TrackDriverNode(Node):
                 # 여기(신호등) 하나로만 결정된다.
                 self.phase = Phase.LAVACON
                 self._b2_passed = False
+                self._b2_passed_t = 0.0
                 self._b3_passed = False
                 self._lavacon_engaged = False
                 self._lavacon_empty_cnt = 0
@@ -2573,10 +2600,13 @@ class TrackDriverNode(Node):
                 self._change_state(MissionState.S1_LANE_FOLLOW)
                 self.phase = Phase.LAVACON
                 self._b2_passed = False
+                self._b2_passed_t = 0.0
                 self._b3_passed = False
                 self._lavacon_engaged = False
                 self._lavacon_empty_cnt = 0
                 self._lavacon_trigger_cnt = 0
+                # [2026-08-25, 요청 반영] 직진 신호와 동일하게 처리 — "새 튜닝" 구간도 동일하게 시작.
+                self._new_tuning_active = True
             return
 
         self.ctrl_angle, self.ctrl_speed = 0.0, SPEED_STOP
@@ -2649,6 +2679,10 @@ class TrackDriverNode(Node):
             # [2026-08-24] 지름길 출구 T자 강제 좌회전(config.py SHORTCUT_EXIT_DIST_M 참고) —
             #   이 램프(입구)가 끝나는 시점부터 출구까지 거리를 재기 시작한다.
             self._shortcut_exit_dist = 0.0
+            # [2026-08-25, 요청 반영] 좌회전 램프 완료 ~ 다음 신호등 확정 전까지 "새 튜닝"
+            # 구간 — 뒤이은 지름길 출구 킥(_do_shortcut_exit_kick())은 PP를 안 쓰는
+            # 오픈루프라 이 플래그와 무관하게 그대로 동작한다.
+            self._new_tuning_active = True
 
     # ── 지름길 출구 T자 강제 좌회전 (2026-08-24, config.py SHORTCUT_EXIT_DIST_M 주석 참고) ──
     #   T자 교차로엔 라이다 랜드마크도 정지선도 없어(사용자 실측 확인) 물리 트리거를 못 쓰고,
@@ -2714,6 +2748,11 @@ class TrackDriverNode(Node):
             was_engaged = self._lavacon_engaged
             if self.lavacon_trigger:
                 self._lavacon_engaged = True
+            if (not was_engaged) and self._lavacon_engaged:
+                # [2026-08-25, 요청 반영] B1 진입 트리거 확정 상승엣지 — "새 튜닝" 구간(직진
+                # 신호 확정 후 대기 구간) 종료. B1은 항상 _LAVACON 전용 고정 게인만 쓰므로
+                # 이 플래그와 무관하다.
+                self._new_tuning_active = False
             if LAVACON_KICK_ENABLED and (not was_engaged) and self._lavacon_engaged:
                 # [2026-08-23, 요청 반영] 진입 확정 상승엣지 — 여기서 딱 한 번만 걸린다
                 # (_lavacon_engaged가 True로 유지되는 동안엔 다시 안 걸림). 프레임수는
@@ -2762,7 +2801,10 @@ class TrackDriverNode(Node):
                 # 'vehicle'(방해차량=B3). 트랙 순서는 "B2 먼저"(§5.2, §5.4에서 잠깐 반대로
                 # 뒤집혔다가 §5.5로 원복) — _b2_passed가 아직 False면 타입이 vehicle로 잡혀도
                 # B2로 취급한다 — 초반 오분류로 B3를 먼저 통과 처리해버리는 사고를 원천 차단.
-                if self.obstacle_cut_type == 'vehicle' and self._b2_passed:
+                # [2026-08-25, 요청 반영] self._b2_passed → self._b3_armed()로 교체 — B2 종료
+                # 직후 B2_TO_B3_DELAY_SEC(config.py) 동안은 vehicle로 잡혀도 B2로 취급한다
+                # (방금 지나친 B2 장애물 잔상 오인식 방지).
+                if self.obstacle_cut_type == 'vehicle' and self._b3_armed():
                     self._obscut_zone_tag = 'B3'
                 else:
                     self._obscut_zone_tag = 'B2'
@@ -3102,11 +3144,27 @@ class TrackDriverNode(Node):
         # _update_obstacle_cut_hold()가 타이머만 세팅, 실제 반영은 여기서.
         now_t = time.time()
         vehicle_lookahead_fix = now_t < self._pp_vehicle_lookahead_fix_until_t
+        # [2026-08-25, 요청 반영] "새 튜닝(FINAL)" 구간(self._new_tuning_active) 동안만
+        # lookahead_base_px/wheelbase_px/wheelbase_boost_gain_per_deg/lookahead_min_px를
+        # PP_*_FINAL(config.py)로 덮어쓴다 — 그 외엔 speed15 기본값(=9e59bbf와 동일)
+        # 그대로. B1 전용 self.pure_pursuit_lavacon은 별개 인스턴스라 영향 없음.
+        base_curvature_gain = (
+            PP_LOOKAHEAD_CURVATURE_GAIN_FINAL if self._new_tuning_active
+            else PP_LOOKAHEAD_CURVATURE_GAIN)
+        self.pure_pursuit.lookahead_base_px = (
+            PP_LOOKAHEAD_BASE_PX_FINAL if self._new_tuning_active else PP_LOOKAHEAD_BASE_PX)
+        self.pure_pursuit.wheelbase_px = (
+            PP_WHEELBASE_PX_FINAL if self._new_tuning_active else PP_WHEELBASE_PX)
+        self.pure_pursuit.lookahead_min_px = (
+            PP_LOOKAHEAD_MIN_PX_FINAL if self._new_tuning_active else PP_LOOKAHEAD_MIN_PX)
+        self.pure_pursuit.wheelbase_boost_gain_per_deg = (
+            PP_WHEELBASE_BOOST_GAIN_PER_DEG_FINAL if self._new_tuning_active
+            else PP_WHEELBASE_BOOST_GAIN_PER_DEG)
         # lookahead를 고정하는 동안은 curvature 부스트를 겹쳐 걸지 않고 평상시 게인으로 둔다(요청 반영).
         self.pure_pursuit.lookahead_curvature_gain = (
-            PP_LOOKAHEAD_CURVATURE_GAIN if vehicle_lookahead_fix
+            base_curvature_gain if vehicle_lookahead_fix
             else PP_CURVATURE_BOOST_GAIN if now_t < self._pp_curvature_boost_until_t
-            else PP_LOOKAHEAD_CURVATURE_GAIN)
+            else base_curvature_gain)
         # [2026-08-24] B1(라바콘) 중엔 lookahead 상한을 PP_LOOKAHEAD_MAX_PX_LAVACON으로
         # 낮춘다 — SPEED_LAVACON_CAP 조건(2026-08-24b)과 동일하게 self._lavacon_engaged로
         # 좁혀 진짜 B1 구간에서만 적용(대기 구간은 일반 상한 유지).
@@ -3537,6 +3595,13 @@ class TrackDriverNode(Node):
             if not self._b2_passed:
                 tag, label_kr, label_en = 'B2', 'B2 고정장애물', 'B2 FIXED OBSTACLE'
             elif not self._b3_passed:
+                # [2026-08-25, 요청 반영] B2 종료 직후 B2_TO_B3_DELAY_SEC(config.py) 동안은
+                # _b3_armed()가 아직 False — vehicle YOLO/트리거가 안 켜진 상태이므로 그대로
+                # "B3"라고 보여주면 오해의 소지가 있어 대기 중임을 남은 시간과 함께 표시한다.
+                if not self._b3_armed():
+                    remain = max(0.0, B2_TO_B3_DELAY_SEC - (time.time() - self._b2_passed_t))
+                    return (f'B3 무장 대기 중 ({remain:.1f}s)', (0, 140, 255),
+                            f'B3 arming in {remain:.1f}s')
                 tag, label_kr, label_en = 'B3', 'B3 방해차량', 'B3 VEHICLE'
             else:
                 return 'OBSTACLE_ZONE 종료 처리 중', (150, 150, 150), 'OBSTACLE_ZONE finishing'
@@ -4240,6 +4305,14 @@ class TrackDriverNode(Node):
         self._b3_fail_cnt = 0
         self._b3_side = 0
 
+    # [2026-08-25, 요청 반영] B2 종료 → B3 무장까지 B2_TO_B3_DELAY_SEC(config.py)만큼
+    # 텀을 둔다 — self._b2_passed만 보고 곧장 vehicle YOLO/트리거 ROI를 켜면, 방금
+    # 지나친 B2 장애물이 아직 시야/라이다에 남아있는 채로 B3로 오인식될 위험이 있다.
+    # _active_yolo_stage()/perc_obstacle_cut_trigger()/run_behavior_fsm()의 Phase.
+    # OBSTACLE_ZONE 분기가 self._b2_passed 대신 이 메서드를 쓴다.
+    def _b3_armed(self):
+        return self._b2_passed and (time.time() - self._b2_passed_t) >= B2_TO_B3_DELAY_SEC
+
     # [2026-08-15] Phase.OBSTACLE_ZONE 통합(da_based_b2b3_proposal.md B안) — B2/B3가
     # 완료를 알리는 공통 지점. 예전엔 각자 다음 Phase를 직접 지정했는데(B2 완료 →
     # Phase.VEHICLE, B3 완료 → Phase.DONE, 트랙 순서가 고정이라는 가정), 이제 Phase가
@@ -4250,8 +4323,11 @@ class TrackDriverNode(Node):
     def _mark_behavior_passed(self, tag):
         if tag == 'B2':
             self._b2_passed = True
+            self._b2_passed_t = time.time()  # [2026-08-25, 요청 반영] _b3_armed()가 이 시각 기준으로 재는 시작점
         elif tag == 'B3':
             self._b3_passed = True
+            # [2026-08-25, 요청 반영] B3 통과 확정 직후 ~ 다음 신호등 확정 전까지 "새 튜닝" 구간.
+            self._new_tuning_active = True
         if self._b2_passed and self._b3_passed:
             self.phase = Phase.DONE
             # Phase.DONE 진입 즉시 신호등 재판독 시작 (예전엔 다음 바퀴 리셋 때까지 꺼져있었음)

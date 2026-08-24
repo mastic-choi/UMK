@@ -287,11 +287,17 @@ DL_PIXELS_PER_METER = 200.0   # 설계값(실측 아님) — 목적 캔버스를
 #   바뀌는 것도 아니다(그건 DL_BEV_SRC_PX_RAW 4점의 실측 재측정이 필요 — README §6.3 참고).
 #   1.0 → 0.7로 낮춤(요청 반영) — 실차 미검증, DEBUG_VIZ_DL_LANE에서 크롭 경계가 원하는
 #   위치에 오는지 확인할 것.
-#   [2026-08-24, 테스트] B1_LAVACON과 그 외(S1 등) 상태에서 값을 분리 — 라바콘 구간은
-#   기존 0.7 그대로, 평소엔 더 멀리(1.0) 보게. dl_lane.py DLSlideWindow.detect()가
-#   behavior_state에 따라 둘 중 하나를 골라 쓴다. 1.0 쪽은 실차 미검증.
-DL_BEV_FAR_LIMIT_M_LAVACON = 0.7
-DL_BEV_FAR_LIMIT_M_NORMAL  = 1.0
+#   [2026-08-24, 테스트] B1_LAVACON과 그 외(S1 등) 상태에서 값을 분리했었으나(라바콘 0.7 /
+#   평소 1.0), [2026-08-25, 요청 반영] 9e59bbf(완주성공 커밋) 기준 조향/BEV로 원복하면서
+#   "평소" 쪽도 다시 0.7로 되돌렸다 — B1/B2/B3 포함 아래 _FINAL(1.0) 구간이 아닌 전 구간이
+#   이 값을 쓴다. dl_lane.py DLSlideWindow.detect()가 self._new_tuning_active
+#   (track_drive.py)에 따라 이 값 또는 _FINAL을 고른다.
+DL_BEV_FAR_LIMIT_M_NORMAL  = 0.7
+# [2026-08-25, 요청 반영] "새 튜닝(speed15 재튜닝값)" 구간 전용 — 직진신호 확정~B1 인식 전,
+#   좌회전 램프 완료~다음 신호, B3 통과~다음 신호(정확한 트리거는 track_drive.py
+#   _new_tuning_active 관련 주석 참고) 동안만 이 값(1.0)을 쓴다. 그 외 전 구간(B1 관여,
+#   B2/B3 회피, 체크무늬 램프/지름길 출구 킥 포함)은 위 0.7 그대로 — 9e59bbf와 동일 거동.
+DL_BEV_FAR_LIMIT_M_FINAL = 1.0
 
 # ── 세그멘테이션 결과에서 좌/우 차선 중심을 뽑을 관심영역 (원본 480행 기준 절대 픽셀, 실차 실측값) ──
 DL_ROI_Y0 = 250
@@ -731,9 +737,17 @@ OBSTACLE_CUT_HOLD_SEC_MIN = 2.0           # 진입 확정 후 라이다/YOLO가 
 #   "cut이 등장했다가 사라지는 게" 너무 김). B2로 진입할 때만 이 값을 최소유지시간으로 쓴다
 #   (_update_obstacle_cut_hold() 진입 순간 self.obstacle_cut_type으로 분기, README §4.3 참고).
 #   OBSTACLE_CUT_RELEASE_CONFIRM_FRAMES 해제 디바운스는 그대로 공유 — 이 값은 "floor"만 낮춘다.
-OBSTACLE_CUT_HOLD_SEC_MIN_FIXED = 0.5     # B2(고정장애물) 전용 최소유지시간 — 실차 미검증
+OBSTACLE_CUT_HOLD_SEC_MIN_FIXED = 0.2     # B2(고정장애물) 전용 최소유지시간 — 실차 미검증
 OBSTACLE_CUT_RELEASE_DIST_M = 1.0         # [2026-08-20] 1.5→1.0(요청 반영, 트리거와 동일 — 히스테리시스 없앰). 실차 미검증
 OBSTACLE_CUT_RELEASE_CONFIRM_FRAMES = 4   # 해제 디바운스 — AVOID_HOLD_RELEASE_CONFIRM_FRAMES와 동일 관례, 실차 미검증
+
+# ── B2 종료 → B3 무장 지연 (2026-08-25, 요청 반영) ──
+#   B2(고정장애물) 통과 확정(_mark_behavior_passed('B2')) 직후 곧장 B3(방해차량) 관련 판정
+#   (_active_yolo_stage()의 vehicle YOLO 전환, perc_obstacle_cut_trigger()의 VEHICLE 전용
+#   트리거 ROI 전환, obstacle_cut_type 'vehicle' 태깅)을 켜면 방금 지나친 B2 장애물이 아직
+#   시야/라이다에 남아있는 채로 B3로 오인식될 위험이 있다 — 이 시간(초) 동안은 그 판정들을
+#   전부 보류하고 B2와 동일하게(cone/fixed) 취급한다. track_drive.py _b3_armed() 참고.
+B2_TO_B3_DELAY_SEC = 3.0  # 실차 미검증
 
 # ── 컷 활성 "전"(장애물 미감지 구간) 속도 캡 ──
 #   [2026-08-23, 요청 반영] 기존엔 회피(obstacle_cut_active) "중"에 속도를 낮추는
@@ -1796,10 +1810,12 @@ LAVACON_STEER_MODE_DA_PUSH = True
 #   아이디어를 실차로 빠르게 테스트해보기 위한 스위치 — 효과 없거나 오히려 나쁘면
 #   LAVACON_KICK_ENABLED만 False로 되돌리면 이 블록 전체가 비활성화된다(실차 미검증).
 LAVACON_KICK_ENABLED    = True
-LAVACON_KICK_DURATION_S = 0.2    # 이 시간(초) 동안 고정 조향각 유지 — CONTROL_HZ(20Hz)로 환산해 프레임수로 씀
+LAVACON_KICK_DURATION_S = 0.4    # 이 시간(초) 동안 고정 조향각 유지 — CONTROL_HZ(20Hz)로 환산해 프레임수로 씀
                                   # [2026-08-23] 0.2 → 0.4 → 0.2 → 0.0 → 0.2(요청 반영)
-LAVACON_KICK_ANGLE_DEG  = -10.0  # 강제 조향각(도) — 부호규약은 ctrl_angle과 동일(우측 콘 쪽으로 짐작, 실차에서 방향 확인 필요)
+                                  # [2026-08-25] 0.2 → 0.4(요청 반영)
+LAVACON_KICK_ANGLE_DEG  = -30.0  # 강제 조향각(도) — 부호규약은 ctrl_angle과 동일(우측 콘 쪽으로 짐작, 실차에서 방향 확인 필요)
                                   # [2026-08-23] -20.0 → -30.0 → 0.0 → -20.0(요청 반영)
+                                  # [2026-08-25] -10.0 유지(요청 반영)
 
 # [2026-08-19] 안전마진(m) — 이 값보다 콘이 차량 중심에 가깝게 들어오면 그만큼 반대쪽으로
 #   민다. VEHICLE_WIDTH_M(0.31, 실측)/2=0.155(차량 반폭) + DL_DA_SIDE_MARGIN_M(0.1, B2/B3
@@ -1957,6 +1973,7 @@ DEBUG_VIZ_YOLO_VEHICLE = True       # [2026-08-23r, 요청 반영] False→True 
 #   전부 삭제했다(README §1.18) — 이제 신호등 인식은 이 YOLO 모델 하나뿐이다.
 YOLO_SIGNAL_STATE_INPUT_SIZE = 640     # signal_state_best_n.onnx export 시 imgsz와 반드시 일치시킬 것
 YOLO_SIGNAL_STATE_CONF_THRESHOLD = 0.7 # 이 신뢰도 이상인 검출만 인정(모델이 nms=True로 export돼 좌표 디코딩은 불필요)
+# [2026-08-25, 요청 반영] 0.7 → 0.65 → 0.7로 원복
 # [2026-08-23] 0.5→0.8(요청 반영). [2026-08-23e, 요청 반영] 0.8→0.5로 다시 원복 —
 #   green_left가 green_straight보다 평균 신뢰도가 낮게 나오는 것으로 보여, 0.8에서는
 #   green_left만 유독 문턱을 못 넘어 못 잡히고 green_straight/red만 통과하는 쪽으로
@@ -2206,11 +2223,17 @@ PP_TUNE_PRESETS = {
         #   숫자만 다시 계산: 구 BASE_PX(110.38) + GAIN(3.01)*ANCHOR(12.0) = 146.50.
         #   즉 speed=SPEED_NORMAL(12)일 때 speed_lookahead_px는 여전히 146.5로 그리드서치
         #   원값과 동일 — PP_LOOKAHEAD_SPEED_ANCHOR를 12.0으로 같이 지정해야 이 등가성이 성립한다.
-        PP_LOOKAHEAD_BASE_PX=220, PP_LOOKAHEAD_SPEED_GAIN=3.01, PP_LOOKAHEAD_MAX_PX=265.4,
+        # [2026-08-25, 요청 반영] BASE_PX/WHEELBASE_PX/CURVATURE_GAIN/MIN_PX/BOOST_GAIN_PER_DEG
+        #   5개를 9e59bbf(완주성공 커밋) 값으로 원복 — 220/33/80/140/0.14로 재튜닝했던 값은
+        #   아래 "새 튜닝(FINAL)" 전용 상수(PP_*_FINAL)로 옮겨, 특정 구간(직진신호 확정~B1
+        #   인식 전 / 좌회전 램프 완료~다음 신호 / B3 통과~다음 신호)에서만 쓴다 —
+        #   track_drive.py self._new_tuning_active/_lane_steer() 참고. 이 프리셋(기본값)은
+        #   나머지 전 구간(B1/B2/B3 관여 중 포함)에서 그대로 쓰이므로 9e59bbf와 동일해야 한다.
+        PP_LOOKAHEAD_BASE_PX=180, PP_LOOKAHEAD_SPEED_GAIN=3.01, PP_LOOKAHEAD_MAX_PX=265.4,
         PP_LOOKAHEAD_SPEED_ANCHOR=12.0,
-        PP_WHEELBASE_PX=33, PP_ALPHA=0.9, PP_LD_FLOOR_PX=120.19, PP_DX_DEADZONE_PX=5,
+        PP_WHEELBASE_PX=25, PP_ALPHA=0.9, PP_LD_FLOOR_PX=120.19, PP_DX_DEADZONE_PX=5,
 
-        PP_LOOKAHEAD_CURVATURE_GAIN=80, PP_LOOKAHEAD_MIN_PX=80,
+        PP_LOOKAHEAD_CURVATURE_GAIN=120, PP_LOOKAHEAD_MIN_PX=80,
         SPEED_CORNER_MIN=10.0, CORNER_SIGN_EMA_ALPHA=0.15, LANE_LOOKAHEAD_REF=220.0,
         SPEED_CORNER_STEER_GAIN=0.50,
         SPEED_ACCEL_STEP=0.8, CORNER_HOLD_DECAY_LO=0.92, CORNER_HOLD_DECAY_HI=0.97,
@@ -2226,7 +2249,7 @@ PP_TUNE_PRESETS = {
         # 재조정했다 — 0.15를 문턱 없이 그대로 쓰면 (1.5-1)/0.15≈3.3°만 넘어도 MAX_SCALE에
         # 도달해 사실상 상시 최대 부스트가 걸린다(요청("미미할 땐 작게")과 어긋남). 순전히
         # 추정치, 실차에서 체감보고 재조정할 것.
-        PP_WHEELBASE_BOOST_ENABLE=True, PP_WHEELBASE_BOOST_GAIN_PER_DEG=0.14,
+        PP_WHEELBASE_BOOST_ENABLE=True, PP_WHEELBASE_BOOST_GAIN_PER_DEG=0.13,
         PP_WHEELBASE_BOOST_MAX_SCALE=2.75,
     ),
     'speed17_5': dict(
@@ -2285,6 +2308,22 @@ PP_TUNE_PRESETS = {
 PP_TUNE_ACTIVE_PRESET = 'speed15'   # None / 'speed3' / 'speed10' / 'speed12_5' / 'speed15' / 'speed17_5' / 'speed20' / 'speed22_5' / 'speed25'
 if PP_TUNE_ACTIVE_PRESET is not None:
     globals().update(PP_TUNE_PRESETS[PP_TUNE_ACTIVE_PRESET])
+
+# ── "새 튜닝(FINAL)" 전용 Pure Pursuit 상수 (2026-08-25, 요청 반영) ──
+#   위 'speed15' 프리셋을 9e59bbf(완주성공 커밋) 값으로 원복하면서, 그 사이 재튜닝했던
+#   값(220/33/80/140/0.14)은 여기로 옮겼다 — 다음 세 구간에서만 self.pure_pursuit에
+#   덮어써서 쓴다(track_drive.py _lane_steer()의 self._new_tuning_active 분기 참고):
+#     1. 직진 신호 확정(phase=LAVACON 진입) 후 ~ B1 진입 트리거(_lavacon_engaged) 뜨기 전
+#     2. 체크무늬 게이트 좌회전 램프 완료 후 ~ 다음 신호등 확정 전
+#     3. B3(방해차량) 통과 확정 후 ~ 다음 신호등 확정 전
+#   그 외 전 구간(B1 관여 중, B2/B3 회피 중, 좌회전 램프/지름길 출구 킥 진행 중 포함)은
+#   위 speed15 기본값(=9e59bbf와 동일)을 그대로 쓴다. B1 전용 _LAVACON 상수(아래)와는
+#   완전히 무관 — 그쪽은 이미 프리셋과 독립된 별도 스냅샷이라 이번 변경의 영향을 안 받는다.
+PP_LOOKAHEAD_BASE_PX_FINAL             = 220.0
+PP_WHEELBASE_PX_FINAL                  = 33.0
+PP_LOOKAHEAD_CURVATURE_GAIN_FINAL      = 80.0
+PP_LOOKAHEAD_MIN_PX_FINAL              = 140.0
+PP_WHEELBASE_BOOST_GAIN_PER_DEG_FINAL  = 0.14
 
 # ── B1(라바콘) 전용 Pure Pursuit 상수 (2026-08-24) ──
 #   지금까지 라바콘 조향(_lavacon_steer_da_push())은 track_drive.py의 self.pure_pursuit

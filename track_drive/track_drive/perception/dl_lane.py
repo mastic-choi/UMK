@@ -133,7 +133,7 @@ from ..config import DL_FG_THRESHOLD, DL_LL_FG_THRESHOLD, DL_ROI_Y0, DL_ROI_Y1
 #   바뀐다(아래 캔버스 자동계산 결과 면적이 원래 ROI의 약 1.95배).
 from ..config import (
     DL_USE_BEV, DL_BEV_SRC_PX_RAW, DL_PIXELS_PER_METER,
-    DL_BEV_FAR_LIMIT_M_LAVACON, DL_BEV_FAR_LIMIT_M_NORMAL,
+    DL_BEV_FAR_LIMIT_M_NORMAL, DL_BEV_FAR_LIMIT_M_FINAL,
 )
 DL_BEV_SRC_PX = DL_BEV_SRC_PX_RAW - np.float32([0, DL_ROI_Y0])
 
@@ -188,10 +188,12 @@ DL_BEV_VEHICLE_CENTER_X = float(
 #   DL_PIXELS_PER_METER/DL_BEV_SRC_PX_RAW는 그대로라 캘리브레이션 왜곡 없이 순수하게
 #   "얼마나 먼 데까지 볼지"만 제한한다(위 config.py 주석 참고).
 _dl_near_canvas_y = _dl_block_h - _dl_min_xy[1]
-# [2026-08-24, 테스트] B1_LAVACON/그 외 상태별로 크롭 행이 다르다 — detect()가 매 호출마다
-# bev_lavacon_mode로 골라 쓴다(config.py DL_BEV_FAR_LIMIT_M_LAVACON/_NORMAL 참고).
-DL_BEV_FAR_CROP_ROW_LAVACON = max(0, int(round(_dl_near_canvas_y - DL_BEV_FAR_LIMIT_M_LAVACON * DL_PIXELS_PER_METER)))
+# [2026-08-25, 요청 반영] "새 튜닝(FINAL)" 구간인지 아닌지로 크롭 행이 다르다 — detect()가
+# 매 호출마다 bev_far_mode로 골라 쓴다(config.py DL_BEV_FAR_LIMIT_M_NORMAL/_FINAL,
+# track_drive.py self._new_tuning_active 참고). NORMAL은 B1/B2/B3 포함 그 외 전 구간
+# (9e59bbf와 동일 0.7m), FINAL은 새 튜닝 구간 전용(1.0m).
 DL_BEV_FAR_CROP_ROW_NORMAL = max(0, int(round(_dl_near_canvas_y - DL_BEV_FAR_LIMIT_M_NORMAL * DL_PIXELS_PER_METER)))
+DL_BEV_FAR_CROP_ROW_FINAL = max(0, int(round(_dl_near_canvas_y - DL_BEV_FAR_LIMIT_M_FINAL * DL_PIXELS_PER_METER)))
 
 # ── SlideWindow moments 로직 재사용을 위한 DL 전용 튜닝값 ──
 #   classic 파이프라인은 BEV로 워프된 ROI px 스케일이고, DL은 원본 카메라 프레임 px
@@ -1021,10 +1023,10 @@ class DLSlideWindow(SlideWindow):
         [컷의 먼 경계를 obstacle_dist로 계산하지 않는 이유] 컷의 먼 경계는 그냥 캔버스
         자체의 끝(row 0, detect()에서 이미 크롭된 상태)으로 두고, 가까운 경계만 차량
         바로 앞 고정값(OBSTACLE_CUT_NEAR_M)으로 잡는다 — 그 사이는 전부 컷 대상.
-        [2026-08-24, 테스트] 이 캔버스 끝(=먼 경계)이 이제 상태에 따라 다르다 —
-        DL_BEV_FAR_CROP_ROW_LAVACON(0.7m, B1_LAVACON) / _NORMAL(1.0m, 그 외 — B2/B3
-        컷 포함). B2/B3에서 컷이 더 멀리(길게) 나가길 원해서(요청 반영) 캔버스를 같이
-        늘린 것 — trigger 조건(OBSTACLE_CUT_TRIGGER_X_MAX_M=1.0)과도 더 가까워졌다.
+        [2026-08-25, 요청 반영] 이 캔버스 끝(=먼 경계)이 "새 튜닝(FINAL)" 구간인지에 따라
+        다르다 — DL_BEV_FAR_CROP_ROW_NORMAL(0.7m, B1/B2/B3 포함 그 외 전 구간, 9e59bbf와
+        동일) / _FINAL(1.0m, self._new_tuning_active 구간 전용). B2/B3 회피는 항상
+        NORMAL(0.7m)이라 컷 범위도 9e59bbf와 동일하게 유지된다.
 
         ★부호규약 주의(실차 미검증, 반드시 저속에서 먼저 확인)★ obstacle_y_m은
         perc_obstacle_cut_trigger()가 라이다로 잰 값으로, 이 저장소 관례상 +가 좌측
@@ -1780,7 +1782,7 @@ class DLSlideWindow(SlideWindow):
 
     def detect(self, raw_bgr, da_prob, ll_prob, yellow_mask, avoid_hold=False, direction_hint=0, v_mps=0.0,
                obstacle_y_m=None, obstacle_cut_confirmed=False, obstacle_cut_type='none',
-               lavacon_push_active=False, lavacon_push_px=0.0, bev_lavacon_mode=False):
+               lavacon_push_active=False, lavacon_push_px=0.0, bev_far_mode=False):
         """입력 : raw_bgr — 원본 카메라 프레임 그대로의 (H,W,3) BGR(크롭/리사이즈 없음)
                  da_prob, ll_prob — 위와 같은 (H,W) float32 foreground 확률(모델은 360행
                    고정이지만 TwinLiteNetEngine.infer_raw()가 이미 원본 크기로 업샘플링해서 줌)
@@ -1810,8 +1812,9 @@ class DLSlideWindow(SlideWindow):
                  lavacon_push_px — [2026-08-22] 위와 같이 넘어오는 실제 push량(px, +면
                    우측). DA 클리핑엔 역시 관여하지 않고, draw_path()가 밀리기 전(보라)
                    원본과 밀린 뒤(주황) 경로를 나란히 그리는 데만 쓴다(게인 튜닝 참고용).
-                 bev_lavacon_mode — [2026-08-24, 테스트] True면 원거리 크롭을
-                   DL_BEV_FAR_CROP_ROW_LAVACON(0.7m), False면 _NORMAL(1.0m) 사용.
+                 bev_far_mode — [2026-08-25, 요청 반영] True("새 튜닝" 구간)면 원거리 크롭을
+                   DL_BEV_FAR_CROP_ROW_FINAL(1.0m), False(그 외 전 구간, B1/B2/B3 포함)면
+                   _NORMAL(0.7m, 9e59bbf와 동일) 사용.
           출력 : lane_valid, offset, lookahead, lane_center, path — 기존 SlideWindow.calc_center()와
                  동일한 계약(같은 4-tuple+path 형태)이지만, 계산은 da 중심선 기준으로 직접 한다.
           내부에서 DL_ROI_Y0:DL_ROI_Y1(원본 프레임 절대 픽셀)만 잘라서 da 중심선을 뽑는다.
@@ -1840,9 +1843,9 @@ class DLSlideWindow(SlideWindow):
             yellow_roi = self._bev_warp(yellow_roi, nearest=True)
             vis_roi = self._bev_warp(vis_roi)
             # [2026-08-06] 원거리 크롭 — 크롭 행보다 위(더 먼) 행은 버린다(config.py
-            # DL_BEV_FAR_LIMIT_M_LAVACON/_NORMAL 주석 참고). 네 배열 전부 같은 행을
+            # DL_BEV_FAR_LIMIT_M_NORMAL/_FINAL 주석 참고). 네 배열 전부 같은 행을
             # 자르므로 이후 좌표계는 계속 서로 일치한다.
-            far_crop_row = DL_BEV_FAR_CROP_ROW_LAVACON if bev_lavacon_mode else DL_BEV_FAR_CROP_ROW_NORMAL
+            far_crop_row = DL_BEV_FAR_CROP_ROW_FINAL if bev_far_mode else DL_BEV_FAR_CROP_ROW_NORMAL
             if far_crop_row > 0:
                 ll_roi = ll_roi[far_crop_row:]
                 da_roi = da_roi[far_crop_row:]
@@ -2668,8 +2671,8 @@ class DLLaneDetector:
         # [2026-08-22] 위 플래그와 같이 넘어오는 실제 push량(px) — draw_path()가 밀리기
         # 전(보라) 원본과 밀린 뒤(주황) 경로를 나란히 그리는 데 쓴다.
         self._latest_lavacon_push_px = 0.0
-        # [2026-08-24, 테스트] B1_LAVACON 여부 — BEV 원거리 크롭(0.7 vs 1.0)에 쓴다.
-        self._latest_bev_lavacon_mode = False
+        # [2026-08-25, 요청 반영] "새 튜닝(FINAL)" 구간 여부 — BEV 원거리 크롭(0.7 vs 1.0)에 쓴다.
+        self._latest_bev_far_mode = False
         self._latest_result = (False, 0.0, 0.0, default_center, [], None)
         # 디버그 창에 띄울 최근 프레임(초록/빨강 오버레이가 이미 그려진 vis, da/ll 원본 마스크).
         # 워커 스레드가 여기 값만 갱신하고, 실제 cv2.imshow()는 show_debug_windows()가
@@ -2734,11 +2737,12 @@ class DLLaneDetector:
             self._latest_lavacon_push_active = bool(active)
             self._latest_lavacon_push_px = float(push_px)
 
-    def set_bev_mode(self, lavacon_active):
-        """[2026-08-24, 테스트] track_drive.py의 perc_lane()이 매 틱 호출 — BEV 원거리
-        크롭을 B1_LAVACON이면 0.7m, 아니면 1.0m로 바꾼다(set_lavacon_push()와 동일 관례)."""
+    def set_bev_mode(self, far_mode_active):
+        """[2026-08-25, 요청 반영] track_drive.py의 perc_lane()이 매 틱 호출 — BEV 원거리
+        크롭을 "새 튜닝(FINAL)" 구간(self._new_tuning_active)이면 1.0m, 그 외(B1/B2/B3
+        포함 전 구간, 9e59bbf와 동일)면 0.7m로 바꾼다(set_lavacon_push()와 동일 관례)."""
         with self._lock:
-            self._latest_bev_lavacon_mode = bool(lavacon_active)
+            self._latest_bev_far_mode = bool(far_mode_active)
 
     def _worker(self):
         """추론 워커 — 이 스레드 안에서는 절대 cv2.imshow()/cv2.waitKey()를 호출하지 않는다.
@@ -2759,7 +2763,7 @@ class DLLaneDetector:
                 obstacle_cut_type = self._latest_obstacle_cut_type
                 lavacon_push_active = self._latest_lavacon_push_active
                 lavacon_push_px = self._latest_lavacon_push_px
-                bev_lavacon_mode = self._latest_bev_lavacon_mode
+                bev_far_mode = self._latest_bev_far_mode
             if frame is None:
                 time.sleep(0.005)
                 continue
@@ -2775,7 +2779,7 @@ class DLLaneDetector:
                     obstacle_y_m=obstacle_y, obstacle_cut_confirmed=obstacle_cut_confirmed,
                     obstacle_cut_type=obstacle_cut_type,
                     lavacon_push_active=lavacon_push_active, lavacon_push_px=lavacon_push_px,
-                    bev_lavacon_mode=bev_lavacon_mode,
+                    bev_far_mode=bev_far_mode,
                 )
                 debug_img = self._slide.vis
             except Exception as e:
