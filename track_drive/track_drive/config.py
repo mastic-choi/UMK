@@ -1452,8 +1452,8 @@ DEBUG_VIZ_LIDAR    = False  # 라이다 BEV 장애물 감지 디버그 창 (trac
 #   (요청 반영).
 # [2026-08-23, 요청 반영] True → False — B1 박스면적 테스트 창(DEBUG_VIZ_B1_CONE_AREA)만
 #   보기 위한 임시 비활성화. 복원 시 True로.
-DEBUG_VIZ_LAVACON  = True   # [2026-08-23 밤, 요청 반영] False→True — B1/B2/B3 면적 실측
-                             #   임시 비활성화 종료, 원래 상태로 복원.
+DEBUG_VIZ_LAVACON  = False  # [2026-08-25, 요청 반영] 대회 실주행 준비 — 성능(imshow 오버헤드)
+                             #   영향 없게 모든 디버그창 끔. 필요시 다시 True로.
                              # 라바콘 트리거 ROI + push ROI(지금 실제 조향에 쓰이는 좌우 최근접
                              #   콘 검출) 통합 BEV 디버그 창 (track_drive.py _draw_lavacon_bev())
                              #   — 콘 침범 시 경로를 옆으로 미는 push(margin/gain/lat) 표시.
@@ -1477,8 +1477,7 @@ DEBUG_VIZ_IMU      = False  # IMU(/imu) 연동 상태 + 현재 yaw값 디버그 
 
 # [2026-08-23, 요청 반영] True → False — B1 박스면적 테스트 창만 보기 위한 임시 비활성화.
 #   복원 시 True로.
-DEBUG_VIZ_DL_LANE    = True   # [2026-08-23 밤, 요청 반영] False→True — B1/B2/B3 면적 실측
-                               #   임시 비활성화 종료, 원래 상태로 복원.
+DEBUG_VIZ_DL_LANE    = False  # [2026-08-25, 요청 반영] 대회 실주행 준비 — 모든 디버그창 끔.
                                # 차선 — 기본 백엔드('dl') 디버그 창 (perception/dl_lane.py),
                                # da(주행가능영역) 오버레이+경로가 찍히는 'dl_lane' 창
                                # [2026-08-23] False → True(요청 반영) — B1/B2/B3(고정·이동장애물
@@ -1526,7 +1525,8 @@ DEBUG_VIZ_CHECKER_PILLAR = False   # 체크무늬 게이트 라이다 기둥쌍 
 DEBUG_VIZ_LEFT_TURN = False  # 좌회전 실행중/실행끝/발행각도/라이다감지+카메라+BEV 통합 디버그 창 (track_drive.py)
                               # [2026-08-23] True → False(요청 반영) — B1(라바콘) 검증 중이라
                               #   당장 필요 없어 끔. 좌회전 진행 확인 필요해지면 다시 True로.
-DEBUG_VIZ_YOLO_CONE  = True   # 콘 원시검출 창('yolo_cone_result', yolo_cone.py
+DEBUG_VIZ_YOLO_CONE  = False  # [2026-08-25, 요청 반영] 대회 실주행 준비 — 모든 디버그창 끔.
+                               # 콘 원시검출 창('yolo_cone_result', yolo_cone.py
                                # show_debug_windows()) + obstacle_cut_debug 창의 콘 카메라
                                # 패널(cam_stage=='cone'일 때)용 vis 프레임(yolo_cone.py
                                # _worker() 참고, yolo_vehicle.py DEBUG_VIZ_YOLO_VEHICLE과
@@ -1537,8 +1537,7 @@ DEBUG_VIZ_YOLO_CONE  = True   # 콘 원시검출 창('yolo_cone_result', yolo_co
 #   눈으로 확인하기 위함.
 # [2026-08-23, 요청 반영] True → False — B1 박스면적 테스트 창만 보기 위한 임시 비활성화.
 #   복원 시 True로.
-DEBUG_VIZ_YOLO_SIGNAL_STATE = True    # [2026-08-23 밤, 요청 반영] False→True — B1/B2/B3 면적
-                                      #   실측 임시 비활성화 종료, 원래 상태로 복원.
+DEBUG_VIZ_YOLO_SIGNAL_STATE = False   # [2026-08-25, 요청 반영] 대회 실주행 준비 — 모든 디버그창 끔.
                                       # 신호등 위치+색상상태 YOLO 검출 박스 디버그 창 (perception/yolo_signal_state.py, 창 이름 'YOLO_신호등')
                                       # [2026-08-22h] 요청 반영으로 껐다가, [2026-08-23] B3 통과 후
                                       #   S0_SIGNAL 대기 검증(아래 "6. 미션 State" override) 위해 다시 켰다가,
@@ -1561,7 +1560,8 @@ DEBUG_VIZ_AVOID_HOLD = False
 #   같은 구조로 한곳에 모아 보여준다(track_drive.py _debug_viz_obstacle_cut()).
 # [2026-08-23] False → True — B1/B2/B3 최대 박스면적(B1/B2/B3 태그 포함)을 이 창에서도
 #   보고 싶다는 요청으로 다시 켬.
-DEBUG_VIZ_OBSTACLE_CUT = True    # [2026-08-22i] 요청 반영으로 껐다가, [2026-08-22m] 회피(da 근접 컷)
+DEBUG_VIZ_OBSTACLE_CUT = False   # [2026-08-25, 요청 반영] 대회 실주행 준비 — 모든 디버그창 끔.
+#   [2026-08-22i] 요청 반영으로 껐다가, [2026-08-22m] 회피(da 근접 컷)
 #   검출범위 확인용으로 다시 켰다가, [2026-08-23a] 요청 반영으로 다시 끔, [2026-08-23b] B1/B2/B3
 #   회피 전체 흐름 검증 시작하며 다시 켬 — dl_lane(da) 창과 같이 켜서 "라이다가 왜 지금
 #   잡았는지"와 "그래서 경로가 실제로 밀렸는지"를 두 창에서 나란히 확인.
@@ -1966,11 +1966,12 @@ YOLO_VEHICLE_MODEL_PATH = None     # None이면 yolo_ros/target_vehicle_best.onn
 YOLO_VEHICLE_MIN_BOX_AREA_PX_B3 = 4500.0   # B3(방해차량 obstacle_cut) 전용 — 실차 실측 확정치
 # [2026-08-23s, 요청 반영] False → True — B3 박스면적 실측 창(b3_vehicle_area_debug)에
 #   카메라 화면이 안 보이는(면적 숫자는 찍히는데 프레임이 빈 칸) 문제 확인 후 복원.
-DEBUG_VIZ_YOLO_VEHICLE = True       # [2026-08-23r, 요청 반영] False→True — 끈 채로 두면
-                                     # _debug_viz_obstacle_cut()의 카메라 패널이 B3(방해차량)
-                                     # 단계에서 get_latest_debug_frame()이 항상 None을 반환해
-                                     # 빈 칸으로만 보이는 문제(yolo_vehicle.py _worker() 참고,
-                                     # DEBUG_VIZ_YOLO_VEHICLE=False면 vis 자체를 안 만듦).
+DEBUG_VIZ_YOLO_VEHICLE = False      # [2026-08-25, 요청 반영] 대회 실주행 준비 — 모든 디버그창
+                                     # 끔(성능 영향 없게). 끄면 _debug_viz_obstacle_cut()의 카메라
+                                     # 패널이 B3(방해차량) 단계에서 get_latest_debug_frame()이 항상
+                                     # None을 반환해 빈 칸으로 보이지만(yolo_vehicle.py _worker()
+                                     # 참고), 위 DEBUG_VIZ_OBSTACLE_CUT도 같이 꺼서 그 창 자체가
+                                     # 안 뜨므로 무관 — 실제 B3 YOLO 검출/트리거 로직에는 영향 없음.
 
 # ── 신호등 위치+색상상태 YOLO (perception/yolo_signal_state.py, YOLOv8n ONNX) ──
 #   [2026-08-19] datasets/signal_state/(라벨링 워크플로는 그쪽 README 참고)로 파인튜닝한
