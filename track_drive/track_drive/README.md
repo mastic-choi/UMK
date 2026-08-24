@@ -1684,6 +1684,50 @@ B1 오발동의 실제 원인이었을 가능성이 있음(미확인). 다음 �
 부당하게 곧장 켜지는지 반드시 재확인할 것 — 재발하면 이 되돌림 대신 좌회전 완료 후 몇 초간만
 B1 감지를 유예하는 방향(`_signal_reentry_cooldown_t`와 같은 타임스탬프 가드 패턴)으로 갈 것.
 
+### 1.19o 지름길 출구 T자 교차로 — 거리 트리거 + 시간 기반 강제 좌회전 킥 신설 (2026-08-24)
+
+**배경:** 지름길(§1.19b 이후 좌회전 진입 램프로 처리)을 빠져나오는 지점이 T자 교차로라,
+da/차선인식만으로는 직진(벽)/좌회전/우회전 중 어느 쪽이 맞는지 판단할 방법이 없다 — 이
+트랙은 반시계방향이라 항상 좌회전이어야 하지만 da는 그 규칙을 모른다. 사용자 확인: 이
+T자엔 라이다 랜드마크도 정지선도 없어 §1.19의 체크무늬 게이트 같은 물리 트리거를 못 쓴다.
+또한 지름길을 빠져나오면 B1/B2/B3 없이 곧장 결승선으로 이어지는 트랙이라(사용자 확인),
+출구 이후엔 Phase/Behavior를 다시 신경 쓸 필요가 없다. 결승선은 통과시점을 심판이 재는
+방식이라(사용자 확인) 별도 정차 로직도 불필요.
+
+**설계:**
+- **트리거**: 입구 램프 완료 시점(`_do_checker_ramp_turn()`의 `done` 분기)부터
+  `self._shortcut_exit_dist`를 `_s2_commit_dist`와 동일한 VESC 거리적분 패턴으로 누적,
+  `SHORTCUT_EXIT_DIST_M=6.3m`(실측 직선거리 5.8m + 곡선분/슬립 여유, config.py 주석 참고)
+  도달 시 발동. `_s1_lane_follow()`가 `_lane_drive()` 다음에 매틱 누적(VESC 끊기면 1초
+  디바운스 경고 로그).
+- **조향**: 처음엔 입구와 같은 `_checker_turn_ramp_angle()`(거리기반 smoothstep 램프)을
+  재사용했으나, 입구/출구를 서로 독립된 메커니즘으로 가져가자는 요청으로
+  `SHORTCUT_EXIT_KICK_ANGLE_DEG=-20°`를 `SHORTCUT_EXIT_KICK_DURATION_S=0.5초` 동안 그대로
+  꽂는 시간 기반 오픈루프 킥으로 교체(`_do_shortcut_exit_kick()`, `LAVACON_KICK_*`와 동일
+  패턴 — 프레임수 카운트다운).
+- **Phase 비변경**: 입구 램프 완료는 Phase를 `LAVACON`으로 리셋해 다음 구간 B1을 다시
+  여는데, 출구 킥 완료는 Phase/`_b2_passed`/`_b3_passed`/`_lavacon_engaged`를 전혀 안
+  건드린다 — 출구 뒤엔 더 볼 Behavior가 없어서(위 참고) 리셋하면 오히려 불필요한 B1 콘
+  YOLO 재가동 등 부작용만 생긴다.
+- **근접 안전정지 도입 후 삭제**: `obstacle_front`/`obstacle_dist` 기반 근접 정지
+  (`SHORTCUT_EXIT_WALL_STOP_M`)를 한 번 넣었다가 삭제했다 — 대회 규정상 코스 이탈/충돌
+  시 사람이 차량을 코스 안으로 복귀시키는 절차가 있어 소프트웨어로 막을 필요가 없다는
+  판단(요청 반영). 지금은 거리 트리거 단독 판단.
+
+**버그수정(같은 세션):** 출구 킥은 입구 램프와 달리 `mission_state`가 계속
+`S1_LANE_FOLLOW`인 채로 돈다(입구는 `S0_SIGNAL`로 빠짐) — `control_loop()`의 Behavior
+게이트 조건(`mission_state==S1_LANE_FOLLOW`)에 그대로 걸려서, 이 가드가 없으면
+`run_behavior_fsm()`/`apply_behavior_override()`가 킥 도중에도 계속 돌아 만에 하나 B1이
+오검출되면 강제 좌회전 조향을 그대로 덮어쓸 수 있는 구멍이 있었다 — "벽 피하려고 강제로
+꺾는" 바로 그 순간에 조향을 뺏기는 셈이라 위험도가 높다고 판단해, `control_loop()`에
+`self._shortcut_exit_kick_cnt <= 0` 조건을 추가해 킥 도중엔 Behavior FSM 자체를 끈다.
+
+**알려진 한계:** `SHORTCUT_EXIT_DIST_M`/`SHORTCUT_EXIT_KICK_ANGLE_DEG`/
+`SHORTCUT_EXIT_KICK_DURATION_S` 전부 실차 미검증 초기값 — 특히 거리 트리거는 VESC
+적분의 슬립/누적오차와 "직선거리로 측정했지만 실제 주행경로는 입구 램프의 곡선분만큼 더
+길다"는 시스템적 편향(항상 "조금 이르게" 트리거되는 방향)을 안고 있어, 처음 실차 테스트
+결과에 따라 가장 먼저 조정할 값이다.
+
 ---
 
 ## 2. 라인트래킹 (차선주행, S1)
