@@ -269,8 +269,7 @@ class PurePursuitController:
             prev = (x, y)
         return best_pt
 
-    def control(self, path, vehicle_xy, speed=0.0, imu_curvature_px=None, near_obstacle=False,
-                lookahead_override_px=None):
+    def control(self, path, vehicle_xy, speed=0.0, imu_curvature_px=None, near_obstacle=False):
         """path : [(x,y), ...] ROI 픽셀좌표, 가까운점(차량 근처)→먼점 순
            vehicle_xy : (x,y) 차량 기준점(관례상 ROI 하단 중앙 == path[0] 근방)
            speed : 직전 프레임 명령속도(track_drive.py의 _prev_speed, 모터 단위) 근사치 —
@@ -295,56 +294,51 @@ class PurePursuitController:
             self.held = True
             return self.prev_steer_deg
 
-        if lookahead_override_px is not None:
-            # 차량 감지 직후 일정 시간 lookahead 고정 — 적응형 계산/저역통과 전부 스킵.
-            self.last_imu_curvature_px = imu_curvature_px
-            lookahead_px = float(lookahead_override_px)
+        speed_lookahead_px = self.lookahead_base_px + self.lookahead_speed_gain * (
+            max(speed, 0.0) - self.lookahead_speed_anchor)
+
+        # [2026-08-06 버그 수정] damp 판단은 "직전에 실제로 쓴(이미 줄어들었을 수 있는)
+        # lookahead에서 나온 self.last_curvature"가 아니라, 매 프레임 댐핑 적용 전
+        # 고정 기준(probe_px)에서 새로 계산한 probe_curvature로 한다. self.last_curvature를
+        # 재사용하면 "ld가 짧아짐 → 노이즈가 curvature로 증폭됨 → damp가 ld를 또 줄임"이
+        # 무한 반복되는 자기순환 피드백에 빠져(클래스 상단 lookahead_curvature_gain 주석
+        # 참고) 실제 경로가 직진으로 돌아와도 절대 못 돌아오는 락업이 생긴다. probe는 항상
+        # 같은 기준거리에서 다시 재는 것이므로 "지금 경로가 진짜 코너인지"를 매 프레임
+        # 독립적으로 재평가한다 — 직진이면(probe_curvature≈0) damp≈1이라 기존과 동일하게
+        # 동작한다.
+        probe_px = float(np.clip(speed_lookahead_px, self.lookahead_min_px, self.lookahead_max_px))
+        probe_tx, probe_ty = self._target_point(path, vehicle_xy, probe_px)
+        probe_dx = probe_tx - vehicle_xy[0]
+        probe_dy = max(vehicle_xy[1] - probe_ty, 1e-3)
+        probe_ld = max(math.hypot(probe_dx, probe_dy), min(self.ld_floor_px, probe_px))
+        probe_curvature = 2.0 * math.sin(math.atan2(probe_dx, probe_dy)) / probe_ld
+        # [2026-08-06] IMU 실측 curvature 반영 — probe_curvature는 "아직 안 가본 앞쪽
+        # 경로가 얼마나 휘었는지"에 대한 비전 추정치라, 경로 자체가 흔들리면 같이
+        # 흔들린다. imu_curvature_px는 "차량이 지금 실제로 얼마나 돌고 있는지" 실측값
+        # 이라 이 노이즈가 없다. 둘 중 하나만 믿기보다 둘 중 절댓값이 더 큰 쪽으로
+        # damp를 건다 — 비전이 못 본 코너를 IMU가 잡아내는 경우(혹은 그 반대)를 놓치지
+        # 않기 위한 보수적(더 세게 죽이는 쪽) 선택. imu_curvature_px가 None이면
+        # (IMU/VESC 중 하나라도 죽어있거나 dl+BEV 조합이 아니면) 기존과 동일하게
+        # probe_curvature 단독으로 판단한다.
+        damp_curvature = abs(probe_curvature)
+        if imu_curvature_px is not None:
+            damp_curvature = max(damp_curvature, abs(imu_curvature_px))
+        self.last_imu_curvature_px = imu_curvature_px
+        curvature_damp = 1.0 / (1.0 + self.lookahead_curvature_gain * damp_curvature)
+
+        lookahead_px_raw = float(np.clip(
+            speed_lookahead_px * curvature_damp,
+            self.lookahead_min_px, self.lookahead_max_px
+        ))
+        # [2026-08-19] lookahead_px 저역통과(__init__ lookahead_alpha 주석 참고) — 직전
+        # 프레임에 새로 계산됐던 lookahead(self.last_lookahead_px)와 블렌딩한다. held=True로
+        # 건너뛴 프레임 직후에는 last_lookahead_px가 "몇 프레임 전" 값일 수 있지만, 그것도
+        # "직전에 유효했던 값"이라는 점에서 prev_steer_deg와 같은 원칙이라 문제 없다.
+        if self.last_lookahead_px is None:
+            lookahead_px = lookahead_px_raw
         else:
-            speed_lookahead_px = self.lookahead_base_px + self.lookahead_speed_gain * (
-                max(speed, 0.0) - self.lookahead_speed_anchor)
-
-            # [2026-08-06 버그 수정] damp 판단은 "직전에 실제로 쓴(이미 줄어들었을 수 있는)
-            # lookahead에서 나온 self.last_curvature"가 아니라, 매 프레임 댐핑 적용 전
-            # 고정 기준(probe_px)에서 새로 계산한 probe_curvature로 한다. self.last_curvature를
-            # 재사용하면 "ld가 짧아짐 → 노이즈가 curvature로 증폭됨 → damp가 ld를 또 줄임"이
-            # 무한 반복되는 자기순환 피드백에 빠져(클래스 상단 lookahead_curvature_gain 주석
-            # 참고) 실제 경로가 직진으로 돌아와도 절대 못 돌아오는 락업이 생긴다. probe는 항상
-            # 같은 기준거리에서 다시 재는 것이므로 "지금 경로가 진짜 코너인지"를 매 프레임
-            # 독립적으로 재평가한다 — 직진이면(probe_curvature≈0) damp≈1이라 기존과 동일하게
-            # 동작한다.
-            probe_px = float(np.clip(speed_lookahead_px, self.lookahead_min_px, self.lookahead_max_px))
-            probe_tx, probe_ty = self._target_point(path, vehicle_xy, probe_px)
-            probe_dx = probe_tx - vehicle_xy[0]
-            probe_dy = max(vehicle_xy[1] - probe_ty, 1e-3)
-            probe_ld = max(math.hypot(probe_dx, probe_dy), min(self.ld_floor_px, probe_px))
-            probe_curvature = 2.0 * math.sin(math.atan2(probe_dx, probe_dy)) / probe_ld
-            # [2026-08-06] IMU 실측 curvature 반영 — probe_curvature는 "아직 안 가본 앞쪽
-            # 경로가 얼마나 휘었는지"에 대한 비전 추정치라, 경로 자체가 흔들리면 같이
-            # 흔들린다. imu_curvature_px는 "차량이 지금 실제로 얼마나 돌고 있는지" 실측값
-            # 이라 이 노이즈가 없다. 둘 중 하나만 믿기보다 둘 중 절댓값이 더 큰 쪽으로
-            # damp를 건다 — 비전이 못 본 코너를 IMU가 잡아내는 경우(혹은 그 반대)를 놓치지
-            # 않기 위한 보수적(더 세게 죽이는 쪽) 선택. imu_curvature_px가 None이면
-            # (IMU/VESC 중 하나라도 죽어있거나 dl+BEV 조합이 아니면) 기존과 동일하게
-            # probe_curvature 단독으로 판단한다.
-            damp_curvature = abs(probe_curvature)
-            if imu_curvature_px is not None:
-                damp_curvature = max(damp_curvature, abs(imu_curvature_px))
-            self.last_imu_curvature_px = imu_curvature_px
-            curvature_damp = 1.0 / (1.0 + self.lookahead_curvature_gain * damp_curvature)
-
-            lookahead_px_raw = float(np.clip(
-                speed_lookahead_px * curvature_damp,
-                self.lookahead_min_px, self.lookahead_max_px
-            ))
-            # [2026-08-19] lookahead_px 저역통과(__init__ lookahead_alpha 주석 참고) — 직전
-            # 프레임에 새로 계산됐던 lookahead(self.last_lookahead_px)와 블렌딩한다. held=True로
-            # 건너뛴 프레임 직후에는 last_lookahead_px가 "몇 프레임 전" 값일 수 있지만, 그것도
-            # "직전에 유효했던 값"이라는 점에서 prev_steer_deg와 같은 원칙이라 문제 없다.
-            if self.last_lookahead_px is None:
-                lookahead_px = lookahead_px_raw
-            else:
-                lookahead_px = (self.lookahead_alpha * lookahead_px_raw
-                                 + (1.0 - self.lookahead_alpha) * self.last_lookahead_px)
+            lookahead_px = (self.lookahead_alpha * lookahead_px_raw
+                             + (1.0 - self.lookahead_alpha) * self.last_lookahead_px)
         if near_obstacle:
             tx, ty = self._target_point_max_deviation(path, vehicle_xy, lookahead_px)
         else:

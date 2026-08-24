@@ -196,6 +196,7 @@ class YoloConeDetector:
                                                      #   (track_drive.py, B1/B2 각자)가 건다.
         self._latest_max_area = 0.0                 # [2026-08-23] 이번 프레임 검출 박스 중 최대 면적(px²,
                                                      #   640 입력 스케일) — get_latest_max_area() 참고
+        self._latest_side = None                      # [2026-08-25] 'L'/'R'/None — get_latest_side() 참고
         self._latest_debug = None                    # 시각화용 vis 프레임
         # [2026-08-23] 'yolo_cone_result' 창을 처음 띄울 때만 cv2.moveWindow로 위치를 잡기
         #   위한 1회성 가드(DEBUG_WIN_POS_YOLO_CONE 참고, yolo_signal_state.py의 동일 패턴).
@@ -230,6 +231,13 @@ class YoloConeDetector:
                 # track_drive.py perc_lavacon_trigger()/perc_obstacle_cut_trigger()가 각자 건다.
                 max_area = max(((x2 - x1) * (y2 - y1) for x1, y1, x2, y2, _c in detections),
                                 default=0.0)
+                # [2026-08-25] 라이다-YOLO 좌우 교차검증(perc_obstacle_cut_trigger() B2)용 —
+                # yolo_vehicle.py _worker()와 동일 계산(최고 신뢰도 박스 중심 x 기준 L/R).
+                side = None
+                if detections:
+                    best = max(detections, key=lambda d: d[4])
+                    cx = (best[0] + best[2]) / 2.0
+                    side = 'L' if cx < YOLO_CONE_INPUT_SIZE / 2.0 else 'R'
                 vis = None
                 if DEBUG_VIZ_YOLO_CONE:
                     # 그리기만 여기서(스레드 세이프하지 않은 imshow/waitKey는 절대 호출 안 함
@@ -254,6 +262,7 @@ class YoloConeDetector:
             with self._lock:
                 self._latest_result = (cone_detected, detections)
                 self._latest_max_area = max_area
+                self._latest_side = side
                 self._latest_debug = vis
 
             now = time.time()
@@ -282,6 +291,13 @@ class YoloConeDetector:
         띄워 실차에서 임계값을 조정할 때 참고하게 한다."""
         with self._lock:
             return self._latest_max_area
+
+    def get_latest_side(self):
+        """[2026-08-25] 최신 프레임에서 검출된(최고 신뢰도) 콘 박스의 좌우 위치 — 'L'/'R'
+        (검출 없었으면 None). yolo_vehicle.py get_latest_side()와 동일 용도 — B2용
+        perc_obstacle_cut_trigger() 좌우 교차검증."""
+        with self._lock:
+            return self._latest_side
 
     def get_latest_debug_frame(self):
         """[2026-08-21] 최신 시각화 프레임(카메라 원본 + 검출 박스)을 스레드 세이프하게

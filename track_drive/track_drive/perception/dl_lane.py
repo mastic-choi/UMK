@@ -133,7 +133,7 @@ from ..config import DL_FG_THRESHOLD, DL_LL_FG_THRESHOLD, DL_ROI_Y0, DL_ROI_Y1
 #   바뀐다(아래 캔버스 자동계산 결과 면적이 원래 ROI의 약 1.95배).
 from ..config import (
     DL_USE_BEV, DL_BEV_SRC_PX_RAW, DL_PIXELS_PER_METER,
-    DL_BEV_FAR_LIMIT_M_NORMAL, DL_BEV_FAR_LIMIT_M_FINAL,
+    DL_BEV_FAR_LIMIT_M_NORMAL,
 )
 DL_BEV_SRC_PX = DL_BEV_SRC_PX_RAW - np.float32([0, DL_ROI_Y0])
 
@@ -188,12 +188,9 @@ DL_BEV_VEHICLE_CENTER_X = float(
 #   DL_PIXELS_PER_METER/DL_BEV_SRC_PX_RAW는 그대로라 캘리브레이션 왜곡 없이 순수하게
 #   "얼마나 먼 데까지 볼지"만 제한한다(위 config.py 주석 참고).
 _dl_near_canvas_y = _dl_block_h - _dl_min_xy[1]
-# [2026-08-25, 요청 반영] "새 튜닝(FINAL)" 구간인지 아닌지로 크롭 행이 다르다 — detect()가
-# 매 호출마다 bev_far_mode로 골라 쓴다(config.py DL_BEV_FAR_LIMIT_M_NORMAL/_FINAL,
-# track_drive.py self._new_tuning_active 참고). NORMAL은 B1/B2/B3 포함 그 외 전 구간
-# (9e59bbf와 동일 0.7m), FINAL은 새 튜닝 구간 전용(1.0m).
+# [2026-08-25, 요청 반영] 상태별 구간 분리(bev_far_mode/_new_tuning_active) 되돌림 — B1
+# (라바콘) 이외 전 구간(B2/B3 포함)이 항상 이 크롭 행을 쓴다.
 DL_BEV_FAR_CROP_ROW_NORMAL = max(0, int(round(_dl_near_canvas_y - DL_BEV_FAR_LIMIT_M_NORMAL * DL_PIXELS_PER_METER)))
-DL_BEV_FAR_CROP_ROW_FINAL = max(0, int(round(_dl_near_canvas_y - DL_BEV_FAR_LIMIT_M_FINAL * DL_PIXELS_PER_METER)))
 
 # ── SlideWindow moments 로직 재사용을 위한 DL 전용 튜닝값 ──
 #   classic 파이프라인은 BEV로 워프된 ROI px 스케일이고, DL은 원본 카메라 프레임 px
@@ -205,7 +202,7 @@ DL_BEV_FAR_CROP_ROW_FINAL = max(0, int(round(_dl_near_canvas_y - DL_BEV_FAR_LIMI
 #   LL_SANITY_MIN_RATIO/LL_CLIP_MARGIN_PX, DEBUG_VIZ_DL_LANE, YELLOW_LOWER/UPPER,
 #   FPS_LOG_PERIOD_SEC) — 실차 테스트 중 값을 바꾸려면 이 파일이 아니라 config.py를 고칠 것.
 from ..config import (
-    DL_N_SLICES, DL_MIN_PIXELS, DL_NEAR_SLICES, DL_FAR_SLICES,
+    DL_N_SLICES, DL_MIN_PIXELS, DL_MIN_PIXELS_OBSTACLE, DL_NEAR_SLICES, DL_FAR_SLICES,
     DL_SLICE_OUTLIER_MAX, DL_SLICE_FIT_MIN,
     DL_STABLE_FRAME_MIN, DL_STABLE_JUMP_MAX,
     # [2026-08-19] 근접 밴드 이상치 오판 방지(1차) + hold 타임아웃(2차) — README 참고
@@ -225,6 +222,8 @@ from ..config import (
     # [2026-08-17g] 방해차량 "뒤" 방향 속도비례 추가마진 — config.py DL_DA_REAR_MARGIN_* 주석 참고
     DL_DA_APPLY_VEHICLE_MARGIN, DL_DA_VEHICLE_MARGIN_M, VEHICLE_WIDTH_M,
     DL_DA_SIDE_MARGIN_M,
+    # [2026-08-25] B2/B3 회피주행 중 침식 커트라인 축소(요청 반영) — README §2.5x 참고
+    DL_DA_SIDE_CUTLINE_PX_OBSTACLE,
     DL_DA_REAR_MARGIN_REACT_SEC, DL_DA_REAR_MARGIN_MAX_M,
     # [2026-08-15] avoid-hold 개선 적용2(da 연속성 보조트리거)/적용3(방향 힌트) — README §2.32,
     # avoid_hold_improvement_proposal.md
@@ -256,6 +255,8 @@ from ..config import (
     DEBUG_VIZ_DL_LANE, YELLOW_LOWER, YELLOW_UPPER, FPS_LOG_PERIOD_SEC,
     DL_DEBUG_HISTORY_LEN,
     DEBUG_WIN_POS_DL_LANE,
+    # [2026-08-25] 룩어헤드 한 프레임 튐 방지(config.py 위 PATH_REACH_DROP_MAX_PX 주석 참고)
+    PATH_REACH_DROP_MAX_PX, PATH_REACH_DROP_FRAMES,
 )
 
 # ── [2026-08-14] da 안전마진(차량 폭) 침식 커널 — README §2.30 "da 안전마진 설계 논의" ──
@@ -268,17 +269,20 @@ from ..config import (
 #   REAR_MARGIN_*이 여기에 속도비례로 얹힘)을 독립적으로 조정할 수 있다.
 _DL_DA_MARGIN_PX = int(round((VEHICLE_WIDTH_M / 2.0 + DL_DA_VEHICLE_MARGIN_M) * DL_PIXELS_PER_METER))
 _DL_DA_SIDE_MARGIN_PX = int(round((VEHICLE_WIDTH_M / 2.0 + DL_DA_SIDE_MARGIN_M) * DL_PIXELS_PER_METER))
+# [2026-08-25] B2/B3 회피주행 중 전용 좌우 반경 — config.py DL_DA_SIDE_CUTLINE_PX_OBSTACLE
+#   주석 참고(단위 px, 폭 기준이라 반경은 //2).
+_DL_DA_SIDE_MARGIN_PX_OBSTACLE = DL_DA_SIDE_CUTLINE_PX_OBSTACLE // 2
 # [2026-08-17g] 세로(진행방향) 반경만 v_mps에 비례해 늘려서 "뒤" 쪽 여유를 속도에 맞게
 #   더 벌린다 — config.py DL_DA_REAR_MARGIN_REACT_SEC/MAX_M 주석 참고. 속도에 따라 매
 #   프레임 달라지므로(다른 커널들과 달리) 모듈 임포트 시 한 번만 만들어두지 못하고
 #   _apply_vehicle_margin()이 호출될 때마다 새로 만든다 — cv2.getStructuringElement는
 #   이 크기(수십 px)에서는 무시할 만큼 가볍다.
-def _dl_da_margin_kernel(v_mps):
-    if not DL_DA_APPLY_VEHICLE_MARGIN or (_DL_DA_MARGIN_PX <= 0 and _DL_DA_SIDE_MARGIN_PX <= 0):
+def _dl_da_margin_kernel(v_mps, obstacle_mode=False):
+    rx = _DL_DA_SIDE_MARGIN_PX_OBSTACLE if obstacle_mode else _DL_DA_SIDE_MARGIN_PX
+    if not DL_DA_APPLY_VEHICLE_MARGIN or (_DL_DA_MARGIN_PX <= 0 and rx <= 0):
         return None
     extra_m = min(DL_DA_REAR_MARGIN_REACT_SEC * max(float(v_mps), 0.0), DL_DA_REAR_MARGIN_MAX_M)
     ry = _DL_DA_MARGIN_PX + int(round(extra_m * DL_PIXELS_PER_METER))
-    rx = _DL_DA_SIDE_MARGIN_PX
     return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (max(rx, 0) * 2 + 1, max(ry, 0) * 2 + 1))
 
 # [2026-08-10] visualize()가 result 패널 맨 위에 그리는 모드 배너 색을 한곳에서 관리.
@@ -481,6 +485,10 @@ class DLSlideWindow(SlideWindow):
         self._path_ok_pending = None
         self._path_ok_pending_count = 0
         self.path_ok = False
+        # [2026-08-25] reach(=self.path가 지금 얼마나 멀리까지 보는지, px) 급감 디바운스
+        # 상태 — config.py PATH_REACH_DROP_MAX_PX 주석/_debounce_path_reach_drop() 참고.
+        self._path_reach_confirmed = None
+        self._path_reach_drop_pending_count = 0
         self.da_mask_roi = None    # 시각화용(가장 큰 덩어리만 남긴 이후의 da 마스크 — 실제 waypoint 추출에 쓰는 것)
         self.da_mask_all_roi = None  # 시각화용(이진화 직후, 덩어리 선택/ll클리핑 전 da 전체 — visualize()가 파란색으로 그림)
         self.ll_mask_roi = None    # 시각화용
@@ -749,7 +757,7 @@ class DLSlideWindow(SlideWindow):
         self._prev_da_centroid = None
         return np.zeros_like(da_mask)
 
-    def _apply_vehicle_margin(self, da_mask, v_mps=0.0):
+    def _apply_vehicle_margin(self, da_mask, v_mps=0.0, obstacle_mode=False):
         """[2026-08-14] da 마스크를 차폭(VEHICLE_WIDTH_M)+여유(DL_DA_VEHICLE_MARGIN_M)만큼
         침식(erosion)해서, 중심선이 da 경계(장애물이든 트랙 벽이든 무관)에서 최소 이만큼은
         떨어지도록 강제한다 — ROS2 Nav2의 costmap inflation과 같은 개념(README §2.30 "da
@@ -769,13 +777,13 @@ class DLSlideWindow(SlideWindow):
         침식으로 da가 통째로 비면(좁은 커브 등에서 과침식) 원본을 그대로 반환한다 —
         `_largest_da_component()`의 "차선책" 폴백들과 같은 원칙: 마진 없이라도 주행하는
         게 프레임이 무효 처리돼 멈추는 것보다 낫다는 판단."""
-        kernel = _dl_da_margin_kernel(v_mps)
+        kernel = _dl_da_margin_kernel(v_mps, obstacle_mode)
         if kernel is None:
             return da_mask
         eroded = cv2.erode(da_mask, kernel)
         return eroded if np.any(eroded) else da_mask
 
-    def _da_slice_centers_windowed(self, da_mask, ref_x):
+    def _da_slice_centers_windowed(self, da_mask, ref_x, min_pixels=None):
         """[2026-08-12] DL_CENTER_MODE='da' 밴드 중심 계산 — 탐색창(prior) + 밴드 간
         속도예측 + 프레임 간 앵커링. `_slice_centers()`(무보정 cv2.moments, 밴드 전체
         폭)를 대체한다.
@@ -823,6 +831,7 @@ class DLSlideWindow(SlideWindow):
         slice_h = h // self.n_slices
         centers = [None] * self.n_slices
         self.da_near_width_corrected = [False] * self.n_slices
+        min_px = self.min_pixels if min_pixels is None else min_pixels
 
         cur_x = ref_x
         base_win = DL_DA_SEARCH_HALF_WIDTH_PX
@@ -845,7 +854,7 @@ class DLSlideWindow(SlideWindow):
             cx = None
             if x1 > x0:
                 M = cv2.moments(da_mask[y_low:y_high, x0:x1], binaryImage=True)
-                if M['m00'] >= self.min_pixels:
+                if M['m00'] >= min_px:
                     cx = x0 + M['m10'] / M['m00']
 
             # [2026-08-24, 요청 반영] TODO_da_near_band_bias.md — BEV 근접 밴드 모서리
@@ -1021,12 +1030,9 @@ class DLSlideWindow(SlideWindow):
         따라가듯 자연스럽게 이른 조향을 낸다.
 
         [컷의 먼 경계를 obstacle_dist로 계산하지 않는 이유] 컷의 먼 경계는 그냥 캔버스
-        자체의 끝(row 0, detect()에서 이미 크롭된 상태)으로 두고, 가까운 경계만 차량
-        바로 앞 고정값(OBSTACLE_CUT_NEAR_M)으로 잡는다 — 그 사이는 전부 컷 대상.
-        [2026-08-25, 요청 반영] 이 캔버스 끝(=먼 경계)이 "새 튜닝(FINAL)" 구간인지에 따라
-        다르다 — DL_BEV_FAR_CROP_ROW_NORMAL(0.7m, B1/B2/B3 포함 그 외 전 구간, 9e59bbf와
-        동일) / _FINAL(1.0m, self._new_tuning_active 구간 전용). B2/B3 회피는 항상
-        NORMAL(0.7m)이라 컷 범위도 9e59bbf와 동일하게 유지된다.
+        자체의 끝(row 0, detect()에서 이미 크롭된 DL_BEV_FAR_CROP_ROW_NORMAL)으로 두고,
+        가까운 경계만 차량 바로 앞 고정값(OBSTACLE_CUT_NEAR_M)으로 잡는다 — 그 사이는
+        전부 컷 대상.
 
         ★부호규약 주의(실차 미검증, 반드시 저속에서 먼저 확인)★ obstacle_y_m은
         perc_obstacle_cut_trigger()가 라이다로 잰 값으로, 이 저장소 관례상 +가 좌측
@@ -1780,9 +1786,43 @@ class DLSlideWindow(SlideWindow):
 
         return self._path_ok_confirmed
 
+    def _debounce_path_reach_drop(self, reach_raw):
+        """[2026-08-25] "룩어헤드가 엄청 잠깐 짧게 코앞으로 튄다" 대응 — self.path가
+        지금 얼마나 멀리까지 보는지(reach = path[0].y - path[-1].y, px)가 한 프레임
+        만에 PATH_REACH_DROP_MAX_PX 이상 줄면 일단 노이즈로 의심하고 즉시 반영하지
+        않는다. path_ok_raw(_debounce_path_ok() 참고)는 near_center/far_center 중
+        하나만 있어도 True라, 원거리 슬라이스들이 딱 한 프레임만 노이즈로 비어도
+        (모델 순간 미검출, _largest_da_component() 덩어리 전환 등) 걸러지지 않고
+        _fit_and_sample_path()의 y_far=min(ys)가 그 프레임만 차량 근처로 훅 당겨진
+        fitted_path를 만든다 — 이게 그대로 self.path에 EMA 반영되면(PATH_EMA_ALPHA가
+        큰 프리셋일수록 거의 그대로) pure_pursuit 목표점이 코앞으로 튀는 것으로 보인다.
+
+        offset 디바운스(SlideWindow._debounce())와 동일한 "N프레임 연속 확인" 철학을
+        reach에 적용한 것 — PATH_REACH_DROP_FRAMES 연속으로 같은 폭의 감소가 재현돼야만
+        (=진짜 상황 변화, 장애물 컷/급커브 진입 등) 받아들인다. 늘어나는 쪽(reach 회복/
+        연장)은 위험하지 않으므로 즉시 통과시켜서, 이 가드가 정상 복귀를 늦추지 않는다.
+
+        반환 True면 이번 프레임 fitted_path를 self.path에 반영해도 좋다는 뜻,
+        False면 노이즈로 의심되니 이번 프레임 self.path 갱신을 건너뛰라는 뜻(직전
+        self.path가 그대로 유지된다 — _update_path()의 "무효 프레임엔 마지막 값 유지"
+        원칙과 동일)."""
+        if (self._path_reach_confirmed is None
+                or reach_raw >= self._path_reach_confirmed - PATH_REACH_DROP_MAX_PX):
+            self._path_reach_confirmed = reach_raw
+            self._path_reach_drop_pending_count = 0
+            return True
+
+        self._path_reach_drop_pending_count += 1
+        if self._path_reach_drop_pending_count >= PATH_REACH_DROP_FRAMES:
+            self._path_reach_confirmed = reach_raw
+            self._path_reach_drop_pending_count = 0
+            return True
+        return False
+
     def detect(self, raw_bgr, da_prob, ll_prob, yellow_mask, avoid_hold=False, direction_hint=0, v_mps=0.0,
                obstacle_y_m=None, obstacle_cut_confirmed=False, obstacle_cut_type='none',
-               lavacon_push_active=False, lavacon_push_px=0.0, bev_far_mode=False):
+               obstacle_cut_yolo_seen=False,
+               lavacon_push_active=False, lavacon_push_px=0.0):
         """입력 : raw_bgr — 원본 카메라 프레임 그대로의 (H,W,3) BGR(크롭/리사이즈 없음)
                  da_prob, ll_prob — 위와 같은 (H,W) float32 foreground 확률(모델은 360행
                    고정이지만 TwinLiteNetEngine.infer_raw()가 이미 원본 크기로 업샘플링해서 줌)
@@ -1812,9 +1852,6 @@ class DLSlideWindow(SlideWindow):
                  lavacon_push_px — [2026-08-22] 위와 같이 넘어오는 실제 push량(px, +면
                    우측). DA 클리핑엔 역시 관여하지 않고, draw_path()가 밀리기 전(보라)
                    원본과 밀린 뒤(주황) 경로를 나란히 그리는 데만 쓴다(게인 튜닝 참고용).
-                 bev_far_mode — [2026-08-25, 요청 반영] True("새 튜닝" 구간)면 원거리 크롭을
-                   DL_BEV_FAR_CROP_ROW_FINAL(1.0m), False(그 외 전 구간, B1/B2/B3 포함)면
-                   _NORMAL(0.7m, 9e59bbf와 동일) 사용.
           출력 : lane_valid, offset, lookahead, lane_center, path — 기존 SlideWindow.calc_center()와
                  동일한 계약(같은 4-tuple+path 형태)이지만, 계산은 da 중심선 기준으로 직접 한다.
           내부에서 DL_ROI_Y0:DL_ROI_Y1(원본 프레임 절대 픽셀)만 잘라서 da 중심선을 뽑는다.
@@ -1843,9 +1880,9 @@ class DLSlideWindow(SlideWindow):
             yellow_roi = self._bev_warp(yellow_roi, nearest=True)
             vis_roi = self._bev_warp(vis_roi)
             # [2026-08-06] 원거리 크롭 — 크롭 행보다 위(더 먼) 행은 버린다(config.py
-            # DL_BEV_FAR_LIMIT_M_NORMAL/_FINAL 주석 참고). 네 배열 전부 같은 행을
-            # 자르므로 이후 좌표계는 계속 서로 일치한다.
-            far_crop_row = DL_BEV_FAR_CROP_ROW_FINAL if bev_far_mode else DL_BEV_FAR_CROP_ROW_NORMAL
+            # DL_BEV_FAR_LIMIT_M_NORMAL 주석 참고). 네 배열 전부 같은 행을 자르므로
+            # 이후 좌표계는 계속 서로 일치한다.
+            far_crop_row = DL_BEV_FAR_CROP_ROW_NORMAL
             if far_crop_row > 0:
                 ll_roi = ll_roi[far_crop_row:]
                 da_roi = da_roi[far_crop_row:]
@@ -2053,8 +2090,12 @@ class DLSlideWindow(SlideWindow):
                 # [2026-08-14] 중심선 계산에만 안전마진을 적용한다 — self.da_mask_roi(아래,
                 # 디버그 시각화용)는 침식 전 원본을 그대로 담아야 "da가 실제로 어디까지
                 # 검출됐는지"와 "마진 때문에 얼마나 물러났는지"를 구분해서 볼 수 있다.
-                margined_da_mask = self._apply_vehicle_margin(da_mask, v_mps)
-                merged_centers = self._da_slice_centers_windowed(margined_da_mask, ref_x)
+                # [2026-08-25, 요청 반영] obstacle_cut_confirmed(라이다 AND+디바운스+hold)
+                # 대신 obstacle_cut_yolo_seen(순수 YOLO, 컷보다 먼저 켜짐)으로 게이팅 —
+                # 실제 컷이 뜨기 전부터 da 마진/픽셀문턱을 미리 완화해둔다.
+                margined_da_mask = self._apply_vehicle_margin(da_mask, v_mps, obstacle_mode=obstacle_cut_yolo_seen)
+                da_min_px = DL_MIN_PIXELS_OBSTACLE if obstacle_cut_yolo_seen else self.min_pixels
+                merged_centers = self._da_slice_centers_windowed(margined_da_mask, ref_x, min_pixels=da_min_px)
                 self.ll_band_used = [False] * len(merged_centers)
                 self.ll_search_windows = []
                 self.ll_band_reason = [None] * self.n_slices
@@ -2161,7 +2202,15 @@ class DLSlideWindow(SlideWindow):
         fitted_path = self._fit_and_sample_path(
             [c for c in self.centerline if c is not None]
         )
-        if self.path_ok:
+        # [2026-08-25] reach 급감(한 프레임짜리 룩어헤드 튐) 가드 — config.py
+        # PATH_REACH_DROP_MAX_PX 주석/_debounce_path_reach_drop() 참고. fitted_path가
+        # None이면(유효 슬라이스 2개 미만) reach를 정의할 수 없으니 기존과 동일하게
+        # _update_path(None)에 맡겨 그대로 지나간다(내부에서 즉시 return).
+        path_reach_ok = True
+        if fitted_path is not None:
+            reach_raw = fitted_path[0][1] - fitted_path[-1][1]
+            path_reach_ok = self._debounce_path_reach_drop(reach_raw)
+        if self.path_ok and path_reach_ok:
             self._update_path(fitted_path)
 
         lane_valid, offset, lookahead, lane_center = self._debounce(
@@ -2664,6 +2713,7 @@ class DLLaneDetector:
         self._latest_obstacle_y = None
         self._latest_obstacle_cut_confirmed = False
         self._latest_obstacle_cut_type = 'none'   # [2026-08-23] B2/B3 컷 좌우폭 분리용, set_obstacle() 참고
+        self._latest_obstacle_cut_yolo_seen = False  # [2026-08-25] set_obstacle() yolo_seen 참고
         # [2026-08-22] B1 콘 침범 push(_lavacon_steer_da_push()) 상태 — set_obstacle()과
         # 동일한 관례로 track_drive.py가 매 틱 set_lavacon_push()로 갱신하면 _worker()가
         # 다음 추론 때 같은 락으로 같이 읽어 DLSlideWindow.detect()에 넘긴다.
@@ -2671,8 +2721,6 @@ class DLLaneDetector:
         # [2026-08-22] 위 플래그와 같이 넘어오는 실제 push량(px) — draw_path()가 밀리기
         # 전(보라) 원본과 밀린 뒤(주황) 경로를 나란히 그리는 데 쓴다.
         self._latest_lavacon_push_px = 0.0
-        # [2026-08-25, 요청 반영] "새 튜닝(FINAL)" 구간 여부 — BEV 원거리 크롭(0.7 vs 1.0)에 쓴다.
-        self._latest_bev_far_mode = False
         self._latest_result = (False, 0.0, 0.0, default_center, [], None)
         # 디버그 창에 띄울 최근 프레임(초록/빨강 오버레이가 이미 그려진 vis, da/ll 원본 마스크).
         # 워커 스레드가 여기 값만 갱신하고, 실제 cv2.imshow()는 show_debug_windows()가
@@ -2715,17 +2763,20 @@ class DLLaneDetector:
         with self._lock:
             self._latest_v_mps = float(v_mps)
 
-    def set_obstacle(self, y_m, confirmed, cut_type='none'):
+    def set_obstacle(self, y_m, confirmed, cut_type='none', yolo_seen=False):
         """[2026-08-20] track_drive.py의 perc_lane()이 매 틱 호출 — da 근접 컷
         (_clip_da_by_obstacle(), ENABLE_OBSTACLE_CUT) 트리거 상태를 다음 추론에
         반영한다(set_avoid_hold()/set_speed()와 동일 관례). 단순 대입이라 별도 검증
         없이 저장한다. y_m=None이면 장애물 횡위치 정보 없음(confirmed도 무시됨).
         cut_type — [2026-08-23] 'fixed'(B2)/'vehicle'(B3)/'none', B2/B3 컷 좌우폭을
-        다르게 쓰는 데만 쓰인다(_clip_da_by_obstacle() 참고)."""
+        다르게 쓰는 데만 쓰인다(_clip_da_by_obstacle() 참고).
+        yolo_seen — [2026-08-25] confirmed(라이다 AND+디바운스+hold)보다 먼저 켜지는
+        순수 YOLO 신호(요청 반영) — da 안전마진/밴드 최소픽셀수 완화 게이팅 전용."""
         with self._lock:
             self._latest_obstacle_y = None if y_m is None else float(y_m)
             self._latest_obstacle_cut_confirmed = bool(confirmed)
             self._latest_obstacle_cut_type = cut_type
+            self._latest_obstacle_cut_yolo_seen = bool(yolo_seen)
 
     def set_lavacon_push(self, active, push_px=0.0):
         """[2026-08-22] track_drive.py의 perc_lane()이 매 틱 호출 — B1 콘 침범 push
@@ -2736,13 +2787,6 @@ class DLLaneDetector:
         with self._lock:
             self._latest_lavacon_push_active = bool(active)
             self._latest_lavacon_push_px = float(push_px)
-
-    def set_bev_mode(self, far_mode_active):
-        """[2026-08-25, 요청 반영] track_drive.py의 perc_lane()이 매 틱 호출 — BEV 원거리
-        크롭을 "새 튜닝(FINAL)" 구간(self._new_tuning_active)이면 1.0m, 그 외(B1/B2/B3
-        포함 전 구간, 9e59bbf와 동일)면 0.7m로 바꾼다(set_lavacon_push()와 동일 관례)."""
-        with self._lock:
-            self._latest_bev_far_mode = bool(far_mode_active)
 
     def _worker(self):
         """추론 워커 — 이 스레드 안에서는 절대 cv2.imshow()/cv2.waitKey()를 호출하지 않는다.
@@ -2761,9 +2805,9 @@ class DLLaneDetector:
                 obstacle_y = self._latest_obstacle_y
                 obstacle_cut_confirmed = self._latest_obstacle_cut_confirmed
                 obstacle_cut_type = self._latest_obstacle_cut_type
+                obstacle_cut_yolo_seen = self._latest_obstacle_cut_yolo_seen
                 lavacon_push_active = self._latest_lavacon_push_active
                 lavacon_push_px = self._latest_lavacon_push_px
-                bev_far_mode = self._latest_bev_far_mode
             if frame is None:
                 time.sleep(0.005)
                 continue
@@ -2777,9 +2821,8 @@ class DLLaneDetector:
                     raw_bgr, da_prob, ll_prob, yellow_mask,
                     avoid_hold=avoid_hold, direction_hint=avoid_hold_side, v_mps=v_mps,
                     obstacle_y_m=obstacle_y, obstacle_cut_confirmed=obstacle_cut_confirmed,
-                    obstacle_cut_type=obstacle_cut_type,
+                    obstacle_cut_type=obstacle_cut_type, obstacle_cut_yolo_seen=obstacle_cut_yolo_seen,
                     lavacon_push_active=lavacon_push_active, lavacon_push_px=lavacon_push_px,
-                    bev_far_mode=bev_far_mode,
                 )
                 debug_img = self._slide.vis
             except Exception as e:

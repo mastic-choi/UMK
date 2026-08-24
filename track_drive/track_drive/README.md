@@ -501,6 +501,40 @@ obstacle_cut_active와 무관하게 부스트 중이면 적용됨 — 의도된 
 그 회귀를 고친 건지, 새 실험인지 근거가 없다. 커밋/UMK 반영 전에 실차로 직진·코너 둘 다
 재확인할 것.
 
+### 0.5.17 상태별 조향/BEV 튜닝 분리(`_new_tuning_active`) 되돌림 (2026-08-25)
+같은 날 먼저 들어갔던 변경(커밋 961d2c9) — `speed15` 프리셋을 9e59bbf(완주성공 커밋) 값으로
+되돌리고, 재튜닝값(`PP_LOOKAHEAD_BASE_PX`=220/`PP_WHEELBASE_PX`=33/`PP_LOOKAHEAD_CURVATURE_GAIN`
+=80/`PP_LOOKAHEAD_MIN_PX`=140/`PP_WHEELBASE_BOOST_GAIN_PER_DEG`=0.14)은 `PP_*_FINAL` 상수로
+분리해서 `self._new_tuning_active` 플래그가 True인 3구간(직진 신호 확정~B1 진입 전 / 좌회전
+램프 완료~다음 신호 / B3 통과~다음 신호)에서만 쓰고, 그 외(B1 관여·B2/B3 회피 포함)는
+speed15 기본값(=9e59bbf, BEV 원거리크롭 0.7m)을 쓰던 구조였다 — 요청 반영으로 이 구간별
+분리를 전부 되돌렸다.
+
+지금은 `PP_*_FINAL`/`DL_BEV_FAR_LIMIT_M_FINAL` 값(220/33/80/140/0.14, BEV 1.0m)을 `speed15`
+프리셋 하나로 다시 합쳐서, B1(라바콘) 이외 전 구간(B2/B3 포함)이 항상 이 값만 쓴다.
+`config.py`: `speed15` 딕셔너리 5개 값 갱신 + `DL_BEV_FAR_LIMIT_M_NORMAL=1.0`(단일값) +
+`PP_*_FINAL` 상수 블록 삭제. `track_drive.py`: `self._new_tuning_active` 플래그와 6개
+set/reset 지점, `perc_lane()`의 `set_bev_mode()` 호출, `_lane_steer()`의 FINAL 분기 전부
+삭제. `perception/dl_lane.py`: `bev_far_mode` 파라미터/`set_bev_mode()`/
+`DL_BEV_FAR_CROP_ROW_FINAL` 삭제, 항상 `DL_BEV_FAR_CROP_ROW_NORMAL`(1.0m)만 씀. B1 전용
+`_LAVACON` 상수/`self.pure_pursuit_lavacon`은 완전히 별개라 이번 변경과 무관 — 안 건드림.
+실차 미검증 — 다음 주행에서 확인 예정.
+
+### 0.5.18 "차량 감지 시 lookahead 100px 고정" 로직 삭제 (2026-08-25)
+`avoid_hold`(§2.32) 새 트리거 시점에 `obstacle_type=='vehicle'`면 `PP_VEHICLE_LOOKAHEAD_FIX_SEC`
+(0.5초)간 `lookahead_px`를 `PP_VEHICLE_LOOKAHEAD_FIX_PX`(100.0)로 고정해 적응형 계산/저역통과를
+건너뛰던 로직(2026-08-21 도입, README 미기록)을 요청 반영으로 완전히 제거했다. 위 §0.5.15
+"da 근접 컷 진입 시 curvature 부스트"와는 별개 메커니즘 — 그건 lookahead의 코너감쇠 게인만
+일시적으로 세게 트는 것이고, 이건 lookahead 값 자체를 강제로 덮어쓰던 것이었다(이번엔 안
+건드린 §0.5.15는 그대로 살아있음).
+
+구현: `config.py`의 `PP_VEHICLE_LOOKAHEAD_FIX_PX`/`_SEC` 상수 삭제. `track_drive.py`의
+`self._pp_vehicle_lookahead_fix_until_t` 상태, `_update_avoid_hold()`의 트리거 지점(진입
+엣지에서 `obstacle_type=='vehicle'`면 세팅), `_lane_steer()`의 사용부(`vehicle_lookahead_fix`
+분기) 전부 삭제. `controller/pure_pursuit.py`의 `control()`에서도 이제 아무 호출부도 안 쓰는
+`lookahead_override_px` 파라미터와 `if/else` 고정-lookahead 분기를 걷어내고, 기존 적응형
+lookahead 계산(`probe_curvature` 기반 댐핑) 하나만 남겼다.
+
 ---
 
 ## 1. 신호등 (`MissionState.S0_SIGNAL` — 출발/교차로 공용) — 통합 4구 신호등

@@ -309,6 +309,12 @@ class TrackDriverNode(Node):
         self._vehicle_area_b3_cnt      = 0       # [2026-08-24] 면적게이트(_B3) 통과 연속 프레임 수 — YOLO_AREA_CONFIRM_FRAMES 참고
         self._obstacle_cut_trigger_cnt = 0       # (라이다 근접 AND YOLO(콘 또는 차량)) 연속확인 프레임 수(디바운스)
         self.obstacle_cut_trigger      = False   # 위 디바운스가 OBSTACLE_CUT_TRIGGER_FRAMES 넘겨 확정됐는지
+        # [2026-08-25, 요청 반영] YOLO 단독 신호(라이다 근접/디바운스/hold와 무관) — cone_seen
+        # 또는 vehicle_seen(면적게이트+YOLO_AREA_CONFIRM_FRAMES만 거침)이면 True. 실제 da
+        # 컷(obstacle_cut_active, 라이다 AND+트리거프레임+hold까지 거침)보다 먼저 켜진다 —
+        # dl_lane.py da 안전마진/밴드 최소픽셀수를 "컷이 뜨기 살짝 전부터" 완화하는 데 씀
+        # (perc_obstacle_cut_trigger() 참고).
+        self.obstacle_cut_yolo_seen    = False
         # [2026-08-20] 요청 반영 — 이 트리거를 B2(고정장애물=라바콘 1개)/B3(방해차량) 공용으로
         # 확장하면서 추가. 'fixed'(YOLO 콘 검출로 확정)/'vehicle'(YOLO 차량 검출로 확정) —
         # perc_obstacle_cut_trigger() 참고, run_behavior_fsm()의 Phase.OBSTACLE_ZONE 분기가
@@ -334,6 +340,7 @@ class TrackDriverNode(Node):
         # 별도 저장 — B3가 OBSTACLE_CUT_TRIGGER_X_MAX_M_VEHICLE(2.5m)로 확장된 뒤 디버그 뷰가
         # 여전히 B2 값(1.0m)만 표시/그리던 불일치를 없앤다.
         self._obstacle_cut_x_max       = OBSTACLE_CUT_TRIGGER_X_MAX_M
+        self._obstacle_cut_x_min       = OBSTACLE_CUT_TRIGGER_X_MIN_M  # [2026-08-25] 트리거 ROI 전방 하한(m), 위 x_max와 동일한 이유로 저장
         self._obstacle_cut_until_t     = 0.0     # 이 시각까지는 obstacle_cut_active=True 유지
         self.obstacle_cut_active       = False   # perc_lane()이 set_obstacle()로 DL 백엔드에 전달하는 최종 상태
         self._obstacle_cut_hold_start_t = 0.0    # 최소유지시간(OBSTACLE_CUT_HOLD_SEC_MIN) 판정 기준 시각
@@ -356,9 +363,6 @@ class TrackDriverNode(Node):
         # PP_CURVATURE_BOOST_GAIN으로 잠깐 올려두는 타이머 — 이 시각까지는 부스트 유지
         # (_update_obstacle_cut_hold()가 진입 엣지에서 세팅, _lane_steer()가 매틱 소비).
         self._pp_curvature_boost_until_t = 0.0
-        # avoid_hold 새 트리거(=da 마진 확장) 시점에 obstacle_type=='vehicle'면 세팅 —
-        # 이 시각까지 lookahead 고정(_update_avoid_hold()가 세팅, _lane_steer()가 소비).
-        self._pp_vehicle_lookahead_fix_until_t = 0.0
         # [2026-08-20] _debug_viz_obstacle_cut() BEV 패널용 — avoid_hold_debug의
         # _obstacle_front_all_x/y·_obstacle_cluster_x/y와 동일 패턴(매틱 갱신되는 라이브 값).
         # bg_*는 표시범위 안의 배경점 전부(회색), roi_*는 실제 트리거 ROI 안에 잡힌 점만(빨강).
@@ -419,8 +423,9 @@ class TrackDriverNode(Node):
         # ── 판단/제어 상태 ──
         self.mission_state  = START_STATE
         self.behavior_state = BehaviorState.B0_NORMAL
-        # [2026-08-24, 요청 반영] B2 대기 단독 테스트용 오버라이드(Phase.OBSTACLE_ZONE 시작)
-        # 원복 — 전체 바퀴/신호 흐름(S0_SIGNAL→B1→B2→B3) 검증으로 다시 전환.
+        # [2026-08-25, 요청 반영] 최종주행코드 확정 — Phase.OBSTACLE_ZONE(B2 개별 검증용
+        # 디버그 스타트)에서 Phase.LAVACON으로 원복. config.py START_STATE=S0_SIGNAL/
+        # TEST_FORCE_BEHAVIOR=False와 짝 — 정상 레이스 경로(S0_SIGNAL→S1→B1→B2→B3)로 시작.
         self.phase          = Phase.LAVACON
         # [2026-08-15] Phase.OBSTACLE_ZONE 통합(da_based_b2b3_proposal.md B안) —
         # B2/B3 각각 최소 한 번 완료됐는지 추적. 둘 다 True가 돼야 Phase.DONE으로
@@ -437,14 +442,6 @@ class TrackDriverNode(Node):
         # 지나야 B3 관련 판정을 켠다(_b3_armed() 참고). _b2_passed와 함께 매 바퀴/재무장
         # 시점에 리셋된다.
         self._b2_passed_t = 0.0
-        # [2026-08-25, 요청 반영] "새 튜닝(FINAL)" 구간 플래그 — True인 동안 _lane_steer()가
-        # self.pure_pursuit의 lookahead/wheelbase/부스트 게인을 PP_*_FINAL(config.py)로
-        # 덮어쓰고, perc_lane()이 dl_lane BEV 원거리 크롭도 DL_BEV_FAR_LIMIT_M_FINAL(1.0)로
-        # 바꾼다. ON: 직진신호 확정 직후 / 체크무늬 게이트 좌회전 램프 완료 직후 / B3 통과
-        # 확정 직후. OFF: B1 진입 트리거(_lavacon_engaged) 확정 순간 / 다음 신호등 확정 시점
-        # (매 바퀴·재무장 리셋과 동일 지점들). 그 외 구간(B1/B2/B3 관여 중)은 계속 False —
-        # self.pure_pursuit는 기본값(=9e59bbf 값)을 그대로 쓴다.
-        self._new_tuning_active = False
         # [2026-08-20] 요청 반영 — B2/B3 실제 처리를 da 근접 컷(obstacle_cut_active) 기반으로
         # 바꾸면서 추가. obstacle_cut_active 진입 순간 'B2'/'B3' 중 하나를 latch해뒀다가,
         # obstacle_cut_active가 다시 꺼지는 순간(탈출) 그 태그로 _mark_behavior_passed()를
@@ -885,21 +882,19 @@ class TrackDriverNode(Node):
         # 순간 고정값)을 넘긴다 — 매틱 갱신되는 self._obstacle_cut_y를 그대로 넘기면
         # 컷 방향이 회피 도중 좌우로 뒤집힐 수 있었다(위 self._obstacle_cut_y_locked
         # 주석 참고).
+        # [2026-08-25] yolo_seen(순수 YOLO 신호, obstacle_cut_active보다 먼저 켜짐)도
+        # 같이 넘긴다 — dl_lane.py da 안전마진/밴드 최소픽셀수 완화를 실제 컷보다 앞서
+        # 시작하기 위함(perc_obstacle_cut_trigger() 주석 참고).
         getattr(self.lane_detector, 'set_obstacle', lambda *_a, **_k: None)(
             self._obstacle_cut_y_locked if self.obstacle_cut_active else self._obstacle_cut_y,
-            self.obstacle_cut_active, self.obstacle_cut_type)
+            self.obstacle_cut_active, self.obstacle_cut_type,
+            yolo_seen=self.obstacle_cut_yolo_seen)
         # [2026-08-22] B1 콘 침범 push(_lavacon_steer_da_push()) 상태도 같이 넘긴다 —
         # set_obstacle()과 동일한 1틱 지연 허용(위 주석 참고). DA 디버그창 경로 색
         # (자홍/보라/주황, lane_util.py draw_path())과, 밀리기 전/후 두 경로를 나란히
         # 그리기 위한 실제 push량(px)에 쓰인다.
         getattr(self.lane_detector, 'set_lavacon_push', lambda *_a, **_k: None)(
             self._lavacon_push_active, self._lavacon_push_px)
-        # [2026-08-25, 요청 반영] BEV 원거리 크롭 모드 — self._new_tuning_active(위 PP_*_FINAL
-        #   전환과 동일 조건)일 때만 1.0m, 그 외 전 구간(B1 관여/B2/B3 회피 포함)은 0.7m로
-        #   9e59bbf와 동일하게 유지. B2/B3 컷의 먼 경계는 캔버스 끝을 그대로 쓰므로
-        #   (_clip_da_by_obstacle()), "새 튜닝" 구간이 아닌 이상 컷 범위도 옛 커밋과 동일.
-        getattr(self.lane_detector, 'set_bev_mode', lambda *_a, **_k: None)(
-            self._new_tuning_active)
 
         # hough_lane.py의 HoughLaneDetector를 사용하여 차선 인식 수행
         valid, offset, lookahead, lane_center, path, debug_img = self.lane_detector.detect(self.img_front)
@@ -1399,11 +1394,6 @@ class TrackDriverNode(Node):
                 self._avoid_hold_trigger_cause = (
                     'lidar' if (self.obstacle_front and self.obstacle_dist < AVOID_HOLD_TRIGGER_DIST_M)
                     else 'da_jump')
-                # da 마진 확장(avoid_hold)이 걸리는 이 시점이 실제 "차량 감지" 순간이다 —
-                # obstacle_cut_active(ENABLE_OBSTACLE_CUT+라이다근접+YOLO+디바운스)는 훨씬
-                # 늦게/드물게 걸려서 여기 걸어야 lookahead 고정이 실제로 동작한다.
-                if self.obstacle_type == 'vehicle':
-                    self._pp_vehicle_lookahead_fix_until_t = now + PP_VEHICLE_LOOKAHEAD_FIX_SEC
             self._avoid_hold_until_t = now + self.avoid_hold_hold_sec
 
         # ③ 조기 해제 판정용 상태 갱신 — obstacle_front가 True인 동안(=아직 가까움)은
@@ -1486,6 +1476,7 @@ class TrackDriverNode(Node):
         if not ENABLE_OBSTACLE_CUT or self.phase == Phase.LAVACON:
             self._obstacle_cut_trigger_cnt = 0
             self.obstacle_cut_trigger = False
+            self.obstacle_cut_yolo_seen = False
             return
 
         BODY_LO, BODY_HI = 215, 305   # perc_obstacle()/perc_lavacon_trigger()와 동일(차체 자기가림)
@@ -1493,6 +1484,7 @@ class TrackDriverNode(Node):
         if self.lidar_ranges is None:
             self._obstacle_cut_trigger_cnt = 0
             self.obstacle_cut_trigger = False
+            self.obstacle_cut_yolo_seen = False
             self._obstacle_cut_lidar_near = False
             self._obstacle_cut_bg_x = self._obstacle_cut_bg_y = np.array([])
             self._obstacle_cut_roi_x = self._obstacle_cut_roi_y = np.array([])
@@ -1522,9 +1514,13 @@ class TrackDriverNode(Node):
                   else OBSTACLE_CUT_TRIGGER_Y_HALF_M)
         x_max = (OBSTACLE_CUT_TRIGGER_X_MAX_M_VEHICLE if self._b3_armed()
                  else OBSTACLE_CUT_TRIGGER_X_MAX_M)
+        # [2026-08-25, 요청 반영] 전방 하한을 x>0.0(라이다 원점)에서 OBSTACLE_CUT_TRIGGER_X_MIN_M
+        # 만큼 뒤로 밀었다(아래만, 상한 x_max는 그대로) — B2/B3 공용.
+        x_min = OBSTACLE_CUT_TRIGGER_X_MIN_M
         self._obstacle_cut_y_half = y_half
         self._obstacle_cut_x_max = x_max
-        roi_mask = ((r > 0.0) & (x > 0.0) & (x < x_max)
+        self._obstacle_cut_x_min = x_min
+        roi_mask = ((r > 0.0) & (x > x_min) & (x < x_max)
                     & (np.abs(y) < y_half))
 
         lidar_near = bool(np.any(roi_mask))
@@ -1537,7 +1533,7 @@ class TrackDriverNode(Node):
         # [2026-08-20] _debug_viz_obstacle_cut() BEV 패널용 라이브 스냅샷 — ROI보다 조금
         # 넓게 잡아서(여백 없으면 박스 바로 밖 점이 왜 트리거 안 됐는지 안 보임) 배경으로
         # 같이 그린다. roi_mask 안쪽만 별도로 빼서 "실제로 트리거에 쓰인 점"을 구분.
-        disp_mask = ((r > 0.0) & (x > 0.0) & (x < x_max + 1.0)
+        disp_mask = ((r > 0.0) & (x > x_min - 0.2) & (x < x_max + 1.0)
                      & (np.abs(y) < y_half + 0.45))
         self._obstacle_cut_bg_x, self._obstacle_cut_bg_y = x[disp_mask], y[disp_mask]
         self._obstacle_cut_roi_x, self._obstacle_cut_roi_y = x[roi_mask], y[roi_mask]
@@ -1561,6 +1557,10 @@ class TrackDriverNode(Node):
                         and self.vehicle_max_box_area_cut >= YOLO_VEHICLE_MIN_BOX_AREA_PX_B3) if self.yolo_vehicle_cut_detector is not None else False
         self._vehicle_area_b3_cnt = self._vehicle_area_b3_cnt + 1 if vehicle_area_ok_now else 0
         vehicle_seen = self._vehicle_area_b3_cnt >= YOLO_AREA_CONFIRM_FRAMES
+        # [2026-08-25] 라이다 근접/좌우교차검증(veto)/hold와 무관한 "YOLO만 봤다" 신호 —
+        # 아래 veto 블록이 cone_seen/vehicle_seen을 취소하기 전 값을 스냅샷한다(순수 카메라
+        # 판단 유지 목적). dl_lane.py da 마진 완화 게이팅 전용, 실제 컷 여부와는 무관.
+        self.obstacle_cut_yolo_seen = cone_seen or vehicle_seen
         # [2026-08-21] 방해차량(vehicle) 오검출 방지 — 라이다/YOLO가 각각 판단한 좌우가
         # 일치할 때만 vehicle_seen을 신뢰한다. 라이다·카메라가 "이번 틱에 뭔가 있다"까지는
         # 둘 다 맞아도 서로 다른 위치(예: 라이다는 우측 근접 장애물, YOLO는 좌측 배경
@@ -1577,10 +1577,15 @@ class TrackDriverNode(Node):
         # 컷 방향이 YOLO 검출 방향을 따라가게 한다(set_obstacle()이 이 값을 그대로 씀,
         # perc_lane() 참고). veto는 이제 "YOLO가 가리키는 쪽엔 라이다 점이 아예 없다"는
         # 진짜 불일치일 때만 발동한다.
+        # [2026-08-25, 요청 반영] 위 교차검증을 B3(vehicle) 전용에서 B2(cone)까지 공용으로
+        # 확장 — yolo_cone.py에도 get_latest_side()가 생겼으므로(vehicle과 동일 계산)
+        # cone_seen일 때도 같은 방식으로 라이다/YOLO 좌우를 대조한다.
         self._obstacle_cut_lidar_side = self._obstacle_cut_yolo_side = None
         self._obstacle_cut_side_veto = False
-        if vehicle_seen and lidar_near and self.yolo_vehicle_cut_detector is not None:
-            yolo_side = self.yolo_vehicle_cut_detector.get_latest_side()
+        active_side_detector = (self.yolo_vehicle_cut_detector if vehicle_seen
+                                 else self.yolo_cone_detector if cone_seen else None)
+        if lidar_near and active_side_detector is not None:
+            yolo_side = active_side_detector.get_latest_side()
             lidar_side = 'L' if self._obstacle_cut_y > 0.0 else 'R'
             self._obstacle_cut_lidar_side, self._obstacle_cut_yolo_side = lidar_side, yolo_side
             if yolo_side is not None and yolo_side != lidar_side:
@@ -1591,7 +1596,10 @@ class TrackDriverNode(Node):
                     self._obstacle_cut_y = float(y[nearest_yolo_side])
                     self._obstacle_cut_lidar_side = yolo_side
                 else:
-                    vehicle_seen = False
+                    if vehicle_seen:
+                        vehicle_seen = False
+                    else:
+                        cone_seen = False
                     self._obstacle_cut_side_veto = True
         # 두 검출기 다 초기화 실패면(드묾) perc_lavacon_trigger()와 동일 원칙으로 라이다
         # 단독 판정으로 폴백(카메라 확인 자체를 생략, cam_confirmed=True).
@@ -2362,7 +2370,6 @@ class TrackDriverNode(Node):
             self._b2_passed = False   # [2026-08-15] Phase.OBSTACLE_ZONE 통합 — 완료 추적도 매 바퀴 리셋
             self._b2_passed_t = 0.0
             self._b3_passed = False
-            self._new_tuning_active = False  # [2026-08-25, 요청 반영] 새 바퀴 시작 — 새 튜닝 플래그도 리셋
             self._obscut_zone_tag = None  # [2026-08-20] da 근접 컷 기반 B2/B3 latch도 매 바퀴 리셋
 
     def run_mission_fsm(self):
@@ -2475,9 +2482,6 @@ class TrackDriverNode(Node):
         # 자체가 원천 차단된다.
         if not (TEST_DISABLE_INTERSECTION or time.time() < self._signal_reentry_cooldown_t):
             if self.signal_left_confirmed:
-                # [2026-08-25, 요청 반영] 다음 신호등을 확정지은 시점 — B3 통과/좌회전 램프
-                # 완료로 켜져 있었을 수 있는 "새 튜닝" 구간을 여기서 끈다.
-                self._new_tuning_active = False
                 self._change_state(MissionState.S0_SIGNAL)
                 self._s2_commit_dist = 0.0   # _change_state()가 진입 처리에서 None으로 리셋한 뒤 다시 세팅
                 self._s2_commit_dir  = 'left'
@@ -2488,10 +2492,6 @@ class TrackDriverNode(Node):
                 # (_signal_yolo_off는 이제 perc_signal()이 확정되는 순간 바로 세팅한다.)
                 self._behavior_enabled = True
                 self._signal_reentry_cooldown_t = time.time() + SIGNAL_REENTRY_COOLDOWN
-                # [2026-08-25, 요청 반영] 직진 신호 확정 직후 ~ B1 진입 트리거 전까지 "새 튜닝"
-                # 구간 시작 — run_behavior_fsm()의 Phase.LAVACON 분기가 _lavacon_engaged로
-                # 바뀌는 상승엣지에서 다시 끈다.
-                self._new_tuning_active = True
                 # [2026-08-24, 요청 반영] TEST_SIGNAL_LOOP 조건 제거 — B1/B2/B3 재무장을
                 # _update_lap()(IMU yaw 누적/정지선 기반 바퀴 완주)이 아니라 신호등 직진
                 # 확정 하나로 통일한다. 신호등을 다시 받는 것 자체가 "다음 구간 시작"이라는
@@ -2605,8 +2605,6 @@ class TrackDriverNode(Node):
                 self._lavacon_engaged = False
                 self._lavacon_empty_cnt = 0
                 self._lavacon_trigger_cnt = 0
-                # [2026-08-25, 요청 반영] 직진 신호와 동일하게 처리 — "새 튜닝" 구간도 동일하게 시작.
-                self._new_tuning_active = True
             return
 
         self.ctrl_angle, self.ctrl_speed = 0.0, SPEED_STOP
@@ -2679,10 +2677,6 @@ class TrackDriverNode(Node):
             # [2026-08-24] 지름길 출구 T자 강제 좌회전(config.py SHORTCUT_EXIT_DIST_M 참고) —
             #   이 램프(입구)가 끝나는 시점부터 출구까지 거리를 재기 시작한다.
             self._shortcut_exit_dist = 0.0
-            # [2026-08-25, 요청 반영] 좌회전 램프 완료 ~ 다음 신호등 확정 전까지 "새 튜닝"
-            # 구간 — 뒤이은 지름길 출구 킥(_do_shortcut_exit_kick())은 PP를 안 쓰는
-            # 오픈루프라 이 플래그와 무관하게 그대로 동작한다.
-            self._new_tuning_active = True
 
     # ── 지름길 출구 T자 강제 좌회전 (2026-08-24, config.py SHORTCUT_EXIT_DIST_M 주석 참고) ──
     #   T자 교차로엔 라이다 랜드마크도 정지선도 없어(사용자 실측 확인) 물리 트리거를 못 쓰고,
@@ -2748,11 +2742,6 @@ class TrackDriverNode(Node):
             was_engaged = self._lavacon_engaged
             if self.lavacon_trigger:
                 self._lavacon_engaged = True
-            if (not was_engaged) and self._lavacon_engaged:
-                # [2026-08-25, 요청 반영] B1 진입 트리거 확정 상승엣지 — "새 튜닝" 구간(직진
-                # 신호 확정 후 대기 구간) 종료. B1은 항상 _LAVACON 전용 고정 게인만 쓰므로
-                # 이 플래그와 무관하다.
-                self._new_tuning_active = False
             if LAVACON_KICK_ENABLED and (not was_engaged) and self._lavacon_engaged:
                 # [2026-08-23, 요청 반영] 진입 확정 상승엣지 — 여기서 딱 한 번만 걸린다
                 # (_lavacon_engaged가 True로 유지되는 동안엔 다시 안 걸림). 프레임수는
@@ -3143,28 +3132,16 @@ class TrackDriverNode(Node):
         # (_handle_lavacon() 등, near_obstacle=False 경로)에도 그대로 적용된다.
         # _update_obstacle_cut_hold()가 타이머만 세팅, 실제 반영은 여기서.
         now_t = time.time()
-        vehicle_lookahead_fix = now_t < self._pp_vehicle_lookahead_fix_until_t
-        # [2026-08-25, 요청 반영] "새 튜닝(FINAL)" 구간(self._new_tuning_active) 동안만
-        # lookahead_base_px/wheelbase_px/wheelbase_boost_gain_per_deg/lookahead_min_px를
-        # PP_*_FINAL(config.py)로 덮어쓴다 — 그 외엔 speed15 기본값(=9e59bbf와 동일)
-        # 그대로. B1 전용 self.pure_pursuit_lavacon은 별개 인스턴스라 영향 없음.
-        base_curvature_gain = (
-            PP_LOOKAHEAD_CURVATURE_GAIN_FINAL if self._new_tuning_active
-            else PP_LOOKAHEAD_CURVATURE_GAIN)
-        self.pure_pursuit.lookahead_base_px = (
-            PP_LOOKAHEAD_BASE_PX_FINAL if self._new_tuning_active else PP_LOOKAHEAD_BASE_PX)
-        self.pure_pursuit.wheelbase_px = (
-            PP_WHEELBASE_PX_FINAL if self._new_tuning_active else PP_WHEELBASE_PX)
-        self.pure_pursuit.lookahead_min_px = (
-            PP_LOOKAHEAD_MIN_PX_FINAL if self._new_tuning_active else PP_LOOKAHEAD_MIN_PX)
-        self.pure_pursuit.wheelbase_boost_gain_per_deg = (
-            PP_WHEELBASE_BOOST_GAIN_PER_DEG_FINAL if self._new_tuning_active
-            else PP_WHEELBASE_BOOST_GAIN_PER_DEG)
-        # lookahead를 고정하는 동안은 curvature 부스트를 겹쳐 걸지 않고 평상시 게인으로 둔다(요청 반영).
+        # [2026-08-25, 요청 반영] 상태별 구간 분리(_new_tuning_active/PP_*_FINAL) 되돌림 —
+        # B1(라바콘) 이외 전 구간(B2/B3 포함)이 speed15 프리셋 값을 항상 그대로 쓴다.
+        # B1 전용 self.pure_pursuit_lavacon은 별개 인스턴스라 영향 없음.
+        self.pure_pursuit.lookahead_base_px = PP_LOOKAHEAD_BASE_PX
+        self.pure_pursuit.wheelbase_px = PP_WHEELBASE_PX
+        self.pure_pursuit.lookahead_min_px = PP_LOOKAHEAD_MIN_PX
+        self.pure_pursuit.wheelbase_boost_gain_per_deg = PP_WHEELBASE_BOOST_GAIN_PER_DEG
         self.pure_pursuit.lookahead_curvature_gain = (
-            base_curvature_gain if vehicle_lookahead_fix
-            else PP_CURVATURE_BOOST_GAIN if now_t < self._pp_curvature_boost_until_t
-            else base_curvature_gain)
+            PP_CURVATURE_BOOST_GAIN if now_t < self._pp_curvature_boost_until_t
+            else PP_LOOKAHEAD_CURVATURE_GAIN)
         # [2026-08-24] B1(라바콘) 중엔 lookahead 상한을 PP_LOOKAHEAD_MAX_PX_LAVACON으로
         # 낮춘다 — SPEED_LAVACON_CAP 조건(2026-08-24b)과 동일하게 self._lavacon_engaged로
         # 좁혀 진짜 B1 구간에서만 적용(대기 구간은 일반 상한 유지).
@@ -3174,14 +3151,13 @@ class TrackDriverNode(Node):
             else PP_LOOKAHEAD_MAX_PX)
         return self.pure_pursuit.control(
             path, vehicle_xy, speed=self._speed_for_lookahead(),
-            imu_curvature_px=self._imu_curvature_px(), near_obstacle=near_obstacle,
-            lookahead_override_px=PP_VEHICLE_LOOKAHEAD_FIX_PX if vehicle_lookahead_fix else None)
+            imu_curvature_px=self._imu_curvature_px(), near_obstacle=near_obstacle)
 
     # [2026-08-24] B1(라바콘) 전용 조향 — self.pure_pursuit_lavacon(§ __init__, config.py
     #   _LAVACON 상수)만 쓴다. 위 _lane_steer()와 달리 근접 장애물 회피(near_obstacle),
-    #   차량감지 lookahead 고정(vehicle_lookahead_fix), obstacle_cut curvature 부스트처럼
-    #   B2/B3 상태에 좌우되는 "일반상태" 로직을 전혀 안 거친다 — 라바콘 조향이 그런 다른
-    #   구간의 타이머/상태에 영향받지 않고, 오직 이 함수에 넘어온 path/vehicle_xy와
+    #   obstacle_cut curvature 부스트처럼 B2/B3 상태에 좌우되는 "일반상태" 로직을 전혀 안
+    #   거친다 — 라바콘 조향이 그런 다른 구간의 타이머/상태에 영향받지 않고, 오직 이
+    #   함수에 넘어온 path/vehicle_xy와
     #   config.py의 고정된 _LAVACON 게인만으로 결정되게 하려는 목적(요청 반영). speed/IMU
     #   curvature는 실측 라이브 상태라 그대로 공유한다(_update_speed()가 S1과 동일 로직을
     #   쓰는 것과 같은 이유 — 튜닝 상수만 분리, 실측값까지 얼릴 이유는 없음).
@@ -3698,10 +3674,10 @@ class TrackDriverNode(Node):
              f'yolo detector({cam_stage}): {"OK" if cam_detector is not None else "FAILED->lidar-only"}'),
             ('── ★ 전 파라미터 실차 미검증 ★', (10, text_y0 + 140), UNMEASURED, 13,
              '-- ALL PARAMS UNMEASURED --'),
-            (f'TRIGGER X_MAX={self._obstacle_cut_x_max}m Y_HALF={self._obstacle_cut_y_half}m  '
+            (f'TRIGGER X_MIN={self._obstacle_cut_x_min}m X_MAX={self._obstacle_cut_x_max}m Y_HALF={self._obstacle_cut_y_half}m  '
              f'NEAR_M={OBSTACLE_CUT_NEAR_M}m  PRE_CUT_SPEED_CAP={SPEED_PRE_OBSTACLE_CAP}(감지 전만)',
              (10, text_y0 + 162), UNMEASURED, 12,
-             f'trigger_x={self._obstacle_cut_x_max} y_half={self._obstacle_cut_y_half} '
+             f'trigger_x_min={self._obstacle_cut_x_min} trigger_x={self._obstacle_cut_x_max} y_half={self._obstacle_cut_y_half} '
              f'near={OBSTACLE_CUT_NEAR_M} pre_cut_speed_cap={SPEED_PRE_OBSTACLE_CAP}(pre-detect only)'),
             # [2026-08-23] 요청 반영 — "박스 하나라도 찍히면 검출"이 아니라 "가장 큰 박스
             # 면적이 임계값 이상"으로 바뀐 검출조건을 실차에서 바로 보고 조정할 수 있게
@@ -3755,7 +3731,7 @@ class TrackDriverNode(Node):
         # 실제 트리거 박스(이번 틱 x_max x y_half) — "검증범위" 그 자체.
         # [2026-08-23r2] B3 단계면 self._obstacle_cut_x_max/_y_half가 이미 VEHICLE 전용값
         # (2.5m/0.75m)이라 박스도 자동으로 그만큼 넓게 그려진다(perc_obstacle_cut_trigger() 참고).
-        cv2.rectangle(bev, to_px(0.0, self._obstacle_cut_y_half),
+        cv2.rectangle(bev, to_px(self._obstacle_cut_x_min, self._obstacle_cut_y_half),
                       to_px(self._obstacle_cut_x_max, -self._obstacle_cut_y_half),
                       (0, 255, 255), 1)
 
@@ -4326,8 +4302,6 @@ class TrackDriverNode(Node):
             self._b2_passed_t = time.time()  # [2026-08-25, 요청 반영] _b3_armed()가 이 시각 기준으로 재는 시작점
         elif tag == 'B3':
             self._b3_passed = True
-            # [2026-08-25, 요청 반영] B3 통과 확정 직후 ~ 다음 신호등 확정 전까지 "새 튜닝" 구간.
-            self._new_tuning_active = True
         if self._b2_passed and self._b3_passed:
             self.phase = Phase.DONE
             # Phase.DONE 진입 즉시 신호등 재판독 시작 (예전엔 다음 바퀴 리셋 때까지 꺼져있었음)
