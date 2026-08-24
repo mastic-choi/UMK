@@ -2926,15 +2926,6 @@ class TrackDriverNode(Node):
         # 구간에서만 캡이 걸리게 한다.
         if self.phase == Phase.LAVACON and self._lavacon_engaged:
             target_speed = min(target_speed, SPEED_LAVACON_CAP)
-        # [2026-08-24] 지름길 출구 T자 근접 안전정지(config.py SHORTCUT_EXIT_WALL_STOP_M
-        # 주석 참고) — 거리 트리거(_shortcut_exit_dist)나 출구 램프(_shortcut_exit_ramp_active)
-        # 둘 중 하나가 활성인 동안만 켜진다. perc_obstacle()이 매틱 갱신하는 일반 전방
-        # 장애물 신호(obstacle_front/obstacle_dist)를 그대로 재사용 — 사람이든 벽이든
-        # 구분 없이 그냥 가까우면 선다. "언제 꺾을지"(거리 트리거) 판단과는 완전히 독립된
-        # 최후 안전판이라, 이 캡이 걸린다고 거리 누적/램프 시작 여부가 바뀌진 않는다.
-        if ((self._shortcut_exit_dist is not None or self._shortcut_exit_ramp_active)
-                and self.obstacle_front and self.obstacle_dist < SHORTCUT_EXIT_WALL_STOP_M):
-            target_speed = min(target_speed, SPEED_STOP)
         # [2026-08-18] avoid-hold 적용4(SPEED_AVOID_HOLD_BLOCKED 안전판) 삭제 — 실차 테스트에서
         # "속도 5 고정" 증상의 실제 원인으로 확인됨(README §2.43). TEST_DISABLE_B2_B3=True라
         # 실제 회피 기동(옆차선 이동)은 꺼져있는데 이 캡만 무관하게 계속 걸려서, 트리거를
@@ -4325,7 +4316,16 @@ class TrackDriverNode(Node):
         if DEBUG_VIZ_OBSTACLE_CUT:
             self._debug_viz_obstacle_cut()
 
-        if ENABLE_BEHAVIOR and self.mission_state == MissionState.S1_LANE_FOLLOW and self._behavior_enabled:
+        # [2026-08-24, 버그수정] `and not self._shortcut_exit_ramp_active` 추가 — 출구 램프는
+        # mission_state가 S1_LANE_FOLLOW인 채로 도는 강제 조향 구간이라(입구 램프와 달리
+        # S0_SIGNAL로 안 빠짐, _do_shortcut_exit_ramp_turn() 참고) 이 가드가 없으면 매틱
+        # run_behavior_fsm()/apply_behavior_override()가 계속 돌면서, 만에 하나 B1이
+        # (실제 콘 없이도 오검출로) 걸리면 apply_behavior_override()가 방금 _s1_lane_follow()
+        # 가 찍어둔 강제 좌회전 각도/속도를 그대로 덮어써버린다 — 하필 "벽 피하려고 강제로
+        # 꺾는" 그 순간에 조향이 다른 걸로 뺏기는 셈이라 위험도가 높다. 입구 램프는
+        # mission_state!=S1_LANE_FOLLOW라 이 조건에 이미 자동으로 안 걸려서 문제가 없었다.
+        if (ENABLE_BEHAVIOR and self.mission_state == MissionState.S1_LANE_FOLLOW
+                and self._behavior_enabled and not self._shortcut_exit_ramp_active):
             self.run_behavior_fsm()         #    Behavior 상태 결정
             self.apply_behavior_override()  #    필요 시 조향/속도 덮어쓰기
         else:
