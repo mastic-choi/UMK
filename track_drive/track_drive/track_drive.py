@@ -281,6 +281,18 @@ class TrackDriverNode(Node):
         self._checker_pillar_bev_img = None  # 최근 라이다 BEV 프레임(_draw_checker_pillar_bev()가 채움) — left_turn_debug 통합창이 그대로 재사용
         self._checker_ramp_dist = None  # None=램프 비활성, 아니면 트리거 이후 누적 이동거리(m) — _s2_commit_dist와 동일한 VESC 거리적분 패턴
         self._left_turn_last_done_t = None  # 좌회전 램프가 가장 최근에 "완료"된 time.time() — left_turn_debug 창의 "실행끝" 표시용(None=아직 한 번도 완료 안 됨)
+        # [2026-08-24] 지름길 출구 T자 강제 좌회전(config.py SHORTCUT_EXIT_DIST_M 주석 참고) —
+        #   입구 램프 완료 시점부터만 채워지는 별도 거리 추적. None=추적 안 함(입구 램프를 아직
+        #   안 거쳤거나 이미 출구 램프까지 끝난 상태), 숫자면 그 시점부터 누적 이동거리(m).
+        #   _checker_ramp_dist와 별개 변수인 이유: 저건 "지금 램프를 돌고 있는가", 이건 "램프를
+        #   시작하기 전 T자까지 얼마나 남았는가"라 동시에(램프 도는 동안엔 이 값 갱신 안 함)
+        #   서로 다른 걸 추적한다.
+        self._shortcut_exit_dist = None
+        # 출구 램프 실행 중 플래그 — True인 동안 _s1_lane_follow()가 일반 차선주행 대신
+        # _do_shortcut_exit_ramp_turn()으로 조향을 넘긴다(_s0_signal()이 self._checker_ramp_dist
+        # is not None으로 입구 램프를 감지하는 것과 동일한 역할, 다만 이쪽은 S0_SIGNAL이 아니라
+        # S1_LANE_FOLLOW 안에서 발동하므로 별도 bool 플래그로 뺐다).
+        self._shortcut_exit_ramp_active = False
         # [2-6 방해차량 트리거]
         self.vehicle_trigger       = False   # 라이다 디바운스 통과 → B3 진입 트리거
         self._vehicle_trigger_cnt  = 0       # 동시검출 연속 프레임 수(디바운스 카운터)
@@ -2362,6 +2374,17 @@ class TrackDriverNode(Node):
             self._s2_commit_dist = None
             self._s2_commit_dir  = None
             self._s2_commit_start_t = None
+            # [2026-08-24] 방어적 정리 — 지름길 출구 거리추적 중(_shortcut_exit_dist is not
+            # None) 뭔가 다른 이유로 S0_SIGNAL로 전환되면(정상 트랙에선 이 구간에 더 볼
+            # 신호등이 없어 일어날 일이 없다고 보지만) 그 값을 여기서 지워 다음 바퀴로
+            # 새는 걸 막는다 — 출구 램프 자체(_shortcut_exit_ramp_active)는 이 함수 진입
+            # 훨씬 전인 _s1_lane_follow() 맨 위에서 이미 최우선으로 가로채므로 여기까지
+            # 안 온다.
+            if self._shortcut_exit_dist is not None:
+                self.get_logger().warn(
+                    '지름길 출구 거리추적 중 예상 밖 S0_SIGNAL 전환 — 추적 취소',
+                    throttle_duration_sec=1.0)
+                self._shortcut_exit_dist = None
         # S1 진입 시 처리
         if new_state == MissionState.S1_LANE_FOLLOW:
             # [2026-08-20] S0_SIGNAL 통합 이후 이 state는 출발 때 1번 + 매 바퀴 교차로에서
@@ -2399,6 +2422,13 @@ class TrackDriverNode(Node):
             이미 "직진"이라고 확정했으니 물리적 분기까지 저속으로 기다릴 이유가 없고, 그냥
             S1을 유지한 채 Behavior만 재활성화해 다음 바퀴(라바콘부터)를 바로 준비한다.
         """
+        # [2026-08-24] 지름길 출구 T자 강제 좌회전 램프 실행 중이면 다른 모든 판단(신호
+        # 재확인, B1/B2/B3 가드 등)보다 최우선으로 이걸 돈다 — 위 signal_left_confirmed
+        # 처리를 함수 맨 앞으로 옮긴 것과 동일한 이유("최상위 조향, 다른 로직에 안 씹히게").
+        if self._shortcut_exit_ramp_active:
+            self._do_shortcut_exit_ramp_turn()
+            return
+
         # [2026-08-23q, 요청 반영] 신호 확정(특히 좌회전) 처리를 아래 B1_LAVACON/장애물회피
         # 조기 return보다 먼저 본다 — "최상위 조향, 다른 Behavior에 씹히지 않게". 원래는
         # 이 검사가 함수 맨 끝(_lane_drive() 이후)에 있어서, B1_LAVACON이 조향을 잡고 있거나
@@ -2449,6 +2479,23 @@ class TrackDriverNode(Node):
             return
 
         self._lane_drive()
+
+        # [2026-08-24] 지름길 출구 T자 강제 좌회전 — 입구 램프 완료 시점부터 시작된 거리
+        # 추적(self._shortcut_exit_dist, _do_checker_ramp_turn() 참고)을 여기서 누적한다.
+        # _s2_commit_dist(_s0_signal())와 동일하게 이번 틱 _lane_drive()가 갱신한
+        # self.ctrl_speed를 쓰기 위해 그 호출 "다음"에 둔다 — 먼저 하면 아직 갱신 안 된
+        # 직전 틱 속도로 적분된다.
+        if self._shortcut_exit_dist is not None:
+            if not self._vesc_live():
+                # VESC 실측이 죽으면 명령속도 기반 근사(_speed_mps_fallback() 내부 폴백)로
+                # 열화된다 — 거리기반 트리거라 조용히 부정확해질 수 있어 실차 로그로
+                # 바로 보이게 경고만 남긴다(디바운스: 1초에 한 번).
+                self.get_logger().warn(
+                    '지름길 출구 거리추적 중 VESC 실측 끊김 — 명령속도 근사로 폴백',
+                    throttle_duration_sec=1.0)
+            self._shortcut_exit_dist += self._speed_mps_fallback(self.ctrl_speed) * 0.05  # 20Hz 가정
+            if self._shortcut_exit_dist >= SHORTCUT_EXIT_DIST_M:
+                self._begin_shortcut_exit_ramp()
 
     # ── S0_SIGNAL: 4구 신호등 판단 — 출발선/교차로 공용 (정지 후 신호로 경로 판단) ──
     def _s0_signal(self):
@@ -2588,6 +2635,39 @@ class TrackDriverNode(Node):
             self._lavacon_empty_cnt = 0
             self._lavacon_trigger_cnt = 0
             self._change_state(MissionState.S1_LANE_FOLLOW)
+            # [2026-08-24] 지름길 출구 T자 강제 좌회전(config.py SHORTCUT_EXIT_DIST_M 참고) —
+            #   이 램프(입구)가 끝나는 시점부터 출구까지 거리를 재기 시작한다. 위에서 이미
+            #   Phase/B1~B3를 리셋해뒀지만, 출구 램프 자체는 그걸 다시 건드리지 않는다
+            #   (_do_shortcut_exit_ramp_turn() 참고) — 지름길을 빠져나오면 B1/B2/B3 없이
+            #   바로 결승선으로 이어지는 트랙이라(사용자 확인, 2026-08-24) 출구 쪽에서
+            #   Phase를 또 리셋할 이유가 없다.
+            self._shortcut_exit_dist = 0.0
+
+    # ── 지름길 출구 T자 강제 좌회전 (2026-08-24, config.py SHORTCUT_EXIT_DIST_M 주석 참고) ──
+    #   T자 교차로엔 라이다 랜드마크도 정지선도 없어(사용자 실측 확인) 물리 트리거를 못 쓰고,
+    #   da도 반시계방향 규칙을 모르니 T자에서 방향을 못 정한다 — 그래서 입구 램프 완료
+    #   시점부터 잰 거리(self._shortcut_exit_dist, _s1_lane_follow() 참고)로 강제 트리거한다.
+    #   조향 계산 자체는 입구와 완전히 대칭이라 _checker_turn_ramp_angle()을 그대로 재사용
+    #   (각도/거리/곡선 재튜닝 불필요) — 다만 완료 처리는 입구(_do_checker_ramp_turn())와
+    #   분리된 별도 함수다: 입구는 Phase를 LAVACON으로 리셋해 다음 구간의 B1을 다시 열지만,
+    #   출구 뒤엔 더 볼 Behavior가 없으므로(위 참고) Phase/B1~B3엔 전혀 손대지 않는다 —
+    #   여기서 리셋해버리면 이미 지나온 B1~B3 완료 기록이 지워지거나, 결승선 직전 구간에서
+    #   불필요하게 B1 콘 검출(YOLO 추론)이 다시 켜지는 부작용이 생긴다.
+    def _begin_shortcut_exit_ramp(self):
+        self._shortcut_exit_dist = None
+        self._shortcut_exit_ramp_active = True
+        self._checker_ramp_dist = 0.0  # 입구와 같은 누적변수 재사용 — 두 램프가 동시에 도는 경우가 없어 안전
+        self.get_logger().info(
+            f'지름길 출구 거리 도달({SHORTCUT_EXIT_DIST_M:.1f}m) — 강제 좌회전 램프 시작')
+
+    def _do_shortcut_exit_ramp_turn(self):
+        angle, done = self._checker_turn_ramp_angle(TURN_SPEED)
+        self.ctrl_angle = angle
+        self.ctrl_speed = TURN_SPEED
+        if done:
+            self._checker_ramp_dist = None
+            self._shortcut_exit_ramp_active = False
+            self.get_logger().info('지름길 출구 좌회전 램프 완료 — 일반 주행 복귀(Phase 변경 없음)')
 
     def _yaw_delta(self, start):
         """현재 yaw - start (−π~π wrap)"""
@@ -2846,6 +2926,15 @@ class TrackDriverNode(Node):
         # 구간에서만 캡이 걸리게 한다.
         if self.phase == Phase.LAVACON and self._lavacon_engaged:
             target_speed = min(target_speed, SPEED_LAVACON_CAP)
+        # [2026-08-24] 지름길 출구 T자 근접 안전정지(config.py SHORTCUT_EXIT_WALL_STOP_M
+        # 주석 참고) — 거리 트리거(_shortcut_exit_dist)나 출구 램프(_shortcut_exit_ramp_active)
+        # 둘 중 하나가 활성인 동안만 켜진다. perc_obstacle()이 매틱 갱신하는 일반 전방
+        # 장애물 신호(obstacle_front/obstacle_dist)를 그대로 재사용 — 사람이든 벽이든
+        # 구분 없이 그냥 가까우면 선다. "언제 꺾을지"(거리 트리거) 판단과는 완전히 독립된
+        # 최후 안전판이라, 이 캡이 걸린다고 거리 누적/램프 시작 여부가 바뀌진 않는다.
+        if ((self._shortcut_exit_dist is not None or self._shortcut_exit_ramp_active)
+                and self.obstacle_front and self.obstacle_dist < SHORTCUT_EXIT_WALL_STOP_M):
+            target_speed = min(target_speed, SPEED_STOP)
         # [2026-08-18] avoid-hold 적용4(SPEED_AVOID_HOLD_BLOCKED 안전판) 삭제 — 실차 테스트에서
         # "속도 5 고정" 증상의 실제 원인으로 확인됨(README §2.43). TEST_DISABLE_B2_B3=True라
         # 실제 회피 기동(옆차선 이동)은 꺼져있는데 이 캡만 무관하게 계속 걸려서, 트리거를
