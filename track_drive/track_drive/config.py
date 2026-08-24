@@ -285,12 +285,9 @@ DL_PIXELS_PER_METER = 200.0   # 설계값(실측 아님) — 목적 캔버스를
 #   값들은 그대로 두고 "이미 정확하게 아는 좌표계에서 먼 부분을 그냥 안 본다"는 크롭일
 #   뿐이라 스케일 왜곡이 없다. 반대로 이 숫자를 바꾼다고 카메라가 실제로 보는 물리적 거리가
 #   바뀌는 것도 아니다(그건 DL_BEV_SRC_PX_RAW 4점의 실측 재측정이 필요 — README §6.3 참고).
-#   1.0 → 0.7로 낮췄다가(§2.2 S자 커브 ll 두께 과다검출 대응), [2026-08-24] 속도 상향을
-#   위해 lookahead 물리 상한을 늘리려고 다시 0.7 → 1.0으로 되돌림(요청 반영) — 실차
-#   미검증, 특히 S자 커브에서 §2.2 문제(원거리 blur로 ll이 두껍게 과다검출)가 재현되는지
-#   DEBUG_VIZ_DL_LANE으로 반드시 재확인할 것. 재현되면 DL_LL_FG_THRESHOLD 상향 등으로
-#   대응하거나 이 값을 다시 낮출 것.
-DL_BEV_FAR_LIMIT_M = 1.0
+#   1.0 → 0.7로 낮춤(요청 반영) — 실차 미검증, DEBUG_VIZ_DL_LANE에서 크롭 경계가 원하는
+#   위치에 오는지 확인할 것.
+DL_BEV_FAR_LIMIT_M = 0.7
 
 # ── 세그멘테이션 결과에서 좌/우 차선 중심을 뽑을 관심영역 (원본 480행 기준 절대 픽셀, 실차 실측값) ──
 DL_ROI_Y0 = 250
@@ -425,7 +422,7 @@ DL_DA_BAND_ANCHOR_ALPHA = 0.35      # 밴드별 탐색창 중심 계산 시 "직
 #   cx를 vehicle_center_x 쪽으로 블렌드(_da_slice_centers_windowed() 참고). 실차 미검증 —
 #   비율/블렌드폭 둘 다 실측 필요.
 DL_DA_NEAR_WIDTH_MIN_RATIO = 0.7
-DL_DA_NEAR_WIDTH_BLEND_MAX = 0.7
+DL_DA_NEAR_WIDTH_BLEND_MAX = 0.5
 
 # [2026-08-18] DL_LL_SANITY_MIN_RATIO(ll sanity check) 삭제 — lane_valid/path_ok 모두
 #   da 중심점 유무로만 판정하도록 바꿈(perception/dl_lane.py 참고, ll 미사용 확정에 따른
@@ -1539,14 +1536,7 @@ DEBUG_VIZ_OBSTACLE_CUT = True    # [2026-08-22i] 요청 반영으로 껐다가, 
 #     (지금 켜둔 Phase.LAVACON/_b2_passed=_b3_passed=False B1 테스트 세팅 그대로 이어짐).
 #   - _s1_lane_follow()에서 signal_left_confirmed → S0_SIGNAL 커밋구간 →
 #     _begin_checker_ramp_turn()/_do_checker_ramp_turn()으로 좌회전 조향 램프 실행.
-START_STATE     = MissionState.S1_LANE_FOLLOW
-# [2026-08-24b, 요청 반영] 조향 튜닝(DL_BEV_FAR_LIMIT_M 1.0 확장 검증 포함) 동안 S0(신호
-#   대기)를 매번 안 타도 되게 S1 시작으로 임시 오버라이드. TEST_FORCE_BEHAVIOR는 그대로
-#   False로 둬서 self._behavior_enabled=False → behavior_state는 B0_NORMAL 고정(B1/B2/B3
-#   전부 비활성) — S1+B0 상태로만 주행. self.phase는 기본값 Phase.LAVACON 그대로라(behavior
-#   꺼져있어 실제로 안 쓰임) 별도 변경 불필요. 조향 튜닝 끝나면 반드시 S0_SIGNAL로 원복할
-#   것 — [[project_track_drive_test_start_b2_wait]]와 동일한 함정(원복 안 하면 이후 전체
-#   바퀴 검증에서 "다음 상태로 안 넘어간다"는 혼란 재현).
+START_STATE     = MissionState.S0_SIGNAL
 # [2026-08-24, 요청 반영] B2 대기 단독 테스트용 오버라이드(S1_LANE_FOLLOW 시작) 원복 —
 #   전체 바퀴/신호 흐름(S0_SIGNAL→B1→B2→B3) 검증으로 다시 전환. 아래 TEST_FORCE_BEHAVIOR,
 #   track_drive.py __init__의 phase=Phase.OBSTACLE_ZONE도 짝으로 원복.
@@ -1773,7 +1763,7 @@ LAVACON_STEER_MODE_DA_PUSH = True
 #   아이디어를 실차로 빠르게 테스트해보기 위한 스위치 — 효과 없거나 오히려 나쁘면
 #   LAVACON_KICK_ENABLED만 False로 되돌리면 이 블록 전체가 비활성화된다(실차 미검증).
 LAVACON_KICK_ENABLED    = True
-LAVACON_KICK_DURATION_S = 0.3    # 이 시간(초) 동안 고정 조향각 유지 — CONTROL_HZ(20Hz)로 환산해 프레임수로 씀
+LAVACON_KICK_DURATION_S = 0.2    # 이 시간(초) 동안 고정 조향각 유지 — CONTROL_HZ(20Hz)로 환산해 프레임수로 씀
                                   # [2026-08-23] 0.2 → 0.4 → 0.2 → 0.0 → 0.2(요청 반영)
 LAVACON_KICK_ANGLE_DEG  = -10.0  # 강제 조향각(도) — 부호규약은 ctrl_angle과 동일(우측 콘 쪽으로 짐작, 실차에서 방향 확인 필요)
                                   # [2026-08-23] -20.0 → -30.0 → 0.0 → -20.0(요청 반영)
@@ -1793,7 +1783,7 @@ LAVACON_KICK_ANGLE_DEG  = -10.0  # 강제 조향각(도) — 부호규약은 ctr
 #   복귀). push 세기 자체는 이 값과 별개로 LAVACON_PUSH_GAIN이 담당한다(아래).
 # [2026-08-22c] 좌우 비대칭 요청 반영 — 좌측만 0.3으로 확대, 우측은 기존 0.2 유지.
 LAVACON_PUSH_SAFETY_MARGIN_L_M = 0.35
-LAVACON_PUSH_SAFETY_MARGIN_R_M = 0.25
+LAVACON_PUSH_SAFETY_MARGIN_R_M = 0.23
 
 # [2026-08-22b] push량(push_m) 배율 — 안전마진(위 LAVACON_PUSH_SAFETY_MARGIN_M) 침범량에
 #   곱해 실제로 미는 세기를 정한다. margin을 넓힌 것과는 별개로 "밀리는 정도 자체"도
@@ -1822,6 +1812,8 @@ LAVACON_PUSH_GAIN = 1.35 #1.13
 LAVACON_PUSH_LON_MIN     = -0.1  # 차량(자차 마커) 기준 전방 0.3m(=라이다 원점 기준 -0.1m)부터
 LAVACON_PUSH_LON_MAX     = 0.25  # 이 거리보다 먼 콘은 아직 안 민다
 LAVACON_PUSH_LAT_LIMIT   = 1.0   # 횡방향 탐색 한계 — CONE_LAT_LIMIT(perc_lavacon.py)와 동일값으로 시작
+# [2026-08-24, 테스트] 좌측만 전방(LON_MAX) 0.1m 확장 — 우측(LAVACON_PUSH_LON_MAX)은 그대로.
+LAVACON_PUSH_LON_MAX_L   = LAVACON_PUSH_LON_MAX + 0.1
 
 # [2026-08-19] 박스 안 후보점의 좌/우 배정을 y부호(차량 헤딩 기준 고정 중앙선, y>0=좌/
 #   y<0=우) 대신 직전 박스의 같은 라인과의 최근접 연속성으로 할지 여부
@@ -1948,6 +1940,11 @@ YOLO_SIGNAL_STATE_CONF_THRESHOLD = 0.7 # 이 신뢰도 이상인 검출만 인�
 # 이 파일의 파싱 코드는 원래부터 그 형식 전제라 변경 없음).
 YOLO_SIGNAL_STATE_MODEL_PATH = None    # None이면 yolo_ros/signal_state_best_n.onnx(형제 디렉터리)를 자동으로 찾음(perception/yolo_signal_state.py 참고)
 YOLO_SIGNAL_STATE_CLASS_NAMES = ('red', 'green_straight', 'green_left')  # class id(0/1/2) 순서 — datasets/signal_state/classes.txt와 반드시 일치시킬 것
+# [2026-08-24] YOLO_CONE_MIN_BOX_AREA_PX_B1/_B2, YOLO_VEHICLE_MIN_BOX_AREA_PX_B3와 동일한
+#   목적/패턴 — 클래스별(red/green_straight/green_left) 최고신뢰도 박스의 면적(px², 640
+#   입력 스케일)이 이 값 초과일 때만 검출로 인정한다(yolo_signal_state.py detect() 참고).
+#   실차 실측 확정치(요청 반영, 클래스 구분 없이 단일값).
+YOLO_SIGNAL_MIN_BOX_AREA_PX = 1500.0
 
 SAFETY_DIST      = 5.0        # B2(고정장애물) 발동 거리(m)
 OVERTAKE_TRIGGER = 6.5        # B3(방해차량) 발동 거리(m)
@@ -2176,19 +2173,17 @@ PP_TUNE_PRESETS = {
         #   숫자만 다시 계산: 구 BASE_PX(110.38) + GAIN(3.01)*ANCHOR(12.0) = 146.50.
         #   즉 speed=SPEED_NORMAL(12)일 때 speed_lookahead_px는 여전히 146.5로 그리드서치
         #   원값과 동일 — PP_LOOKAHEAD_SPEED_ANCHOR를 12.0으로 같이 지정해야 이 등가성이 성립한다.
-        PP_LOOKAHEAD_BASE_PX=205, PP_LOOKAHEAD_SPEED_GAIN=3.01, PP_LOOKAHEAD_MAX_PX=265.4,
+        PP_LOOKAHEAD_BASE_PX=180, PP_LOOKAHEAD_SPEED_GAIN=3.01, PP_LOOKAHEAD_MAX_PX=265.4,
         PP_LOOKAHEAD_SPEED_ANCHOR=12.0,
-        PP_WHEELBASE_PX=45, PP_ALPHA=0.9, PP_LD_FLOOR_PX=120.19, PP_DX_DEADZONE_PX=7,
+        PP_WHEELBASE_PX=25, PP_ALPHA=0.9, PP_LD_FLOOR_PX=120.19, PP_DX_DEADZONE_PX=5,
 
-        PP_LOOKAHEAD_CURVATURE_GAIN=40, PP_LOOKAHEAD_MIN_PX=160,
+        PP_LOOKAHEAD_CURVATURE_GAIN=120, PP_LOOKAHEAD_MIN_PX=80,
         SPEED_CORNER_MIN=10.0, CORNER_SIGN_EMA_ALPHA=0.15, LANE_LOOKAHEAD_REF=220.0,
-        SPEED_CORNER_STEER_GAIN=0.30,
+        SPEED_CORNER_STEER_GAIN=0.50,
         SPEED_ACCEL_STEP=0.8, CORNER_HOLD_DECAY_LO=0.92, CORNER_HOLD_DECAY_HI=0.97,
         CORNER_MIN_RADIUS_PX=250.0, CORNER_MIN_SPEED_SCALE=0.35,
         PATH_EMA_ALPHA=0.7, DL_STABLE_FRAME_MIN=1, DL_STABLE_JUMP_MAX=37.44,
-        SPEED_NORMAL=12.0, #[과거 시점] 직진 잘한 상태 — 이후 코너 재튜닝(BASE_PX/WHEELBASE_PX/
-        # CURVATURE_GAIN/MIN_PX/STEER_GAIN 변경, README §2.62)으로 2026-08-24 실차 재검증 시
-        # 직진 불가로 회귀 확인. 코너는 개선됨 — 직진 회귀 원인 미분석, 다음 테스트에서 조사할 것.
+        SPEED_NORMAL=12.0, #직진 잘한 상태
         # [2026-08-19] 조향각 wheelbase 부스트(요청 반영) — "speed15 프리셋일 때만 적용"이라
         # 여기(=speed15 프리셋)에만 켜서(ENABLE=True) 넣는다. 다른 프리셋으로 바꾸면 이 키가
         # 아예 없어서 top-level 기본값(ENABLE=False)이 그대로 남아 자동으로 꺼진다.
@@ -2198,7 +2193,7 @@ PP_TUNE_PRESETS = {
         # 재조정했다 — 0.15를 문턱 없이 그대로 쓰면 (1.5-1)/0.15≈3.3°만 넘어도 MAX_SCALE에
         # 도달해 사실상 상시 최대 부스트가 걸린다(요청("미미할 땐 작게")과 어긋남). 순전히
         # 추정치, 실차에서 체감보고 재조정할 것.
-        PP_WHEELBASE_BOOST_ENABLE=True, PP_WHEELBASE_BOOST_GAIN_PER_DEG=0.15,
+        PP_WHEELBASE_BOOST_ENABLE=True, PP_WHEELBASE_BOOST_GAIN_PER_DEG=0.13,
         PP_WHEELBASE_BOOST_MAX_SCALE=2.75,
     ),
     'speed17_5': dict(
@@ -2257,3 +2252,37 @@ PP_TUNE_PRESETS = {
 PP_TUNE_ACTIVE_PRESET = 'speed15'   # None / 'speed3' / 'speed10' / 'speed12_5' / 'speed15' / 'speed17_5' / 'speed20' / 'speed22_5' / 'speed25'
 if PP_TUNE_ACTIVE_PRESET is not None:
     globals().update(PP_TUNE_PRESETS[PP_TUNE_ACTIVE_PRESET])
+
+# ── B1(라바콘) 전용 Pure Pursuit 상수 (2026-08-24) ──
+#   지금까지 라바콘 조향(_lavacon_steer_da_push())은 track_drive.py의 self.pure_pursuit
+#   하나를 일반 차선주행과 그대로 같이 썼다 — 즉 위 PP_TUNE_PRESETS['speed15']가 정한
+#   PP_LOOKAHEAD_BASE_PX/SPEED_GAIN/SPEED_ANCHOR/CURVATURE_GAIN/MIN_PX, PP_WHEELBASE_PX,
+#   PP_ALPHA, PP_LD_FLOOR_PX, PP_DX_DEADZONE_PX, PP_WHEELBASE_BOOST_* (그리고 이 프리셋
+#   밖의 전역 기본값인 ANGLE_MAX/PP_LOOKAHEAD_ALPHA)까지 전부 "지금 이 순간의" 값을
+#   그대로 물려받고 있었다 — 나중에 speed15 프리셋을 재튜닝하거나 다른 프리셋(speed20 등)
+#   으로 바꾸면 그 즉시 라바콘 조향도 같이 바뀌는 구조(요청 반영해 분리하기로 함).
+#   아래 _LAVACON 상수들은 오늘(2026-08-24) 기준 speed15 프리셋이 만들어낸 값을 그대로
+#   숫자로 박아넣은 스냅샷이다 — 위 프리셋을 갈아끼우거나 재튜닝해도 이 값들은 안 바뀌므로,
+#   track_drive.py가 이 상수들만 쓰는 전용 PurePursuitController를 라바콘 조향에 쓰면
+#   지금 실차 거동이 그대로 고정된다. 값 자체를 라바콘만 따로 재튜닝하고 싶으면 이
+#   블록만 수정할 것 — 위 프리셋과는 이제 완전히 무관.
+#   [2026-08-24, 요청 반영] PP_WHEELBASE_PX_LAVACON/PP_WHEELBASE_BOOST_GAIN_PER_DEG_LAVACON
+#   두 개만은 "지금" speed15 값(25 / 0.13) 대신 커밋 6840146(그 시점 speed15 프리셋,
+#   WHEELBASE=20/GAIN_PER_DEG=0.15) 기준으로 스냅샷했다 — 그 커밋과 지금 speed15 사이에
+#   실제로 값이 달랐던 두 항목이 이거라서, 라바콘 조향은 그 커밋 당시 거동을 기준으로 고정.
+PP_LOOKAHEAD_BASE_PX_LAVACON          = 180.0
+PP_LOOKAHEAD_SPEED_GAIN_LAVACON       = 3.01
+PP_LOOKAHEAD_SPEED_ANCHOR_LAVACON     = 12.0
+# PP_LOOKAHEAD_MAX_PX_LAVACON은 이미 위(§0.5.10 인근)에서 프리셋과 무관한 전용 상수로
+# 정의돼 있어(140.0) 그대로 재사용 — 여기서 다시 선언하지 않는다.
+PP_LOOKAHEAD_CURVATURE_GAIN_LAVACON   = 120.0
+PP_LOOKAHEAD_MIN_PX_LAVACON           = 80.0
+PP_LOOKAHEAD_ALPHA_LAVACON            = 1.0    # 전역 기본값(PP_LOOKAHEAD_ALPHA) 그대로 — speed15가 건드리지 않는 항목
+PP_WHEELBASE_PX_LAVACON               = 20.0
+PP_ALPHA_LAVACON                      = 0.9
+PP_LD_FLOOR_PX_LAVACON                = 120.19
+PP_DX_DEADZONE_PX_LAVACON             = 5.0
+PP_WHEELBASE_BOOST_ENABLE_LAVACON     = True
+PP_WHEELBASE_BOOST_GAIN_PER_DEG_LAVACON = 0.15
+PP_WHEELBASE_BOOST_MAX_SCALE_LAVACON  = 2.75
+ANGLE_MAX_LAVACON                     = 80.0   # 전역 기본값(ANGLE_MAX) 그대로 — 프리셋이 건드리지 않는 항목

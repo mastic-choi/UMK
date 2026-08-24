@@ -520,6 +520,30 @@ class TrackDriverNode(Node):
             lookahead_speed_anchor=PP_LOOKAHEAD_SPEED_ANCHOR,
         )
 
+        # [2026-08-24] B1(라바콘) 전용 Pure Pursuit 인스턴스 — 위 self.pure_pursuit(일반
+        # 차선주행용)와 완전히 분리된 별도 상태(prev_steer_deg/last_lookahead_px 등)를
+        # 갖는다. 게인도 전부 config.py의 _LAVACON 전용 상수(PP_TUNE_PRESETS 프리셋과
+        # 무관하게 고정된 스냅샷, config.py 해당 블록 주석 참고)에서만 가져오므로, 이후
+        # speed15 프리셋을 재튜닝하거나 다른 프리셋으로 바꿔도 라바콘 조향은 지금 거동
+        # 그대로 유지된다. _lavacon_pure_pursuit_steer()가 이 인스턴스를 사용한다.
+        self.pure_pursuit_lavacon = PurePursuitController(
+            lookahead_base_px=PP_LOOKAHEAD_BASE_PX_LAVACON,
+            lookahead_speed_gain=PP_LOOKAHEAD_SPEED_GAIN_LAVACON,
+            lookahead_max_px=PP_LOOKAHEAD_MAX_PX_LAVACON,
+            wheelbase_px=PP_WHEELBASE_PX_LAVACON,
+            angle_max_deg=ANGLE_MAX_LAVACON,
+            alpha=PP_ALPHA_LAVACON,
+            ld_floor_px=PP_LD_FLOOR_PX_LAVACON,
+            dx_deadzone_px=PP_DX_DEADZONE_PX_LAVACON,
+            lookahead_curvature_gain=PP_LOOKAHEAD_CURVATURE_GAIN_LAVACON,
+            lookahead_min_px=PP_LOOKAHEAD_MIN_PX_LAVACON,
+            wheelbase_boost_enable=PP_WHEELBASE_BOOST_ENABLE_LAVACON,
+            wheelbase_boost_gain_per_deg=PP_WHEELBASE_BOOST_GAIN_PER_DEG_LAVACON,
+            wheelbase_boost_max_scale=PP_WHEELBASE_BOOST_MAX_SCALE_LAVACON,
+            lookahead_alpha=PP_LOOKAHEAD_ALPHA_LAVACON,
+            lookahead_speed_anchor=PP_LOOKAHEAD_SPEED_ANCHOR_LAVACON,
+        )
+
         self.path = None
         self.grid = None
         self.goal = None
@@ -1892,9 +1916,12 @@ class TrackDriverNode(Node):
         (push_left_y, push_right_y, push_left_range, push_right_range,
          push_left_x, push_right_x) = nearest_cone_lateral(
             self.lidar_ranges, LAVACON_PUSH_LON_MIN, LAVACON_PUSH_LON_MAX, LAVACON_PUSH_LAT_LIMIT,
-            return_range=True)
-        cv2.rectangle(bev, to_px(LAVACON_PUSH_LON_MIN, LAVACON_PUSH_LAT_LIMIT),
+            return_range=True, lon_max_l=LAVACON_PUSH_LON_MAX_L)
+        cv2.rectangle(bev, to_px(LAVACON_PUSH_LON_MIN, 0.0),
                       to_px(LAVACON_PUSH_LON_MAX, -LAVACON_PUSH_LAT_LIMIT), (200, 0, 200), 1)
+        # [2026-08-24, 테스트] 좌측(y>0)만 LAVACON_PUSH_LON_MAX_L까지 별도 박스로 표시
+        cv2.rectangle(bev, to_px(LAVACON_PUSH_LON_MIN, LAVACON_PUSH_LAT_LIMIT),
+                      to_px(LAVACON_PUSH_LON_MAX_L, 0.0), (200, 0, 200), 1)
         cv2.putText(bev, 'PUSH ROI', to_px(LAVACON_PUSH_LON_MAX, LAVACON_PUSH_LAT_LIMIT),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 0, 200), 1, cv2.LINE_AA)
         # 안전마진 경계선(좌 LAVACON_PUSH_SAFETY_MARGIN_L_M / 우 _R_M) — 이 선보다 안쪽으로
@@ -2532,6 +2559,12 @@ class TrackDriverNode(Node):
     #   GHOST_POINT_*, 2026-08-22 작업기록 참고)으로 완화됐을 가능성이 있어 실차에서
     #   재확인할 것 — 다시 문제가 보이면 이 되돌림 대신 좌회전 직후에만 짧게 B1 감지를
     #   유예하는 방향으로 갈 것.
+    #   [2026-08-24] 요청 반영 — 위에서 우려했던 "짧게 B1 감지를 유예"를 실제로 적용했다.
+    #   단, S0_SIGNAL(정지 대기)로 돌아가진 않는다(그건 08-23q가 겪은 속도0 고정 재현) —
+    #   S1_LANE_FOLLOW+B0로 계속 달리면서 다음 신호등 직진 확정을 기다리고, 확정되는
+    #   순간에만 phase=LAVACON(B1)이 열린다(_s1_lane_follow() 상단 분기). 좌회전 직후
+    #   구간에 실제로 읽을 신호등이 없으면 이 바퀴 B1이 영원히 안 열린다 — 트랙에 신호등이
+    #   있는지 실차로 재확인할 것.
     def _begin_checker_ramp_turn(self):
         self._checker_ramp_dist = 0.0
         self.get_logger().info('체크무늬 게이트 통과 — 좌회전 램프 시작')
@@ -2541,21 +2574,19 @@ class TrackDriverNode(Node):
         self.ctrl_angle = angle
         self.ctrl_speed = TURN_SPEED
         if done:
-            self.get_logger().info('체크무늬 게이트 좌회전 램프 완료')
             self._checker_ramp_dist = None
             self._left_turn_last_done_t = time.time()  # left_turn_debug 창 "실행끝" 표시용
-            # 'straight' 커밋 완료(_s0_signal())와 동일하게 처리 — 좌회전도 별도 지름길
-            # state 없이 곧장 일반 차선주행으로 복귀하고, B1→B2→B3 Behavior를 다시 연다.
-            self._behavior_enabled = True
+            self._signal_yolo_off = False
+            self._signal_off_hold_cnt = None
             self._signal_reentry_cooldown_t = time.time() + SIGNAL_REENTRY_COOLDOWN
-            if TEST_SIGNAL_LOOP and self.phase == Phase.DONE:
-                # 격리 테스트 전용 — phase가 그대로 Phase.DONE이면(=이 좌회전이 신호 판단
-                # 테스트 대기 상태에서 시작된 것) "아까 상태"로 되돌아가는 것이므로, 다음
-                # 테스트를 위해 신호등 YOLO를 다시 켠다. 정상 레이스에선 이 리셋을
-                # _update_lap()(결승선 통과)만 담당해야 하므로 phase==LAVACON/
-                # OBSTACLE_ZONE(=실제 레이스 중 좌회전)일 땐 안 건드린다.
-                self._signal_yolo_off = False
-                self._signal_off_hold_cnt = None
+            self.get_logger().info('체크무늬 게이트 좌회전 램프 완료 — 곧장 B1 검출로 진입')
+            self._behavior_enabled = True
+            self.phase = Phase.LAVACON
+            self._b2_passed = False
+            self._b3_passed = False
+            self._lavacon_engaged = False
+            self._lavacon_empty_cnt = 0
+            self._lavacon_trigger_cnt = 0
             self._change_state(MissionState.S1_LANE_FOLLOW)
 
     def _yaw_delta(self, start):
@@ -3000,6 +3031,22 @@ class TrackDriverNode(Node):
             path, vehicle_xy, speed=self._speed_for_lookahead(),
             imu_curvature_px=self._imu_curvature_px(), near_obstacle=near_obstacle,
             lookahead_override_px=PP_VEHICLE_LOOKAHEAD_FIX_PX if vehicle_lookahead_fix else None)
+
+    # [2026-08-24] B1(라바콘) 전용 조향 — self.pure_pursuit_lavacon(§ __init__, config.py
+    #   _LAVACON 상수)만 쓴다. 위 _lane_steer()와 달리 근접 장애물 회피(near_obstacle),
+    #   차량감지 lookahead 고정(vehicle_lookahead_fix), obstacle_cut curvature 부스트처럼
+    #   B2/B3 상태에 좌우되는 "일반상태" 로직을 전혀 안 거친다 — 라바콘 조향이 그런 다른
+    #   구간의 타이머/상태에 영향받지 않고, 오직 이 함수에 넘어온 path/vehicle_xy와
+    #   config.py의 고정된 _LAVACON 게인만으로 결정되게 하려는 목적(요청 반영). speed/IMU
+    #   curvature는 실측 라이브 상태라 그대로 공유한다(_update_speed()가 S1과 동일 로직을
+    #   쓰는 것과 같은 이유 — 튜닝 상수만 분리, 실측값까지 얼릴 이유는 없음).
+    def _lavacon_pure_pursuit_steer(self, path, vehicle_x, vehicle_y_px=None):
+        if not path or vehicle_x is None:
+            return self.pure_pursuit_lavacon.prev_steer_deg
+        vehicle_xy = (vehicle_x, path[0][1] if vehicle_y_px is None else vehicle_y_px)
+        return self.pure_pursuit_lavacon.control(
+            path, vehicle_xy, speed=self._speed_for_lookahead(),
+            imu_curvature_px=self._imu_curvature_px())
 
     # [DEBUG_VIZ_STEER] 조향 컨트롤러가 이번 주기에 "새로 계산"했는지(초록/현재값 반영)
     # "직전 조향각을 그대로 유지"했는지(주황/직전값 유지)를 별도 창으로 바로 확인.
@@ -3866,7 +3913,7 @@ class TrackDriverNode(Node):
         """
         left_y, right_y = nearest_cone_lateral(
             self.lidar_ranges, LAVACON_PUSH_LON_MIN, LAVACON_PUSH_LON_MAX,
-            LAVACON_PUSH_LAT_LIMIT)
+            LAVACON_PUSH_LAT_LIMIT, lon_max_l=LAVACON_PUSH_LON_MAX_L)
         push_m = 0.0
         if left_y is not None and left_y < LAVACON_PUSH_SAFETY_MARGIN_L_M:
             push_m += LAVACON_PUSH_SAFETY_MARGIN_L_M - left_y        # 좌측 콘 침범 → 우측(+)으로
@@ -3891,7 +3938,7 @@ class TrackDriverNode(Node):
         if vehicle_x is None:
             vehicle_x = roi_w / 2.0
 
-        return self._lane_steer(path=shifted_path, vehicle_x=vehicle_x)
+        return self._lavacon_pure_pursuit_steer(path=shifted_path, vehicle_x=vehicle_x)
 
     # ── B2-고정장애물 회피 ──
     #   차선 2개 + 넘어도 되는 노란 중앙선 구조라, 방향은 '반대편 차선' 하나로 정해진다.
