@@ -211,7 +211,7 @@ PHYSICS_MODE = 'kinematic'   # 'kinematic'(기존) | 'st'(F1TENTH ST 동역학, 
 ST_PHYSICS_SUBSTEPS = 10
 
 ROI_W_PX = 585.0                            # README §2.35 실측: BEV 캔버스 실측폭
-ROI_DEPTH_M = cfg.DL_BEV_FAR_LIMIT_M        # 0.7 — 원거리 크롭 한계(전방 가시거리 근사)
+ROI_DEPTH_M = cfg.DL_BEV_FAR_LIMIT_M_NORMAL # [2026-08-24] S1(평소) 기준값으로 시뮬레이션 — 라바콘 전용 0.7은 여기선 안 씀
 ROI_H_PX = ROI_DEPTH_M * PX_PER_M           # 140px — roi_h 근사(정확한 BEV 기하 대신 근사, 주석 참고)
 
 N_WAYPOINTS = 12                            # lane_util.PATH_N_WAYPOINTS와 동일

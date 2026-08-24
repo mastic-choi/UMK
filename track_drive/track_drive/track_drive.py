@@ -727,6 +727,12 @@ class TrackDriverNode(Node):
             # 에서는 그대로 계속 켜둔다.
             return None if self._signal_yolo_off else 'signal'
         if self.mission_state == MissionState.S1_LANE_FOLLOW:
+            # [2026-08-25] 좌회전 진입 램프 완료 직후 _behavior_enabled=False(B0, 다음
+            # 신호 대기)인데 self.phase는 아직 리셋 전이라(_do_checker_ramp_turn() 참고)
+            # 아래 phase==LAVACON 분기가 그대로 걸려 cone YOLO가 신호 확정도 없이 켜지는
+            # 문제가 있었다 — Phase.DONE 분기와 동일하게 신호등 YOLO로 대체한다.
+            if not self._behavior_enabled:
+                return None if self._signal_yolo_off else 'signal'
             if self.phase == Phase.LAVACON:
                 # [2026-08-23] 진입 확정(_lavacon_engaged) 전까지는 진입 트리거 판정
                 # (perc_lavacon_trigger()의 cone_confirmed_cam)에 cone YOLO가 필요하지만,
@@ -874,6 +880,11 @@ class TrackDriverNode(Node):
         # 그리기 위한 실제 push량(px)에 쓰인다.
         getattr(self.lane_detector, 'set_lavacon_push', lambda *_a, **_k: None)(
             self._lavacon_push_active, self._lavacon_push_px)
+        # [2026-08-24, 테스트] BEV 원거리 크롭 모드 — B1_LAVACON일 때만 0.7m, 그 외(S1,
+        #   B2/B3 컷 중 포함) 전부 1.0m. B2/B3 컷의 먼 경계는 캔버스 끝을 그대로 쓰므로
+        #   (_clip_da_by_obstacle()), 캔버스가 길어지면 컷도 같이 길어진다 — 요청 반영.
+        getattr(self.lane_detector, 'set_bev_mode', lambda *_a, **_k: None)(
+            self.behavior_state == BehaviorState.B1_LAVACON)
 
         # hough_lane.py의 HoughLaneDetector를 사용하여 차선 인식 수행
         valid, offset, lookahead, lane_center, path, debug_img = self.lane_detector.detect(self.img_front)
@@ -896,7 +907,9 @@ class TrackDriverNode(Node):
         getattr(self.lane_detector, 'show_debug_windows', lambda *a, **k: None)(
             lookahead_xy, lookahead_px, self.ctrl_speed,
             steer_deg_raw=self.pure_pursuit.last_pre_boost_steer_deg,
-            steer_deg_final=self.pure_pursuit.prev_steer_deg)
+            steer_deg_final=self.pure_pursuit.prev_steer_deg,
+            entry_turn_active=self._checker_ramp_dist is not None,
+            exit_turn_active=self._shortcut_exit_kick_cnt > 0)
 
         # [2026-08-11] "재사용된 최신값"과 "완전히 안 갱신됨"을 구분 — DLLaneDetector가
         # 추론 1회 끝날 때마다 올리는 result_seq(dl_lane.py 참고)가 직전 틱에서 본 값과
@@ -2626,21 +2639,15 @@ class TrackDriverNode(Node):
             self._signal_yolo_off = False
             self._signal_off_hold_cnt = None
             self._signal_reentry_cooldown_t = time.time() + SIGNAL_REENTRY_COOLDOWN
-            self.get_logger().info('체크무늬 게이트 좌회전 램프 완료 — 곧장 B1 검출로 진입')
-            self._behavior_enabled = True
-            self.phase = Phase.LAVACON
-            self._b2_passed = False
-            self._b3_passed = False
-            self._lavacon_engaged = False
-            self._lavacon_empty_cnt = 0
-            self._lavacon_trigger_cnt = 0
+            self.get_logger().info('체크무늬 게이트 좌회전 램프 완료 — B0로 복귀, 다음 신호 대기')
+            # [2026-08-25] 요청 반영 — 곧장 B1을 열지 않는다. B0로 S1 유지하며 다음 신호등을
+            # 다시 읽어(_s1_lane_follow() 상단 분기) 직진 확정 시에만 phase=LAVACON+
+            # _behavior_enabled=True로 B1이 열리고, 좌회전 확정이면 그 분기가 다시 S0_SIGNAL
+            # 커밋 구간으로 보낸다.
+            self._behavior_enabled = False
             self._change_state(MissionState.S1_LANE_FOLLOW)
             # [2026-08-24] 지름길 출구 T자 강제 좌회전(config.py SHORTCUT_EXIT_DIST_M 참고) —
-            #   이 램프(입구)가 끝나는 시점부터 출구까지 거리를 재기 시작한다. 위에서 이미
-            #   Phase/B1~B3를 리셋해뒀지만, 출구 킥 자체는 그걸 다시 건드리지 않는다
-            #   (_do_shortcut_exit_kick() 참고) — 지름길을 빠져나오면 B1/B2/B3 없이
-            #   바로 결승선으로 이어지는 트랙이라(사용자 확인, 2026-08-24) 출구 쪽에서
-            #   Phase를 또 리셋할 이유가 없다.
+            #   이 램프(입구)가 끝나는 시점부터 출구까지 거리를 재기 시작한다.
             self._shortcut_exit_dist = 0.0
 
     # ── 지름길 출구 T자 강제 좌회전 (2026-08-24, config.py SHORTCUT_EXIT_DIST_M 주석 참고) ──
@@ -3511,6 +3518,13 @@ class TrackDriverNode(Node):
             return '신호등 판독 대기', (0, 200, 255), 'S0_SIGNAL: waiting for light'
         if ms == MissionState.S4_FINISH:
             return '주행 종료', (150, 150, 150), 'S4_FINISH'
+
+        # [2026-08-25] 좌회전 진입 램프 완료 직후엔 _behavior_enabled=False(B0)로 다음
+        # 신호를 기다리는데(_do_checker_ramp_turn() 참고), self.phase는 그대로 남아있어
+        # (아직 리셋 전) 아래 phase==LAVACON 분기가 B1로 오인 표시하는 문제가 있었다 —
+        # _behavior_enabled를 먼저 걸러 실제 B0 상태를 정확히 보여준다.
+        if not self._behavior_enabled:
+            return 'B0 — 다음 신호 대기 중', (0, 140, 255), 'B0 — waiting for next signal'
 
         if self.phase == Phase.LAVACON:
             engaged = self._lavacon_engaged

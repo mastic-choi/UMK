@@ -287,7 +287,11 @@ DL_PIXELS_PER_METER = 200.0   # 설계값(실측 아님) — 목적 캔버스를
 #   바뀌는 것도 아니다(그건 DL_BEV_SRC_PX_RAW 4점의 실측 재측정이 필요 — README §6.3 참고).
 #   1.0 → 0.7로 낮춤(요청 반영) — 실차 미검증, DEBUG_VIZ_DL_LANE에서 크롭 경계가 원하는
 #   위치에 오는지 확인할 것.
-DL_BEV_FAR_LIMIT_M = 0.7
+#   [2026-08-24, 테스트] B1_LAVACON과 그 외(S1 등) 상태에서 값을 분리 — 라바콘 구간은
+#   기존 0.7 그대로, 평소엔 더 멀리(1.0) 보게. dl_lane.py DLSlideWindow.detect()가
+#   behavior_state에 따라 둘 중 하나를 골라 쓴다. 1.0 쪽은 실차 미검증.
+DL_BEV_FAR_LIMIT_M_LAVACON = 0.7
+DL_BEV_FAR_LIMIT_M_NORMAL  = 1.0
 
 # ── 세그멘테이션 결과에서 좌/우 차선 중심을 뽑을 관심영역 (원본 480행 기준 절대 픽셀, 실차 실측값) ──
 DL_ROI_Y0 = 250
@@ -1037,8 +1041,8 @@ CHECKER_PILLAR_LIDAR_TIMEOUT_SEC = 5.0  # [안전장치] 좌회전 커밋 시작
 #   곡선이 된다(예전 'ease_in'=t² 는 시작은 완만했지만 t=1에서 END_ANGLE 고정값으로
 #   넘어가는 순간 기울기가 뚝 끊겨 저크가 있었음 — 이번에 대체).
 CHECKER_TURN_RAMP_START_ANGLE = 0
-CHECKER_TURN_RAMP_END_ANGLE   = -20.0   # [2026-08-23] 요청 반영: -30→-20 (완만하게)
-CHECKER_TURN_RAMP_DIST_M      = 2    # [2026-08-23] 요청 반영: 3.0→1.5 (짧게)
+CHECKER_TURN_RAMP_END_ANGLE   = -25.0   # [2026-08-25] 요청 반영: -20→-25
+CHECKER_TURN_RAMP_DIST_M      = 2.5    # [2026-08-23] 요청 반영: 3.0→1.5 (짧게)
 CHECKER_TURN_RAMP_CURVE       = 'smoothstep'  # 'linear' | 'smoothstep'
 
 # ── 지름길 출구 T자 교차로 — 거리 기반 강제 좌회전 (2026-08-24) ──
@@ -1054,7 +1058,7 @@ CHECKER_TURN_RAMP_CURVE       = 'smoothstep'  # 'linear' | 'smoothstep'
 #   직선거리라 순수 직선값만 쓰면 항상 "조금 이르게" 트리거된다는 걸 의미). 여기에 VESC
 #   적분 특유의 슬립/누적오차(코드베이스 관례상 늘 있는 오차원)까지 더해, 5.8m보다 여유를
 #   얹어 시작한다 — 실차에서 좌/우로 튜닝할 것.
-SHORTCUT_EXIT_DIST_M = 6.3
+SHORTCUT_EXIT_DIST_M = 5.5 # [2026-08-25] 요청 반영: 6.3→4.5
 # [2026-08-24] 근접 안전정지(obstacle_front/obstacle_dist 기반 SPEED_STOP 캡)는 도입했다가
 #   삭제했다(요청 반영) — 대회 규정상 코스 이탈/충돌 시 사람이 차량을 들어 코스 안으로
 #   복귀시키는 절차가 있어, 이 실패모드를 소프트웨어로 막을 필요가 없다는 판단. 거리
@@ -2202,11 +2206,11 @@ PP_TUNE_PRESETS = {
         #   숫자만 다시 계산: 구 BASE_PX(110.38) + GAIN(3.01)*ANCHOR(12.0) = 146.50.
         #   즉 speed=SPEED_NORMAL(12)일 때 speed_lookahead_px는 여전히 146.5로 그리드서치
         #   원값과 동일 — PP_LOOKAHEAD_SPEED_ANCHOR를 12.0으로 같이 지정해야 이 등가성이 성립한다.
-        PP_LOOKAHEAD_BASE_PX=180, PP_LOOKAHEAD_SPEED_GAIN=3.01, PP_LOOKAHEAD_MAX_PX=265.4,
+        PP_LOOKAHEAD_BASE_PX=220, PP_LOOKAHEAD_SPEED_GAIN=3.01, PP_LOOKAHEAD_MAX_PX=265.4,
         PP_LOOKAHEAD_SPEED_ANCHOR=12.0,
-        PP_WHEELBASE_PX=25, PP_ALPHA=0.9, PP_LD_FLOOR_PX=120.19, PP_DX_DEADZONE_PX=5,
+        PP_WHEELBASE_PX=33, PP_ALPHA=0.9, PP_LD_FLOOR_PX=120.19, PP_DX_DEADZONE_PX=5,
 
-        PP_LOOKAHEAD_CURVATURE_GAIN=120, PP_LOOKAHEAD_MIN_PX=80,
+        PP_LOOKAHEAD_CURVATURE_GAIN=80, PP_LOOKAHEAD_MIN_PX=80,
         SPEED_CORNER_MIN=10.0, CORNER_SIGN_EMA_ALPHA=0.15, LANE_LOOKAHEAD_REF=220.0,
         SPEED_CORNER_STEER_GAIN=0.50,
         SPEED_ACCEL_STEP=0.8, CORNER_HOLD_DECAY_LO=0.92, CORNER_HOLD_DECAY_HI=0.97,
@@ -2222,7 +2226,7 @@ PP_TUNE_PRESETS = {
         # 재조정했다 — 0.15를 문턱 없이 그대로 쓰면 (1.5-1)/0.15≈3.3°만 넘어도 MAX_SCALE에
         # 도달해 사실상 상시 최대 부스트가 걸린다(요청("미미할 땐 작게")과 어긋남). 순전히
         # 추정치, 실차에서 체감보고 재조정할 것.
-        PP_WHEELBASE_BOOST_ENABLE=True, PP_WHEELBASE_BOOST_GAIN_PER_DEG=0.13,
+        PP_WHEELBASE_BOOST_ENABLE=True, PP_WHEELBASE_BOOST_GAIN_PER_DEG=0.14,
         PP_WHEELBASE_BOOST_MAX_SCALE=2.75,
     ),
     'speed17_5': dict(
