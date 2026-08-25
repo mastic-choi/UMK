@@ -32,6 +32,7 @@ setup(
         'console_scripts': [
             'track_drive = track_drive.track_drive:main',
             'manual_drive_collector = track_drive.manual_drive_collector:main',
+            'xydrive = track_drive.xydrive:main',
         ],
     },
 )

@@ -2653,6 +2653,10 @@ class TrackDriverNode(Node):
     #   순간에만 phase=LAVACON(B1)이 열린다(_s1_lane_follow() 상단 분기). 좌회전 직후
     #   구간에 실제로 읽을 신호등이 없으면 이 바퀴 B1이 영원히 안 열린다 — 트랙에 신호등이
     #   있는지 실차로 재확인할 것.
+    #   [2026-08-25b, 요청 반영] 위 08-24 신호 대기를 되돌렸다 — 실차에서 confirm이 거의
+    #   안 채워져(SIG_CONFIRM_FRAMES) B0에 계속 묶이는 문제가 더 커서, 램프 완료 즉시
+    #   phase=LAVACON+B1 재무장으로 바꿨다(아래 함수 참고). 08-23q가 우려했던 B1 오발동은
+    #   유령 라이다 점 마스킹으로 완화됐다고 보고 감수한다.
     def _begin_checker_ramp_turn(self):
         self._checker_ramp_dist = 0.0
         self.get_logger().info('체크무늬 게이트 통과 — 좌회전 램프 시작')
@@ -2667,12 +2671,18 @@ class TrackDriverNode(Node):
             self._signal_yolo_off = False
             self._signal_off_hold_cnt = None
             self._signal_reentry_cooldown_t = time.time() + SIGNAL_REENTRY_COOLDOWN
-            self.get_logger().info('체크무늬 게이트 좌회전 램프 완료 — B0로 복귀, 다음 신호 대기')
-            # [2026-08-25] 요청 반영 — 곧장 B1을 열지 않는다. B0로 S1 유지하며 다음 신호등을
-            # 다시 읽어(_s1_lane_follow() 상단 분기) 직진 확정 시에만 phase=LAVACON+
-            # _behavior_enabled=True로 B1이 열리고, 좌회전 확정이면 그 분기가 다시 S0_SIGNAL
-            # 커밋 구간으로 보낸다.
-            self._behavior_enabled = False
+            self.get_logger().info('체크무늬 게이트 좌회전 램프 완료 — B1 즉시 재무장(신호 대기 생략)')
+            # [2026-08-25b, 요청 반영] 신호 재확인 대기(B0)를 없앴다 — YOLO 신호등 confirm이
+            # 실차에서 잘 안 채워져(SIG_CONFIRM_FRAMES 연속 프레임 확보 실패) B0에 계속
+            # 묶이는 문제가 있었고, 좌회전 직후 구간엔 어차피 다음에 읽을 신호등도 없다.
+            self._behavior_enabled = True
+            self.phase = Phase.LAVACON
+            self._b2_passed = False
+            self._b2_passed_t = 0.0
+            self._b3_passed = False
+            self._lavacon_engaged = False
+            self._lavacon_empty_cnt = 0
+            self._lavacon_trigger_cnt = 0
             self._change_state(MissionState.S1_LANE_FOLLOW)
             # [2026-08-24] 지름길 출구 T자 강제 좌회전(config.py SHORTCUT_EXIT_DIST_M 참고) —
             #   이 램프(입구)가 끝나는 시점부터 출구까지 거리를 재기 시작한다.
