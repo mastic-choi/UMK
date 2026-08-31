@@ -962,7 +962,7 @@ class DLSlideWindow(SlideWindow):
         return clipped, virtual_used
 
     def _clip_da_by_obstacle(self, da_mask, obstacle_y_m, confirmed, cut_type='none'):
-        """[2026-08-20] da 근접 컷(ENABLE_OBSTACLE_CUT) — `_clip_da_by_ll()`(위)의
+        """da 근접 컷(ENABLE_OBSTACLE_CUT) — `_clip_da_by_ll()`(위)의
         가상경계(②)와 `_apply_vehicle_margin()`에 이은 이 파일의 세 번째 "근거(픽셀)
         없이 강제로 da를 클리핑"하는 함수. 다만 여기서는 근거가 픽셀이 아니라
         라이다+YOLO로 확정된 외부 신호(`confirmed`)다.
@@ -1543,11 +1543,10 @@ class DLSlideWindow(SlideWindow):
         지역변수로 새로 시작한다(프레임 경계를 넘어 간격을 계산하면 밴드 인덱스가
         롤오버돼 음수 gap이 나옴).
 
-        [2026-08-10] 프레임 간 밴드별 앵커링도 추가했다(config.py
-        DL_LL_BAND_ANCHOR_ALPHA 주석 참고) — 기존엔 band 0(근거리)만 직전 프레임 전체
-        확정 lane_center(ref_x)에 앵커링되고 그 위 밴드는 전부 이번 프레임 안에서만
-        전파되던 방식이라, band 0 검출이 노이즈로 틀어지면 그 오차가 위 밴드까지
-        누적 전파됐다. self._ll_prev_band_left/right[i]에 밴드별로 "직전 프레임에 그
+        프레임 간 밴드별 앵커링(config.py DL_LL_BAND_ANCHOR_ALPHA 주석 참고) — band
+        0(근거리)만 직전 프레임 전체 확정 lane_center(ref_x)에 앵커링되고 그 위
+        밴드는 전부 이번 프레임 안에서만 전파되면, band 0 검출이 노이즈로 틀어질 때
+        그 오차가 위 밴드까지 누적 전파된다. self._ll_prev_band_left/right[i]에 밴드별로 "직전 프레임에 그
         밴드(같은 y위치)에서 실제로 찾은 위치"를 따로 기억해뒀다가, 이번 프레임 그
         밴드의 탐색창 중심을 (이번 프레임 내 전파값, 직전 프레임 그 밴드 값)의
         가중평균(DL_LL_BAND_ANCHOR_ALPHA)으로 잡는다 — 도로 곡률이 프레임 간
@@ -1563,9 +1562,9 @@ class DLSlideWindow(SlideWindow):
                  used[i]    : results[i]가 ll 기반으로 채택됐는지(양쪽/편측 무관, bool) — 디버그 시각화용
 
         알려진 한계:
-        - [2026-08-10 일부 완화] 속도예측+탐색창 확장을 추가했지만 둘 다 실차
-          미검증이다 — 급커브에서 창이 실제로 선을 놓치지 않고 따라가는지, 확장된
-          창이 오히려 옆 차선/반사광을 잘못 물지는 않는지 확인 필요.
+        - 속도예측+탐색창 확장 둘 다 실차 미검증이다 — 급커브에서 창이 실제로 선을
+          놓치지 않고 따라가는지, 확장된 창이 오히려 옆 차선/반사광을 잘못 물지는
+          않는지 확인 필요.
         - 편측 폴백(위 2번)이 여러 밴드 연속으로 이어지면, self._ll_half_width가 그 사이
           갱신되지 않아(양쪽 다 찾은 밴드에서만 갱신) 오래된 추정치를 계속 쓰게 된다 —
           실차 미검증, 편측 검출이 긴 구간에서 추정 중심이 실제와 얼마나 벌어지는지
@@ -1580,7 +1579,7 @@ class DLSlideWindow(SlideWindow):
         # 디버그 시각화용 — 밴드별 좌/우 탐색창 좌표 + 실제로 찾았는지(visualize()가
         # 사각형/색으로 그림). 알고리즘 자체엔 전혀 쓰이지 않는 부가 정보.
         self.ll_search_windows = []
-        # [2026-08-10] 디버그 시각화 전용 스냅샷 — 이번 프레임이 실제로 앵커로 쓴 "직전
+        # 디버그 시각화 전용 스냅샷 — 이번 프레임이 실제로 앵커로 쓴 "직전
         # 프레임 밴드별 위치"를 self._ll_prev_band_left/right가 이 루프 안에서 곧바로
         # 덮어써지기 전에 따로 떠둔다. visualize()가 이 스냅샷을 마젠타 점으로 찍어서
         # "이번 프레임이 어디를 앵커로 당겨졌는지"를 실제 검출 결과와 나란히 비교할 수
@@ -1694,23 +1693,17 @@ class DLSlideWindow(SlideWindow):
         """self.path(자홍색 경로, pure_pursuit이 그대로 쓰는 값) 갱신을 허용해도 되는지를
         lane_valid(근접 밴드 필수, offset/lane_center용)와 별도로 판단한다.
 
-        [2026-08-17n, README §2.36 후속] 원래는 lane_valid 하나로 self.path 갱신까지
-        같이 막았다(§2.36 "룩어헤드 점프" 크래시 수정) — 내부 self.path와 외부
-        track_drive.py의 self.lane_path가 서로 다른 조건으로 얼고 풀리면 그 틈에 내부만
-        몰래 흘러가다 한 틱에 점프하는 문제였다. 그런데 lane_valid는 근접 밴드
-        (near_center)가 반드시 있어야 하는데, 급커브 진입처럼 "근접만 일시적으로 안
-        보이고 원거리는 있는" 상황(실차 재현: 좌회전 진입에서 근접 밴드가 몇 초간
-        비어 그동안 경로 전체가 필요 이상으로 얼어붙음, 카카오톡 영상 2026-08-17
-        15:44)에서 원거리 정보를 아예 못 쓰게 만들어버린다는 게 뒤늦게 드러났다.
-
-        그래서 "경로 갱신 허용"은 근접 OR 원거리 둘 중 하나만 있어도(+ll sanity 통과)
-        허용하는 별도의 raw 신호로 만들고, 여기서 offset과 동일한 강도(stable_frame_min
-        연속 확인)로 디바운스한다 — 2026-08-10에 고쳤던 "밴드 판정이 프레임마다
-        흔들려 조향이 그 흔들림을 그대로 흡수하는" 문제가 되돌아오지 않게 하기 위함.
-        detect()가 이 디바운스된 값(self.path_ok)으로 내부 _update_path() 호출을
-        가드하고, DLLaneDetector._worker()가 그대로 읽어 밖으로 노출하면
+        self.path 갱신을 lane_valid(근접 밴드 필수)에 직접 걸면, 급커브 진입처럼
+        "근접만 일시적으로 안 보이고 원거리는 있는" 상황에서 원거리 정보를 아예 못
+        쓰게 돼 경로 전체가 필요 이상으로 얼어붙는다. 그래서 "경로 갱신 허용"은 근접
+        OR 원거리 둘 중 하나만 있어도(+ll sanity 통과) 허용하는 별도의 raw 신호로
+        만들고, 여기서 offset과 동일한 강도(stable_frame_min 연속 확인)로 디바운스한다
+        — 밴드 판정이 프레임마다 흔들려 조향이 그 흔들림을 그대로 흡수하는 문제를
+        막기 위함. detect()가 이 디바운스된 값(self.path_ok)으로 내부 _update_path()
+        호출을 가드하고, DLLaneDetector._worker()가 그대로 읽어 밖으로 노출하면
         track_drive.py도 같은 값으로 self.lane_path 갱신을 가드한다(perc_lane() 참고) —
-        내부/외부가 항상 같은 신호를 보므로 §2.36 크래시가 재발할 여지가 없다."""
+        내부/외부가 항상 같은 신호를 보므로 내부만 몰래 흘러가다 한 틱에 경로가
+        점프하는 문제가 생기지 않는다."""
         if self._path_ok_confirmed is None:
             self._path_ok_confirmed = path_ok_raw
             self._path_ok_pending = path_ok_raw
@@ -1729,7 +1722,7 @@ class DLSlideWindow(SlideWindow):
         return self._path_ok_confirmed
 
     def _debounce_path_reach_drop(self, reach_raw):
-        """[2026-08-25] "룩어헤드가 엄청 잠깐 짧게 코앞으로 튄다" 대응 — self.path가
+        """"룩어헤드가 엄청 잠깐 짧게 코앞으로 튄다" 대응 — self.path가
         지금 얼마나 멀리까지 보는지(reach = path[0].y - path[-1].y, px)가 한 프레임
         만에 PATH_REACH_DROP_MAX_PX 이상 줄면 일단 노이즈로 의심하고 즉시 반영하지
         않는다. path_ok_raw(_debounce_path_ok() 참고)는 near_center/far_center 중
@@ -1769,29 +1762,29 @@ class DLSlideWindow(SlideWindow):
                  da_prob, ll_prob — 위와 같은 (H,W) float32 foreground 확률(모델은 360행
                    고정이지만 TwinLiteNetEngine.infer_raw()가 이미 원본 크기로 업샘플링해서 줌)
                  yellow_mask — 위와 같은 (H,W) uint8 이진마스크(HSV 기반, da/ll과 무관)
-                 avoid_hold — [2026-08-14] True면 DL_DA_SKIP_LL_CLIP=True(평소 테스트 설정)를
-                   무시하고 _clip_da_by_ll()을 강제로 돌린다(§2.32, DL_CENTER_MODE='da' 전용
+                 avoid_hold — True면 DL_DA_SKIP_LL_CLIP=True(평소 테스트 설정)를
+                   무시하고 _clip_da_by_ll()을 강제로 돌린다(DL_CENTER_MODE='da' 전용
                    — 다른 모드는 이 인자와 무관하게 항상 클리핑 적용). track_drive.py의
-                   _update_avoid_hold()가 라이다 obstacle_front/dist(+da 연속성, 적용2)로
+                   _update_avoid_hold()가 라이다 obstacle_front/dist(+da 연속성)로
                    판단해 넘긴다.
-                 v_mps — [2026-08-17g] 현재 실측 속도(m/s). DL_CENTER_MODE='da'의
+                 v_mps — 현재 실측 속도(m/s). DL_CENTER_MODE='da'의
                    _apply_vehicle_margin()이 방해차량 "뒤" 방향 추가 마진 계산에만 쓴다
                    (config.py DL_DA_REAR_MARGIN_* 참고) — 그 외 로직에는 영향 없다.
-                 direction_hint — [2026-08-15] 적용3(avoid_hold_improvement_proposal.md).
-                   track_drive.py TargetPassing.choose_side()가 반환한 -1/0/+1(lane_offset과
-                   동일한 "우측+" 부호규약) — _clip_da_by_ll()의 실측/잔상이 전혀 없는
-                   최후수단(가상경계) 폴백에서만 기준점을 이 방향으로 살짝 기울이는 데 쓴다.
-                 obstacle_y_m, obstacle_cut_confirmed — [2026-08-20] da 근접 컷
+                 direction_hint — track_drive.py TargetPassing.choose_side()가 반환한
+                   -1/0/+1(lane_offset과 동일한 "우측+" 부호규약) — _clip_da_by_ll()의
+                   실측/잔상이 전혀 없는 최후수단(가상경계) 폴백에서만 기준점을 이
+                   방향으로 살짝 기울이는 데 쓴다.
+                 obstacle_y_m, obstacle_cut_confirmed — da 근접 컷
                    (_clip_da_by_obstacle(), ENABLE_OBSTACLE_CUT). track_drive.py의
                    perc_obstacle_cut_trigger()가 라이다 AND YOLO로 확정한 값을
                    set_obstacle()을 거쳐 넘겨준다. DL_CENTER_MODE=='da' 전용.
-                 obstacle_cut_type — [2026-08-23] 'fixed'(B2)/'vehicle'(B3)/'none'.
+                 obstacle_cut_type — 'fixed'(B2)/'vehicle'(B3)/'none'.
                    위와 동일하게 set_obstacle()을 거쳐 넘어오며, B2/B3 컷 좌우폭을
                    다르게 쓰는 데만 쓰인다(_clip_da_by_obstacle() 참고).
-                 lavacon_push_active — [2026-08-22] B1 콘 침범 push(_lavacon_steer_da_push())가
+                 lavacon_push_active — B1 콘 침범 push(_lavacon_steer_da_push())가
                    이번 틱에 실제로 경로를 밀었는지. set_lavacon_push()를 거쳐 넘어오며,
                    DA 클리핑엔 관여하지 않고 draw_path() 경로 색/이중 경로 표시에만 쓰인다.
-                 lavacon_push_px — [2026-08-22] 위와 같이 넘어오는 실제 push량(px, +면
+                 lavacon_push_px — 위와 같이 넘어오는 실제 push량(px, +면
                    우측). DA 클리핑엔 역시 관여하지 않고, draw_path()가 밀리기 전(보라)
                    원본과 밀린 뒤(주황) 경로를 나란히 그리는 데만 쓴다(게인 튜닝 참고용).
           출력 : lane_valid, offset, lookahead, lane_center, path — 기존 SlideWindow.calc_center()와
@@ -1811,7 +1804,7 @@ class DLSlideWindow(SlideWindow):
         yellow_roi = yellow_mask[y0:y1]
         vis_roi = raw_bgr[y0:y1]
 
-        # [2026-08-05] DL_USE_BEV=True면 여기서 원근왜곡을 제거한다 — da/ll은 이진화 전
+        # DL_USE_BEV=True면 여기서 원근왜곡을 제거한다 — da/ll은 이진화 전
         # (float 확률맵) 상태로 워프해야 경계가 계단처럼 뭉개지지 않는다. 이후의 이진화/
         # largest_component/clip_by_ll/slice_centers는 전부 마스크 shape만 보는 범용
         # 로직이라 좌표계가 원근이든 BEV든 그대로 재사용된다(self.roi_h/roi_w가 da_mask.shape
@@ -1821,7 +1814,7 @@ class DLSlideWindow(SlideWindow):
             da_roi = self._bev_warp(da_roi)
             yellow_roi = self._bev_warp(yellow_roi, nearest=True)
             vis_roi = self._bev_warp(vis_roi)
-            # [2026-08-06] 원거리 크롭 — 크롭 행보다 위(더 먼) 행은 버린다(config.py
+            # 원거리 크롭 — 크롭 행보다 위(더 먼) 행은 버린다(config.py
             # DL_BEV_FAR_LIMIT_M_NORMAL 주석 참고). 네 배열 전부 같은 행을 자르므로
             # 이후 좌표계는 계속 서로 일치한다.
             far_crop_row = DL_BEV_FAR_CROP_ROW_NORMAL
@@ -1837,7 +1830,7 @@ class DLSlideWindow(SlideWindow):
         ll_mask = (ll_roi >= DL_LL_FG_THRESHOLD).astype(np.uint8) * 255
         self.ll_coverage = float(np.count_nonzero(ll_mask)) / ll_mask.size if ll_mask.size else 0.0
 
-        # [2026-08-07] ll 잔상(decay) — _clip_da_by_ll() 전용 입력. 이번 프레임 ll이
+        # ll 잔상(decay) — _clip_da_by_ll() 전용 입력. 이번 프레임 ll이
         # 순간적으로 끊겨도(반사/모션블러 등) 직전까지 확실했던 픽셀을 감쇠 가중치로 몇
         # 프레임 더 "보이는 것"처럼 들고 있는다 — DL_LL_DECAY_ALPHA(매 프레임 곱해지는
         # 감쇠율)만큼 값이 줄다가 DL_LL_DECAY_MIN_VALUE 밑으로 내려가면 자연히 "안 보임"
@@ -1853,7 +1846,7 @@ class DLSlideWindow(SlideWindow):
         )
         ll_mask_for_clip = (self._ll_decay_mask >= DL_LL_DECAY_MIN_VALUE).astype(np.uint8) * 255
 
-        # [2026-08-07] ll 흰선/노란선 분리(_split_ll_by_yellow() 참고) — DL_CENTER_MODE='ll'
+        # ll 흰선/노란선 분리(_split_ll_by_yellow() 참고) — DL_CENTER_MODE='ll'
         # 전용 _ll_yellow_white_centers()(DL_LL_ALGO='yw')는 노란선/흰선을 각각 분리된
         # 마스크(ll_yellow_mask/ll_white_mask)로 따로 추적하고, _ll_slice_centers()
         # (DL_LL_ALGO='lr')는 흰선 마스크만 쓴다(중앙 노란 점선이 좌/우 트래킹에 안
@@ -1876,14 +1869,14 @@ class DLSlideWindow(SlideWindow):
         # 아래에서 클리핑 전/후 시험 호출을 하기 전에 미리 채워둔다. da_mask.shape는 이후
         # largest_component/clip을 거쳐도 안 바뀌므로 지금 확정해도 안전하다.
         self.roi_h, self.roi_w = da_mask.shape
-        # [2026-08-17] roi_w/2.0(캔버스 단순 절반) 대신 BEV 사다리꼴의 실제 기하로 구한
+        # roi_w/2.0(캔버스 단순 절반) 대신 BEV 사다리꼴의 실제 기하로 구한
         # 차량 중심(DL_BEV_VEHICLE_CENTER_X, 위 모듈 상단 주석 참고)을 쓴다. DL_USE_BEV=False면
         # 워프 자체가 없어 저 상수가 의미 없으므로 그때만 roi_w/2.0로 되돌아간다.
         self.vehicle_center_x = DL_BEV_VEHICLE_CENTER_X if DL_USE_BEV else self.roi_w / 2.0
         self.vis = vis_roi.copy()
         self.ll_mask_roi = ll_mask
 
-        # [2026-08-10] 세 모드가 이제 서로 완전히 다른 알고리즘이다(모듈 상단 주석,
+        # 세 모드는 서로 완전히 다른 알고리즘이다(모듈 상단 주석,
         # config.py DL_CENTER_MODE 주석 참고) — 'll_da'(corridor)만 완전히 별도 경로다.
         if DL_CENTER_MODE == 'll_da':
             # corridor는 "자기 차선 하나"를 전제로 한 largest-component/ll클리핑을
@@ -1920,7 +1913,7 @@ class DLSlideWindow(SlideWindow):
             # 확인됨).
             da_mask = self._largest_da_component(da_mask)
 
-            # [2026-08-15] avoid-hold 적용2(문제3 라이다 사각지대 보완, config.py
+            # avoid-hold 보조 신호(라이다 사각지대 보완, config.py
             # AVOID_HOLD_DA_AREA_JUMP_RATIO 주석) — da_chosen_area_px가 직전 프레임 대비
             # 급증했으면(=방금까지 뚫려있던 구멍이 갑자기 메워짐) "뭔가 방금 시야에서
             # 사라졌을 수 있다"는 보조 신호로 쓴다. track_drive.py _update_avoid_hold()가
@@ -1940,7 +1933,7 @@ class DLSlideWindow(SlideWindow):
             # ll_mask_for_clip(잔상 합성본)을 넘긴다 — 원본 ll_mask/ll_white_mask는
             # 아래 centerline 추출에만 쓴다.
             #
-            # [2026-08-06] 클리핑 결과가 fit 가능한 최소 밴드 수(DL_SLICE_FIT_MIN)에 못
+            # 클리핑 결과가 fit 가능한 최소 밴드 수(DL_SLICE_FIT_MIN)에 못
             # 미치면 클리핑을 버리고 클리핑 전 da로 되돌린다("차선책",
             # _largest_da_component()의 면적상한 폴백과 같은 원칙). S자 연속 커브에서
             # 원거리 ll이 DL_LL_FG_THRESHOLD를 올려도 여전히 두껍게 잡히면
@@ -1950,20 +1943,18 @@ class DLSlideWindow(SlideWindow):
             # 하는) da를 쓰는 편이 self.path가 무한정 얼어붙어 완전정지하는 것보다
             # 낫다는 판단. self.da_ll_clip_skipped로 표시해 visualize()가 구분 표시한다.
             ref_x = self._confirmed[3] if self._confirmed is not None else da_mask.shape[1] / 2.0
-            # [2026-08-13] DL_CENTER_MODE='da' + DL_DA_SKIP_LL_CLIP=True(config.py 주석
+            # DL_CENTER_MODE='da' + DL_DA_SKIP_LL_CLIP=True(config.py 주석
             # 참고) — "da 자체가 잘 검출된다" 가정하에 이 클리핑 단계를 아예 건너뛴다.
-            # 기존 "클리핑을 버리고 되돌린" 경우(da_ll_clip_skipped)와 화면상 표시가
+            # "클리핑을 버리고 되돌린" 경우(da_ll_clip_skipped)와 화면상 표시가
             # 같아지도록(청록 오버레이 + 클리핑 틱 없음) 같은 필드를 그대로 재사용한다 —
             # 이유는 다르지만("밴드 부족으로 버림" vs "테스트를 위해 애초에 안 함") 둘 다
             # "이번 프레임 da_mask는 클리핑 안 된 largest-component 그대로"라는 결과는
             # 동일하다.
-            # [2026-08-14] avoid_hold(§2.32)가 True면 위 스킵을 무시하고 클리핑을 강제
-            # 되살리던 예외였으나, [2026-08-17] da 단독 검출 테스트 중엔 노란선/ll을 완전히
-            # 무시하고 싶다는 요청으로 이 예외를 없앴다 — avoid_hold 중에도 항상 스킵.
-            # avoid_hold_active 자체(§2.32 유예 타이머)는 ENABLE_BEHAVIOR와 무관하게 계속
-            # 갱신되므로, 이 예외를 살려두면 라이다가 전방 장애물을 잡을 때마다 테스트 중에도
-            # 조용히 클리핑이 되살아나 "노란선 무시"가 깨졌었다. da 클리핑을 다시 켜고 싶으면
-            # DL_DA_SKIP_LL_CLIP=False로 되돌리거나(모든 프레임 클리핑 적용) 이 예외를 복원할 것.
+            # avoid_hold_active와 무관하게 항상 스킵한다 — avoid_hold_active(유예
+            # 타이머) 자체는 ENABLE_BEHAVIOR와 무관하게 계속 갱신되므로, 여기서 예외를
+            # 두면 라이다가 전방 장애물을 잡을 때마다 조용히 클리핑이 되살아나 "노란선
+            # 무시" 테스트 설정이 깨진다. da 클리핑을 다시 켜고 싶으면
+            # DL_DA_SKIP_LL_CLIP=False로 되돌릴 것(모든 프레임 클리핑 적용).
             if DL_CENTER_MODE == 'da' and DL_DA_SKIP_LL_CLIP:
                 self.da_ll_virtual_clip_used = False
                 self.da_ll_clip_skipped = True
@@ -1984,26 +1975,18 @@ class DLSlideWindow(SlideWindow):
                     self.da_clip_band_virtual = [None] * self.n_slices
 
             # 밴드별 중심점 — DL_CENTER_MODE='da'면 da 무게중심(_slice_centers(),
-            # cv2.moments)을 그대로 쓴다. [2026-08-10] 한때 좌우 경계 중점
-            # (_slice_edge_midpoints())으로 바꿔봤는데(갓길 등 여백이 비대칭일 때
-            # 무게중심이 그쪽으로 쏠리는 문제를 없애려는 목적), 실차 주행 결과 오히려
-            # 더 나빠졌다("S자로 좌우 왔다갔다") — 왼쪽/오른쪽 끝 열 딱 2개 값만 보다
-            # 보니, 세그멘테이션 노이즈로 마스크 가장자리에 픽셀 하나만 튀어도 경계가
-            # 그만큼 통째로 밀려서 매 프레임 크게 흔들렸던 것으로 보인다(README §2.12
-            # "알려진 한계"에 이미 이 위험을 적어뒀었음 — 실차에서 그대로 재현됨).
-            # 무게중심은 반대로 "여백 쏠림"이라는 자체 문제가 있지만(픽셀 밀도 가중
-            # 평균이라 비대칭 여백에 끌려감), 노이즈 픽셀 하나의 영향이 전체 평균에
-            # 희석되어 프레임 간 흔들림은 훨씬 적다 — 지금은 "쏠림이 있지만 안정적인"
-            # 쪽을 "안 쏠리지만 흔들리는" 쪽보다 우선한 것. 여백 쏠림 자체는
-            # ①시드/②연속성(위 _largest_da_component() 참고)이 어느 정도 완화해준다는
-            # 판단도 있다.
-            # [2026-08-12] 무보정 전체 밴드 폭 무게중심(_slice_centers())을 탐색창
-            # 버전(_da_slice_centers_windowed())으로 교체 — S자 커브에서 da가 과검출돼도
-            # (§2.1/§2.2, §2.16에서 면적 상한 자체를 없앤 뒤로는 더욱) 창 밖 픽셀은
-            # 애초에 무게중심 계산에 안 들어가게 한다. 무게중심(moments) 자체는 그대로
-            # 쓴다 — 위에서 이미 "여백 쏠림보다 안정성 우선"이라고 정리한 결론은 바뀌지
-            # 않았고, 이번 변경은 "그 무게중심을 볼 범위를 예측 위치 근방으로 좁힌다"는
-            # 별개의 축이다(README §2.27).
+            # cv2.moments)을 그대로 쓴다. 무게중심은 여백이 비대칭이면 그쪽으로
+            # 쏠리는 자체적인 문제가 있지만(픽셀 밀도 가중평균이라 비대칭 여백에
+            # 끌려감), 노이즈 픽셀 하나의 영향이 전체 평균에 희석되어 프레임 간
+            # 흔들림은 적다. 대안으로 검토했던 좌우 경계 중점 방식은 왼쪽/오른쪽 끝
+            # 열 딱 2개 값만 보므로 세그멘테이션 노이즈로 가장자리 픽셀 하나만 튀어도
+            # 경계가 통째로 밀려 매 프레임 크게 흔들리는 문제가 실차에서 확인돼,
+            # "쏠림이 있지만 안정적인" 무게중심 쪽을 우선했다. 여백 쏠림 자체는
+            # ①시드/②연속성(위 _largest_da_component() 참고)이 어느 정도 완화해준다.
+            # 실제로 무게중심을 계산할 땐 전체 밴드 폭이 아니라 탐색창 버전
+            # (_da_slice_centers_windowed())을 쓴다 — S자 커브에서 da가 과검출돼도
+            # 창 밖 픽셀은 애초에 무게중심 계산에 안 들어가게 한다. 무게중심(moments)
+            # 자체는 그대로 쓰고, 그 계산 범위를 예측 위치 근방으로 좁히는 것만 다르다.
             # 'll'이면 DL_LL_ALGO로 실제 추적 알고리즘을 고른다(둘 다 da 폴백 없음 —
             # 모듈 상단/config.py DL_CENTER_MODE/DL_LL_ALGO 주석, README §2.19 참고).
             #   'yw'(main 기본) : 노란 중앙선 + 한쪽 흰색 경계선을 _ll_yellow_white_centers()로.
@@ -2023,17 +2006,17 @@ class DLSlideWindow(SlideWindow):
                     )
                     self.ll_band_reason = [None] * self.n_slices
             else:
-                # [2026-08-20] da 근접 컷 — ll 클리핑 이후, 차폭 안전마진 침식 이전에
+                # da 근접 컷 — ll 클리핑 이후, 차폭 안전마진 침식 이전에
                 # 적용한다(_apply_vehicle_margin()이 그 위에 다시 침식을 걸어주므로 레이어
                 # 순서가 자연스럽게 쌓인다). ENABLE_OBSTACLE_CUT=False면 obstacle_cut_confirmed가
                 # 항상 False라 여기서 사실상 아무 일도 안 한다(그대로 반환).
                 da_mask = self._clip_da_by_obstacle(da_mask, obstacle_y_m, obstacle_cut_confirmed, obstacle_cut_type)
 
-                # [2026-08-14] 중심선 계산에만 안전마진을 적용한다 — self.da_mask_roi(아래,
+                # 중심선 계산에만 안전마진을 적용한다 — self.da_mask_roi(아래,
                 # 디버그 시각화용)는 침식 전 원본을 그대로 담아야 "da가 실제로 어디까지
                 # 검출됐는지"와 "마진 때문에 얼마나 물러났는지"를 구분해서 볼 수 있다.
-                # [2026-08-25, 요청 반영] obstacle_cut_confirmed(라이다 AND+디바운스+hold)
-                # 대신 obstacle_cut_yolo_seen(순수 YOLO, 컷보다 먼저 켜짐)으로 게이팅 —
+                # obstacle_cut_confirmed(라이다 AND+디바운스+hold) 대신
+                # obstacle_cut_yolo_seen(순수 YOLO, 컷보다 먼저 켜짐)으로 게이팅 —
                 # 실제 컷이 뜨기 전부터 da 마진/픽셀문턱을 미리 완화해둔다.
                 margined_da_mask = self._apply_vehicle_margin(da_mask, v_mps, obstacle_mode=obstacle_cut_yolo_seen)
                 da_min_px = DL_MIN_PIXELS_OBSTACLE if obstacle_cut_yolo_seen else self.min_pixels
@@ -2046,7 +2029,7 @@ class DLSlideWindow(SlideWindow):
                 self.ll_degraded = False
 
         self.da_mask_roi = da_mask
-        # [2026-08-19] da 모드에서만 근접 밴드를 이상치 검사에서 보호한다(①) —
+        # da 모드에서만 근접 밴드를 이상치 검사에서 보호한다(①) —
         # lane_util.py _reject_outliers() protect_indices 주석 참고. 'll'/'ll_da'는
         # 이 문제의 전제(회피 중 원거리 여러 밴드가 함께 휘는 것)와 무관해 기존과
         # 동일하게 전부 검사한다.
@@ -2054,7 +2037,7 @@ class DLSlideWindow(SlideWindow):
         self.centerline = self._reject_outliers(merged_centers, protect_indices=protect_near)
 
         if DL_CENTER_MODE == 'da':
-            # [2026-08-19] ②(2차 안전판) — ①을 통과하고도(진짜 순간 미검출 등) 근접
+            # ②(2차 안전판) — ①을 통과하고도(진짜 순간 미검출 등) 근접
             # 밴드가 비면, 마지막으로 실제 찾았던 위치(_da_prev_band_x[i], 못 찾은
             # 프레임엔 안 갱신되므로 자연히 "마지막 확인값"을 들고 있다)로
             # DL_NEAR_HOLD_MAX_FRAMES 프레임까지만 대신 채운다. 그 이상 넘기면 포기하고
@@ -2102,9 +2085,8 @@ class DLSlideWindow(SlideWindow):
         near_center = self._group_mean(self.centerline, self.near_slices, True)
         far_center = self._group_mean(self.centerline, self.far_slices, False)
 
-        # [2026-08-18] ll sanity check(ll_coverage >= DL_LL_SANITY_MIN_RATIO) 삭제 — ll(차선)을
-        # 더 이상 안 쓰기로 확정(요청 반영, SPEED_LL_DEGRADED 삭제와 같은 사유, README §2.42
-        # 참고). da 근접 중심점 유무만으로 판정한다.
+        # ll sanity check(ll_coverage >= DL_LL_SANITY_MIN_RATIO)는 안 쓴다 — ll(차선)을
+        # 더 이상 안 쓰기로 확정. da 근접 중심점 유무만으로 판정한다.
         lane_valid = near_center is not None
 
         offset = lookahead = 0.0
@@ -2120,31 +2102,25 @@ class DLSlideWindow(SlideWindow):
         # 마지막 값 유지" 원칙을 따른다. 유효할 때도 그대로 대입하지 않고 직전 경로와
         # EMA 블렌딩한다(lane_util.PATH_EMA_ALPHA 주석 참고) — 조향이 매 프레임 새로
         # 피팅된 경로에 과민하게 반응하는 걸 막기 위함.
-        # [2026-08-17][중대 버그 수정, §2.36] 원래 lane_valid(근접 밴드 필수)로 이 갱신을
-        # 가드했다 — fitted_path는 근접 없이 원거리만으로도 만들어지는데(2점 이상이면
-        # 충분) lane_valid는 그걸 몰라서, 내부 self.path가 외부 track_drive.py의
-        # self.lane_path(lane_valid로 얼림)와 다른 조건으로 계속 흘러가다 유효 판정이
-        # 복귀하는 순간 한 틱 만에 점프해 룩어헤드가 튀는 형태로 벽 충돌까지 재현됐었다
-        # (카카오톡 녹화, 2026-08-17 13:03) — 그래서 lane_valid로 가드했었다.
-        # [2026-08-17n 후속, §2.36 재발] 그런데 lane_valid를 그대로 쓰면 "근접만 일시
-        # 안 보이고 원거리는 있는" 상황(급커브 진입)에서 원거리 정보를 아예 못 써서
-        # 경로가 필요 이상으로 오래 얼어붙는 게 실차로 확인됐다(카카오톡 녹화,
-        # 2026-08-17 15:44 — 좌회전 진입에서 근접 밴드만 몇 초간 비었는데 경로 전체가
-        # 그동안 멈춤). self.path_ok(아래, _debounce_path_ok() 참고)는 근접 OR 원거리
-        # 둘 중 하나만 있어도 통과시키면서도 offset과 같은 강도로 디바운스해 예전
-        # 크래시 원인(내부/외부 조건 불일치)은 재발하지 않게 한다 — DLLaneDetector가
-        # 이 값을 그대로 밖으로 노출해 track_drive.py의 self.lane_path도 같은 값으로
-        # 가드한다(perc_lane() 참고), 이제 lane_valid는 offset/lane_center 전용이다.
-        # [2026-08-18] ll sanity check(ll_coverage >= DL_LL_SANITY_MIN_RATIO) 삭제 — ll을
-        # 더 이상 안 쓰기로 확정(위 lane_valid와 동일 사유, README §2.42 참고). near/far
-        # 중심점 조건만 남아 오히려 완화되는 방향(path가 얼어붙는 빈도가 줄어듦).
+        # 이 갱신은 lane_valid(근접 밴드 필수)가 아니라 self.path_ok(아래,
+        # _debounce_path_ok() 참고)로 가드한다 — fitted_path는 근접 없이 원거리만
+        # 있어도 만들어지는데(2점 이상이면 충분) lane_valid로 가드하면 그 경우를
+        # 몰라서 내부 self.path와 외부 track_drive.py의 self.lane_path가 서로 다른
+        # 조건으로 갈라져 흘러가다 유효 판정이 복귀하는 순간 한 틱 만에 점프해
+        # 룩어헤드가 튀는 문제가 있었다. self.path_ok는 근접 OR 원거리 둘 중 하나만
+        # 있어도 통과시키면서 offset과 같은 강도로 디바운스해 그 문제를 막고,
+        # DLLaneDetector가 이 값을 그대로 밖으로 노출해 track_drive.py의
+        # self.lane_path도 같은 값으로 가드한다(perc_lane() 참고) — lane_valid는
+        # offset/lane_center 전용이다. ll sanity check(ll_coverage >=
+        # DL_LL_SANITY_MIN_RATIO)는 안 쓴다 — near/far 중심점 조건만 남아 오히려
+        # 완화되는 방향(path가 얼어붙는 빈도가 줄어듦).
         path_ok_raw = (near_center is not None or far_center is not None)
         self.path_ok = self._debounce_path_ok(path_ok_raw)
 
         fitted_path = self._fit_and_sample_path(
             [c for c in self.centerline if c is not None]
         )
-        # [2026-08-25] reach 급감(한 프레임짜리 룩어헤드 튐) 가드 — config.py
+        # reach 급감(한 프레임짜리 룩어헤드 튐) 가드 — config.py
         # PATH_REACH_DROP_MAX_PX 주석/_debounce_path_reach_drop() 참고. fitted_path가
         # None이면(유효 슬라이스 2개 미만) reach를 정의할 수 없으니 기존과 동일하게
         # _update_path(None)에 맡겨 그대로 지나간다(내부에서 즉시 return).
@@ -2159,7 +2135,7 @@ class DLSlideWindow(SlideWindow):
             lane_valid, offset, lookahead, lane_center
         )
 
-        # [2026-08-10] 디버그 스파크라인용 — 실제로 조향에 쓰이는 디바운스 이후 최종
+        # 디버그 스파크라인용 — 실제로 조향에 쓰이는 디바운스 이후 최종
         # offset을 남긴다(디바운스 전 순간값이 아님 — 그건 조향에 안 쓰이므로 흔들림을
         # 봐도 실제 주행 흔들림과 무관할 수 있음).
         self._offset_history.append(offset)
@@ -2222,26 +2198,20 @@ class DLSlideWindow(SlideWindow):
                 overlay[self.ll_yellow_mask_roi > 0] = (0, 255, 255)   # 노란선
             cv2.addWeighted(overlay, 0.35, self.vis, 0.65, 0, dst=self.vis)
 
-            # [2026-08-20] da 근접 컷(_clip_da_by_obstacle(), ENABLE_OBSTACLE_CUT) — 실차
+            # da 근접 컷(_clip_da_by_obstacle(), ENABLE_OBSTACLE_CUT) — 실차
             # 주행 중 "지금 자르고 있는지"를 한눈에 보려는 목적으로, 반투명 채움 + 굵은
             # "CUT" 라벨을 실제 자른 열(px) 범위에 그린다. da_clip_band_virtual(①/② 틱,
             # ll 클리핑용)과는 별개 오버레이 — 근접 컷은 밴드 단위가 아니라 한 사각형이라
             # 별도로 그린다. 컷이 안 걸린 프레임에도(꺼짐/트리거 전) 좌상단에 "OBSTACLE
             # CUT: enabled/off" 한 줄은 항상 띄워, 기능 자체가 켜져 있는지부터 확인할 수
-            # 있게 한다.
-            # [2026-08-20 색 변경] 원래 마젠타였는데 draw_path()의 최종 경로(당시 항상
-            # 자홍색 고정)와 정확히 같은 색이라, 컷 영역 안을 지나는 경로선이 반투명
-            # 채움에 묻혀 안 보이는 문제가 있었다("way가 어떻게 찍히는지 안 보인다" 요청
-            # 반영) — 팔레트에서 안 쓰던 빨강으로 바꿔서 경로선이 항상 위에 또렷하게
-            # 보이게 했다. draw_path()가 이 함수보다 나중에 호출되므로(visualize() 흐름상
-            # 컷 사각형이 먼저 그려지고 경로가 그 위에 덧그려짐) 색만 구분되면 항상 경로가
-            # 컷 위에 보인다.
-            # [2026-08-22, 요청 반영] "지금 추종 중인 경로가 라이다 근접 판정으로 밀린
-            # 경로인지"를 이 창만 보고 바로 구분하고 싶다는 요청 — draw_path()
-            # (lane_util.py)가 self.obstacle_cut_active를 직접 보고, 밀린 프레임엔 경로
+            # 있게 한다. 컷 채움 색은 draw_path()의 최종 경로(자홍색)와 겹치지 않도록
+            # 빨강을 쓴다 — draw_path()가 이 함수보다 나중에 호출되므로(visualize()
+            # 흐름상 컷 사각형이 먼저 그려지고 경로가 그 위에 덧그려짐) 색만 구분되면
+            # 항상 경로가 컷 위에 또렷하게 보인다. "지금 추종 중인 경로가 라이다 근접
+            # 판정으로 밀린 경로인지"를 이 창만 보고 구분할 수 있도록, draw_path()
+            # (lane_util.py)가 self.obstacle_cut_active를 직접 보고 밀린 프레임엔 경로
             # 색을 자홍색 대신 주황(da_fallback_used와 같은 "차선책/정상아님" 계열 색)으로
-            # 바꿔 그린다. 컷 사각형(빨강)과는 색이 달라 위 문단의 가독성 수정과 계속
-            # 호환된다.
+            # 바꿔 그린다.
             cut_status = 'enabled(대기)' if ENABLE_OBSTACLE_CUT else 'off'
             cv2.putText(self.vis, f'OBSTACLE CUT: {cut_status}', (8, self.roi_h - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 200), 1, cv2.LINE_AA)
@@ -2273,7 +2243,7 @@ class DLSlideWindow(SlideWindow):
                         bx_i = int(np.clip(bx, 0, self.roi_w - 1))
                         cv2.line(self.vis, (bx_i, y_low), (bx_i, y_high), (255, 0, 255), 2)
 
-            # [2026-08-10] da/ll 클리핑(_clip_da_by_ll(), 'da'/'ll' 공통, 'll_da'=corridor는
+            # da/ll 클리핑(_clip_da_by_ll(), 'da'/'ll' 공통, 'll_da'=corridor는
             # 클리핑 자체를 안 해서 self.da_clip_band_virtual이 전부 None)이 밴드별로
             # ①(실측/잔상 ll)/②(가상경계)중 뭘 썼는지를 화면 왼쪽 끝 세로 띠에 작은 틱으로
             # 표시한다 — 초록=①(근거 있음), 주황=②(근거 없이 기대 차로폭으로 강제 클리핑,
@@ -2291,7 +2261,7 @@ class DLSlideWindow(SlideWindow):
                 color = (0, 140, 255) if is_virtual else (0, 220, 0)
                 cv2.rectangle(self.vis, (0, y_low), (5, max(y_high - 1, y_low)), color, -1)
 
-            # [2026-08-17] 위 왼쪽 끝 틱은 "①/②중 뭘 썼는지"만 보여주고 "실제로 몇 px가
+            # 위 왼쪽 끝 틱은 "①/②중 뭘 썼는지"만 보여주고 "실제로 몇 px가
             # 잘렸는지"는 안 보여준다 — avoid-hold ll클리핑 마진(DL_LL_CLIP_MARGIN_PX)/
             # 방향 힌트 바이어스(AVOID_HOLD_DIR_BIAS_PX)가 튜닝값대로 동작하는지 실차에서
             # 바로 확인할 수 있게, 밴드가 실제로 잘려나간 x좌표에 세로선을 그린다(틱과 같은
@@ -2315,7 +2285,7 @@ class DLSlideWindow(SlideWindow):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 140, 255), 1
                     )
 
-            # [2026-08-10 병합] 탐색창 시각화 — DL_LL_ALGO에 따라 self.ll_search_windows
+            # 탐색창 시각화 — DL_LL_ALGO에 따라 self.ll_search_windows
             # 튜플의 의미가 다르다(둘 다 8-tuple이지만 'lr'은
             # (y_low,y_high,lx0,lx1,lx,rx0,rx1,rx), 'yw'는
             # (y_low,y_high,yx0,yx1,yx,wx0,wx1,wx)) — 그려주는 로직도 완전히 분기한다.
@@ -2345,7 +2315,7 @@ class DLSlideWindow(SlideWindow):
                             cv2.FONT_HERSHEY_SIMPLEX, 0.35,
                             (0, 255, 0) if in_range else (0, 0, 255), 1
                         )
-                    # [2026-08-10] 밴드별 프레임 간 앵커링(DL_LL_BAND_ANCHOR_ALPHA) 디버그 —
+                    # 밴드별 프레임 간 앵커링(DL_LL_BAND_ANCHOR_ALPHA) 디버그 —
                     # 이번 프레임이 실제로 앵커로 끌어당긴 "직전 프레임 그 밴드 위치"를
                     # 마젠타 점으로 찍는다. 이 점이 이번 프레임 실제 검출(lx/rx, 사각형
                     # 중심 부근)과 많이 벌어져 있으면 앵커링이 오히려 창을 엉뚱한 쪽으로
@@ -2359,7 +2329,7 @@ class DLSlideWindow(SlideWindow):
                     if anchor_r is not None:
                         cv2.drawMarker(self.vis, (int(np.clip(anchor_r, 0, self.roi_w - 1)), y_c),
                                         (255, 0, 255), markerType=cv2.MARKER_SQUARE, markerSize=6, thickness=1)
-                    # [2026-08-10] 밴드별 채택 근거 태그 — 'B'=양쪽검출/채택, 'X'=양쪽검출됐지만
+                    # 밴드별 채택 근거 태그 — 'B'=양쪽검출/채택, 'X'=양쪽검출됐지만
                     # 폭(DL_LL_WIDTH_MIN~MAX_PX) 밖이라 거부, 'L'/'R'=편측만 검출(반대쪽은
                     # self._ll_half_width로 추정), '-'=양쪽 다 못 찾음. 왼쪽 사각형 바로
                     # 왼편에 붙여서, 색(초록/회색 테두리)만으론 안 보이던 "왜 이 색인지"를
@@ -2377,7 +2347,7 @@ class DLSlideWindow(SlideWindow):
             else:
                 # 노란선/흰선 탐색창(_ll_yellow_white_centers()가 이번 프레임에 훑은 범위)
                 # — 노란 창은 노란색, 흰 창은 흰색 테두리로 찾았을 때 표시하고, 못
-                # 찾았으면(창 안에 픽셀 부족) 회색으로 구분. [2026-08-10] 연속 미검출로
+                # 찾았으면(창 안에 픽셀 부족) 회색으로 구분. 연속 미검출로
                 # 그 사이드 반경이 기본값(DL_LL_SEARCH_HALF_WIDTH_PX)보다 넓어진 상태면
                 # ('lr' 모드와 동일한 표시 관례) 주황 테두리로 강조한다 — 특히 흰 창이
                 # 자주 주황으로 뜨면 급조향 복귀 구간에서 확장이 실제로 발동하고 있다는
@@ -2432,11 +2402,10 @@ class DLSlideWindow(SlideWindow):
             pt = (int(np.clip(cx, 0, self.roi_w - 1)), int(y))
             ll_used = i < len(self.ll_band_used) and self.ll_band_used[i]
             cv2.circle(self.vis, pt, 4, (255, 255, 255) if ll_used else (0, 140, 255), -1)
-            # [2026-08-24] 근접 밴드 폭편향 보정(모서리 사각지대) 적용된 밴드는 자홍색
-            # 링으로 표시 — TODO_da_near_band_bias.md.
+            # 근접 밴드 폭편향 보정(모서리 사각지대) 적용된 밴드는 자홍색 링으로 표시.
             if i < len(self.da_near_width_corrected) and self.da_near_width_corrected[i]:
                 cv2.circle(self.vis, pt, 8, (255, 0, 255), 2)
-            # [2026-08-10] "지금 SW가 3분기(2W/1W/LOST) 중 뭘로 주행중인지" 실차에서
+            # "지금 SW가 3분기(2W/1W/LOST) 중 뭘로 주행중인지" 실차에서
             # 바로 보이게, 밴드별 분기 태그(_ll_yellow_white_centers() 참고)를 점 옆에
             # 그린다. DL_CENTER_MODE='ll'&&DL_LL_ALGO='yw'에서만 의미 있는 값이라 그때만
             # 그린다('lr'로 돌 때는 detect()가 이 리스트를 전부 '?'로 리셋해두므로, 안
@@ -2448,15 +2417,15 @@ class DLSlideWindow(SlideWindow):
                 )
         self.draw_path(self.path)  # 피팅된 최종 경로(자홍색, obstacle_cut_active면 주황)
 
-        # [2026-08-17] 이 빨간 세로선은 단순 "화면 중앙"이 아니다 — track_drive.py
+        # 이 빨간 세로선은 단순 "화면 중앙"이 아니다 — track_drive.py
         # _lane_steer()가 pure_pursuit에 넘기는 vehicle_x 기본값(self.vehicle_center_x,
         # vehicle_x=0.0을 명시로 넘기는 라바콘 등 일부 예외 제외)과 정확히 같은 값이라, 이
         # 줄이 곧 "차량이 지금 자기 위치라고 믿는 x좌표" 그 자체다. 자홍색 경로(self.path)가
         # 이 줄에서 얼마나 벗어나 있는지가 pure_pursuit이 보는 실제 횡편차와 같다는 걸
         # 라벨로 명시해, "이게 그냥 화면 중앙 참고선"이라고 오해하지 않게 한다.
-        # [같은 날 후속 수정] vehicle_center_x는 더 이상 roi_w//2(캔버스 단순 절반)가
-        # 아니라 BEV 사다리꼴 실측 기하로 구한 실제 차량 중심이다(모듈 상단
-        # DL_BEV_VEHICLE_CENTER_X 주석 참고) — 그 값을 그대로 이 줄의 위치로 쓴다.
+        # vehicle_center_x는 roi_w//2(캔버스 단순 절반)가 아니라 BEV 사다리꼴 실측
+        # 기하로 구한 실제 차량 중심이다(모듈 상단 DL_BEV_VEHICLE_CENTER_X 주석 참고)
+        # — 그 값을 그대로 이 줄의 위치로 쓴다.
         vehicle_center_x_i = int(round(self.vehicle_center_x))
         cv2.line(self.vis, (vehicle_center_x_i, 0), (vehicle_center_x_i, self.roi_h), (0, 0, 255), 1)
         cv2.putText(
@@ -2492,7 +2461,7 @@ class DLSlideWindow(SlideWindow):
         elif DL_CENTER_MODE == 'll':
             yellow_band_count = sum(1 for c in self.yellow_band_centers if c is not None)
             if DL_LL_ALGO == 'lr':
-                # [2026-08-10] Lvel/Rvel(px/밴드) — _ll_slice_centers()가 추적하는 좌/우
+                # Lvel/Rvel(px/밴드) — _ll_slice_centers()가 추적하는 좌/우
                 # 속도 예측 EMA 실측값. 급커브 구간에서 이 값이 DL_LL_VELOCITY_MAX_PX
                 # 근처에 계속 붙어있으면 클램프가 실제 곡률을 못 따라간다는 뜻이니 그
                 # 값을 올릴 근거가 된다.
@@ -2510,7 +2479,7 @@ class DLSlideWindow(SlideWindow):
                     f'yellow_bands:{yellow_band_count}/{self.n_slices} '
                     f'gap:{self._white_yellow_gap_px:.0f}px side:{self.lane_side}'
                 )
-                # [2026-08-10] "지금 SW가 어느 분기로 주행중인지" 한눈에 보이게, 노란선
+                # "지금 SW가 어느 분기로 주행중인지" 한눈에 보이게, 노란선
                 # 없을 때의 3분기(케이스1=2W/케이스2=1W:L·1W:R/케이스3=LOST) + 기존
                 # 분기(Y+W/Y+gap) 밴드 수를 따로 한 줄 더 찍는다. 밴드별 태그는 위
                 # centerline 점 옆에도 그려지지만(개별 밴드 확인용), 이건 이번 프레임
@@ -2522,12 +2491,10 @@ class DLSlideWindow(SlideWindow):
         else:
             extra = f'll_bands:{ll_band_count}/{self.n_slices}'
 
-        # [2026-08-10] 지금 어느 DL_CENTER_MODE로 주행 중인지 한눈에 보이게 result 패널
-        # 맨 위에 색 배너를 깐다 — 기존엔 하단 텍스트 줄 안에 `mode:xx`로만 섞여 있어서
-        # 다른 정보 사이에서 놓치기 쉬웠다(da/ll/ll_da를 실차에서 A/B로 계속 바꿔가며
-        # 테스트할 예정이라 지금 뭘 보고 있는지 착각하면 튜닝값을 엉뚱한 모드에 반영하는
-        # 사고로 이어짐). 모든 다른 오버레이보다 나중에(맨 위에) 그려서 절대 안 가려지게
-        # 한다.
+        # 지금 어느 DL_CENTER_MODE로 주행 중인지 한눈에 보이게 result 패널
+        # 맨 위에 색 배너를 깐다 — da/ll/ll_da를 실차에서 A/B로 계속 바꿔가며 테스트할
+        # 예정이라, 지금 뭘 보고 있는지 착각하면 튜닝값을 엉뚱한 모드에 반영하는 사고로
+        # 이어진다. 모든 다른 오버레이보다 나중에(맨 위에) 그려서 절대 안 가려지게 한다.
         mode_color = DL_MODE_COLORS.get(DL_CENTER_MODE, DL_MODE_COLOR_DEFAULT)
         cv2.rectangle(self.vis, (0, 0), (self.roi_w - 1, 22), mode_color, -1)
         cv2.putText(
@@ -2540,28 +2507,24 @@ class DLSlideWindow(SlideWindow):
             f'mode:{DL_CENTER_MODE} {extra}{tags}',
             (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2
         )
-        # [2026-08-10 병합] DL_LL_ALGO='yw'일 때만 채워지는 밴드 분기 요약 — MODE 배너
-        # 도입으로 원래 (10,40)에 그리던 걸 위 상태 줄이 차지하게 돼서 그 아래(60)로
-        # 한 줄 밀었다(README §2.19).
+        # DL_LL_ALGO='yw'일 때만 채워지는 밴드 분기 요약 — MODE 배너가 (10,40)을
+        # 차지하므로 그 아래(60)에 한 줄로 그린다.
         if branch_summary_line is not None:
             cv2.putText(
                 self.vis, f'branch: {branch_summary_line}',
                 (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2
             )
 
-        # [2026-08-11] 예전엔 여기서 _build_params_panel()이 'dl_lane_params'라는 별도
-        # 창을 만들어 지금 DL_CENTER_MODE의 튜닝값(대부분 config 고정값, 일부만 런닝
-        # 추정치)을 텍스트로 늘어놓고 그 아래 offset 스파크라인을 붙였다 — 그런데 실차
-        # 테스트 중 매 프레임 봐야 하는 건 "차선이 흔들리고 있는가"(스파크라인)뿐이고
-        # 나머지 텍스트는 코드/config.py를 보면 알 수 있는 값이라 화면만 차지했다.
-        # 텍스트 목록은 통째로 지우고, 스파크라인만 'dl_lane' 창(result/da/ll/yellow
-        # vconcat) 맨 아래에 같이 붙이도록 show_debug_windows()로 넘긴다 — 폭은 그
+        # offset 스파크라인만 'dl_lane' 창(result/da/ll/yellow vconcat) 맨 아래에
+        # 붙이도록 show_debug_windows()로 넘긴다 — 실차 테스트 중 매 프레임 봐야 하는
+        # 건 "차선이 흔들리고 있는가"(스파크라인)뿐이고, 튜닝값 텍스트 목록은
+        # 코드/config.py를 보면 알 수 있어 화면만 차지하므로 넣지 않는다. 폭은 그
         # 패널들과 같은 self.vis.shape[1](= self.roi_w)로 맞춘다.
         self.offset_sparkline_img = self._build_offset_sparkline(self.vis.shape[1])
 
     def _build_offset_sparkline(self, width, height=70):
-        """[2026-08-10] 최근 self._offset_history(최대 DL_DEBUG_HISTORY_LEN프레임, 디바운스
-        이후 최종 offset)를 선 그래프로 그린다. README §2.12 "S자로 좌우 왔다갔다" 같은
+        """최근 self._offset_history(최대 DL_DEBUG_HISTORY_LEN프레임, 디바운스
+        이후 최종 offset)를 선 그래프로 그린다. "S자로 좌우 왔다갔다" 같은
         프레임 간 흔들림은 순간 텍스트 값만 봐서는 "지금 떨고 있다"는 걸 알아채기 어려운데,
         최근 값을 이어서 그리면 진폭이 그대로 보인다. y축 스케일은 고정하지 않고 이번
         창(window) 안의 |offset| 최댓값에 맞춰 자동으로 잡는다 — 고정 스케일이면 조용한
@@ -2608,59 +2571,59 @@ class DLLaneDetector:
         self.engine = TwinLiteNetEngine(model_path=model_path, providers=providers, logger=logger)
         self._slide = DLSlideWindow()
         self._logger = logger
-        # [2026-08-22] 'dl_lane' 창을 처음 띄울 때만 cv2.moveWindow로 위치를 잡기 위한
+        # 'dl_lane' 창을 처음 띄울 때만 cv2.moveWindow로 위치를 잡기 위한
         #   1회성 가드(DEBUG_WIN_POS_DL_LANE 참고, track_drive.py의 같은 패턴과 동일 이유).
         self._dbg_win_positioned = False
 
-        # [2026-08-17] 첫 프레임 처리 전까지만 쓰이는 초기 플레이스홀더 — _worker()가 매
-        # 추론마다 self._slide.roi_w(실제 da_mask/path 좌표계 폭)로 덮어쓴다. 예전엔 이
-        # DL_INPUT_W(640, 모델 입력 고정폭)가 계속 유지돼서 _lane_steer()/_update_lane_side()가
-        # 잘못된 폭으로 vehicle_x/차선판정 기준을 잡는 버그가 있었다(위 _worker() 주석 참고).
+        # 첫 프레임 처리 전까지만 쓰이는 초기 플레이스홀더 — _worker()가 매
+        # 추론마다 self._slide.roi_w(실제 da_mask/path 좌표계 폭)로 덮어쓴다. 이걸 안
+        # 덮어쓰면 DL_INPUT_W(640, 모델 입력 고정폭)가 계속 유지돼 _lane_steer()/
+        # _update_lane_side()가 잘못된 폭으로 vehicle_x/차선판정 기준을 잡게 된다.
         self.roi_w = DL_INPUT_W          # _update_lane_side()가 참조하는 정규화 분모
         self.yellow_centers = []         # _update_lane_side() 호환용, 워커가 매 추론마다 갱신
 
         default_center = DL_INPUT_W / 2.0
-        # [2026-08-17] _lane_steer()/_update_lane_side()가 roi_w/2.0 대신 참조하는 실제
+        # _lane_steer()/_update_lane_side()가 roi_w/2.0 대신 참조하는 실제
         # 차량 중심 x좌표 — DLSlideWindow.vehicle_center_x와 동일한 값을 워커가 매 추론마다
         # 동기화한다(아래 _worker() 참고). 첫 프레임 전까지는 이 플레이스홀더를 쓴다.
         self.vehicle_center_x = DL_BEV_VEHICLE_CENTER_X if DL_USE_BEV else default_center
         self._lock = threading.Lock()
         self._latest_frame = None
-        # [2026-08-14] avoid-hold(§2.32) — track_drive.py의 perc_lane()이 매 틱
+        # avoid-hold — track_drive.py의 perc_lane()이 매 틱
         # set_avoid_hold()로 갱신하고, _worker()가 다음 추론 때 _latest_frame과 같은
         # 락으로 같이 읽어서 DLSlideWindow.detect()에 넘긴다(config.py
         # AVOID_HOLD_TRIGGER_DIST_M/AVOID_HOLD_SEC_* 주석 참고).
         self._latest_avoid_hold = False
-        # [2026-08-15] 적용3 — set_avoid_hold()가 side도 같이 받아 저장해두면 _worker()가
+        # set_avoid_hold()가 side도 같이 받아 저장해두면 _worker()가
         # 다음 추론 때 avoid_hold와 같은 락으로 같이 읽어 DLSlideWindow.detect()에 넘긴다.
         self._latest_avoid_hold_side = 0
-        # [2026-08-17g] 현재 속도(m/s) — track_drive.py가 매 틱 set_speed()로 갱신하면
+        # 현재 속도(m/s) — track_drive.py가 매 틱 set_speed()로 갱신하면
         # _worker()가 avoid_hold와 같은 락으로 같이 읽어 DLSlideWindow.detect()에 넘긴다
         # (da 안전마진의 속도비례 "뒤" 마진 계산용, config.py DL_DA_REAR_MARGIN_* 참고).
         self._latest_v_mps = 0.0
-        # [2026-08-15] 적용2 — _worker()가 매 추론 후 DLSlideWindow.da_area_jump_detected를
+        # _worker()가 매 추론 후 DLSlideWindow.da_area_jump_detected를
         # 여기로 복사해둔다. result_seq/yellow_centers와 동일한 관례로, 단순 bool 대입이라
         # GIL 하에서 원자적이므로 별도 락 없이 읽는다(track_drive.py _update_avoid_hold()가
         # getattr(self.lane_detector, 'da_area_jump', False)로 조회).
         self.da_area_jump = False
-        # [2026-08-17n] self._slide.path_ok(§2.36 재발 수정)를 그대로 복사해 노출 —
+        # self._slide.path_ok를 그대로 복사해 노출 —
         # da_area_jump와 동일한 관례(getattr로 조회, GIL 하에서 원자적이라 락 불필요).
         # track_drive.py perc_lane()이 getattr(self.lane_detector, 'path_ok', valid)로
         # 읽어 self.lane_path 갱신을 가드한다 — hough/classic_cv처럼 이 속성이 없는
         # 백엔드는 getattr 기본값(valid)으로 조용히 폴백해 기존 동작 그대로 유지된다.
         self.path_ok = False
-        # [2026-08-20] da 근접 컷(_clip_da_by_obstacle(), ENABLE_OBSTACLE_CUT) — track_drive.py가
+        # da 근접 컷(_clip_da_by_obstacle(), ENABLE_OBSTACLE_CUT) — track_drive.py가
         # 매 틱 set_obstacle()로 갱신하면 _worker()가 다음 추론 때 avoid_hold와 같은 락으로
         # 같이 읽어 DLSlideWindow.detect()에 넘긴다.
         self._latest_obstacle_y = None
         self._latest_obstacle_cut_confirmed = False
-        self._latest_obstacle_cut_type = 'none'   # [2026-08-23] B2/B3 컷 좌우폭 분리용, set_obstacle() 참고
-        self._latest_obstacle_cut_yolo_seen = False  # [2026-08-25] set_obstacle() yolo_seen 참고
-        # [2026-08-22] B1 콘 침범 push(_lavacon_steer_da_push()) 상태 — set_obstacle()과
+        self._latest_obstacle_cut_type = 'none'   # B2/B3 컷 좌우폭 분리용, set_obstacle() 참고
+        self._latest_obstacle_cut_yolo_seen = False  # set_obstacle() yolo_seen 참고
+        # B1 콘 침범 push(_lavacon_steer_da_push()) 상태 — set_obstacle()과
         # 동일한 관례로 track_drive.py가 매 틱 set_lavacon_push()로 갱신하면 _worker()가
         # 다음 추론 때 같은 락으로 같이 읽어 DLSlideWindow.detect()에 넘긴다.
         self._latest_lavacon_push_active = False
-        # [2026-08-22] 위 플래그와 같이 넘어오는 실제 push량(px) — draw_path()가 밀리기
+        # 위 플래그와 같이 넘어오는 실제 push량(px) — draw_path()가 밀리기
         # 전(보라) 원본과 밀린 뒤(주황) 경로를 나란히 그리는 데 쓴다.
         self._latest_lavacon_push_px = 0.0
         self._latest_result = (False, 0.0, 0.0, default_center, [], None)
@@ -2669,7 +2632,7 @@ class DLLaneDetector:
         # 메인 스레드에서만 호출한다(스레드 간 GUI 호출 혼용 방지 — 아래 _worker()/
         # show_debug_windows() 주석 참고).
         self._latest_debug = (None, None, None, None, None)   # (vis, da_mask_roi, ll_mask_roi, ll_yellow_mask_roi, offset_sparkline_img)
-        # [2026-08-11] "이번 틱이 새로 나온 추론 결과인지" 구분용 카운터 — _worker()가 추론
+        # "이번 틱이 새로 나온 추론 결과인지" 구분용 카운터 — _worker()가 추론
         # 한 번을 끝내고 _latest_result를 갱신할 때마다만 1씩 증가한다(detect()가 몇 번
         # 호출됐는지가 아니라 "실제로 새 결과가 몇 번 나왔는지"를 센다). track_drive.py의
         # perc_lane()이 매 틱 이 값을 직전 틱 값과 비교해서, 변화가 없는 상태가 얼마나
@@ -2692,28 +2655,28 @@ class DLLaneDetector:
             self._logger.info(f'[dl_lane] {msg}')
 
     def set_avoid_hold(self, active, side=0):
-        """track_drive.py의 perc_lane()이 매 틱 호출 — avoid-hold(§2.32) 상태와
-        [2026-08-15 적용3] 방향 힌트(side, -1/0/+1)를 다음 추론에 반영한다. 단순 대입이라
+        """track_drive.py의 perc_lane()이 매 틱 호출 — avoid-hold 상태와
+        방향 힌트(side, -1/0/+1)를 다음 추론에 반영한다. 단순 대입이라
         별도 검증 없이 그대로 저장한다."""
         with self._lock:
             self._latest_avoid_hold = bool(active)
             self._latest_avoid_hold_side = int(side)
 
     def set_speed(self, v_mps):
-        """[2026-08-17g] track_drive.py가 매 틱 호출 — 현재 실측 속도(m/s)를 다음 추론에
+        """track_drive.py가 매 틱 호출 — 현재 실측 속도(m/s)를 다음 추론에
         반영한다(set_avoid_hold()와 동일 관례). 단순 대입이라 별도 검증 없이 저장한다."""
         with self._lock:
             self._latest_v_mps = float(v_mps)
 
     def set_obstacle(self, y_m, confirmed, cut_type='none', yolo_seen=False):
-        """[2026-08-20] track_drive.py의 perc_lane()이 매 틱 호출 — da 근접 컷
+        """track_drive.py의 perc_lane()이 매 틱 호출 — da 근접 컷
         (_clip_da_by_obstacle(), ENABLE_OBSTACLE_CUT) 트리거 상태를 다음 추론에
         반영한다(set_avoid_hold()/set_speed()와 동일 관례). 단순 대입이라 별도 검증
         없이 저장한다. y_m=None이면 장애물 횡위치 정보 없음(confirmed도 무시됨).
-        cut_type — [2026-08-23] 'fixed'(B2)/'vehicle'(B3)/'none', B2/B3 컷 좌우폭을
+        cut_type — 'fixed'(B2)/'vehicle'(B3)/'none', B2/B3 컷 좌우폭을
         다르게 쓰는 데만 쓰인다(_clip_da_by_obstacle() 참고).
-        yolo_seen — [2026-08-25] confirmed(라이다 AND+디바운스+hold)보다 먼저 켜지는
-        순수 YOLO 신호(요청 반영) — da 안전마진/밴드 최소픽셀수 완화 게이팅 전용."""
+        yolo_seen — confirmed(라이다 AND+디바운스+hold)보다 먼저 켜지는
+        순수 YOLO 신호 — da 안전마진/밴드 최소픽셀수 완화 게이팅 전용."""
         with self._lock:
             self._latest_obstacle_y = None if y_m is None else float(y_m)
             self._latest_obstacle_cut_confirmed = bool(confirmed)
@@ -2721,7 +2684,7 @@ class DLLaneDetector:
             self._latest_obstacle_cut_yolo_seen = bool(yolo_seen)
 
     def set_lavacon_push(self, active, push_px=0.0):
-        """[2026-08-22] track_drive.py의 perc_lane()이 매 틱 호출 — B1 콘 침범 push
+        """track_drive.py의 perc_lane()이 매 틱 호출 — B1 콘 침범 push
         (_lavacon_steer_da_push()) 상태를 다음 추론에 반영한다(set_obstacle()과 동일
         관례). DA 클리핑엔 관여하지 않고 DA 디버그창 경로 색/이중 경로 표시에만 쓰인다.
         push_px(실제 밀린 픽셀량)도 같이 받아, draw_path()가 밀리기 전(보라) 원본과
@@ -2773,21 +2736,16 @@ class DLLaneDetector:
 
             with self._lock:
                 self.yellow_centers = self._slide.yellow_centers
-                # [2026-08-17 버그 수정] self.roi_w를 __init__에서 DL_INPUT_W(640, 모델 입력
-                # 고정폭)로 하드코딩해뒀었는데, path/yellow_centers는 전부 self._slide.roi_w
-                # (BEV 캔버스 실측폭, DL_USE_BEV=True 기준 585 — da_mask.shape에서 나옴) 좌표계다.
-                # _lane_steer()의 vehicle_x = self.lane_detector.roi_w/2.0가 이 640을 그대로
-                # 썼던 탓에, 실제 차량 기준점(292.5)이 아니라 320을 기준으로 dx를 계산해 매
-                # 프레임 27.5px(≈13.75cm) 만큼 조향이 한쪽으로 밀리는 상시 편향이 있었다(raw
-                # 카메라 데이터셋(lap_005) 재생 검증 결과 평균 -24°/최대 -38° 좌편향 확인,
-                # 실차 미검증이었던 이유는 이 값이 조용히 항상 틀려서 "차선을 못 맞추는" 것과
-                # "진동"이 뒤섞여 보였을 가능성). _slide.roi_w는 첫 프레임부터 항상 실제
-                # da_mask 폭으로 정확하므로, 매 프레임 그대로 동기화한다 — _update_lane_side()도
-                # 같은 self.roi_w를 쓰므로 이 수정 하나로 조향/차선판정 둘 다 고쳐진다.
+                # self.roi_w는 self._slide.roi_w(BEV 캔버스 실측폭, da_mask.shape에서
+                # 나옴)와 항상 동기화해야 한다 — _lane_steer()의 vehicle_x =
+                # self.lane_detector.roi_w/2.0이 이 값을 그대로 쓰므로, DL_INPUT_W(640,
+                # 모델 입력 고정폭)처럼 실제 폭과 다른 값이 남아있으면 vehicle_x 기준점이
+                # 틀어져 조향이 한쪽으로 상시 편향된다. _update_lane_side()도 같은
+                # self.roi_w를 쓰므로 여기 하나만 맞으면 조향/차선판정 둘 다 정확해진다.
                 self.roi_w = self._slide.roi_w
                 self.vehicle_center_x = self._slide.vehicle_center_x
-                self.da_area_jump = self._slide.da_area_jump_detected  # [2026-08-15] 적용2
-                self.path_ok = self._slide.path_ok  # [2026-08-17n] §2.36 재발 수정 참고
+                self.da_area_jump = self._slide.da_area_jump_detected
+                self.path_ok = self._slide.path_ok
                 self._latest_result = (lane_valid, offset, lookahead, lane_center, path, debug_img)
                 self._latest_debug = (
                     self._slide.vis, self._slide.da_mask_roi, self._slide.ll_mask_roi,
@@ -2812,12 +2770,9 @@ class DLLaneDetector:
     def show_debug_windows(self, lookahead_xy=None, lookahead_px=None, ctrl_speed=None,
                             steer_deg_raw=None, steer_deg_final=None,
                             entry_turn_active=False, exit_turn_active=False):
-        """[2026-08-20, 요청 반영: "디버그창 간소화 — da 파랑+경로 찍힌 result 1개만
-        남기고 조향/증폭조향/발행 spd는 그 안에 텍스트로"] 예전엔 result(da 파랑 오버레이+
-        경로)/da/ll/speed 4패널을 세로로 이어붙여 창 하나(`dl_lane`)로 띄웠는데, 이제 result
-        패널 하나만 그대로 띄우고 나머지 세 패널(원본 이진마스크 da/ll, speed 전용 패널)과
-        맨 아래 offset 스파크라인은 뺐다 — da/ll은 이미 result에 색으로 겹쳐 그려져 있어
-        정보 손실이 없고, speed는 아래에서 텍스트로 result 위에 직접 찍는다.
+        """디버그창은 result(da 파랑 오버레이+경로) 패널 하나만 `dl_lane` 창으로 띄운다
+        — da/ll은 이미 result에 색으로 겹쳐 그려져 있어 별도 패널 없이도 정보 손실이
+        없고, speed는 아래에서 텍스트로 result 위에 직접 찍는다.
 
         lookahead_xy(있으면) : pure_pursuit.PurePursuitController가 직전에 계산한 look-ahead
         목표점, (x, y) — self.lane_path와 같은 da ROI 픽셀좌표계라 result 패널에 좌표 변환
@@ -2830,11 +2785,10 @@ class DLLaneDetector:
 
         ctrl_speed(있으면) : 지금 실제로 모터에 발행되고 있는 speed(track_drive.py
         self.ctrl_speed, control_loop()의 self.drive(ctrl_angle, ctrl_speed)로 나가는 값) —
-        [2026-08-20 이전까지는 실측 v_mps를 찍었는데] "발행되고 있는 spd를 보고 싶다"는
-        요청으로 명령값(공급/publish 값)으로 교체했다. 실측 속도가 필요하면 vesc_debug
-        창(DEBUG_VIZ_VESC)을 별도로 켤 것.
+        실측 v_mps가 아니라 명령값(공급/publish 값)을 찍는다. 실측 속도가 필요하면
+        vesc_debug 창(DEBUG_VIZ_VESC)을 별도로 켤 것.
 
-        steer_deg_raw/steer_deg_final(있으면) : [2026-08-19] pure_pursuit의 wheelbase
+        steer_deg_raw/steer_deg_final(있으면) : pure_pursuit의 wheelbase
         부스트(controller/pure_pursuit.py PP_WHEELBASE_BOOST_* 참고) "전" 1차 조향각
         (last_pre_boost_steer_deg, "조향")과 "후"(필터+클램프까지 다 거쳐 실제로 차에
         나가는 prev_steer_deg, "증폭된 실제조향")를 함께 찍는다 — 부스트가 지금 실제로
@@ -2884,8 +2838,8 @@ class DLLaneDetector:
             cv2.namedWindow('dl_lane', cv2.WINDOW_AUTOSIZE)
             cv2.moveWindow('dl_lane', *DEBUG_WIN_POS_DL_LANE)
             self._dbg_win_positioned = True
-        # [2026-08-23g, 요청 반영: "아까사이즈로돌려"] 표시 직전 축소(DEBUG_WIN_DISP_SIZE_DL_LANE)가
-        # 종횡비를 무시하고 강제 리사이즈해서 화면비율이 깨졌다 — 원래 크기(vis 원본)로 되돌림.
+        # 표시 직전 강제 리사이즈는 하지 않는다 — 종횡비를 무시한 리사이즈는 화면비율을
+        # 깨뜨리므로 vis 원본 크기 그대로 띄운다.
         cv2.imshow('dl_lane', vis)
         cv2.waitKey(1)
 
