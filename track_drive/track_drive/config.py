@@ -487,8 +487,7 @@ AVOID_HOLD_DIR_BIAS_PX = 20.0   # ≈ PASS_OFFSET(80.0, "7. 기타" 절, 실측 
 #   ENABLE_OBSTACLE_CUT=False가 기본값이다 — 부호규약(장애물 쪽을 정확히 잘라야
 #   하는지 반대로 잘라 오히려 장애물 쪽으로 조향하게 되는지)이 실차 미검증이라,
 #   반드시 정지/저속에서 먼저 확인 후 켤 것.
-ENABLE_OBSTACLE_CUT = True    # [2026-08-21, 임시] B3(방해차량) 회피 실차 검증을 위해 다시 켬 —
-                               # 이게 현재 B2/B3의 실제 회피 메커니즘(위 배경 설명 참고)이라 꺼진
+ENABLE_OBSTACLE_CUT = True    # 현재 B2/B3의 실제 회피 메커니즘(위 배경 설명 참고) — 꺼진
                                # 채로는 트리거만 잡히고 실제 회피 조향/속도캡이 전혀 안 걸린다.
                                # ⚠ 위 "부호규약 실차 미검증" 경고 그대로 유효 — 반드시 정지/저속
                                # 구간에서 먼저 방향 확인 후 트랙 주행에 쓸 것.
@@ -499,62 +498,58 @@ ENABLE_OBSTACLE_CUT = True    # [2026-08-21, 임시] B3(방해차량) 회피 실
 #   perc_obstacle()의 공유 ROI(FRONT_X_MAX/FRONT_Y_HALF, 다른 B2/B3/avoid_hold
 #   소비처와 공유)를 재사용하지 않고 이 트리거 전용의 독립 라이다 ROI를 새로 잡는다
 #   — 나중에 그 소비처들의 튜닝이 이 트리거와 갈라져도 서로 간섭하지 않게.
-#   [2026-08-20] 트리거 거리 1.0m는 da BEV 캔버스의 표현 한계(DL_BEV_FAR_LIMIT_M=0.7m)
-#   보다 살짝 여유를 둔 값 — 디바운스(OBSTACLE_CUT_TRIGGER_FRAMES)가 끝나는 시점이
-#   da가 실제로 컷을 보여줄 수 있는 경계(0.7m) 바로 앞에 오도록 확정했다(더 멀리
-#   보는 것 자체는 의미 없음 — da가 0.7m보다 먼 거리를 표현 못 해서 어차피 컷의
-#   "먼 경계"는 항상 캔버스 끝으로 클램프된다). B2(고정장애물)/일반 기본값.
-OBSTACLE_CUT_TRIGGER_X_MAX_M  = 1.0   # 실차 미검증(2026-08-20 논의로 확정)
-# [2026-08-25, 요청 반영] 트리거 ROI 전방 하한(m) — B2/B3 공용. 기존엔 x>0.0(라이다 원점)
-#   부터였는데, 그 근처 차체 반사/노이즈를 배제하려고 0.25m 뒤로(멀리) 밀었다. 상한(X_MAX)은
-#   그대로 유지 — 아래쪽만 올림.
+#   트리거 거리 1.0m는 da BEV 캔버스의 표현 한계(DL_BEV_FAR_LIMIT_M=0.7m)보다 살짝
+#   여유를 둔 값 — 디바운스(OBSTACLE_CUT_TRIGGER_FRAMES)가 끝나는 시점이 da가 실제로
+#   컷을 보여줄 수 있는 경계(0.7m) 바로 앞에 오도록 확정했다(더 멀리 보는 것 자체는
+#   의미 없음 — da가 0.7m보다 먼 거리를 표현 못 해서 어차피 컷의 "먼 경계"는 항상
+#   캔버스 끝으로 클램프된다). B2(고정장애물)/일반 기본값.
+OBSTACLE_CUT_TRIGGER_X_MAX_M  = 1.0   # 실차 미검증
+# 트리거 ROI 전방 하한(m) — B2/B3 공용. 라이다 원점 근처 차체 반사/노이즈를 배제하려고
+#   뒤로(멀리) 밀었다.
 OBSTACLE_CUT_TRIGGER_X_MIN_M  = 0.25
-# [2026-08-23r2, 요청 반영] "B3 검출범위 좌우 0.75m, 전방 2.5m로 확대" — B3(방해차량)는
-#   위 DL_BEV_FAR_LIMIT_M=0.7m 캡보다 훨씬 멀리 본다(트리거만 먼저 잡고, 실제 컷 지오메트리는
-#   여전히 da가 보이는 범위로 클램프됨 — OBSTACLE_CUT_NEAR_M/da 캔버스 한계 참고). 즉 트리거가
-#   da로 시각 확인되기 전에 먼저 울릴 수 있음 — 실차 미검증, 오검출 잦으면 다시 좁힐 것.
+# B3(방해차량)는 위 DL_BEV_FAR_LIMIT_M=0.7m 캡보다 훨씬 멀리 본다(트리거만 먼저 잡고,
+#   실제 컷 지오메트리는 여전히 da가 보이는 범위로 클램프됨 — OBSTACLE_CUT_NEAR_M/da
+#   캔버스 한계 참고). 즉 트리거가 da로 시각 확인되기 전에 먼저 울릴 수 있음 — 실차
+#   미검증, 오검출 잦으면 다시 좁힐 것.
 OBSTACLE_CUT_TRIGGER_X_MAX_M_VEHICLE = 2.5   # B3(방해차량) 전용 전방 트리거 거리(m)
 OBSTACLE_CUT_TRIGGER_Y_HALF_M = 0.55  # 횡방향 반폭 — LANE_WIDTH_M(0.4m) 기준 한 차선+여유, 실차 미검증 추정치
                                        #   B2(고정장애물=콘)/일반 기본값. B3(방해차량)는 아래
                                        #   OBSTACLE_CUT_TRIGGER_Y_HALF_M_VEHICLE로 별도 사용
                                        #   (perc_obstacle_cut_trigger()가 self._b2_passed로 분기).
-# [2026-08-23r2, 요청 반영] "B3 검출범위 좌우 0.75m로 확대" — 기존 0.8배 축소(0.44m)에서
-#   변경. 실차 미검증 — 너무 넓어 인접 차선 물체까지 잡히면 다시 좁힐 것.
-OBSTACLE_CUT_TRIGGER_Y_HALF_M_VEHICLE = 0.75  # m (2026-08-23r2 변경: 0.44m → 0.75m)
-OBSTACLE_CUT_TRIGGER_FRAMES   = 2     # [2026-08-23, 요청 반영] 3→2 — 더 빨리 감지(디바운스 완화). 라이다 AND YOLO 연속확인 프레임 수(디바운스) — 실차 미검증
+OBSTACLE_CUT_TRIGGER_Y_HALF_M_VEHICLE = 0.75  # m — B3(방해차량) 전용, 실차 미검증. 너무 넓어
+                                               #   인접 차선 물체까지 잡히면 다시 좁힐 것.
+OBSTACLE_CUT_TRIGGER_FRAMES   = 2     # 라이다 AND YOLO 연속확인 프레임 수(디바운스) — 실차 미검증
                                        #   ★값을 더 낮출수록(1까지) 반응은 빨라지지만 노이즈(순간 오검출) 하나로도 트리거가 걸릴 위험이 커진다 — 실차에서 오검출 잦으면 다시 3으로.
 
 # ── da 근접 컷 지오메트리 + 유지/해제 타이머 ──
-#   [2026-08-20] 트리거 확정 시점엔 obstacle_dist가 항상 0.7~1.0m(=da 크롭 한계 이내)
-#   이므로 컷의 먼 경계를 obstacle_dist로 계산하지 않는다 — "지금 보이는 da 전체
-#   깊이"를 그대로 먼 경계로 쓰고, 가까운 경계만 아래 OBSTACLE_CUT_NEAR_M로 고정한다.
-OBSTACLE_CUT_NEAR_M = 0.1                 # 컷의 차량쪽 고정 경계(m) — 차량 뒤 더 넓은 범위 차단(기존 0.3→0.1, 2026-08-20)
-# [2026-08-23, 요청 반영] B2(고정장애물)/B3(방해차량)가 컷 좌우폭을 따로 가지도록 분리 —
-#   기존 단일 OBSTACLE_CUT_LANE_HALF_WIDTH_PX를 타입별 두 상수로 나눴다(둘 다 None이면
-#   기존과 동일하게 LANE_WIDTH_M*DL_PIXELS_PER_METER로 계산, _clip_da_by_obstacle() 참고).
-#   B2는 "조향이 너무 크다"는 실차 체감 피드백으로 좌우폭 10%↓(OBSTACLE_CUT_HALF_WIDTH_SCALE_FIXED).
-#   B3는 아직 실차 미검증 상태 그대로 유지 — 추후 별도 조정 예정.
+#   트리거 확정 시점엔 obstacle_dist가 항상 0.7~1.0m(=da 크롭 한계 이내)이므로 컷의 먼
+#   경계를 obstacle_dist로 계산하지 않는다 — "지금 보이는 da 전체 깊이"를 그대로 먼
+#   경계로 쓰고, 가까운 경계만 아래 OBSTACLE_CUT_NEAR_M로 고정한다.
+OBSTACLE_CUT_NEAR_M = 0.1                 # 컷의 차량쪽 고정 경계(m) — 차량 뒤 더 넓은 범위 차단
+# B2(고정장애물)/B3(방해차량)가 컷 좌우폭을 따로 가진다(둘 다 None이면 기존과 동일하게
+#   LANE_WIDTH_M*DL_PIXELS_PER_METER로 계산, _clip_da_by_obstacle() 참고). B2는 "조향이
+#   너무 크다"는 실차 체감 피드백으로 좌우폭을 10% 줄였다(OBSTACLE_CUT_HALF_WIDTH_SCALE_FIXED).
+#   B3는 아직 실차 미검증 상태 그대로 유지.
 OBSTACLE_CUT_LANE_HALF_WIDTH_PX_FIXED   = None   # B2(고정장애물) 전용
 OBSTACLE_CUT_LANE_HALF_WIDTH_PX_VEHICLE = None   # B3(방해차량) 전용 — 기존 동작과 동일(배율 없음)
 OBSTACLE_CUT_HALF_WIDTH_SCALE_FIXED = 0.9        # B2 전용 배율 — LANE_WIDTH_M*DL_PIXELS_PER_METER(80px) 대비 10%↓(→72px), 실차 미검증
-OBSTACLE_CUT_MIN_REMAIN_PX = 25.0         # [2026-08-20] 클리핑 후 밴드에 이 폭(px) 미만만 남으면 그 밴드는 컷을 건너뛴다 (40→25로 낮춤)
+OBSTACLE_CUT_MIN_REMAIN_PX = 25.0         # 클리핑 후 밴드에 이 폭(px) 미만만 남으면 그 밴드는 컷을 건너뛴다
                                            #   — da가 완전히 비면 pure_pursuit.control()의 "path 없으면 직전값 유지(held)"
-                                           #   폴백이 걸려 회피가 가장 필요한 순간 조향이 얼어붙는 위험(초기 세션에서
-                                           #   다룬 그 문제) 재발 방지. 실차 미검증 추정치.
-#   [2026-08-20] 해제는 진입과 동일한 전용 트리거 ROI(위 OBSTACLE_CUT_TRIGGER_*)로
-#   재계산한 "clear" 상태를 쓴다 — perc_obstacle()의 공유 ROI(범위가 다름)를 쓰면
-#   해제 타이밍이 트리거 설계 의도와 어긋난다.
+                                           #   폴백이 걸려 회피가 가장 필요한 순간 조향이 얼어붙는 위험을 방지. 실차 미검증 추정치.
+# 해제는 진입과 동일한 전용 트리거 ROI(위 OBSTACLE_CUT_TRIGGER_*)로 재계산한 "clear"
+#   상태를 쓴다 — perc_obstacle()의 공유 ROI(범위가 다름)를 쓰면 해제 타이밍이 트리거
+#   설계 의도와 어긋난다.
 OBSTACLE_CUT_HOLD_SEC_MIN = 2.0           # 진입 확정 후 라이다/YOLO가 뭐라 하든 무조건 유지하는 최소시간(B3/방해차량 기준) — 실차 미검증
-# [2026-08-21, 요청 반영] B2(고정장애물=콘)는 정지해 있어 회피가 끝나면 바로 지나쳐가므로,
-#   B3와 같은 2.0초를 그대로 쓰면 이미 다 지나간 뒤에도 컷이 오래 남아있는다(요청 원문:
-#   "cut이 등장했다가 사라지는 게" 너무 김). B2로 진입할 때만 이 값을 최소유지시간으로 쓴다
-#   (_update_obstacle_cut_hold() 진입 순간 self.obstacle_cut_type으로 분기, README §4.3 참고).
-#   OBSTACLE_CUT_RELEASE_CONFIRM_FRAMES 해제 디바운스는 그대로 공유 — 이 값은 "floor"만 낮춘다.
+# B2(고정장애물=콘)는 정지해 있어 회피가 끝나면 바로 지나쳐가므로, B3와 같은 2.0초를
+#   그대로 쓰면 이미 다 지나간 뒤에도 컷이 오래 남아있는다. B2로 진입할 때만 이 값을
+#   최소유지시간으로 쓴다(_update_obstacle_cut_hold() 진입 순간 self.obstacle_cut_type으로
+#   분기, README §4.3 참고). OBSTACLE_CUT_RELEASE_CONFIRM_FRAMES 해제 디바운스는 그대로
+#   공유 — 이 값은 "floor"만 낮춘다.
 OBSTACLE_CUT_HOLD_SEC_MIN_FIXED = 0.2     # B2(고정장애물) 전용 최소유지시간 — 실차 미검증
-OBSTACLE_CUT_RELEASE_DIST_M = 1.0         # [2026-08-20] 1.5→1.0(요청 반영, 트리거와 동일 — 히스테리시스 없앰). 실차 미검증
+OBSTACLE_CUT_RELEASE_DIST_M = 1.0         # 트리거와 동일(히스테리시스 없음). 실차 미검증
 OBSTACLE_CUT_RELEASE_CONFIRM_FRAMES = 4   # 해제 디바운스 — AVOID_HOLD_RELEASE_CONFIRM_FRAMES와 동일 관례, 실차 미검증
 
-# ── B2 종료 → B3 무장 지연 (2026-08-25, 요청 반영) ──
+# ── B2 종료 → B3 무장 지연 ──
 #   B2(고정장애물) 통과 확정(_mark_behavior_passed('B2')) 직후 곧장 B3(방해차량) 관련 판정
 #   (_active_yolo_stage()의 vehicle YOLO 전환, perc_obstacle_cut_trigger()의 VEHICLE 전용
 #   트리거 ROI 전환, obstacle_cut_type 'vehicle' 태깅)을 켜면 방금 지나친 B2 장애물이 아직
@@ -563,34 +558,22 @@ OBSTACLE_CUT_RELEASE_CONFIRM_FRAMES = 4   # 해제 디바운스 — AVOID_HOLD_R
 B2_TO_B3_DELAY_SEC = 3.0  # 실차 미검증
 
 # ── 컷 활성 "전"(장애물 미감지 구간) 속도 캡 ──
-#   [2026-08-23, 요청 반영] 기존엔 회피(obstacle_cut_active) "중"에 속도를 낮추는
-#   SPEED_OBSTACLE_CUT(12.0) 캡이 있었으나(아래 옛 주석 — da 가시범위 0.7m 기준 원호
-#   기하 계산상 회피 조향에 필요한 여유가 얇다는 근거였음), 요청으로 방향이 뒤집혔다.
-#   이제는 반대로 라바콘 탈출 직후(Phase.OBSTACLE_ZONE 진입)부터 실제로 장애물을
-#   감지해 회피 조향이 들어가는 순간(obstacle_cut_active=True)까지 이 값으로 속도를
-#   낮춰 유지하고, 회피가 시작되면 캡을 아예 풀어(_update_speed() 참고) 일반
-#   주행속도(SPEED_NORMAL 기반 코너감속 로직)로 올린다. 옛 SPEED_OBSTACLE_CUT의
-#   "회피 중엔 느리게" 안전판 근거는 더 이상 적용되지 않으니, 실차에서 회피 기동 중
-#   불안정하면 이 캡 대신 회피 조향 로직 자체(da 근접 컷) 쪽 튜닝을 먼저 볼 것.
-#   실차 미검증.
+#   라바콘 탈출 직후(Phase.OBSTACLE_ZONE 진입)부터 실제로 장애물을 감지해 회피 조향이
+#   들어가는 순간(obstacle_cut_active=True)까지 이 값으로 속도를 낮춰 유지하고, 회피가
+#   시작되면 캡을 아예 풀어(_update_speed() 참고) 일반 주행속도(SPEED_NORMAL 기반
+#   코너감속 로직)로 올린다. 실차에서 회피 기동 중 불안정하면 이 캡 대신 회피 조향
+#   로직 자체(da 근접 컷) 쪽 튜닝을 먼저 볼 것. 실차 미검증.
 SPEED_PRE_OBSTACLE_CAP = 8.0
-#   [2026-08-23, 요청 반영] 취소 — track_drive.py _update_speed()에서 이 캡을 적용하던 분기를
-#   제거했다. 이제 라바콘 탈출 후(Phase.OBSTACLE_ZONE) 장애물 미감지 구간은 감속 없이 곧장
-#   일반 코너감속 속도(SPEED_NORMAL 기반)를 쓴다 — 속도 8 유지는 B1(라바콘) 중에만 적용
-#   (SPEED_LAVACON_CAP). 이 상수는 더 이상 어디서도 참조되지 않는다.
 
-# [2026-08-23, 요청 반영] B1(Phase.LAVACON) 중 목표속도 상한 — track_drive.py
-#   `_update_speed()`가 SPEED_PRE_OBSTACLE_CAP과 동일한 방식(target_speed에 min()으로만
-#   얹음)으로 적용한다. 과거 SPEED_LAVACON(2.5 고정, §2.22/§0.5.11 이력)처럼 매 틱
-#   정확한 값으로 강제 고정해 "굳는" 증상을 일으켰던 방식이 아니라, accel_step 램프가
-#   그대로 적용된 채로만 상한을 낮추므로 그 문제가 재현되지 않을 것으로 예상 —
-#   실차 미검증, 라바콘 구간에서 급감속/정지처럼 느껴지면 값을 올릴 것.
+# B1(Phase.LAVACON) 중 목표속도 상한 — track_drive.py `_update_speed()`가
+#   SPEED_PRE_OBSTACLE_CAP과 동일한 방식(target_speed에 min()으로만 얹음)으로 적용한다.
+#   accel_step 램프가 그대로 적용된 채로만 상한을 낮추는 방식이라, 매 틱 정확한 값으로
+#   강제 고정해 "굳는" 증상을 일으키지 않는다 — 실차 미검증, 라바콘 구간에서 급감속/정지처럼
+#   느껴지면 값을 올릴 것.
 SPEED_LAVACON_CAP = 8.0
 
-# [2026-08-10] DL_CENTER_MODE='ll' 내부에서 실제 밴드 중심 계산 알고리즘을 고르는
-#   2차 스위치 — 같은 날 두 사람이 독립적으로 서로 다른 재설계를 했다(origin/main
-#   병합 시 두 구현이 정면으로 겹쳐 병합 커밋에서 "둘 다 남기고 전환 가능하게" 하기로
-#   결정, 아래 README §2.19 참고).
+# DL_CENTER_MODE='ll' 내부에서 실제 밴드 중심 계산 알고리즘을 고르는 2차 스위치 — 두
+#   구현을 둘 다 남기고 전환 가능하게 유지한다(README §2.19 참고).
 #   'yw' (main 기본값, 팀원 작성) : 노란 중앙선 + (차선 판정에 따른) 한쪽 흰색
 #        경계선을 짝지어 추적한다(DLSlideWindow._ll_yellow_white_centers()). 노란선이
 #        안 보이면 3분기 폴백(양쪽 흰선 실측/한쪽만 실측/잔상). 관련 튜닝값:
@@ -605,13 +588,9 @@ SPEED_LAVACON_CAP = 8.0
 #   두 알고리즘 다 DL_LL_SEARCH_HALF_WIDTH_PX/DL_LL_SIDE_MIN_PIXELS는 공유한다(둘 다
 #   "좁은 탐색창 + 최소 픽셀수" 기본 뼈대는 같아서). 실차에서 A/B 비교할 때 이 값만
 #   바꾸면 된다 — DL_CENTER_MODE는 그대로 'll' 유지.
-#   [2026-08-12] DL_LL_VELOCITY_EMA_ALPHA/DL_LL_VELOCITY_MAX_PX/DL_LL_BAND_ANCHOR_ALPHA
-#   (아래 'lr' 섹션에 있음)도 이제 'yw'가 같이 쓴다 — main 기본값인 'yw'
-#   (_ll_yellow_white_centers())엔 원래 §2.23 탐색창 확장(widen)만 있고 'lr'
-#   (_ll_slice_centers())의 속도예측+프레임간 앵커링이 빠져 있던 공백을 메웠다
-#   (README §2.27). 새 상수를 따로 만들지 않고 재사용한 이유는 둘 다 "밴드 간
-#   이동 속도를 추적해 탐색창을 미리 옮기고, 직전 프레임 그 밴드 위치로 당긴다"는
-#   동일한 물리적 개념이라서다.
+#   DL_LL_VELOCITY_EMA_ALPHA/DL_LL_VELOCITY_MAX_PX/DL_LL_BAND_ANCHOR_ALPHA(아래 'lr'
+#   섹션에 있음)는 "밴드 간 이동 속도를 추적해 탐색창을 미리 옮기고, 직전 프레임 그
+#   밴드 위치로 당긴다"는 동일한 물리적 개념이라 'yw'/'lr' 둘 다 공유해서 쓴다.
 DL_LL_ALGO = 'yw'  # 'yw'(노란+흰선 짝짓기, main 기본) | 'lr'(좌우 흰선 독립 슬라이딩 윈도우)
 
 # ── DL_CENTER_MODE='ll_da'(corridor 알고리즘) 전용 튜닝값 (전부 실차 미검증 초기값) ──
@@ -634,12 +613,12 @@ DL_CORRIDOR_WIDTH_MAX_PX = 450
 # 좁은 틈으로 무리하게 끼어들지 않는지 실차에서 확인 후 조정할 것.
 DL_CORRIDOR_MIN_PASSABLE_PX = 80
 
-# [2026-08-12] _pick_open_run()의 프레임 간 히스테리시스(직전 프레임 채택 위치와 가장
-#   가까운 open run을 우선)는 정적이라, 빠른 S자에서 실제 열린 구간 위치가 그 사이 크게
-#   이동하면 뒤처질 수 있다. da/ll 모드에 적용한 것과 동일한 원리로 밴드 간 이동 속도를
-#   EMA 추적해(_corridor_slice_centers()) prefer_x를 "직전 위치 + 예측 이동량"으로
-#   미리 옮긴다(README §2.27). corridor는 좌/우 두 갈래가 아니라 "열린 구간 하나"만
-#   추적하므로 da처럼 스칼라 하나면 된다. 실차 미검증 초기값.
+# _pick_open_run()의 프레임 간 히스테리시스(직전 프레임 채택 위치와 가장 가까운 open
+#   run을 우선)는 정적이라, 빠른 S자에서 실제 열린 구간 위치가 그 사이 크게 이동하면
+#   뒤처질 수 있다. da/ll 모드에 적용한 것과 동일한 원리로 밴드 간 이동 속도를 EMA
+#   추적해(_corridor_slice_centers()) prefer_x를 "직전 위치 + 예측 이동량"으로 미리
+#   옮긴다(README §2.27). corridor는 좌/우 두 갈래가 아니라 "열린 구간 하나"만 추적하므로
+#   da처럼 스칼라 하나면 된다. 실차 미검증 초기값.
 DL_CORRIDOR_VELOCITY_EMA_ALPHA = 0.3
 DL_CORRIDOR_VELOCITY_MAX_PX = 40.0
 
@@ -649,65 +628,52 @@ DL_CORRIDOR_VELOCITY_MAX_PX = 40.0
 #   선이라 같은 밴드 안에 있는 픽셀수 자체가 원래 훨씬 적다. 실차 미검증 초기값.
 DL_LL_SIDE_MIN_PIXELS = 15
 
-# [2026-08-07] _ll_yellow_white_centers()가 노란선/흰선을 찾을 때 보는 탐색창 반경(px).
-#   좌/우 분리 기준점 하나로 밴드를 절반씩(왼쪽 전체/오른쪽 전체, 보통 수백 px) 나눠 그
-#   안 전체 픽셀로 무게중심을 내면, 그 "반쪽"이 넓다 보니 옆 차선 선이나 반사광이 반쪽
-#   어디에 있든 평균에 섞여 들어가는 문제가 있다(다중 후보 오탐). 참고:
+# _ll_yellow_white_centers()가 노란선/흰선을 찾을 때 보는 탐색창 반경(px). 좌/우 분리
+#   기준점 하나로 밴드를 절반씩(왼쪽 전체/오른쪽 전체, 보통 수백 px) 나눠 그 안 전체
+#   픽셀로 무게중심을 내면, 그 "반쪽"이 넓다 보니 옆 차선 선이나 반사광이 반쪽 어디에
+#   있든 평균에 섞여 들어가는 문제가 있다(다중 후보 오탐). 참고:
 #   github.com/junhyukch7/Advanced-Lane-Detection의 슬라이딩 윈도우가 폭 120px(반경
 #   60px)짜리 좁은 창만 보는 것에서 착안 — 창 밖의 무관한 픽셀이 애초에 평균 계산에 안
-#   들어오게 예상 위치 중심의 좁은 창만 보도록 한다. 실차 미검증 초기값(참고 프로젝트와
-#   동일하게 60으로 시작) — 급커브에서 밴드 간 실제 선 이동량이 이 값보다 크면 창이
-#   선을 놓치고 추적이 끊길 수 있으니, 그런 구간에서 검출 밴드 비율이 뚝 떨어지면 이
-#   값을 키울 것.
+#   들어오게 예상 위치 중심의 좁은 창만 보도록 한다. 실차 미검증 초기값 — 급커브에서
+#   밴드 간 실제 선 이동량이 이 값보다 크면 창이 선을 놓치고 추적이 끊길 수 있으니,
+#   그런 구간에서 검출 밴드 비율이 뚝 떨어지면 이 값을 키울 것.
 DL_LL_SEARCH_HALF_WIDTH_PX = 60.0
 
-# [2026-08-10] DL_CENTER_MODE='ll' 재설계 — "좌/우 흰선 두 개를 독립 추적"에서 "노란
-#   중앙선 + (차선 판정에 따라) 한쪽 흰색 경계선"으로 바꿨다(실제 도로 구조가 편도 1
-#   차로 기준 흰-노-흰이라, 옛 모델은 노란선이 있는 쪽엔 애초에 흰선 탐색이 거의 항상
-#   실패하는 구조적 문제가 있었음 — 실차 영상에서 white_bands가 계속 0~1/8이었던 원인).
-#   노란선 대비 흰색 경계선까지의 간격(px) 러닝 추정치 self._white_yellow_gap_px의 초기값
+# 노란선 대비 흰색 경계선까지의 간격(px) 러닝 추정치 self._white_yellow_gap_px의 초기값
 #   /EMA 계수. 둘 다 찾은 밴드에서만 이 계수로 갱신한다(_ll_yellow_white_centers() 참고).
-#   [2026-08-10] 초기값을 실측 기반으로 교체 — 흰-노 간격 실측 0.4m을
-#   DL_PIXELS_PER_METER(200px/m)로 환산해 80px(=0.4*200)로 잡았다. 처음엔
-#   DL_LL_SEARCH_HALF_WIDTH_PX(60) 근방으로 대충 잡았던 값이 우연히 비슷했을 뿐,
-#   이제는 그 실측값으로 대체된 것 — 다만 DL_PIXELS_PER_METER 자체가 "설계값(실측
-#   아님)"이라(위 주석 참고), 이 200px/m 환산이 실제로 맞는지는 별도 확인 필요.
-#   DEBUG_VIZ_DL_LANE에서 정상 구간의 gap 표시값이 80px 근방으로 수렴하는지 보고
-#   재조정할 것 — 크게 벗어나면 DL_PIXELS_PER_METER 쪽 오차를 의심할 것.
+#   흰-노 간격 실측 0.4m을 DL_PIXELS_PER_METER(200px/m)로 환산해 80px로 잡았다 — 다만
+#   DL_PIXELS_PER_METER 자체가 "설계값(실측 아님)"이라(위 주석 참고), 이 200px/m 환산이
+#   실제로 맞는지는 별도 확인 필요. DEBUG_VIZ_DL_LANE에서 정상 구간의 gap 표시값이 80px
+#   근방으로 수렴하는지 보고 재조정할 것.
 DL_LL_YELLOW_GAP_INIT_PX = 80.0
 DL_LL_YELLOW_GAP_EMA_ALPHA = 0.1
 
-# [2026-08-10] gap EMA 상하한 클램프 — 실차 영상(15초 지점)에서 노란선이 죽기 전
-#   노이즈(글레어 등)로 몇 프레임 큰 |흰선-노란선| 값이 잡히면서 EMA가 161px까지
-#   부풀었고, 그 직후 노란선이 아예 안 잡히기 시작해 "둘 다 찾았을 때만 갱신"되는
-#   이 값이 부푼 채로 얼어붙어버린 게 확인됐다(실측 40cm=80px의 두 배). 그 상태로
-#   한쪽 선 없는 밴드의 위치 추정에 이 부푼 gap을 그대로 썼더니 waypoint가 실제
-#   흰선을 넘어 차선 밖까지 밀려나 급조향(15초 우회전)으로 이어졌다. 실측값(80px)
-#   근방으로 상하한을 걸어 어떤 노이즈가 껴도 이만큼은 안 부풀게 막는다 — 여유폭은
-#   경험적으로 잡은 값(실측 미세조정 여지 있음), DEBUG_VIZ_DL_LANE의 gap 표시값이
-#   이 범위 끝에 계속 붙어있으면 실제 트랙 폭이 이 범위 밖일 수 있다는 뜻이니 재조정할 것.
+# gap EMA 상하한 클램프 — 노란선이 죽기 전 노이즈(글레어 등)로 큰 |흰선-노란선| 값이
+#   잡히면 EMA가 크게 부풀 수 있고, 그 직후 노란선이 아예 안 잡히기 시작하면 "둘 다
+#   찾았을 때만 갱신"되는 이 값이 부푼 채로 얼어붙는다(실측 40cm=80px 대비 과대). 그
+#   상태로 한쪽 선 없는 밴드의 위치 추정에 부푼 gap을 그대로 쓰면 waypoint가 실제
+#   흰선을 넘어 차선 밖까지 밀려나 급조향으로 이어질 수 있다(실차 재현 확인). 실측값
+#   (80px) 근방으로 상하한을 걸어 어떤 노이즈가 껴도 이만큼은 안 부풀게 막는다 —
+#   DEBUG_VIZ_DL_LANE의 gap 표시값이 이 범위 끝에 계속 붙어있으면 실제 트랙 폭이 이
+#   범위 밖일 수 있다는 뜻이니 재조정할 것.
 DL_LL_YELLOW_GAP_MIN_PX = 50.0
 DL_LL_YELLOW_GAP_MAX_PX = 110.0
 
-# [2026-08-10] 노란선이 이번 밴드에서 안 보일 때 흰선을 찾는 탐색창 반경(px) —
-#   DL_LL_SEARCH_HALF_WIDTH_PX(60, 노란/흰 각각 하나씩 좁게 찾는 창)와 별개로,
-#   "노란선 없을 때 양쪽 흰선이 몇 개나 보이는지"를 세야 하므로 그보다 훨씬 넓게
-#   잡는다 — 좌우 흰선이 각각 gap(최대 DL_LL_YELLOW_GAP_MAX_PX=110)만큼 떨어져
-#   있을 수 있으므로 그보다 여유를 더 둔 값. cur_yellow(기준점) 중심으로 이 반경
-#   안의 흰선 connected component를 전부 찾아(_ll_line_centers() 재사용) 개수로
-#   3분기한다(_ll_yellow_white_centers() 참고): 2개=양쪽 다 보임(중점 채택),
-#   1개=한쪽만 보임(어느 쪽인지 실측 위치로 판정 후 gap만큼 안쪽으로 재구성),
-#   0개=잔상. 실측 미검증 — 실제 트랙 폭 기준으로 재조정할 것.
+# 노란선이 이번 밴드에서 안 보일 때 흰선을 찾는 탐색창 반경(px) — DL_LL_SEARCH_HALF_WIDTH_PX
+#   (60, 노란/흰 각각 하나씩 좁게 찾는 창)와 별개로, "노란선 없을 때 양쪽 흰선이 몇
+#   개나 보이는지"를 세야 하므로 그보다 훨씬 넓게 잡는다 — 좌우 흰선이 각각 gap(최대
+#   DL_LL_YELLOW_GAP_MAX_PX=110)만큼 떨어져 있을 수 있으므로 그보다 여유를 더 둔 값.
+#   cur_yellow(기준점) 중심으로 이 반경 안의 흰선 connected component를 전부 찾아
+#   (_ll_line_centers() 재사용) 개수로 3분기한다(_ll_yellow_white_centers() 참고): 2개=
+#   양쪽 다 보임(중점 채택), 1개=한쪽만 보임(어느 쪽인지 실측 위치로 판정 후 gap만큼
+#   안쪽으로 재구성), 0개=잔상. 실측 미검증 — 실제 트랙 폭 기준으로 재조정할 것.
 DL_LL_NO_YELLOW_SEARCH_HALF_WIDTH_PX = 150.0
 
 # ── DL_LL_ALGO='lr'(좌/우 흰선 독립 슬라이딩 윈도우, _ll_slice_centers()) 전용 튜닝값 ──
-#   [2026-08-10 병합] 'yw'(위)가 main 기본이 되면서 병합 충돌로 지워질 뻔했으나, 두
-#   알고리즘을 둘 다 살리고 DL_LL_ALGO로 전환 가능하게 하기로 해서 복원했다(README
-#   §2.19). 원래 주석: 밴드 내 좌/우 ll 중점을 채택하기 위한 두 선 사이 거리(px)
-#   허용범위 — 범위 밖이면(반대쪽 밴드의 다른 차선을 잘못 짝지은 경우 등) 그 밴드는
-#   버린다(da 폴백 없음). 실측 라인 간격이 75~80px로 나와 하한을 100→50으로 낮춘 이력
-#   있음(2026-08-07) — 여전히 넓게 열려있으니 visualize()의 밴드별 실측 폭 표시로 좁힐 것.
-#   실차 미검증 초기값.
+#   밴드 내 좌/우 ll 중점을 채택하기 위한 두 선 사이 거리(px) 허용범위 — 범위 밖이면
+#   (반대쪽 밴드의 다른 차선을 잘못 짝지은 경우 등) 그 밴드는 버린다(da 폴백 없음).
+#   실측 라인 간격이 75~80px로 나와 하한을 100에서 낮췄다 — 여전히 넓게 열려있으니
+#   visualize()의 밴드별 실측 폭 표시로 좁힐 것. 실차 미검증 초기값.
 DL_LL_WIDTH_MIN_PX = 50
 DL_LL_WIDTH_MAX_PX = 200
 # 좌/우 둘 다 찾아 실측 폭이 나온 밴드에서만 self._ll_half_width(차로 반폭 러닝
@@ -715,9 +681,8 @@ DL_LL_WIDTH_MAX_PX = 200
 #   hough_lane.py)와 동일한 관례.
 DL_LL_WIDTH_EMA_ALPHA = 0.1
 
-# [2026-08-10] _ll_slice_centers()(DL_LL_ALGO='lr') 적응형 탐색창 — 밴드 간 실제 선 이동량이
-#   DL_LL_SEARCH_HALF_WIDTH_PX보다 크면 창이 선을 놓치는 문제(위 주석 "급커브에서...
-#   추적이 끊길 수 있으니" 참고) 대응. 두 갈래로 완화한다:
+# _ll_slice_centers()(DL_LL_ALGO='lr') 적응형 탐색창 — 밴드 간 실제 선 이동량이
+#   DL_LL_SEARCH_HALF_WIDTH_PX보다 크면 창이 선을 놓치는 문제 대응. 두 갈래로 완화한다:
 #   ①속도 예측 — 그 사이드에서 실제로 찾은 밴드들 사이의 x 이동량(밴드 간 간격으로
 #     나눈 px/밴드)을 EMA로 추적해뒀다가, 다음 밴드 탐색창 중심을 "마지막으로 찾은
 #     위치"가 아니라 "그 위치 + 예측 이동량"으로 미리 옮긴다(창이 곡선을 따라 먼저

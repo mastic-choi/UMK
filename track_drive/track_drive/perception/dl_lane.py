@@ -1199,11 +1199,11 @@ class DLSlideWindow(SlideWindow):
             da_band = da_mask[y_low:y_high, lb:rb]
             open_cols = np.any(da_band > 0, axis=0)
 
-            # [2026-08-12] prefer_x = "직전 프레임 이 밴드 값"과 "이번 프레임 속도예측
-            # 값"을 blend — 하나만 있으면 그거 그대로, 둘 다 없으면(첫 프레임 등) None
-            # (기존과 동일하게 _pick_open_run()이 가장 넓은 run을 고른다). 직전 프레임
-            # 값만 쓰던 예전 방식은 그 밴드가 한 번도 채택된 적 없으면(cur_x도 없는
-            # 첫 시도) 방향 힌트가 전혀 없어 flip-flop에 더 취약했다.
+            # prefer_x = "직전 프레임 이 밴드 값"과 "이번 프레임 속도예측 값"을 blend
+            # — 하나만 있으면 그거 그대로, 둘 다 없으면(첫 프레임 등) None
+            # (_pick_open_run()이 가장 넓은 run을 고른다). 직전 프레임 값만 쓰면
+            # 그 밴드가 한 번도 채택된 적 없을 때(cur_x도 없는 첫 시도) 방향 힌트가
+            # 전혀 없어 flip-flop에 더 취약하다.
             prev_x = self._corridor_prev_open_x[i]
             if prev_x is not None and cur_x is not None:
                 predicted_x = 0.5 * prev_x + 0.5 * cur_x
@@ -1232,15 +1232,14 @@ class DLSlideWindow(SlideWindow):
         return results, used
 
     def _ll_yellow_white_centers(self, ll_white_mask, ll_yellow_mask, ref_x):
-        """[2026-08-10] DL_CENTER_MODE='ll' && DL_LL_ALGO='yw'(main 기본값)일 때만
-        호출된다 — DL_LL_ALGO='lr'이면 대신 _ll_slice_centers()가 호출된다(둘 다
-        살리고 config.py DL_LL_ALGO로 전환하도록 병합, README §2.19 참고). 원래
-        "좌/우 흰선 두 개를 독립 추적"하던 _ll_slice_centers() 하나만 있었는데, 실제
-        도로는 편도 1차로 기준 흰-노-흰 구조라 노란선이 있는 쪽엔 애초에 흰선이
-        없어서(노란선은 흰선 마스크에서 이미 제외됨, _split_ll_by_yellow() 참고)
-        그쪽 탐색이 거의 항상 실패하는 구조적 문제가 있었다(실차 영상에서 검출 밴드가
-        계속 0~1/8이었던 원인) — 이 함수는 그 문제에 대응해 새로 작성됐다. **노란
-        중앙선 + (내 차선에 맞는) 한쪽 흰색 경계선**만 추적한다.
+        """DL_CENTER_MODE='ll' && DL_LL_ALGO='yw'(main 기본값)일 때만 호출된다 —
+        DL_LL_ALGO='lr'이면 대신 _ll_slice_centers()가 호출된다(둘 다 살아있고
+        config.py DL_LL_ALGO로 전환한다, README §2.19 참고). "좌/우 흰선 두 개를 독립
+        추적"하는 방식(_ll_slice_centers())은 실제 도로가 편도 1차로 기준 흰-노-흰
+        구조라, 노란선이 있는 쪽엔 애초에 흰선이 없어서(노란선은 흰선 마스크에서 이미
+        제외됨, _split_ll_by_yellow() 참고) 그쪽 탐색이 거의 항상 실패하는 구조적
+        문제가 있다. 이 함수는 대신 **노란 중앙선 + (내 차선에 맞는) 한쪽 흰색
+        경계선**만 추적한다.
 
         ① 차선 판정(self.lane_side): 근거리(가장 아래)부터 밴드를 훑다가 노란선을
         처음 찾은 밴드에서, 그 x좌표가 seed(ref_x, 차량 위치) 기준 왼쪽이면 "우측차선
@@ -1259,12 +1258,10 @@ class DLSlideWindow(SlideWindow):
         gap으로 흰선 위치를 추정해서 중점을 계산한다. 근거 없는 추정이므로 이 밴드는
         self.ll_band_degraded[i]=True로 표시한다. 태그 'Y+gap'.
 
-        ④ [2026-08-10 재설계, README §2.18] 노란선을 이번 밴드에서 못 찾으면 →
-        예전엔 좁은 창(cur_white 중심) 하나로 흰선 하나만 찾아 gap을 역적용했는데,
-        실차 15초 지점에서 gap EMA가 노이즈로 161px까지 부푼 뒤(정상 실측치는
-        80px) 노란선이 아예 안 잡히기 시작해 그 부푼 값이 그대로 얼어붙었고, 그
-        값으로 흰선 위치를 무시한 채 waypoint를 실제 흰선 너머 차선 밖으로 밀어내
-        급조향(우회전)으로 이어지는 게 확인됐다. 이제 넓은 창
+        ④ 노란선을 이번 밴드에서 못 찾으면 → 좁은 창(cur_white 중심) 하나로 흰선
+        하나만 찾아 gap을 역적용하는 방식은, gap EMA가 노이즈로 부풀어 오른 뒤
+        노란선이 계속 안 잡히면 그 부푼 값이 그대로 얼어붙어 waypoint를 실제 흰선
+        너머 차선 밖으로 밀어내는 실차 사고를 냈다(README §2.18). 대신 넓은 창
         (DL_LL_NO_YELLOW_SEARCH_HALF_WIDTH_PX)에서 _ll_line_centers()로 흰선
         컴포넌트를 전부 찾아 개수로 3분기한다:
           - 케이스1(태그 '2W', 흰선 2개 이상 — 가장 왼쪽/오른쪽을 채택): 두 실측
@@ -1283,15 +1280,15 @@ class DLSlideWindow(SlideWindow):
 
         ③④ 전부 self.ll_degraded(프레임 단위, 이번 프레임에 degraded 밴드가 하나라도
         있으면 True)를 세우고, track_drive.py _lane_drive()가 이를 보고 속도를
-        SPEED_LL_DEGRADED로 강제 제한한다(요청 반영: "안 보이면 잔상 주행 + 속도 5").
-        밴드별로 어느 분기를 탔는지는 self.ll_band_case(visualize()가 밴드 점 옆
-        텍스트 + 상단 요약 줄로 그림)에 남는다.
+        SPEED_LL_DEGRADED로 강제 제한한다("안 보이면 잔상 주행 + 속도 감속"). 밴드별로
+        어느 분기를 탔는지는 self.ll_band_case(visualize()가 밴드 점 옆 텍스트 + 상단
+        요약 줄로 그림)에 남는다.
 
-        [2026-08-10] ②의 노란/흰 탐색창(DL_LL_SEARCH_HALF_WIDTH_PX)에 _ll_slice_centers()
-        (DL_LL_ALGO='lr')에서 쓰던 "연속 미검출 시 반경 확장" 메커니즘을 이식했다 —
+        ②의 노란/흰 탐색창(DL_LL_SEARCH_HALF_WIDTH_PX)은 _ll_slice_centers()
+        (DL_LL_ALGO='lr')와 동일한 "연속 미검출 시 반경 확장" 메커니즘을 쓴다 —
         급조향 후 직진 복귀 구간에서 ref_x(탐색창 seed)가 디바운스로 지연돼 있는 동안
-        실제 위치가 좁은 창 밖으로 나가 계속 놓치는 문제(README §2.20/§2.22, 사용자
-        보고) 대응. 노란/흰 각각 독립적으로 연속 미검출 횟수(yellow_miss_streak/
+        실제 위치가 좁은 창 밖으로 나가 계속 놓치는 문제(README §2.20/§2.22) 대응.
+        노란/흰 각각 독립적으로 연속 미검출 횟수(yellow_miss_streak/
         white_miss_streak)를 세서 그 사이드의 탐색창 반경을 DL_LL_SEARCH_WIDEN_STEP_PX
         씩 넓히고(DL_LL_SEARCH_WIDEN_MAX_PX 상한), 다시 찾으면 기본 반경으로 리셋한다.
         특히 **흰선 쪽에 실질적 효과**가 크다 — 노란선은 이미 못 찾으면 곧바로 ④(150px
@@ -1312,8 +1309,8 @@ class DLSlideWindow(SlideWindow):
                               (③④=degraded는 False).
 
         알려진 한계:
-        - [2026-08-10 일부 완화] 탐색창이 좁아서(②③) 급커브에서 밴드 간 실제 선
-          이동량이 반경보다 크면 추적이 끊길 수 있다(노란/흰 각각 독립) — 위 확장
+        - 탐색창이 좁아서(②③) 급커브에서 밴드 간 실제 선 이동량이 반경보다 크면
+          추적이 끊길 수 있다(노란/흰 각각 독립) — 위 확장
           메커니즘으로 연속 미검출 시 반경이 넓어지긴 하지만, 실차 미검증이라 급커브에서
           실제로 놓치지 않고 따라가는지, 넓어진 창이 오히려 옆 차선/반사광을 잘못
           무는지는 확인 필요.
@@ -1342,15 +1339,15 @@ class DLSlideWindow(SlideWindow):
         side_sign = -1.0 if self.lane_side == 'left' else 1.0
         cur_white = ref_x + side_sign * self._white_yellow_gap_px
         lane_side_locked = False
-        # [2026-08-10] 탐색창 확장(위 docstring 참고) — 노란/흰 각각 독립적으로 연속
-        # 미검출 횟수를 센다. 찾으면 0으로 리셋, 못 찾으면 +1 → 다음 밴드 그 사이드
-        # 탐색창 반경이 그만큼 넓어진다.
+        # 탐색창 확장(위 docstring 참고) — 노란/흰 각각 독립적으로 연속 미검출 횟수를
+        # 센다. 찾으면 0으로 리셋, 못 찾으면 +1 → 다음 밴드 그 사이드 탐색창 반경이
+        # 그만큼 넓어진다.
         yellow_miss_streak = 0
         white_miss_streak = 0
-        # [2026-08-12] 밴드 간 속도예측용 — 이번 프레임 안에서만 유효한 "마지막으로
-        # 실제 찾은 밴드" 기록(_ll_slice_centers()와 동일 원리, README §2.27). 매
-        # 호출(=매 프레임)마다 새로 시작해야 밴드 인덱스가 프레임 경계를 넘어 롤오버되는
-        # 걸 막는다.
+        # 밴드 간 속도예측용 — 이번 프레임 안에서만 유효한 "마지막으로 실제 찾은
+        # 밴드" 기록(_ll_slice_centers()와 동일 원리, README §2.27). 매 호출(=매
+        # 프레임)마다 새로 시작해야 밴드 인덱스가 프레임 경계를 넘어 롤오버되는 걸
+        # 막는다.
         last_yellow_i = last_yellow_x = None
         last_white_i = last_white_x = None
 
@@ -1362,10 +1359,10 @@ class DLSlideWindow(SlideWindow):
             win_y = min(base_win + yellow_miss_streak * DL_LL_SEARCH_WIDEN_STEP_PX, DL_LL_SEARCH_WIDEN_MAX_PX)
             win_w = min(base_win + white_miss_streak * DL_LL_SEARCH_WIDEN_STEP_PX, DL_LL_SEARCH_WIDEN_MAX_PX)
 
-            # [2026-08-12] 밴드별 프레임 간 앵커링 — 직전 프레임에 이 밴드(같은
-            # y위치)에서 실제로 찾았던 위치가 있으면 이번 프레임 내 전파값과 가중평균해
-            # 탐색창 중심으로 쓴다(_ll_slice_centers()와 동일 원리, README §2.27) — band 0
-            # 검출 오차가 위 밴드로 그대로 누적 전파되는 걸 막는다.
+            # 밴드별 프레임 간 앵커링 — 직전 프레임에 이 밴드(같은 y위치)에서 실제로
+            # 찾았던 위치가 있으면 이번 프레임 내 전파값과 가중평균해 탐색창 중심으로
+            # 쓴다(_ll_slice_centers()와 동일 원리, README §2.27) — band 0 검출 오차가
+            # 위 밴드로 그대로 누적 전파되는 걸 막는다.
             prev_y = self._yw_prev_band_yellow[i]
             anchor_yellow = (
                 cur_yellow if prev_y is None else
@@ -1384,9 +1381,9 @@ class DLSlideWindow(SlideWindow):
                 if M_y['m00'] >= DL_LL_SIDE_MIN_PIXELS:
                     yx = yx0 + M_y['m10'] / M_y['m00']
             if yx is not None:
-                # [2026-08-12] 속도예측 — 밴드 간 이동량(px/밴드)을 EMA로 추적해뒀다가
-                # 다음 밴드 탐색창을 "찾은 위치" 그대로가 아니라 "그 위치 + 예측 이동량"
-                # 으로 미리 옮긴다(미검출 밴드가 이어지는 동안엔 이 속도로 계속
+                # 속도예측 — 밴드 간 이동량(px/밴드)을 EMA로 추적해뒀다가 다음 밴드
+                # 탐색창을 "찾은 위치" 그대로가 아니라 "그 위치 + 예측 이동량"으로
+                # 미리 옮긴다(미검출 밴드가 이어지는 동안엔 이 속도로 계속
                 # dead-reckoning, 아래 else 분기 참고).
                 if last_yellow_i is not None and i > last_yellow_i:
                     raw_v = (yx - last_yellow_x) / (i - last_yellow_i)
@@ -1449,13 +1446,13 @@ class DLSlideWindow(SlideWindow):
                 self.ll_band_degraded[i] = True
                 self.ll_band_case[i] = 'Y+gap'
             else:
-                # ④ 노란선을 이번 밴드에서 못 찾음 — [2026-08-10] 좁은 창(cur_white
-                # 중심) 하나로 흰선을 찾아 간격을 역적용하던 옛 방식은, gap EMA가
-                # 부풀면 실제 흰선 위치와 무관하게 waypoint를 차선 밖으로 밀어내는
-                # 문제가 실차에서 확인됐다(config.py DL_LL_YELLOW_GAP_MIN/MAX_PX
-                # 주석 참고). 넓은 창(DL_LL_NO_YELLOW_SEARCH_HALF_WIDTH_PX)에서
-                # 흰선을 몇 개 찾았는지로 3분기한다 — _ll_line_centers()는 로컬
-                # 슬라이스 좌표를 반환하므로 wx0w를 다시 더해 원래 좌표로 되돌린다.
+                # ④ 노란선을 이번 밴드에서 못 찾음 — 좁은 창(cur_white 중심) 하나로
+                # 흰선을 찾아 간격을 역적용하는 방식은 gap EMA가 부풀면 실제 흰선
+                # 위치와 무관하게 waypoint를 차선 밖으로 밀어낸다(config.py
+                # DL_LL_YELLOW_GAP_MIN/MAX_PX 주석 참고). 대신 넓은 창
+                # (DL_LL_NO_YELLOW_SEARCH_HALF_WIDTH_PX)에서 흰선을 몇 개 찾았는지로
+                # 3분기한다 — _ll_line_centers()는 로컬 슬라이스 좌표를 반환하므로
+                # wx0w를 다시 더해 원래 좌표로 되돌린다.
                 wide_win = DL_LL_NO_YELLOW_SEARCH_HALF_WIDTH_PX
                 wx0w = int(np.clip(cur_yellow - wide_win, 0, w))
                 wx1w = int(np.clip(cur_yellow + wide_win, 0, w))
@@ -1501,23 +1498,21 @@ class DLSlideWindow(SlideWindow):
         return results, used
 
     def _ll_slice_centers(self, ll_mask, ref_x):
-        """[2026-08-10] DL_CENTER_MODE='ll' && DL_LL_ALGO='lr'일 때만 호출된다('ll_da'는
-        corridor 알고리즘(_corridor_slice_centers())으로 교체돼 더 이상 이 함수를 안 쓴다.
-        DL_LL_ALGO='yw'(main 기본값)면 대신 _ll_yellow_white_centers()가 호출된다 — 두
-        알고리즘을 병합 때 둘 다 살리고 전환 가능하게 하기로 해서 이 함수가 남아있다,
-        README §2.19 참고). ll_mask(흰선만
-        담긴 이진마스크, _split_ll_by_yellow() 참고)를
-        _slice_centers()와 동일한 n_slices 밴드로 나눠, **좌/우 라인을 각각 독립적인
-        슬라이딩 윈도우로 추적**한다 — 참고 프로젝트
-        (github.com/junhyukch7/Advanced-Lane-Detection)의 `slidingWindow()`가 좌/우를
-        따로 두 번 호출해 서로 무관하게 창을 옮기는 것과 동일한 원칙.
+        """DL_CENTER_MODE='ll' && DL_LL_ALGO='lr'일 때만 호출된다('ll_da'는 corridor
+        알고리즘(_corridor_slice_centers())을 쓰므로 이 함수를 안 쓴다. DL_LL_ALGO='yw'
+        (main 기본값)면 대신 _ll_yellow_white_centers()가 호출된다 — 둘 다 살아있고
+        config.py DL_LL_ALGO로 전환한다, README §2.19 참고). ll_mask(흰선만 담긴
+        이진마스크, _split_ll_by_yellow() 참고)를 _slice_centers()와 동일한 n_slices
+        밴드로 나눠, **좌/우 라인을 각각 독립적인 슬라이딩 윈도우로 추적**한다 — 참고
+        프로젝트(github.com/junhyukch7/Advanced-Lane-Detection)의 `slidingWindow()`가
+        좌/우를 따로 두 번 호출해 서로 무관하게 창을 옮기는 것과 동일한 원칙.
 
-        [2026-08-07] 기존에는 좌/우를 한 밴드 안에서 같이 판정해서, 한쪽이라도 실패하면
-        (한쪽 창에 픽셀이 모자라거나, 둘 다 찾았어도 폭이 비정상이면) 그 밴드 전체를
-        버렸다 — 반대쪽 선은 멀쩡히 보이는데도 같이 버려지는 게 낭비였다(예: 한쪽
-        차선이 반사/가려짐으로 몇 밴드 끊겨도 반대쪽은 계속 잘 보이는 실제 상황).
-        이번에 좌/우 창(cur_left/cur_right)을 완전히 독립적으로 갱신하도록 바꿨다 —
-        왼쪽 창은 왼쪽에서 뭔가 찾았을 때만(오른쪽 결과와 무관하게) 갱신하고, 오른쪽도
+        좌/우를 한 밴드 안에서 같이 판정해 한쪽이라도 실패하면(한쪽 창에 픽셀이
+        모자라거나, 둘 다 찾았어도 폭이 비정상이면) 밴드 전체를 버리는 방식은,
+        반대쪽 선은 멀쩡히 보이는데도 같이 버려지는 낭비가 있다(한쪽 차선이
+        반사/가려짐으로 몇 밴드 끊겨도 반대쪽은 계속 잘 보이는 실제 상황). 그래서
+        좌/우 창(cur_left/cur_right)을 완전히 독립적으로 갱신한다 — 왼쪽 창은
+        왼쪽에서 뭔가 찾았을 때만(오른쪽 결과와 무관하게) 갱신하고, 오른쪽도
         마찬가지다. 밴드별 최종 중심점은 세 갈래로 결정한다:
           1. 양쪽 다 찾고 두 중심 간 거리가 실측 차로폭 범위(DL_LL_WIDTH_MIN_PX~MAX_PX)
              안이면 → 중점을 채택하고, 이때의 실측 폭으로 self._ll_half_width(차로
@@ -1527,11 +1522,11 @@ class DLSlideWindow(SlideWindow):
              추정한다(lane_util.SlideWindow.calc_center()의 "한쪽 차선만 검출" 폴백과
              동일한 원칙 — classic_cv 백엔드가 이미 쓰던 패턴을 ll에도 적용).
           3. 양쪽 다 못 찾았으면 → None.
-        좌/우 각자의 탐색창은 여전히 좁은 고정폭(DL_LL_SEARCH_HALF_WIDTH_PX 반경)만
-        본다 — ROI 폭 전체(수백 px)를 반씩 나눠 보던 옛 방식(2026-08-07 이전)은 옆
-        차선/반사광이 반쪽 어디에 있든 섞여 들어가는 문제가 있었다.
+        좌/우 각자의 탐색창은 좁은 고정폭(DL_LL_SEARCH_HALF_WIDTH_PX 반경)만 본다 —
+        ROI 폭 전체(수백 px)를 반씩 나눠 보는 방식은 옆 차선/반사광이 반쪽 어디에
+        있든 섞여 들어가는 문제가 있다.
 
-        [2026-08-10] 탐색창을 두 방향으로 "적응형"으로 바꿨다(config.py DL_LL_VELOCITY_*/
+        탐색창을 두 방향으로 "적응형"으로 만든다(config.py DL_LL_VELOCITY_*/
         DL_LL_SEARCH_WIDEN_* 주석 참고) — 아래 "알려진 한계" 1번 대응:
           ①속도 예측 — 그 사이드에서 실제로 찾은 밴드들 사이의 x 이동량(밴드 간
             간격으로 나눈 px/밴드)을 self._ll_left_velocity/_right_velocity로 EMA
