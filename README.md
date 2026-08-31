@@ -1,8 +1,7 @@
 <div align="center">
-<h1>UMK 🏎️🚦</h1>
+<h1>KURiver-KMU-auto-contest</h1>
 <p><a href="https://auto-contest.kookmin.ac.kr/">제9회 국민대학교 자율주행 경진대회</a> 본선 참가
-차량의 실차 배포 소스 — 신호등 판단부터 라바콘·고정장애물·방해차량 회피, 지름길 좌회전까지
-한 대의 ROS2 노드(`track_drive`)로 처리하는 자율주행 트랙 경주 로봇.</p>
+차량의 실차 배포 소스</p>
 
 ![완주 주행 기록](docs/completion_run.gif)
 </div>
