@@ -7,3 +7,19 @@ datasets/
 .DS_Store
 __pycache__/
 *.pyc
+
+# 파인튜닝 가중치 — 각자 전용 저장소에서 관리(README "모델 다운로드" 참고). 이 저장소엔
+# 코드만 두고, 실행 전에 각 릴리스에서 받아 아래 경로에 배치한다:
+#   - track_drive/track_drive/models/twinlitenetplus_kmu_v1.2.0.onnx(+.onnx.data)
+#     ← github.com/mastic-choi/TwinLiteNet-KMU-finetune (outputs/models/best.onnx)
+#   - yolo_ros/signal_state_best_n.onnx
+#     ← github.com/mastic-choi/yolo-V8-KMU-xycar (signal_state, v1.2.0)
+#   - yolo_ros/target_vehicle_best.onnx
+#     ← github.com/mastic-choi/yolo-V8-KMU-xycar (target_vehicle, v1.2.0)
+track_drive/track_drive/models/*.onnx
+track_drive/track_drive/models/*.onnx.data
+yolo_ros/signal_state_best_n.onnx
+yolo_ros/target_vehicle_best.onnx
+
+# TensorRT 컴파일 캐시 — GPU/드라이버별로 다시 생성되는 순수 빌드 산출물, 커밋 대상 아님.
+yolo_ros/trt_cache/
