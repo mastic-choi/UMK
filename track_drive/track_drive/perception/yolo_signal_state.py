@@ -3,10 +3,8 @@
 #=============================================
 # yolo_signal_state.py — YOLOv8n(ONNX Runtime) 기반 신호등 위치+색상상태 검출.
 #
-# [2026-08-21] 신호등 인식의 유일한 경로다 — 배경판 "위치"를 먼저 찾고 원 4개의 밝기로
-# 색을 판정하던 이전 HSV/Hough Circle 경로(traffic_signal.py/frst.py)와 배경판 위치
-# 전용 YOLO(yolo_signal.py)는 전부 삭제했다(README §1.18). 이 모듈은 "지금 어떤 색이
-# 켜져 있는지"를 단일 스테이지 YOLO로 직접 예측한다.
+# 신호등 인식의 유일한 경로다. 이 모듈은 "지금 어떤 색이 켜져 있는지"를 단일 스테이지
+# YOLO로 직접 예측한다.
 #
 # signal_state_best_n.pt(yolo_ros/, YOLOv8n 파인튜닝, 클래스: {0: 'red',
 # 1: 'green_straight', 2: 'green_left'} — datasets/signal_state/classes.txt와 순서 동일)를
@@ -86,10 +84,10 @@ class YoloSignalStateEngine:
         available = set(ort.get_available_providers())
         if providers is None:
             # yolo_cone.py의 cone_best_n.onnx(nms=True export)가 TensorRT 빌드 실패(TRT-16198)로
-            # 매번 456초 지연 후 CUDA로 자동 폴백하는 문제를 겪었다(2026-08-13 실차 확인) — 같은
-            # nms=True export 구조라 이 신호등 모델도 같은 문제를 겪을 가능성이 높아, 처음부터
-            # TensorRT를 건너뛰고 CUDA로 간다. 실차에서 TensorRT가 실제로 되는 게 확인되면
-            # 그때 우선순위를 조정할 것.
+            # 매번 수 분 지연 후 CUDA로 자동 폴백하는 문제를 겪었다 — 같은 nms=True export
+            # 구조라 이 신호등 모델도 같은 문제를 겪을 가능성이 높아, 처음부터 TensorRT를
+            # 건너뛰고 CUDA로 간다. 실차에서 TensorRT가 실제로 되는 게 확인되면 그때
+            # 우선순위를 조정할 것.
             priority = ['CUDAExecutionProvider', 'CPUExecutionProvider']
             providers = [p for p in priority if p in available] or ['CPUExecutionProvider']
 
@@ -188,14 +186,14 @@ class YoloSignalStateDetector:
         self._latest_state = {name: (False, 0.0, 0.0) for name in YOLO_SIGNAL_STATE_CLASS_NAMES}
         self._latest_detections = []
         self._latest_debug = None                    # 시각화용 vis 프레임
-        # [2026-08-23] 'YOLO_신호등' 창을 처음 띄울 때만 cv2.moveWindow로 위치를 잡기 위한
+        # 'YOLO_신호등' 창을 처음 띄울 때만 cv2.moveWindow로 위치를 잡기 위한
         #   1회성 가드(DEBUG_WIN_POS_YOLO_SIGNAL_STATE 참고, track_drive.py/dl_lane.py의
         #   같은 패턴과 동일 이유).
         self._dbg_win_positioned = False
         self._stopped = False
         self._last_fps_log_t = time.time()
-        self._logged_infer_error = False  # [2026-08-20] 추론 예외를 매 프레임 로그하면 로그창이
-                                           #   그걸로 도배돼(요청 반영) 최초 1회만 찍고 이후는 조용히 스킵
+        self._logged_infer_error = False  # 추론 예외를 매 프레임 로그하면 로그창이 그걸로
+                                           #   도배되므로 최초 1회만 찍고 이후는 조용히 스킵
 
         self._thread = threading.Thread(target=self._worker, name='yolo_signal_state_infer', daemon=True)
         self._thread.start()
@@ -229,16 +227,14 @@ class YoloSignalStateDetector:
                         cv2.rectangle(vis, p1, p2, color, 2)
                         cv2.putText(vis, f'{name} {conf:.2f}', (p1[0], max(0, p1[1] - 6)),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
-                    # [2026-08-23, 요청 반영: "YOLO 색상검출 신뢰도도 추가"] 기존엔 O/-로
-                    # 점등 여부만 보여줘 임계값(YOLO_SIGNAL_STATE_CONF_THRESHOLD) 근처에서
-                    # 얼마나 아슬아슬하게 통과/실패했는지 알 수 없었다 — 클래스별 최댓값
-                    # 신뢰도(state[name][1], 미검출이면 0.0)를 괄호로 덧붙인다.
+                    # 점등 여부(O/-)에 더해, 임계값(YOLO_SIGNAL_STATE_CONF_THRESHOLD) 근처에서
+                    # 얼마나 아슬아슬하게 통과/실패했는지 보이도록 클래스별 최댓값 신뢰도
+                    # (state[name][1], 미검출이면 0.0)를 괄호로 덧붙인다.
                     summary = ' '.join(f'{n}={"O" if p else "-"}({c:.2f})' for n, (p, c, _a) in state.items())
                     cv2.putText(vis, summary, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                                 (255, 255, 255), 2, cv2.LINE_AA)
-                    # [2026-08-24] 면적 게이트(YOLO_SIGNAL_MIN_BOX_AREA_PX) 도입 — state의
-                    # 최고신뢰도 박스 면적(area, engine.infer()가 이미 계산)을 그대로 보여준다
-                    # (예전엔 여기서 detections를 다시 훑어 중복 계산했음).
+                    # 면적 게이트(YOLO_SIGNAL_MIN_BOX_AREA_PX) 상태도 함께 보여준다 — state의
+                    # 최고신뢰도 박스 면적(area, engine.infer()가 이미 계산)을 그대로 쓴다.
                     area_summary = ' '.join(f'{n}={state[n][2]:.0f}px²'
                                              for n in YOLO_SIGNAL_STATE_CLASS_NAMES)
                     cv2.putText(vis, f'{area_summary}  (gate>{YOLO_SIGNAL_MIN_BOX_AREA_PX:.0f}px²)',
@@ -256,8 +252,8 @@ class YoloSignalStateDetector:
                 self._latest_debug = vis
 
             now = time.time()
-            # [2026-08-20] 검출 안 될 때도 몇 초마다 FPS 로그가 계속 찍혀 로그창을 채우던 것을
-            # "실제로 뭔가 검출됐을 때만" 찍히도록 변경(요청 반영).
+            # FPS 로그는 "실제로 뭔가 검출됐을 때만" 찍는다 — 검출 안 될 때도 계속 찍히면
+            # 로그창을 채운다.
             state_detected = any(present for present, _conf, _area in state.values())
             if state_detected and now - self._last_fps_log_t >= FPS_LOG_PERIOD_SEC:
                 summary = ' '.join(f'{n}={"O" if p else "-"}' for n, (p, _c, _a) in state.items())
@@ -276,7 +272,7 @@ class YoloSignalStateDetector:
             state = self._latest_state
 
         def _present(name):
-            # [2026-08-24] conf 통과만으론 부족 — 최고신뢰도 박스 면적도
+            # conf 통과만으론 부족 — 최고신뢰도 박스 면적도
             # YOLO_SIGNAL_MIN_BOX_AREA_PX 초과여야 검출로 인정(B1/B2/B3와 동일 원칙).
             present, _conf, area = state[name]
             return present and area > YOLO_SIGNAL_MIN_BOX_AREA_PX
@@ -298,14 +294,12 @@ class YoloSignalStateDetector:
             cv2.namedWindow('YOLO_신호등', cv2.WINDOW_AUTOSIZE)
             cv2.moveWindow('YOLO_신호등', *DEBUG_WIN_POS_YOLO_SIGNAL_STATE)
             self._dbg_win_positioned = True
-        # [2026-08-23, 요청 반영: "카메라욜로랑 검출라이다는 크기 완전 작게"] 원본
-        # 640x480(YOLO_SIGNAL_STATE_INPUT_SIZE 기반 프레임)을 화면 표시용으로만 리사이즈 —
-        # 검출/판단에 쓰이는 vis 자체는 그대로 두고 imshow 직전에만 리사이즈한다.
-        # [2026-08-23d, 요청 반영] 160x120은 좌회전/직진 판단 검증 중 박스가 너무 작아 안
-        # 보인다는 재요청으로 600x450(4:3 비율 유지)으로 다시 키움 — DEBUG_WIN_POS_YOLO_
-        # SIGNAL_STATE=(0,0)에서 이 크기로 떠도 오른쪽 checker_pillar_bev(650,0 시작)와는
-        # 50px 여유가 있고, 아래쪽 left_turn_debug(0,650 시작)와도 겹치지 않는다
-        # (config.py DEBUG_WIN_POS_YOLO_SIGNAL_STATE 주석 참고).
+        # 원본 640x480(YOLO_SIGNAL_STATE_INPUT_SIZE 기반 프레임)을 화면 표시용으로만
+        # 600x450(4:3 비율 유지)으로 리사이즈한다 — 검출/판단에 쓰이는 vis 자체는 그대로
+        # 두고 imshow 직전에만 리사이즈한다. DEBUG_WIN_POS_YOLO_SIGNAL_STATE=(0,0)에서 이
+        # 크기로 떠도 오른쪽 checker_pillar_bev(650,0 시작)와는 50px 여유가 있고, 아래쪽
+        # left_turn_debug(0,650 시작)와도 겹치지 않는다(config.py
+        # DEBUG_WIN_POS_YOLO_SIGNAL_STATE 주석 참고).
         small_vis = cv2.resize(vis, (600, 450), interpolation=cv2.INTER_AREA)
         cv2.imshow('YOLO_신호등', small_vis)
         cv2.waitKey(1)

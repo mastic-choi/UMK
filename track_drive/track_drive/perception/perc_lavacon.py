@@ -7,74 +7,29 @@
 #     (prev_boxes는 직전 호출이 반환한 boxes를 self.*에 들고 있다가 그대로 다시 넘긴다 —
 #      LAVACON_TEMPORAL_EMA_ENABLED가 꺼져 있으면 안 넘겨도(None) 무방)
 #
-# [경로생성 방식 변천사, 전부 2026-08-19]
-#   1) 보로노이(scipy.spatial.Voronoi) — 콘 점군 전체로 다이어그램을 계산해 정점(vertex)들을
-#      중심선으로 썼다. 좌우 콘 개수가 비대칭이어도 위상적으로 그럴듯한 골격이 나온다는
-#      장점은 있었지만, 정점 개수/위치가 프레임마다 크게 흔들려 실차 테스트에서 경로가
-#      계속 튀는 문제로 폐기.
-#   2) 클러스터링 + 순번 매칭 — 좌/우 콘 후보 점을 라이다 인덱스 인접성으로 묶어(콘 하나당
-#      중심점 하나) 좌/우 각각 x(전방거리) 오름차순으로 정렬 후 같은 순번끼리 묶었다.
-#      좌우 콘 개수/간격이 비대칭이면(급커브 등) i번째끼리 묶인 두 콘이 물리적으로
-#      가깝다는 보장이 없어 중점이 트랙 중앙을 벗어나는 문제로 폐기.
-#   3) 클러스터링 + 최근접 이웃(유클리드) 매칭(`_pair_nearest`, `_cluster_cone_side`,
-#      한때 채택됐다 폐기) — 순번 대신 기준선(y=0) 위에서 가까운 좌측 콘부터 실제 유클리드
-#      거리가 가장 가까운 우측 콘을 찾아 짝지었다. 그런데 유클리드 거리만 보면 급커브에서
-#      트랙을 가로지르는 두 콘(예: 내 차로 안쪽 콘과 그 너머 바깥쪽 콘)이 실제로는 다른
-#      경계에 속하는데도 "물리적으로 가깝다"는 이유만으로 잘못 짝지어질 위험이 있다는
-#      지적(사용자)에 따라 폐기.
-#   4) 박스 스택 페어링(`_pick_boxed_centers`, 2026-08-19 도입) — perc_lavacon_trigger()의
-#      진입 트리거 박스(전방 0.3~0.5m 좁은 구간에서 좌우 클러스터 유무만 봄)와 완전히
-#      같은 발상으로 돌아간다: 그 박스와 같은 폭(BOX_LON_WIDTH)의 박스를 전방으로 쭉
-#      쌓아 올리고, 각 박스 "안에서만" 좌(y>0)/우(y<0) 각 1점(차량에서 가장 가까운 점)을
-#      뽑아 그 중점을 그 박스의 경로점으로 삼는다. 짝짓기 후보 자체가 같은 좁은 종방향
-#      구간 안으로 국한되므로 3)의 "먼 트랙 구간 콘과 잘못 짝지어지는" 문제가 구조적으로
-#      불가능해진다. 박스를 전방 순서대로 훑으므로 결과가 자연히 x 오름차순이라 별도
-#      정렬도 불필요. 다만 한쪽만 검출된 박스는 통째로 버려져(양쪽 다 있어야만 채택),
-#      콘 간격이 벌어지거나 급커브 안쪽이라 한쪽이 듬성한 구간에서 경로점이 끊기는 약점이
-#      남아있었다.
-#   5) [현재] 좌우 독립 바운더리 + 반폭(half-width) sparse fallback(`_pick_boxed_sides`,
-#      `_build_path`) — 박스 스택의 짝짓기 국한 아이디어(4)는 그대로 두되, 박스마다
-#      "양쪽 다 있어야 채택"이 아니라 좌/우 각각을 독립된 종방향 시퀀스(바운더리 라인)로
-#      전부 들고 있는다. 양쪽 다 검출된 박스는 기존과 동일하게 중점을 쓰고, 한쪽만
-#      검출된 박스는(`LAVACON_SPARSE_FALLBACK_ENABLED`, 기본 False) 직전까지 양쪽 다
-#      검출됐던 박스들의 좌우 반폭 EMA만큼 검출된 쪽 반대로 밀어 중심선을 추정한다.
-#      (da(주행가능영역) 융합도 검토했으나, da는 콘 구간에서 방향성이 검증된 적 없는
-#      신호라 굳이 안 쓰기로 했다 — 라이다 자체 반폭 추정만으로 충분하다는 판단.)
-#      기본값(False)에서는 한쪽만 있는 박스가 그냥 스킵되어 4)와 결과가 100% 동일하다.
-#   6) [현재] 프레임간 "라바콘 차선" EMA(`_blend_boxes_temporal`, 기본 꺼짐) — 라이다가
-#      한 프레임 튀면(반사 노이즈로 잘못된 점이 박스 최근접점으로 뽑히거나, 콘이 순간
-#      한 프레임만 안 보이는 등) 그 튐이 그대로 그 프레임 조향에 들어가는 문제(사용자
-#      지적, waypoint 자체엔 프레임간 스무딩이 전혀 없었음)에 대응. waypoint(중점)를
-#      직접 EMA하지 않고, 그 재료인 박스별 좌/우 포인트("라바콘 차선")를 인덱스별로
-#      EMA한 뒤 중점/반폭 폴백(5)을 매 프레임 그 값으로 다시 계산한다 — 박스 위치가
-#      config 상수로만 정해지는 고정 그리드라 인덱스가 프레임 간에도 항상 같은 종방향
-#      구간을 가리키므로(da 경로가 PATH_N_WAYPOINTS 고정 리샘플링으로 해결한 것과 동일한
-#      문제), `_pick_boxed_sides()`가 빈 박스도 (None,None)으로 채워 반환하도록 같이
-#      바꿨다. `LAVACON_TEMPORAL_EMA_ENABLED`(기본 False)가 꺼져 있으면 5)와 결과가
-#      100% 동일하다. 상태(직전 boxes)는 track_drive.py가 self.*로 들고 있다가 매 틱
-#      다시 넘겨주는 함수형 스레딩(process_lavacon() 자체는 무상태 유지).
-#   7) [현재] 좌/우 배정을 y부호 대신 라인 연속성으로(`_assign_by_continuity`,
-#      `LAVACON_LINE_CONTINUITY_ENABLED`, 기본 True) — 지금까지 5)/6) 전부 박스 안에서
-#      좌/우를 "y부호"(차량 헤딩 기준 고정 중앙선, y>0=좌/y<0=우)로 먼저 가른 뒤 그 절반
-#      안에서 최근접 1점을 뽑았다. 급커브에서는 물리적으로 계속 "오른쪽 라인"이던 콘이
-#      차량 헤딩 기준 y>0(수학적으로는 왼쪽)으로 넘어갈 수 있는데, 고정 y=0 경계로는 그
-#      점이 왼쪽 라인으로 잘못 편입된다 — 사용자가 lavacon_ema_bev 창에서 실제로 확인
-#      (오른쪽 콘 두 개가 초록/주황으로 색이 갈려서 찍힘). 켜면 박스 안 후보를 y부호로
-#      먼저 안 가르고, 직전 박스에서 확정된 좌/우 점과 유클리드 거리가 가장 가까운
-#      후보를 그 라인의 연속으로 우선 배정한다(`LAVACON_LINE_TRACK_MAX_JUMP_M` 이내일
-#      때만) — 처음 검출되는 라인이거나 연속 배정에 실패하면(다른 콘/라인일 가능성) 그
-#      때만 기존 y부호 방식으로 폴백한다. 끄면 5)/6)과 100% 동일(자가 테스트로 확인).
-#      [참고] 같은 날 별도로 박스 스택 자체를 우회하는 da_push 조향 모드
-#      (`LAVACON_STEER_MODE_DA_PUSH`, track_drive.py `_lavacon_steer_da_push()`)도
-#      추가됐다 — da_push가 켜지면 이 파일의 박스 스택 경로(process_lavacon의 path_m)는
-#      lavacon_done 판정에만 쓰이고 조향엔 `nearest_cone_lateral()`이 쓰인다.
+# [경로 생성 방식] 차량 전방을 BOX_LON_WIDTH 폭의 박스로 쭉 쌓아 올리고, 각 박스
+#   "안에서만" 좌(y>0)/우(y<0) 각 1점(차량에서 가장 가까운 점)을 뽑아 좌/우 독립
+#   바운더리 시퀀스로 들고 있는다(`_pick_boxed_sides`). 짝짓기 후보 자체를 같은 좁은
+#   종방향 구간으로 국한시켜, 급커브에서 트랙을 가로지르는 먼 콘끼리 잘못 짝짓는 문제를
+#   구조적으로 막는다. 좌/우 배정은 기본적으로 라인 연속성(직전 박스에서 확정된 좌/우
+#   점과 유클리드 최근접, `_assign_by_continuity`, `LAVACON_LINE_CONTINUITY_ENABLED`)으로
+#   하는데, 급커브에서 물리적으로 "오른쪽 라인"이던 콘이 차량 헤딩 기준 y>0(왼쪽)으로
+#   넘어가도 고정 y=0 경계보다 정확하게 같은 라인으로 계속 배정하기 위해서다. 양쪽 다
+#   검출된 박스는 두 점의 중점을 경로점으로 쓰고, 한쪽만 검출된 박스는
+#   (`LAVACON_SPARSE_FALLBACK_ENABLED`, 기본 False) 직전까지 양쪽 다 검출됐던 박스들의
+#   좌우 반폭 EMA만큼 검출된 쪽 반대로 밀어 중심선을 추정한다(`_build_path`). 라이다가
+#   한 프레임 튀는 문제(반사 노이즈 등)에는 박스별 좌/우 포인트("라바콘 차선")에 거는
+#   프레임간 EMA(`_blend_boxes_temporal`, 기본 꺼짐, `LAVACON_TEMPORAL_EMA_ENABLED`)로
+#   대응한다 — waypoint(중점) 자체가 아니라 그 재료인 좌/우 포인트 쪽에 건다. 박스 스택
+#   자체를 우회하는 da_push 조향 모드(`LAVACON_STEER_MODE_DA_PUSH`, track_drive.py
+#   `_lavacon_steer_da_push()`)도 있다 — 켜지면 이 파일의 박스 스택 경로(path_m)는
+#   lavacon_done 판정에만 쓰이고 조향엔 `nearest_cone_lateral()`이 쓰인다.
 #
-#   출력 형식(offset/done/path_m)과 좌표 약속은 매 단계 동일하게 유지했으므로 Pure
-#   Pursuit(controller/pure_pursuit.py)가 그대로 이 경로를 추종한다. 다만 6) 도입으로
-#   반환 튜플에 boxes가 하나 추가됐으므로 track_drive.py 호출부(perc_lavacon())는
-#   그만큼만 수정했다.
+#   출력 형식(offset/done/path_m)과 좌표 약속은 유지되어 Pure Pursuit
+#   (controller/pure_pursuit.py)이 그대로 이 경로를 추종한다. 반환 튜플엔 boxes도
+#   포함된다(프레임간 EMA용 상태 — track_drive.py perc_lavacon() 호출부 참고).
 #
-# [라이다 좌표 약속] (track_drive.py 재실측 기준, 2026-07-22 확정)
+# [라이다 좌표 약속] (track_drive.py 재실측 기준)
 #   · 360칸, 인덱스 = 각도(도), 반시계 방향
 #   · ★인덱스 0이 정면이 아니다★ — 라이다 장착 각도가 80도 어긋나 있어
 #     "보정후각도 = 인덱스 - LIDAR_ANGLE_OFFSET_DEG" 로 빼줘야 한다.
@@ -82,9 +37,8 @@
 #   · 인덱스 215~304 는 차체 자기가림 구간 → 항상 무효 처리
 #   · 직교좌표 변환: x = r·cos(보정후각도) (전방+), y = r·sin(보정후각도) (좌측+)
 #   ※ 이 두 상수(LIDAR_ANGLE_OFFSET_DEG / BODY_LO,HI)는 track_drive.py의 동일 상수와
-#     반드시 값을 일치시킬 것. 2026-06-19 구 규약(오프셋 0, 마스크 99~262)을 쓰던 시절
-#     코드가 남아 실제 좌측 콘이 마스크에 지워지고 우측 콘이 좌측으로 반전 해석되어
-#     done 이 항상 True 가 되는 버그가 있었다.
+#     반드시 값을 일치시킬 것 — 어긋나면 좌/우 콘이 반전 해석되어 done이 항상 True가
+#     되는 등의 버그로 이어진다.
 #
 # [부호 약속] (track_drive.py 제어팀 합의와 동일)
 #   · lavacon_offset > 0 : 중심선이 차량 기준 '우측'에 있음 → 우조향
@@ -94,19 +48,15 @@
 import math
 import numpy as np
 
-# [2026-08-07] LIDAR_ANGLE_OFFSET_DEG를 이 파일에 별도 상수로 하드코딩해뒀던 게
-#   config.py와 값이 어긋날 수 있는 위험이었다(위 "2026-06-19 구 규약" 버그가 정확히
-#   이 종류의 비동기화로 생겼었음) — config.py를 단일 소스로 삼아 여기서도 그대로
-#   가져다 쓰도록 고쳤다. 값 자체(80.0)는 바뀌지 않았다.
+# 라이다 각도 보정값 — config.py가 단일 소스(track_drive.py와 반드시 일치해야 함).
 from ..config import LIDAR_ANGLE_OFFSET_DEG
-# [2026-08-19] sparse 박스(한쪽만 검출) 반폭 추정 폴백 스위치/게인 — config.py가 단일 소스.
+# sparse 박스(한쪽만 검출) 반폭 추정 폴백 스위치/게인 — config.py가 단일 소스.
 from ..config import LAVACON_SPARSE_FALLBACK_ENABLED, LAVACON_HALFWIDTH_EMA_ALPHA
-# [2026-08-19] 박스별 좌/우 바운더리 포인트("라바콘 차선")에 거는 프레임간 EMA 스위치/게인
-# — waypoint(중점) 자체가 아니라 그 재료인 좌/우 포인트에 건다(_blend_boxes_temporal 참고).
+# 박스별 좌/우 바운더리 포인트("라바콘 차선")에 거는 프레임간 EMA 스위치/게인 —
+# waypoint(중점) 자체가 아니라 그 재료인 좌/우 포인트에 건다(_blend_boxes_temporal 참고).
 from ..config import LAVACON_TEMPORAL_EMA_ENABLED, LAVACON_TEMPORAL_EMA_ALPHA
-# [2026-08-19] 박스 안 후보점을 y부호(고정 중앙선)로 가르는 대신 직전 박스의 같은 라인과의
-# 최근접 연속성으로 배정할지 여부 — _pick_boxed_sides() 참고. 급커브에서 실제로는 오른쪽
-# 라인인 콘이 차량 헤딩 기준 y>0으로 넘어가는 걸 사용자가 디버그 창에서 확인(2026-08-19).
+# 박스 안 후보점을 y부호(고정 중앙선)로 가르는 대신 직전 박스의 같은 라인과의 최근접
+# 연속성으로 배정할지 여부 — _pick_boxed_sides() 참고.
 from ..config import LAVACON_LINE_CONTINUITY_ENABLED, LAVACON_LINE_TRACK_MAX_JUMP_M
 
 # ─────────────────────────────────────────────
@@ -118,56 +68,39 @@ BODY_LO, BODY_HI = 215, 305     # 차체 가림 인덱스 구간 [215, 304] 마�
                                  #  들고 있는 게 이 프로젝트의 기존 관례라 그대로 따름)
 LON_MIN          = 0.0          # 콘 후보 점의 전방 최소거리 (m) — 차체 바로 앞 반사 배제
 CONE_LON_MAX     = 4.0          # 콘 후보 점의 전방 최대거리 (m) — 벽/원거리 잡음 배제
-CONE_LAT_LIMIT   = 0.5          # 콘 후보 점의 횡방향 한계 (m) — [2026-08-19] 2.5→1.8→1.0로 축소.
-                                 # [2026-08-22k] 1.0→0.5(요청 반영) — track_drive.py
+CONE_LAT_LIMIT   = 0.5          # 콘 후보 점의 횡방향 한계 (m) — track_drive.py
                                  #   perc_lavacon_trigger()의 트리거 ROI LAT_MAX와 같은 값으로
-                                 #   맞춤(두 값은 항상 같이 바꿀 것). 트리거 박스(청록)와 이 값
-                                 #   기준 검출 박스(초록/주황, lavacon_bev 창) 사이에 남던 빈
-                                 #   공간을 없애기 위함.
-                                 # track_drive.py _draw_lavacon_bev()가 이 값을 그대로 import해서
-                                 # lavacon_bev 창에 좌우 경계선(흰 선)으로 그린다 — 값을 또 바꾸면 그 선도 같이 움직인다.
+                                 #   맞춰야 한다(두 값은 항상 같이 바꿀 것). track_drive.py
+                                 #   _draw_lavacon_bev()가 이 값을 그대로 import해서 lavacon_bev
+                                 #   창에 좌우 경계선(흰 선)으로 그린다.
 OFFSET_CLAMP     = 0.8          # 편차 물리한계 (m) — 콘 사이 폭 초과값은 오검출로 간주
 OFFSET_GAIN      = 1.0          # y평균 → offset 스케일 계수 (제어팀 LAVACON_KP와 별도, 여기선 1:1)
 
-# [2026-08-22] 종료 판정 ROI — 요청 반영, track_drive.py perc_lavacon_trigger()의 진입
-#   트리거 박스(LON_MIN/LON_MAX/LAT_MAX)와 동일 크기로 축소. 예전엔 CONE_LON_MAX/
-#   CONE_LAT_LIMIT(4.0m×±0.5m, 구간 전체를 넓게 보는 종료판정용 ROI)를 그대로 썼으나,
-#   "진입 때 본 것과 같은 크기의 박스에 1개도 안 찍히면 종료"로 판정 기준을 바꿔달라는
-#   요청으로 전용 상수를 새로 둔다 — CONE_LON_MAX/CONE_LAT_LIMIT는 박스 스택 경로(path_m)
-#   탐색 범위로 계속 쓰이므로 그대로 둔다(용도가 다름). 값은 perc_lavacon_trigger()의
-#   LON_MIN/LON_MAX/LAT_MAX(-0.1~0.3m, ±0.75m)를 복사(두 값은 항상 같이 바꿀 것 — 위
-#   BODY_LO/HI 주석과 동일 관례).
+# 종료 판정 ROI — track_drive.py perc_lavacon_trigger()의 진입 트리거 박스(LON_MIN/LON_MAX/
+#   LAT_MAX)와 동일 크기: "진입 때 본 것과 같은 크기의 박스에 1개도 안 찍히면 종료"로 판정.
+#   CONE_LON_MAX/CONE_LAT_LIMIT는 박스 스택 경로(path_m) 탐색 범위로 별도로 쓰인다(용도가
+#   다름). 값은 perc_lavacon_trigger()의 LON_MIN/LON_MAX/LAT_MAX를 복사한 것이라 두 값은
+#   항상 같이 바꿀 것(위 BODY_LO/HI 주석과 동일 관례).
 EXIT_LON_MIN     = -0.1
 EXIT_LON_MAX     = 0.3
 EXIT_LAT_LIMIT   = 0.75
 
-# [2026-08-19] 박스 스택 페어링 파라미터 — track_drive.py perc_lavacon_trigger()의 진입
-#   트리거 박스와 반드시 같은 폭을 유지할 것(BOX_LON_START=LON_MIN, BOX_LON_WIDTH=
-#   LON_MAX-LON_MIN, 트리거 쪽은 0.3~0.7). perc_lavacon.py와 perc_lavacon_trigger()가
-#   서로 import하지 않는 기존 관례상 값을 복사해서 들고 있다(위 BODY_LO/HI 주석 참고) —
-#   한쪽만 바꾸면 반드시 다른 쪽도 같이 바꿀 것.
+# 박스 스택 페어링 파라미터 — track_drive.py perc_lavacon_trigger()의 진입 트리거 박스와
+#   반드시 같은 폭을 유지할 것(BOX_LON_START=LON_MIN, BOX_LON_WIDTH=LON_MAX-LON_MIN).
+#   perc_lavacon.py와 perc_lavacon_trigger()가 서로 import하지 않는 기존 관례상 값을
+#   복사해서 들고 있다(위 BODY_LO/HI 주석 참고) — 한쪽만 바꾸면 반드시 다른 쪽도 같이 바꿀 것.
 BOX_LON_START    = 0.3          # 첫 박스 시작 지점(전방, m) — 차체 바로 앞 반사 배제
-# [2026-08-19] 0.2→0.4로 확대(실차 확인 반영) — 실제 라바콘 간격이 옛 박스 폭 기준
-#   2칸(≈0.4m)이라, 0.2m 박스로는 콘 하나 걸러 빈 박스가 계속 나와 좌/우 바운더리가
-#   듬성듬성해지고(같은 이유로 프레임간 EMA도 인덱스가 잘 안 맞음) sparse fallback의
-#   반폭 EMA 부트스트랩(양쪽 다 검출된 박스 필요)도 잘 안 걸렸다. 박스 폭을 실제 콘
-#   간격에 맞추면 박스 하나에 콘 하나가 안정적으로 들어와 이 문제들이 구조적으로
-#   완화된다. lavacon_bev/lavacon_ema_bev의 파란 격자도 이 값을 그대로 따라간다
-#   (track_drive.py가 이 상수를 LAVACON_BOX_LON_WIDTH로 import).
-BOX_LON_WIDTH    = 0.4          # 박스 1개의 종방향 폭(m)
+BOX_LON_WIDTH    = 0.4          # 박스 1개의 종방향 폭(m) — 실측 콘 간격(≈0.4m)에 맞춰, 박스
+                                 #   하나에 콘 하나가 안정적으로 들어오게 한다. lavacon_bev/
+                                 #   lavacon_ema_bev의 파란 격자도 이 값을 따라간다
+                                 #   (track_drive.py가 LAVACON_BOX_LON_WIDTH로 import).
 
-# [2026-08-22] 특정 물리 위치(우측 아주 가까운 지점)에서 반복적으로 유령 라이다 점이 찍히는
-#   문제 — 실차 스크린샷(lavacon_bev)으로 대략 위치 추정(x≈0.08/y≈-0.075) 후, lavacon_bev에
-#   빨간 GHOST MASK 원 + 정확한 좌표 텍스트를 띄워 사용자가 직접 실측 좌표로 보정
-#   (X_M -0.05로 수정, 2026-08-22 22:5x경) — **실차에서 이 위치의 유령 점(노이즈)이 완전히
-#   가려지는 것을 사용자가 확인함**. 사용자가 차체를 들어보면 이 점이 사라지는 것도 확인
-#   → 차량 자체(마운트 등) 반사가 원인. 신호등 검증 때도 같은 지점에서 문제가 됐다고 함.
-#   근본 원인 조사(README/작업기록 "다음 작업" — 각도 오프셋 재측정, 자기가림 경계,
-#   멀티패스 순으로 확인)는 여전히 미해결 — 이건 그 증상의 임시 완화일 뿐, 이 좌표 근처의
-#   좁은 원형 구역 안의 라이다 점만 무효 처리한다. 반경을 넓게 잡으면 그 근처의 진짜
-#   라바콘까지 같이 지워버릴 수 있으니 최소한(6cm)만 잡았다 — 다른 위치에서도 유령 점이
-#   재발하면 이 방식(좌표+반경 추가)을 그대로 반복하기보다 위 "다음 작업"의 근본 원인부터
-#   확인할 것. ※ 코드만 고쳐서는 실행 중이던 노드에 반영 안 됨 — 재시작 후에 확인할 것.
+# 특정 물리 위치(우측 아주 가까운 지점, 차량 자체/마운트 반사로 추정)에서 반복적으로
+#   찍히는 유령 라이다 점을 무효화한다 — 실측 좌표(x≈-0.05/y≈-0.075) 근처의 좁은 원형
+#   구역(반경 6cm) 안의 라이다 점만 무효 처리한다. 반경을 넓게 잡으면 그 근처의 진짜
+#   라바콘까지 같이 지워버릴 수 있으니 최소한만 잡았다 — 다른 위치에서도 유령 점이
+#   재발하면 근본 원인(각도 오프셋, 자기가림 경계, 멀티패스)부터 확인할 것.
+#   ※ 코드만 고쳐서는 실행 중이던 노드에 반영 안 됨 — 재시작 후에 확인할 것.
 GHOST_POINT_X_M      = -0.05
 GHOST_POINT_Y_M      = -0.075
 GHOST_POINT_RADIUS_M = 0.06
@@ -177,7 +110,7 @@ def _lidar_to_xy(lidar_ranges):
     """라이다 1스캔을 전처리(무효값/자기가림 마스킹)하고 직교좌표(x=전방+, y=좌측+)로
     변환한다. process_lavacon()과 nearest_cone_lateral()이 똑같이 필요로 하는 전처리라
     공용 함수로 뺐다 — 두 곳이 각자 복사해서 들고 있으면 마스킹 범위나 각도보정 상수가
-    한쪽만 바뀌는 사고(파일 상단 "2026-06-19 구 규약" 버그와 같은 종류)가 재발할 수 있다.
+    한쪽만 바뀌는 사고가 재발할 수 있다.
     입력이 무효(None/빈 배열)면 (None, None, None)을 반환한다."""
     if lidar_ranges is None:
         return None, None, None
@@ -202,23 +135,17 @@ def _lidar_to_xy(lidar_ranges):
 
 
 def nearest_cone_lateral(lidar_ranges, lon_min, lon_max, lat_limit, return_range=False, lon_max_l=None):
-    """[2026-08-19] da(주행가능영역) 경로를 그대로 조향에 쓰고, 콘이 안전마진 안으로
-    들어왔을 때만 그만큼 옆으로 미는 방식(track_drive.py `_lavacon_steer_da_push` 참고)
-    전용 — 박스 스택 페어링(`_pick_boxed_sides`/`_build_path`)처럼 좌우 콘을 짝짓거나
-    경로 전체를 재구성하지 않는다. 지정한 좁은 ROI(lon_min~lon_max, ±lat_limit) 안에서
-    좌(y>0)/우(y<0) 각각 라이다 반사거리가 가장 가까운 점 1개의 y좌표만 반환한다 —
-    "정밀한 경로"가 아니라 "얼마나 침범했는지"만 필요하므로 이거면 충분하고, 라이다가
-    듬성하게/노이즈 섞여 검출돼도(박스 스택이 실차에서 계속 시달린 문제) 한 점만 있으면
-    바로 동작한다.
+    """da(주행가능영역) 경로를 그대로 조향에 쓰고, 콘이 안전마진 안으로 들어왔을 때만
+    그만큼 옆으로 미는 방식(track_drive.py `_lavacon_steer_da_push` 참고) 전용 — 박스
+    스택 페어링(`_pick_boxed_sides`/`_build_path`)처럼 좌우 콘을 짝짓거나 경로 전체를
+    재구성하지 않는다. 지정한 좁은 ROI(lon_min~lon_max, ±lat_limit) 안에서 좌(y>0)/
+    우(y<0) 각각 라이다 반사거리가 가장 가까운 점 1개의 y좌표만 반환한다 — "정밀한
+    경로"가 아니라 "얼마나 침범했는지"만 필요하므로 이거면 충분하고, 라이다가 듬성하게/
+    노이즈 섞여 검출돼도 한 점만 있으면 바로 동작한다.
 
-    [2026-08-22] return_range — 좌우 각각 "실측거리(range) 기준 최근접점"의 y만 보고는
-    "그 점이 실제로 차량에서 얼마나 가까운지"(range)도, "화면에서 정확히 어디 찍히는지"
-    (x, 종방향)도 알 수 없어서, lavacon_bev 디버그창에서 이 y값을 만든 실제 점이 어디
-    있는지 눈으로 못 짚어내겠다는 문제 제기로 추가 — push 판정(margin과 비교하는 대상은
-    여전히 y, 라인 침범 여부라 range/x가 아님) 자체는 그대로 두고, 순수 표시용으로만
-    range와 x를 같이 반환한다. True면 (left_y, right_y, left_range, right_range,
-    left_x, right_x) 6-튜플, False(기본, 기존 호출부 전부 이 경로)면 기존과 동일하게
-    2-튜플만 반환해 하위호환 유지.
+    return_range=True면 push 판정(y, 라인 침범 여부)은 그대로 두고 디버그 표시용으로
+    range/x도 같이 반환한다: (left_y, right_y, left_range, right_range, left_x, right_x)
+    6-튜플. False(기본)면 (left_y, right_y) 2-튜플만 반환.
 
     출력 : (left_y, right_y) — 각각 없으면 None, 있으면 라이다 미터 좌표(좌측+).
     """
@@ -226,8 +153,8 @@ def nearest_cone_lateral(lidar_ranges, lon_min, lon_max, lat_limit, return_range
     if x is None:
         return (None, None, None, None, None, None) if return_range else (None, None)
 
-    # [2026-08-24, 테스트] lon_max_l — 좌측만 전방 ROI를 다르게 주고 싶을 때(config.py
-    # LAVACON_PUSH_LON_MAX_L 참고). None이면 lon_max와 동일해 기존과 100% 동일 동작.
+    # lon_max_l — 좌측만 전방 ROI를 다르게 주고 싶을 때(config.py LAVACON_PUSH_LON_MAX_L
+    # 참고). None이면 lon_max와 동일하게 동작한다.
     roi_common = (ranges > 0.0) & (x > lon_min) & (np.abs(y) < lat_limit)
     left_lon_max = lon_max if lon_max_l is None else lon_max_l
     left_idx = np.where(roi_common & (x < left_lon_max) & (y > 0.0))[0]
@@ -249,12 +176,11 @@ def _assign_by_continuity(box_idx, x, y, ranges, prev_left_xy, prev_right_xy, ma
     """한 박스 안 후보점 인덱스(box_idx)를, 직전 박스에서 확정됐던 좌/우 점(prev_left_xy/
     prev_right_xy)과의 유클리드 최근접 연속성으로 좌/우에 배정한다.
 
-    [2026-08-19 도입 배경] 기존 `_pick_boxed_sides()`는 박스 안 후보를 y부호(y>0=좌/
-    y<0=우, 차량 헤딩 기준 고정 중앙선)로 먼저 갈랐는데, 급커브에서는 물리적으로 계속
-    "오른쪽 라인"이던 콘이 차량 헤딩 기준 y>0(수학적으로는 왼쪽) 쪽으로 넘어갈 수 있다 —
-    이 경우 고정 y=0 경계로는 그 점이 왼쪽 라인으로 잘못 편입된다(사용자가 lavacon_ema_bev
-    창에서 실제로 확인). 이 함수는 그 대신 "직전까지 오른쪽이던 점과 물리적으로 가장
-    가까운 후보가 이번에도 오른쪽일 가능성이 높다"는 연속성 가정으로 배정한다.
+    y부호(y>0=좌/y<0=우, 차량 헤딩 기준 고정 중앙선)로 먼저 가르는 방식은 급커브에서
+    물리적으로 계속 "오른쪽 라인"이던 콘이 차량 헤딩 기준 y>0(수학적으로는 왼쪽) 쪽으로
+    넘어갈 때 그 점을 왼쪽 라인으로 잘못 편입시킨다. 이 함수는 그 대신 "직전까지
+    오른쪽이던 점과 물리적으로 가장 가까운 후보가 이번에도 오른쪽일 가능성이 높다"는
+    연속성 가정으로 배정한다.
 
     한 박스에 후보가 여러 개면 좌 배정을 먼저 확정하고 그 점을 후보군에서 제거한 뒤 우를
     고른다(같은 점이 좌/우 양쪽에 동시 배정되는 것을 구조적으로 막음) — 순서 자체(좌 우선)
@@ -309,31 +235,22 @@ def _pick_boxed_sides(x, y, ranges, lon_start, lon_width, lon_max, lat_limit,
     점을 고른다. 켜져 있으면 `_assign_by_continuity()`로 직전 박스의 같은 라인과의 최근접
     연속성으로 배정한다(급커브에서 y부호가 뒤집히는 문제 대응 — 그 함수 docstring 참고).
 
-    [2026-08-19 최초 도입] 콘 클러스터링 + 유클리드 최근접 이웃 매칭(구버전, 폐기) 대신
-    이 방식을 쓰는 이유: 유클리드 거리만으로 좌/우를 짝지으면, 급커브에서 트랙을
-    가로지르는 두 콘이 실제로는 서로 다른 경계(내 차로 안쪽 vs 그 너머 바깥쪽)에
-    속하는데도 "물리적으로 가깝다"는 이유만으로 잘못 짝지어질 위험이 있다(사용자 지적) —
-    각 박스가 좁은 종방향 구간으로 짝짓기 후보 자체를 국한시키므로 그런 오매칭이 구조적으로
-    불가능해진다.
+    각 박스가 좁은 종방향 구간으로 짝짓기 후보 자체를 국한시키므로, 급커브에서 트랙을
+    가로지르는 두 콘이 서로 다른 경계에 속하는데도 "물리적으로 가깝다"는 이유만으로
+    잘못 짝지어지는 문제가 구조적으로 불가능해진다.
 
-    [2026-08-19 개정] 예전엔 이 함수가 "양쪽 다 있는 박스"만 걸러서 중점까지 계산해
-    반환했는데(`_pick_boxed_centers`), 그러면 한쪽만 검출된 박스가 통째로 버려져 콘 간격이
-    벌어지거나 급커브 안쪽이라 한쪽이 듬성한 구간에서 경로점이 끊기는 문제가 있었다.
-    이제는 박스마다 (left_xy 또는 None, right_xy 또는 None)을 그대로 반환해, 양쪽 유무
-    판단과 중점 계산을 호출부(`_build_path`)로 넘긴다 — 왼쪽만 모으면 왼쪽 바운더리
-    시퀀스, 오른쪽만 모으면 오른쪽 바운더리 시퀀스가 되는 셈이라 "좌우 독립 라인"을
-    별도 자료구조 없이 얻는다. 박스 폭이 이미 좁아서(BOX_LON_WIDTH, 실측 콘 간격 기준)
-    같은 사이드 안에서도 인접 박스끼리 물리적으로 가깝다는 보장이 있으므로 사이드 내부
-    정렬/매칭 로직은 필요 없다
-    (박스 순번이 곧 종방향 순서).
+    박스마다 (left_xy 또는 None, right_xy 또는 None)을 반환해, 양쪽 유무 판단과 중점
+    계산은 호출부(`_build_path`)로 넘긴다 — 왼쪽만 모으면 왼쪽 바운더리 시퀀스,
+    오른쪽만 모으면 오른쪽 바운더리 시퀀스가 되는 셈이라 "좌우 독립 라인"을 별도
+    자료구조 없이 얻는다. 박스 폭이 이미 좁아서(BOX_LON_WIDTH, 실측 콘 간격 기준) 같은
+    사이드 안에서도 인접 박스끼리 물리적으로 가깝다는 보장이 있으므로 사이드 내부
+    정렬/매칭 로직은 필요 없다(박스 순번이 곧 종방향 순서).
 
-    [2026-08-19 재개정] 검출이 하나도 없는 박스도 (None, None)으로 그대로 남겨, 반환
-    리스트 길이가 항상 n_boxes로 고정되게 했다 — 박스 위치가 config 상수(lon_start,
-    lon_width, lon_max)로만 정해지는 고정 그리드라 인덱스 i는 프레임이 바뀌어도 항상
-    "차량 기준 같은 종방향 구간"을 가리킨다. 이 안정적인 인덱스가 있어야 호출부에서
-    좌/우 포인트 각각에 프레임간 EMA(`_blend_boxes_temporal`)를 인덱스 정렬해서 걸 수
-    있다 — da 경로가 PATH_N_WAYPOINTS로 고정 리샘플링해서 같은 문제(리스트 길이가
-    프레임마다 달라지면 인덱스별 블렌딩이 무의미해짐)를 피한 것과 동일한 이유.
+    검출이 하나도 없는 박스도 (None, None)으로 그대로 남겨, 반환 리스트 길이가 항상
+    n_boxes로 고정되게 한다 — 박스 위치가 config 상수(lon_start, lon_width, lon_max)로만
+    정해지는 고정 그리드라 인덱스 i는 프레임이 바뀌어도 항상 "차량 기준 같은 종방향
+    구간"을 가리킨다. 이 안정적인 인덱스가 있어야 호출부에서 좌/우 포인트 각각에
+    프레임간 EMA(`_blend_boxes_temporal`)를 인덱스 정렬해서 걸 수 있다.
     """
     boxes = []
     n_boxes = max(0, int(math.floor((lon_max - lon_start) / lon_width + 1e-6)))
@@ -401,10 +318,9 @@ def _build_path(boxes, halfwidth_ema_alpha, sparse_fallback_enabled):
     - 한쪽만 있는 박스: `sparse_fallback_enabled`일 때만, 직전까지 양쪽 다 검출됐던
       박스들의 좌우 반폭 EMA만큼 검출된 쪽 반대로 밀어 중심선을 추정한다(반폭 EMA가
       아직 없으면, 즉 지금까지 양쪽 다 검출된 박스가 하나도 없었으면 추정 근거가 없으므로
-      스킵). `sparse_fallback_enabled`가 False면(기본값) 한쪽만 있는 박스는 그냥
-      스킵되어 구버전(`_pick_boxed_centers`)과 결과가 완전히 동일해진다.
-    - 양쪽 다 없는 박스: 스킵. [2026-08-19] `_pick_boxed_sides()`가 이제 이런 박스도
-      (None, None)으로 채워서 반환하므로(프레임간 EMA 인덱스 정렬용) 여기서 걸러낸다.
+      스킵). `sparse_fallback_enabled`가 False면(기본값) 한쪽만 있는 박스는 그냥 스킵된다.
+    - 양쪽 다 없는 박스: 스킵(`_pick_boxed_sides()`가 이런 박스도 (None, None)으로 채워서
+      반환하므로 — 프레임간 EMA 인덱스 정렬용).
     """
     mid_x, mid_y = [], []
     hw_ema = None
@@ -464,16 +380,15 @@ def process_lavacon(lidar_ranges, prev_boxes=None):
         return (0.0, True, [], None)
 
     # ── 3) 종료 판정용 콘 후보 필터링 : 진입 트리거와 동일 크기 ROI 안의 유효 점만 남김 ──
-    # [2026-08-22] 요청 반영 — 예전엔 CONE_LON_MAX/CONE_LAT_LIMIT(4.0m×±0.5m)로 넓게 봤으나,
-    # "진입 때 본 것과 같은 크기의 박스에 1개도 안 찍히면 종료"로 바꿔 EXIT_LON_MIN/MAX/
-    # LAT_LIMIT(perc_lavacon_trigger() 트리거 박스와 동일 크기, 위 상수 선언부 주석 참고)를 쓴다.
+    # "진입 때 본 것과 같은 크기의 박스에 1개도 안 찍히면 종료"로 판정하기 위해
+    # EXIT_LON_MIN/MAX/LAT_LIMIT(perc_lavacon_trigger() 트리거 박스와 동일 크기, 위 상수
+    # 선언부 주석 참고)를 쓴다.
     cone_mask = (ranges > 0.0) & (x > EXIT_LON_MIN) & (x < EXIT_LON_MAX) & (np.abs(y) < EXIT_LAT_LIMIT)
     py_cone = y[cone_mask]
 
     # ── 4) 종료 판정 : 좌·우 어느 쪽에도 콘이 없어야 라바콘 구간 끝 ──
-    # 구 로직은 "우측(y<0) 콘 소멸"만 봤는데, 콘 간격이 유동적인 코스에서는
-    # 우측에 넓은 틈이 하나만 있어도 곧바로 '구간 끝'으로 오판한다.
-    # 한쪽 줄이라도 보이면 아직 구간 안이라고 보는 편이 안전하다.
+    # 콘 간격이 유동적인 코스에서는 한쪽(예: 우측)에 넓은 틈이 하나만 있어도 곧바로
+    # '구간 끝'으로 오판할 수 있으므로, 한쪽 줄이라도 보이면 아직 구간 안이라고 본다.
     # (디바운스는 상위 FSM(_handle_lavacon)의 LAVACON_DONE_FRAMES에서 수행 — 1초 이상 연속
     # 유지돼야 확정, config.py LAVACON_DONE_FRAMES 주석 참고)
     has_left  = bool(np.any(py_cone > 0.0))
@@ -518,9 +433,8 @@ def process_lavacon(lidar_ranges, prev_boxes=None):
 # ─────────────────────────────────────────────
 if __name__ == '__main__':
     # 가상 시나리오 : 두 "게이트"(좌우 콘 쌍)를 서로 다른 박스에 하나씩 배치.
-    #   [2026-08-19] y값을 CONE_LAT_LIMIT(현재 1.0m, 실차 튜닝으로 1.8→1.0 축소됨)보다
-    #   확실히 안쪽으로 잡아야 한다 — 예전엔 y=1.5/1.0을 썼는데 1.0은 "< lat_limit" 경계에
-    #   딱 걸쳐 있어서(부동소수 반올림에 우연히 걸러지지 않고 통과) 테스트가 취약했다.
+    #   y값은 CONE_LAT_LIMIT(현재 0.5m)보다 확실히 안쪽으로 잡아야 "< lat_limit" 경계에
+    #   걸치는 취약한 테스트가 되지 않는다.
     #   게이트1(전방 0.4m): 좌 y=+0.8, 우 y=-0.5 → 중점 y=+0.15 → offset 기여 -0.15
     #   게이트2(전방 1.0m): 좌 y=+0.6, 우 y=-0.6 → 중점 y=0.0   → offset 기여 0.0
     #   → offset ≈ -(0.15+0.0)/2 = -0.075(좌조향)
@@ -578,9 +492,8 @@ if __name__ == '__main__':
     ly, ry = nearest_cone_lateral(test4, lon_min=0.2, lon_max=1.5, lat_limit=1.0)
     print(f'nearest_cone_lateral: left_y={ly} right_y={ry} (~+0.4/-0.3 기대)')
 
-    # 시나리오 5 : 좌/우 배정 — y부호 vs 라인 연속성 (2026-08-19, 사용자가 lavacon_ema_bev
-    # 창에서 직접 확인한 문제 재현). 급커브에서 오른쪽 라인 콘이 차량 헤딩 기준
-    # y>0(수학적으로는 왼쪽)으로 넘어가는 상황 — 직전 박스에서 오른쪽=(0.4,-0.2),
+    # 시나리오 5 : 좌/우 배정 — y부호 vs 라인 연속성. 급커브에서 오른쪽 라인 콘이 차량
+    # 헤딩 기준 y>0(수학적으로는 왼쪽)으로 넘어가는 상황 — 직전 박스에서 오른쪽=(0.4,-0.2),
     # 왼쪽=(0.4,0.9)이 확정된 상태에서, 다음 박스엔 오른쪽 라인이 이어진 (0.8,0.2)
     # (y가 양수로 넘어감)와 왼쪽 라인이 이어진 (0.8,0.95) 두 후보만 있다고 하자.
     x5 = np.array([0.8, 0.8])

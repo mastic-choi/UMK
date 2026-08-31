@@ -4,26 +4,11 @@
 # yolo_vehicle.py — YOLOv8n(ONNX Runtime) 기반 방해차량 카메라 이중확인.
 #
 # yolo_cone.py와 거의 동일한 실시간 전략(별도 데몬 스레드에서 자기 페이스로 추론,
-# detect()는 논블로킹으로 최신 결과 반환, cv2.imshow()는 메인 스레드에서만)이지만,
-# 출력 후처리가 다르다:
-#   [2026-08-20 §2.57 이전] COCO 사전학습 yolov8n.pt를 그대로 ONNX(nms=True)로 내보낸
-#   yolov8n_car.onnx를 썼다 — 클래스 80개라 YOLO_VEHICLE_CLASS_ID('car'=2)로 걸러야
-#   했고, 신뢰도도 낮았다(실측 0.15~0.78, 평균 0.3대). 롤백/비교용으로 yolo_ros/에
-#   그대로 남아있음.
-#   [2026-08-20 §2.57] 대회에서 실제 회피 대상인 그 차량 한 대(#46, TRAXXAS 검정/연두)
-#   뒷모습 전용으로 파인튜닝한 target_vehicle_best.onnx(nc=1 'target_vehicle',
-#   class_id=0)로 교체. 이때는 nms=False로 export했었다 — ultralytics
-#   model.export(..., nms=True)를 줬는데도 output0가 raw [1,5,8400]([cx,cy,w,h]+
-#   클래스점수, 박스 후보 필터링 전)로 나오는 문제가 있어서, 여기서 직접 좌표 디코딩 +
-#   cv2.dnn.NMSBoxes를 수행하는 우회로 대응했었다.
-#   [2026-08-20 §2.59] 그 우회의 근본 원인을 찾아 export 단계에서 고쳤다 —
-#   ultralytics 8.3.0의 DetectionModel ONNX export 경로가 `nms` 인자를 아예 참조하지
-#   않는다(그 옵션은 CoreML export 전용). yolo-V8-KMU-xycar 저장소의
-#   `export_onnx_with_nms.py`(torchvision.ops.batched_nms를 forward()에 심은 wrapper로
-#   재export)로 만든 target_vehicle v1.2.0부터는 output0가 다시 정상적으로 NMS 적용된
-#   [1,N,6]=[x1,y1,x2,y2,conf,cls]다(가중치는 v1.1.0과 완전히 동일, export 방식만
-#   바뀜) — 그래서 아래 infer()도 콘/구 vehicle 모델과 같은 단순 파싱으로 되돌렸다.
-#   위 §2.57 우회 코드(좌표 디코딩+NMSBoxes)는 더 이상 안 쓴다.
+# detect()는 논블로킹으로 최신 결과 반환, cv2.imshow()는 메인 스레드에서만)을 쓴다.
+# 대회에서 실제 회피 대상인 그 차량 한 대(#46, TRAXXAS 검정/연두) 뒷모습 전용으로
+# 파인튜닝한 target_vehicle_best.onnx(nc=1 'target_vehicle', class_id=0,
+# `export_onnx_with_nms.py`로 export)를 쓴다 — output0가 NMS 적용된
+# [1,N,6]=[x1,y1,x2,y2,conf,cls]라 콘 모델과 동일한 단순 파싱으로 충분하다.
 # track_drive.py가 이 결과를 라이다 근접판정과 AND로 묶고 프레임 디바운스
 # (YOLO_VEHICLE_CONFIRM_FRAMES)까지 걸어서 쓴다 — 이 모듈 자체는 "이번 프레임
 # target_vehicle이 보이는가"만 답한다.
@@ -53,10 +38,7 @@ from ..config import (
 def _default_model_path():
     """target_vehicle_best.onnx 기본 경로 — yolo_cone.py _default_model_path()와 동일한
     경로 규칙(realpath로 --symlink-install 심볼릭 링크를 해소한 뒤 세 단계 위로
-    올라가 yolo_ros/에 닿음). 그쪽 함수 주석 참고.
-    [2026-08-20 §2.57] 옛 yolov8n_car.onnx(COCO, nms=True)는 롤백/비교용으로 yolo_ros/에
-    그대로 두고, 기본 경로만 전용 파인튜닝 모델(target_vehicle_best.onnx, nc=1,
-    nms=False)로 옮김."""
+    올라가 yolo_ros/에 닿음). 그쪽 함수 주석 참고."""
     if YOLO_VEHICLE_MODEL_PATH:
         return YOLO_VEHICLE_MODEL_PATH
 
@@ -67,8 +49,8 @@ def _default_model_path():
 
 
 class YoloVehicleEngine:
-    """ONNX Runtime으로 YOLOv8n(nms=False export, nc=1 'target_vehicle') 전용 파인튜닝
-    모델을 로드하고, raw 출력을 직접 디코딩+NMS해 추론한다."""
+    """ONNX Runtime으로 YOLOv8n(NMS 포함 export, nc=1 'target_vehicle') 전용 파인튜닝
+    모델을 로드하고 추론한다."""
 
     def __init__(self, model_path=None, providers=None, logger=None):
         if ort is None:
@@ -145,10 +127,8 @@ class YoloVehicleEngine:
         출력 : (vehicle_detected, detections) — detections는 [(x1,y1,x2,y2,conf), ...]
                (640x640 입력 스케일 좌표, yolo_cone.py와 동일하게 원본 스케일로 안
                되돌림 — 지금은 "검출 여부"만 쓴다).
-        [2026-08-20 §2.59] target_vehicle v1.2.0부터 output0가 NMS 내장 [1,N,6]
-        ([x1,y1,x2,y2,conf,cls])로 복귀했다(위 모듈 상단 주석 참고) — yolo_cone.py/
-        구 yolov8n_car.onnx와 동일한 단순 파싱으로 충분하다. §2.57에서 썼던 raw 좌표
-        디코딩 + cv2.dnn.NMSBoxes 우회 코드는 삭제."""
+        output0가 NMS 내장 [1,N,6]([x1,y1,x2,y2,conf,cls])라 yolo_cone.py와 동일한
+        단순 파싱으로 충분하다(위 모듈 상단 주석 참고)."""
         t0 = time.perf_counter()
         blob = self.preprocess(bgr_frame)
         outputs = self.session.run([self._output_name], {self._input_name: blob})[0]
@@ -185,14 +165,14 @@ class YoloVehicleDetector:
                                                      #   박스가 하나라도 있으면 True인 원시값(면적 게이트 전).
                                                      #   면적 임계값은 이 검출기가 아니라 호출부
                                                      #   (track_drive.py perc_obstacle_cut_trigger(), B3)가 건다.
-        self._latest_max_area = 0.0                 # [2026-08-23] 이번 프레임 검출 박스 중 최대 면적(px²,
+        self._latest_max_area = 0.0                 # 이번 프레임 검출 박스 중 최대 면적(px²,
                                                      #   640 입력 스케일) — get_latest_max_area() 참고
-        self._latest_side = None                      # [2026-08-21] 'L'/'R'/None — get_latest_side() 참고
+        self._latest_side = None                      # 'L'/'R'/None — get_latest_side() 참고
         self._latest_debug = None                    # 시각화용 vis 프레임
         self._stopped = False
         self._last_fps_log_t = time.time()
-        self._logged_infer_error = False  # [2026-08-20] 추론 예외를 매 프레임 로그하면 로그창이
-                                           #   그걸로 도배돼(요청 반영) 최초 1회만 찍고 이후는 조용히 스킵
+        self._logged_infer_error = False  # 추론 예외를 매 프레임 로그하면 로그창이 그걸로
+                                           #   도배되므로 최초 1회만 찍고 이후는 조용히 스킵
 
         self._thread = threading.Thread(target=self._worker, name='yolo_vehicle_infer', daemon=True)
         self._thread.start()
@@ -212,13 +192,13 @@ class YoloVehicleDetector:
 
             try:
                 vehicle_detected, detections = self.engine.infer(frame)
-                # [2026-08-23] 검출 박스 중 최대 면적(px², 640 입력 스케일)만 여기서 계산해
-                # 넘긴다 — "면적이 임계값 이상이어야 검출 인정"이라는 최종 판단은 그 임계값
+                # 검출 박스 중 최대 면적(px², 640 입력 스케일)만 여기서 계산해 넘긴다 —
+                # "면적이 임계값 이상이어야 검출 인정"이라는 최종 판단은 그 임계값
                 # (config.py YOLO_VEHICLE_MIN_BOX_AREA_PX_B3)을 아는 track_drive.py
                 # perc_obstacle_cut_trigger()가 건다(B1/B2 콘 쪽과 동일 관례).
                 max_area = max(((x2 - x1) * (y2 - y1) for x1, y1, x2, y2, _c in detections),
                                 default=0.0)
-                # [2026-08-21] 라이다-YOLO 좌우 교차검증(perc_obstacle_cut_trigger() 오검출
+                # 라이다-YOLO 좌우 교차검증(perc_obstacle_cut_trigger() 오검출
                 # 방지 로직)용 — 가장 신뢰도 높은 박스의 중심 x가 프레임 가로 중앙(=
                 # YOLO_VEHICLE_INPUT_SIZE/2, letterbox 없는 단순 리사이즈라 원본 중앙과
                 # 동일 비율 지점) 왼쪽이면 'L', 오른쪽이면 'R'. 전방(비반전) 카메라라
@@ -257,9 +237,8 @@ class YoloVehicleDetector:
                 self._latest_debug = vis
 
             now = time.time()
-            # [2026-08-20] 검출 안 될 때도 몇 초마다 FPS 로그가 계속 찍혀 로그창을 채우던 것을
-            # "실제로 뭔가 검출됐을 때만" 찍히도록 변경(요청 반영) — 주기 자체는 FPS_LOG_PERIOD_SEC로
-            # 그대로 둬서 검출이 계속되는 동안에도 매 프레임 로그가 나가진 않게 한다.
+            # FPS 로그는 "실제로 뭔가 검출됐을 때만" 찍는다 — 주기 자체는 FPS_LOG_PERIOD_SEC로
+            # 둬서 검출이 계속되는 동안에도 매 프레임 로그가 나가진 않게 한다.
             if vehicle_detected and now - self._last_fps_log_t >= FPS_LOG_PERIOD_SEC:
                 self._log(f'YOLO 차량 검출됨 n={len(detections)} FPS≈{self.engine.fps:.1f} '
                           f'(provider={self.engine.active_provider})')
@@ -276,7 +255,7 @@ class YoloVehicleDetector:
         return vehicle_detected
 
     def get_latest_max_area(self):
-        """[2026-08-23] 이번 프레임 검출 박스 중 최대 면적(px², 640 입력 스케일) — 검출이
+        """이번 프레임 검출 박스 중 최대 면적(px², 640 입력 스케일) — 검출이
         하나도 없었으면 0.0. track_drive.py perc_obstacle_cut_trigger()(B3)가
         YOLO_VEHICLE_MIN_BOX_AREA_PX_B3 임계값과 비교해 최종 검출 인정 여부를 정하고,
         _debug_viz_obstacle_cut()이 그 값을 그대로 띄워 실차에서 임계값을 조정할 때
@@ -285,7 +264,7 @@ class YoloVehicleDetector:
             return self._latest_max_area
 
     def get_latest_side(self):
-        """[2026-08-21] 최신 프레임에서 검출된(최고 신뢰도) target_vehicle 박스의 좌우
+        """최신 프레임에서 검출된(최고 신뢰도) target_vehicle 박스의 좌우
         위치 — 'L'/'R'(검출 없었으면 None). perc_obstacle_cut_trigger()가 라이다 판정
         (self._obstacle_cut_y 부호)과 이 값을 대조해 방향이 일치할 때만 방해차량으로
         확정하는 오검출 방지 게이트에 쓴다."""
@@ -295,9 +274,9 @@ class YoloVehicleDetector:
     def get_latest_debug_frame(self):
         """최신 시각화 프레임(카메라 원본 + 검출 박스)을 스레드 세이프하게 반환만 한다
         (cv2.imshow는 호출하지 않음) — track_drive.py의 _debug_viz_obstacle_cut()이 이
-        프레임을 라이다 BEV 패널과 한 창에 합쳐서 그린다(2026-08-20, 이 검출기 전용
-        'yolo_vehicle_result' 창을 따로 안 띄우고 obstacle_cut_debug 창 하나로 합침 —
-        욜로판정과 그 판정에 쓰인 라이다 ROI를 한눈에 대조해서 보고 싶다는 요청 반영).
+        프레임을 라이다 BEV 패널과 한 창에 합쳐서 그린다(이 검출기 전용
+        'yolo_vehicle_result' 창은 따로 안 띄우고 obstacle_cut_debug 창 하나로 합쳐서,
+        욜로판정과 그 판정에 쓰인 라이다 ROI를 한눈에 대조할 수 있게 한다).
         DEBUG_VIZ_YOLO_VEHICLE=False면 _worker()가 애초에 vis를 안 만들어서 항상 None."""
         with self._lock:
             return self._latest_debug

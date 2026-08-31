@@ -57,8 +57,7 @@ def _default_model_path():
       경로는 xycar_ws/build/track_drive/track_drive/perception/yolo_cone.py이고
       (build/track_drive/track_drive는 src/track_drive/track_drive로 가는 심볼릭 링크) —
       abspath는 이 심볼릭 링크를 풀어주지 않아 세 단계 위로 올라가면 xycar_ws/build로
-      잘못 도착한다(실측 확인, 2026-08-13). realpath로 심볼릭 링크를 먼저 해소해야
-      xycar_ws/src에 정확히 닿는다.
+      잘못 도착한다. realpath로 심볼릭 링크를 먼저 해소해야 xycar_ws/src에 정확히 닿는다.
     """
     if YOLO_CONE_MODEL_PATH:
         return YOLO_CONE_MODEL_PATH
@@ -97,15 +96,14 @@ class YoloConeEngine:
 
         available = set(ort.get_available_providers())
         if providers is None:
-            # [2026-08-13 실차 확인] 이 콘 모델(cone_best_n.onnx, nms=True export)은
-            # TensorrtExecutionProvider가 항상 빌드 실패한다 — "TRT-16198: Layers missing
-            # empty tensor support"(export에 포함된 NonMaxSuppression 레이어가 빈 텐서
-            # 케이스를 처리 못 함, onnxruntime/TensorRT 버전 조합 이슈로 추정). 문제는
-            # 실패 자체가 아니라 실패를 확인하기까지 약 456초(7~8분)를 태우고서야
-            # onnxruntime이 조용히 CUDAExecutionProvider로 자동 폴백한다는 것 — 노드를
-            # 켤 때마다(재출발/재테스트 포함) 이 지연이 매번 반복된다. dl_lane.py의
-            # TwinLiteNet은 TensorRT가 정상 동작하므로 그쪽 priority는 그대로 두고,
-            # 이 모델(콘 검출)만 TensorRT를 건너뛰고 바로 CUDA로 간다.
+            # 이 콘 모델(cone_best_n.onnx, nms=True export)은 TensorrtExecutionProvider가
+            # 항상 빌드 실패한다 — "TRT-16198: Layers missing empty tensor support"(export에
+            # 포함된 NonMaxSuppression 레이어가 빈 텐서 케이스를 처리 못 함, onnxruntime/
+            # TensorRT 버전 조합 이슈로 추정). 문제는 실패 자체가 아니라 실패를 확인하기까지
+            # 약 7~8분을 태우고서야 onnxruntime이 조용히 CUDAExecutionProvider로 자동
+            # 폴백한다는 것 — 노드를 켤 때마다(재출발/재테스트 포함) 이 지연이 매번
+            # 반복된다. dl_lane.py의 TwinLiteNet은 TensorRT가 정상 동작하므로 그쪽
+            # priority는 그대로 두고, 이 모델(콘 검출)만 TensorRT를 건너뛰고 바로 CUDA로 간다.
             priority = ['CUDAExecutionProvider', 'CPUExecutionProvider']
             providers = [p for p in priority if p in available] or ['CPUExecutionProvider']
 
@@ -194,17 +192,17 @@ class YoloConeDetector:
                                                      #   하나라도 있으면 True인 원시값(면적 게이트 전).
                                                      #   면적 임계값은 이 검출기가 아니라 호출부
                                                      #   (track_drive.py, B1/B2 각자)가 건다.
-        self._latest_max_area = 0.0                 # [2026-08-23] 이번 프레임 검출 박스 중 최대 면적(px²,
+        self._latest_max_area = 0.0                 # 이번 프레임 검출 박스 중 최대 면적(px²,
                                                      #   640 입력 스케일) — get_latest_max_area() 참고
-        self._latest_side = None                      # [2026-08-25] 'L'/'R'/None — get_latest_side() 참고
+        self._latest_side = None                      # 'L'/'R'/None — get_latest_side() 참고
         self._latest_debug = None                    # 시각화용 vis 프레임
-        # [2026-08-23] 'yolo_cone_result' 창을 처음 띄울 때만 cv2.moveWindow로 위치를 잡기
+        # 'yolo_cone_result' 창을 처음 띄울 때만 cv2.moveWindow로 위치를 잡기
         #   위한 1회성 가드(DEBUG_WIN_POS_YOLO_CONE 참고, yolo_signal_state.py의 동일 패턴).
         self._dbg_win_positioned = False
         self._stopped = False
         self._last_fps_log_t = time.time()
-        self._logged_infer_error = False  # [2026-08-20] 추론 예외를 매 프레임 로그하면 로그창이
-                                           #   그걸로 도배돼(요청 반영) 최초 1회만 찍고 이후는 조용히 스킵
+        self._logged_infer_error = False  # 추론 예외를 매 프레임 로그하면 로그창이 그걸로
+                                           #   도배되므로 최초 1회만 찍고 이후는 조용히 스킵
 
         self._thread = threading.Thread(target=self._worker, name='yolo_cone_infer', daemon=True)
         self._thread.start()
@@ -224,14 +222,14 @@ class YoloConeDetector:
 
             try:
                 cone_detected, detections = self.engine.infer(frame)
-                # [2026-08-23] 검출 박스 중 최대 면적(px², 640 입력 스케일)만 여기서 계산해
-                # 넘긴다 — "면적이 임계값 이상이어야 검출 인정"이라는 최종 판단은 B1/B2가
-                # 서로 다른 임계값(config.py YOLO_CONE_MIN_BOX_AREA_PX_B1/_B2)을 쓸 수 있어야
-                # 해서 이 검출기 레벨(여기는 어느 단계가 부르는지 모름)이 아니라 그 값을 아는
+                # 검출 박스 중 최대 면적(px², 640 입력 스케일)만 여기서 계산해 넘긴다 —
+                # "면적이 임계값 이상이어야 검출 인정"이라는 최종 판단은 B1/B2가 서로 다른
+                # 임계값(config.py YOLO_CONE_MIN_BOX_AREA_PX_B1/_B2)을 쓸 수 있어야 해서 이
+                # 검출기 레벨(여기는 어느 단계가 부르는지 모름)이 아니라 그 값을 아는
                 # track_drive.py perc_lavacon_trigger()/perc_obstacle_cut_trigger()가 각자 건다.
                 max_area = max(((x2 - x1) * (y2 - y1) for x1, y1, x2, y2, _c in detections),
                                 default=0.0)
-                # [2026-08-25] 라이다-YOLO 좌우 교차검증(perc_obstacle_cut_trigger() B2)용 —
+                # 라이다-YOLO 좌우 교차검증(perc_obstacle_cut_trigger() B2)용 —
                 # yolo_vehicle.py _worker()와 동일 계산(최고 신뢰도 박스 중심 x 기준 L/R).
                 side = None
                 if detections:
@@ -266,8 +264,8 @@ class YoloConeDetector:
                 self._latest_debug = vis
 
             now = time.time()
-            # [2026-08-20] 검출 안 될 때도 몇 초마다 FPS 로그가 계속 찍혀 로그창을 채우던 것을
-            # "실제로 뭔가 검출됐을 때만" 찍히도록 변경(요청 반영).
+            # FPS 로그는 "실제로 뭔가 검출됐을 때만" 찍는다 — 검출 안 될 때도 계속 찍히면
+            # 로그창을 채운다.
             if cone_detected and now - self._last_fps_log_t >= FPS_LOG_PERIOD_SEC:
                 self._log(f'YOLO 콘 검출됨 n={len(detections)} FPS≈{self.engine.fps:.1f} '
                           f'(provider={self.engine.active_provider})')
@@ -284,7 +282,7 @@ class YoloConeDetector:
         return cone_detected
 
     def get_latest_max_area(self):
-        """[2026-08-23] 이번 프레임 검출 박스 중 최대 면적(px², 640 입력 스케일) — 검출이
+        """이번 프레임 검출 박스 중 최대 면적(px², 640 입력 스케일) — 검출이
         하나도 없었으면 0.0. track_drive.py의 perc_lavacon_trigger()(B1)/
         perc_obstacle_cut_trigger()(B2)가 각자의 YOLO_CONE_MIN_BOX_AREA_PX_B1/_B2 임계값과
         비교해 최종 검출 인정 여부를 정하고, _debug_viz_obstacle_cut()이 그 값을 그대로
@@ -293,14 +291,14 @@ class YoloConeDetector:
             return self._latest_max_area
 
     def get_latest_side(self):
-        """[2026-08-25] 최신 프레임에서 검출된(최고 신뢰도) 콘 박스의 좌우 위치 — 'L'/'R'
+        """최신 프레임에서 검출된(최고 신뢰도) 콘 박스의 좌우 위치 — 'L'/'R'
         (검출 없었으면 None). yolo_vehicle.py get_latest_side()와 동일 용도 — B2용
         perc_obstacle_cut_trigger() 좌우 교차검증."""
         with self._lock:
             return self._latest_side
 
     def get_latest_debug_frame(self):
-        """[2026-08-21] 최신 시각화 프레임(카메라 원본 + 검출 박스)을 스레드 세이프하게
+        """최신 시각화 프레임(카메라 원본 + 검출 박스)을 스레드 세이프하게
         반환만 한다(cv2.imshow는 호출하지 않음) — yolo_vehicle.py get_latest_debug_frame()과
         동일 패턴. track_drive.py _debug_viz_obstacle_cut()이 B2(고정장애물=콘) 검증 중엔
         이 프레임을, B3(방해차량) 검증 중엔 yolo_vehicle의 프레임을 같은 라이다 BEV 패널
@@ -318,9 +316,9 @@ class YoloConeDetector:
             vis = self._latest_debug
         if vis is None:
             return
-        # [2026-08-21, 요청 반영] 화면을 너무 많이 차지해서 표시 직전에만 아주 작게 축소한다
-        # (원본 해상도 vis 자체·get_latest_debug_frame()이 돌려주는 프레임·검출 좌표 계산에는
-        # 영향 없음 — 순전히 이 창의 표시 크기만 줄이는 것).
+        # 화면을 너무 많이 차지해서 표시 직전에만 아주 작게 축소한다(원본 해상도 vis
+        # 자체·get_latest_debug_frame()이 돌려주는 프레임·검출 좌표 계산에는 영향 없음 —
+        # 순전히 이 창의 표시 크기만 줄이는 것).
         small = cv2.resize(vis, (160, 120), interpolation=cv2.INTER_AREA)
         if not self._dbg_win_positioned:
             cv2.namedWindow('yolo_cone_result', cv2.WINDOW_AUTOSIZE)
