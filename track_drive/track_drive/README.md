@@ -1,3713 +1,447 @@
-# track_drive 테스트 가이드
+# track_drive 아키텍처 레퍼런스
 
-`track_drive.py`는 하나의 노드 안에서 신호등/차선/라바콘/장애물/추월을 전부 처리하는 2중 FSM 구조입니다
-(`MissionState` S0~S4 + `BehaviorState`/`Phase`). 인지 모듈은 `perception/`, 조향/회피 제어는 `controller/`,
-Hybrid A* 경로계획(B2 대안, 보존용)은 `planner/`에 모여 있습니다.
+`track_drive.py`는 신호등 인식/차선주행/라바콘/장애물회피/추월을 하나의 노드에서 처리하는
+2중 FSM 구조입니다(`MissionState` + `BehaviorState`/`Phase`). 인지 모듈은 `perception/`,
+조향/회피 제어는 `controller/`, Hybrid A*(B2 대안, 현재 미사용·보존용)는 `planner/`에
+모여 있습니다.
 
-> **[2026-08-17] 이 문서를 큰 폭으로 압축했습니다.** 원래 각 절이 증상/원인/수정/알려진한계를 실차 디버깅
-> 그대로 상세히 남기는 방식이었는데(관례 자체는 유효, CLAUDE.md 참고) 2,900줄까지 불어나 다음 사람이
-> 훑어보기 어려워졌습니다. 각 절을 "무엇을 왜 바꿨는지 + 현재값 + (아직 안 끝난 것만) 알려진 한계"로
-> 압축했습니다 — 문제가 재발하면 git 히스토리(`git log -p -- track_drive/track_drive/README.md`)에서
-> 이 커밋 이전 버전을 보면 원래의 상세 디버깅 기록(증상 재현/실측 원시값/시도했다 버린 대안 등)을
-> 그대로 찾을 수 있습니다.
+이 문서는 루트 README(설치/실행)를 보완하는 **내부 아키텍처 레퍼런스**로, "지금 시스템이
+어떻게 동작하는가"만 다룹니다. 개발 중 시행착오·날짜별 수정 이력은 `git log`에서 확인하세요.
 
-## 🏁 대회 규정 요약 (국민대 자율주행 경진대회, 2026년 9회 — 본선 경주)
-
-> 출처: `2026년-9회대회-경주진행방법-7월29일자버전-1.pdf`(자이트론, 2026-07-29 버전). **본선 주행 경기(트랙
-> 미션) 규정만** 정리했습니다 — 주차 대회는 별도 경기라 제외했습니다. 대회 진행 방식과 미션은 **대회 직전까지
-> 변경될 수 있다고 원문에 명시**되어 있으니, 최종 확인은 항상 원본 공지로 할 것. 아래 규정이 `MissionState`
-> S0~S4 FSM(위 인트로 참고)과 `Phase`(라바콘→고정장애물→방해차량) 순서가 왜 그렇게 설계됐는지의 근거입니다.
-
-### 한눈에 보기
-- 차량: RC카 기반 자율주행 차량 (카메라 등 센서로 인식, ROS2 기반 SW)
-- 목표: 정해진 트랙을 **3바퀴** 자율주행하며 각 구간의 미션을 통과하고 결승선을 통과
-- 성적: `총 주행시간 = 순수 주행시간 + 벌초(penalty seconds)` — 시간이 짧을수록 좋은 성적
-- 경주는 오전 1회, 오후 1회 총 2회 진행되며 **둘 중 더 좋은 기록**으로 순위를 매김
-- 3바퀴 총 주행시간이 **4분(벌초 미포함)** 을 넘으면 실격
-
-### 미션 순서 (전체 흐름)
-```
-신호등 인식 출발
-   → 라바콘(러버콘) 구간 주행
-   → 차선인식 주행 (차선 준수)
-   → 고정장애물 회피 주행
-   → 방해차량(앞차) 추월 주행
-   → [트랙을 3바퀴 반복 주행, 이 중 2바퀴째 또는 3바퀴째 한 번만 "지름길" 선택 가능]
-   → 결승선 통과 (3바퀴 완주 후) → 경주 종료
-```
-
-### 트랙 구조
-- 트랙은 직사각형 순환 코스(반시계/시계 방향 하나의 루프)이며, 코스 중간에 트랙을 좌우로 나누는 **분기 구간
-  (지름길)** 이 있음(트랙 전체에 분기는 이 한 곳뿐).
-- 트랙 상 구간 배치(대략 시계 순서):
-  1. **출발 지점**: 4구 신호등 ↔ Gate(통과감지장치) 사이
-  2. **라바콘 구간**: 출발 직후 코너 부근, 지그재그로 배치된 라바콘 사이를 충돌 없이 통과
-  3. **차선 주행 구간**: 두 개의 실선(바깥쪽 경계) 사이를 벗어나지 않고 주행 (점선은 그냥 참고선, 1/2차선 구분 없음)
-  4. **고정 장애물 회피 구간**: 고장난 차량 모형 등 정지된 장애물을 충돌 없이 회피
-  5. **방해차량 추월 구간**: 저속으로 주행하는 방해차량을 추월
-  6. **신호등/지름길 분기점**: 트랙 중앙을 가로지르는 지름길 진입 여부를 결정하는 4구 신호등(좌회전 화살표
-     포함)이 있음
-  7. **결승선(Gate, 통과감지장치)**: 출발 지점 근처, 한 바퀴마다 통과 → 3바퀴 주행 시 총 3번 통과하면 경주 종료
-- 트랙을 총 **3바퀴** 주행해야 하며, **2바퀴째 또는 3바퀴째(마지막 바퀴) 중 한 번, 한 번만** 트랙 중앙의
-  지름길을 통과할 수 있음. 나머지 바퀴는 바깥쪽 정규 코스로 주행.
-
-### 진행 인력 / 셋업
-- 대회 당일 **차량에는 반드시 커버를 장착**하고 참가.
-- 팀원 2명 역할 분담: **팀원1**은 노트북을 들고 심판 옆에서 차량 SW를 원격 기동(`ros2 launch ...` 형태로
-  심판이 화면을 볼 수 있어야 함), **팀원2**는 트랙에서 차량을 따라다니며 벌점 상황 등에서 차량 터치 등 필요
-  조치를 수행.
-
-### 출발 절차 (신호등 인식 출발, `MissionState.S0_SIGNAL`)
-- 출발 지점: Gate(통과감지장치)와 4구 신호등 사이. 심판이 신호등을 빨간불→파란불로 전환하는 순간부터
-  주행시간(랩타임) 측정 시작(중간 노란불 대기 없음).
-- **파란불 전 출발(신호위반)**: 10초 벌초 + 재출발 기회. 재출발에서도 빨간불에 출발하면 추가 10초 벌초 +
-  처음 출발 대기 위치로 재이동 후 재주행(`벌초 = 10초 + 10초 + 재위치 소요시간`).
-- 파란불로 바뀌었는데 출발 못 하면 차량 자세/위치를 전후좌우 **20cm 이내**로 손 조정 가능.
-- 파란불 전환 후 **1분 이내** 미출발 시 **실격**.
-
-### 주행 중 정지 금지 / 차량 터치 벌점
-- 주행시간 측정 시작 후 차량이 멈춘 채 **1분 이내**에 재개하지 못하면 **실격**.
-- 주행 중 사람이 차량에 손을 대면 **1회당 5초 벌초** (원칙적으로 심판 지시가 있을 때만). **한 바퀴 기준
-  15회(60초) 초과 시 실격.**
-
-### 라바콘 구간 (`Phase.LAVACON` / `BehaviorState.B1_LAVACON`)
-- 라바콘 충돌 시 **개당 3초 벌초** (충돌해도 정상 경로 주행 중이면 별도 조치 불필요).
-- 경로를 완전히 이탈하면 이탈 위치(앞바퀴가 이탈 발생 라바콘 위치 또는 그 뒤)로 옮겨 재주행 — **너무 앞으로
-  옮기면 안 됨**(부당하게 유리한 위치 금지).
-- **라바콘 구간을 1분 이내에 통과하지 못하면 실격.**
-
-### 차선 준수 주행 (`_lane_drive()`/`_lane_steer()`)
-- 양쪽 바깥쪽 **실선**을 벗어나지 않고 주행. 실선-실선 사이 어디로 주행해도 무방(점선/1·2차선 구분 없음).
-- **차선 이탈 판정 조건** (하나라도 해당하면 이탈위치로 옮겨 재주행):
-  1. 앞바퀴 2개가 동시에 실선 밖으로 나갈 때
-  2. 좌/우 바퀴 2개가 실선 밖 + 동시에 카메라(차량 중앙부)도 실선 밖(차량 절반 이상 이탈)
-  3. 좌/우 바퀴 2개가 실선 밖으로 나가서 **90cm 이상** 그 상태로 주행할 때
-- 코너 안쪽 컷을 막기 위해 일부 코너 안쪽에 **주행 방해용 고정 장애물**이 배치됨 — 여기 걸려 멈추면 빨리
-  판단해 터치(5초 벌초)로 옮겨야 함.
-
-### 고정 장애물 회피 (`Phase.OBSTACLE_ZONE`(2026-08-15부터, 이전 `Phase.FIXED_OBSTACLE`) /
-`BehaviorState.B2_OBSTACLE`)
-- 고장난 차량 모형 등 정지 장애물을 충돌 없이 회피. 이 구간의 차선 이탈/터치는 위 일반 규정과 동일 적용
-  (별도 예외 없음).
-
-### 방해차량 추월 (`Phase.OBSTACLE_ZONE`(2026-08-15부터, 이전 `Phase.VEHICLE`) /
-`BehaviorState.B3_VEHICLE`)
-- 방해차량 1대가 저속으로 1·2차선을 오가며 주행.
-- **추월 중에는 실선 이탈을 차선 이탈로 안 봄.** 추월 후 최대한 빨리 실선 안쪽 복귀 필요 — 복귀 후 방해차량과
-  간격이 **90cm 이상**이면 오히려 차선 이탈로 판정.
-- **추월 방향**: 방해차량이 주행 "안 하는" 차선 쪽으로만 추월 가능(같은 쪽 추월 시도는 차선이탈로 간주).
-- 뒤에서 추돌(가해) / 추돌당함(피해) 모두 각각 **10초 벌초**. 피해 시엔 50cm 이내로 앞으로 옮길 수 있음.
-
-### 지름길 분기 신호 (`MissionState.S0_SIGNAL` 재진입, 1바퀴 주행 후)
-- 트랙 중앙 분기점 4구 신호등(좌회전 화살표 포함)에서 **좌회전(지름길) 신호**가 켜지면 지름길 진입 가능.
-- 좌회전(지름길) 신호는 **2바퀴째 시작 또는 3바퀴째(마지막 바퀴) 시작 중 랜덤으로 딱 한 번만** 등장 —
-  나머지는 항상 초록만 점등(직진 확정). 즉 지름길 선택 기회는 3바퀴 중 **정확히 한 번**.
-  - `signal_left_confirmed`(config.py `SIG_CONFIRM_FRAMES` 디바운스)가 이 좌회전 화살표 점등을 인식.
-
-### 시간 제한 및 실격 사유 총정리
-| 상황 | 조치 / 벌점 |
-|---|---|
-| 빨간불에 출발 | 10초 벌초 + 재출발 기회 |
-| 재출발에서도 빨간불에 출발 | 추가 10초 벌초 + 원위치 이동 후 재주행 (총 10+10초 + 재위치 시간) |
-| 파란불 전환 후 1분 내 미출발 | **실격** |
-| 주행 중 정지 후 1분 내 미재개 | **실격** |
-| 주행 중 차량 터치 1회 | 5초 벌초 (한 바퀴 기준 15회/60초 초과 시 **실격**) |
-| 라바콘 충돌 | 개당 3초 벌초 |
-| 라바콘 구간 1분 내 미통과 | **실격** |
-| 차선 이탈 (조건 3가지 중 하나 해당) | 이탈위치로 이동 후 재주행 |
-| 방해차량 추돌(가해/피해 모두) | 각 10초 벌초 |
-| 3바퀴 총 주행시간이 4분(벌초 제외) 초과 | 주행 중단 및 **실격** |
-| 결승선(Gate) 3회 통과 (3바퀴 완주) | 경주 종료 |
-
-### 성적 산출
-`총 주행시간 = 순수 주행시간 + 벌초 합계`. 오전/오후 각 1회 진행 → **두 기록 중 더 좋은(짧은) 시간**을
-최종 성적으로 채택, 짧은 순으로 순위 결정.
-
----
-
-## ⚙️ 실차 테스트 중 값을 바꾸려면 → `config.py` 하나만 보세요
-
-**튜닝 파라미터, 디버그 on/off, 미션 state 관련 플래그가 전부 [`config.py`](config.py) 한 파일에
-모여 있습니다.** `track_drive.py`를 포함한 프로젝트 거의 모든 모듈이 `from .config import *`
-(또는 `from ..config import ...`)로 이 값을 가져다 씁니다 — 즉 `config.py`만 고치면 그 값을 쓰는
-모든 파일에 동시에 반영됩니다. 개별 모듈 파일(`track_drive.py`, `perception/dl_lane.py` 등)을
-헤집을 필요가 없습니다. `config.py` 안은 아래 순서로 구성돼 있습니다:
-
-1. 차선인식 백엔드 선택 (`LANE_DETECTOR_BACKEND`)
-2. 차량 속도/조향 기본값
-3. 차선인식(`dl_lane.py`) 세부 튜닝 — BEV 적용여부 포함
-4. 조향 컨트롤러 (Pure Pursuit 파라미터 — LQR은 2026-08-14 제거, §0.5 참고)
-5. 디버깅 ON/OFF (모든 `DEBUG_VIZ_*`)
-6. 미션 State / 실차 테스트 범위 제한 (`START_STATE`, `TEST_*`, 바퀴 카운트 등)
-7. 기타 튜닝 파라미터(PID, 트리거, 회피, 신호등, 정지선, 단위환산 등)
-
-**`config.py`에 없는 값들:** OpenCV 알고리즘 내부값(Canny/Hough 임계값, 블러 커널 크기 등)처럼
-"행동을 튜닝한다"기보다 "그 함수 내부 구현"에 가까운 상수, 그리고 현재 기본 백엔드가 아닌
-`hough`/`classic_cv` 차선인식·Hybrid A* B2 대안의 세부 알고리즘 상수는 원래 파일에 그대로
-남아있습니다.
-
-실행 명령은 공통입니다:
+실행 명령:
 ```bash
 ros2 launch track_drive track_drive.launch.py
 ```
 
-## 공통 주의사항
+튜닝 파라미터, 디버그 on/off, 미션 관련 플래그는 전부 [`config.py`](config.py) 한 파일에
+모여 있고 대부분의 모듈이 `from .config import *`로 가져다 씁니다. 값을 찾거나 바꿀 땐
+여기부터 확인하세요.
 
-- **테스트 종료는 항상 `Ctrl+C`로**, launch가 "process has finished cleanly"까지 뜨는 걸 확인하고 끄세요.
-  `Ctrl+Z`(정지)나 터미널 강제종료는 `usb_cam_node_exe` 등이 좀비로 남아 `/dev/video0`를 붙잡고, 다음 실행에서
-  카메라가 아예 안 잡히는 원인이 됩니다. 증상 발생 시:
-  ```bash
-  sudo fuser -k /dev/video0                      # 카메라만 문제일 때 가장 빠른 해결
-  ps -eo pid,stat,cmd | awk '$2 ~ /^T/ && /usb_cam|ros2 launch|xycar_lidar|imu_node|track_drive/ {print $1}' | xargs -r kill -9   # 좀비 전체 정리
-  ```
-- `SPEED_NORMAL`(config.py)을 `0.0`으로 두지 마세요. `_lane_drive()`에서 나눗셈
-  분모로도 쓰여서 `ZeroDivisionError`로 노드가 죽습니다. 저속 테스트는 `5.0`~`10.0` 같은 작은 양수를 쓰세요.
-- 실제 모터 구동은 ROS2 노드만으로 안 됩니다. 대회/실차 기준 **Docker(ROS1) 컨테이너 + `ros1_bridge`**가 같이
-  떠 있어야 합니다 (`/xycar_motor`는 `Float32MultiArray([angle, speed])`로 브릿지됨 — 구형 `XycarMotor` 커스텀
-  메시지는 `ros1_bridge`가 매핑을 못 함). 체크리스트: ①도커 컨테이너 기동 ②`ros1_bridge` 프로세스 기동 확인.
-- **모든 디버그 창 스위치는 `config.py`의 "5. 디버깅 ON/OFF" 절 한곳에 모여 있습니다.**
+---
 
-| 기능 | 디버그 창 ON/OFF 스위치 (`config.py`) |
+## 목차
+1. [대회 규정 요약](#1-대회-규정-요약)
+2. [노드 실행 구조](#2-노드-실행-구조)
+3. [미션 상태 머신 (MissionState)](#3-미션-상태-머신-missionstate)
+4. [비헤이비어 FSM (BehaviorState / Phase)](#4-비헤이비어-fsm-behaviorstate--phase)
+5. [지름길(좌회전) 파이프라인](#5-지름길좌회전-파이프라인)
+6. [인지 스택](#6-인지-스택)
+7. [조향 컨트롤러 (Pure Pursuit)](#7-조향-컨트롤러-pure-pursuit)
+8. [VESC / IMU 연동](#8-vesc--imu-연동)
+9. [디버그 시각화](#9-디버그-시각화)
+10. [알려진 한계](#10-알려진-한계)
+11. [캘리브레이션/실측값](#11-캘리브레이션실측값)
+
+---
+
+## 1. 대회 규정 요약
+
+> 출처: `2026년-9회대회-경주진행방법-7월29일자버전-1.pdf`(자이트론, 2026-07-29 버전). 본선 주행
+> 경기(트랙 미션) 규정만 정리. 대회 직전까지 변경될 수 있다고 원문에 명시돼 있으니 최종 확인은
+> 항상 원본 공지로 할 것. 아래 규정이 `MissionState`/`Phase` 순서 설계의 근거입니다.
+
+### 한눈에 보기
+- 차량: RC카 기반 자율주행 차량(카메라 등 센서 인식, ROS2 기반 SW).
+- 목표: 정해진 트랙을 **3바퀴** 자율주행하며 각 구간 미션을 통과하고 결승선 통과.
+- 성적: `총 주행시간 = 순수 주행시간 + 벌초(penalty seconds)` — 짧을수록 좋음.
+- 오전 1회 + 오후 1회, **둘 중 더 좋은 기록**으로 순위.
+- 3바퀴 총 주행시간이 **4분**(벌초 미포함)을 넘으면 실격.
+
+### 미션 순서
+```
+신호등 인식 출발
+  → 라바콘(러버콘) 구간 주행           [B1]
+  → 차선인식 주행(차선 준수)
+  → 고정장애물 회피 주행               [B2]
+  → 방해차량(앞차) 추월 주행           [B3]
+  → [3바퀴 반복 — 2바퀴째 또는 3바퀴째 중 한 번만 "지름길" 선택 가능]
+  → 결승선 통과(3바퀴 완주) → 경주 종료
+```
+
+### 트랙 구조
+- 직사각형 순환 코스 1개 루프. 코스 중간에 트랙을 좌우로 나누는 분기 구간(지름길)이 트랙
+  전체에서 한 곳만 있음.
+- 구간 배치(시계 순서): ① 출발 지점(4구 신호등 ↔ Gate) → ② 라바콘 구간(지그재그 배치) →
+  ③ 차선 주행 구간(실선-실선 사이, 점선은 참고선) → ④ 고정 장애물 회피 → ⑤ 방해차량 추월 →
+  ⑥ 신호등/지름길 분기점(좌회전 화살표 포함 4구 신호등) → ⑦ 결승선(Gate, 한 바퀴마다 통과).
+- 총 3바퀴, **2바퀴째 또는 3바퀴째 중 한 번만** 지름길 통과 가능. 나머지는 정규 코스.
+
+### 출발 절차 (`MissionState.S0_SIGNAL`)
+- 심판이 신호등을 빨강→파랑으로 전환하는 순간부터 랩타임 측정 시작(중간 노랑 대기 없음).
+- 파란불 전 출발(신호위반): 10초 벌초 + 재출발. 재출발도 위반 시 추가 10초 + 재위치 이동 후
+  재주행.
+- 파란불 전환 후 **1분 이내** 미출발 시 실격.
+
+### 주행 중 정지 / 차량 터치
+- 주행 중 정지 후 **1분 이내** 재개 못 하면 실격.
+- 사람이 차량을 터치하면 1회당 5초 벌초(원칙적으로 심판 지시 시). 한 바퀴 기준 15회(60초)
+  초과 시 실격.
+
+### 라바콘 구간 (`Phase.LAVACON` / `BehaviorState.B1_LAVACON`)
+- 충돌 시 개당 3초 벌초. 경로 완전 이탈 시 이탈 위치(그 이후로는 안 됨)로 옮겨 재주행.
+- 구간을 1분 이내에 통과하지 못하면 실격.
+
+### 차선 준수 주행
+- 양쪽 바깥쪽 실선을 벗어나지 않고 주행(실선 사이 어디든 무방, 점선/1·2차선 구분 없음).
+- 이탈 판정(하나라도 해당 시 이탈위치로 재주행):
+  1. 앞바퀴 2개 동시에 실선 밖
+  2. 좌/우 바퀴 2개 실선 밖 + 카메라(차량 중앙부)도 실선 밖(절반 이상 이탈)
+  3. 좌/우 바퀴 2개가 실선 밖으로 90cm 이상 유지 주행
+- 코너 안쪽 컷 방지용 고정 장애물이 일부 코너 안쪽에 배치됨.
+
+### 고정 장애물 회피 (`Phase.OBSTACLE_ZONE` / `BehaviorState.B2_OBSTACLE`)
+- 정지 장애물을 충돌 없이 회피. 차선 이탈/터치 판정은 위 일반 규정과 동일.
+
+### 방해차량 추월 (`Phase.OBSTACLE_ZONE` / `BehaviorState.B3_VEHICLE`)
+- 방해차량 1대가 저속으로 1·2차선을 오가며 주행.
+- 추월 중 실선 이탈은 차선이탈로 안 봄. 추월 후 최대한 빨리 복귀 필요(복귀 후 방해차량과
+  90cm 이상 간격이면 오히려 이탈 판정).
+- 추월은 방해차량이 없는 차선 쪽으로만 가능.
+- 추돌(가해/피해 모두) 각 10초 벌초. 피해 시 50cm 이내로 앞당겨 이동 가능.
+
+### 지름길 분기 신호 (`MissionState.S0_SIGNAL` 재진입, 1바퀴 주행 후)
+- 트랙 중앙 분기점 4구 신호등에서 좌회전(지름길) 신호가 켜지면 진입 가능.
+- 좌회전 신호는 2바퀴째 또는 3바퀴째 시작 중 랜덤으로 딱 한 번만 등장 — 나머지는 항상
+  직진(초록) 확정. 즉 지름길 선택 기회는 3바퀴 중 정확히 한 번.
+
+### 시간 제한 / 실격 사유 총정리
+| 상황 | 조치 / 벌점 |
 |---|---|
-| 신호등(S0/S2 공용) | `DEBUG_VIZ_SIGNAL` |
-| 차선 — 기본 백엔드(`dl`) | `DEBUG_VIZ_DL_LANE` |
-| 차선 — 대안 백엔드(`hough`) | `DEBUG_VIZ_HOUGH_LANE` |
-| 차선 — 대안 백엔드(`classic_cv`) | `DEBUG_VIZ_LANE` |
-| 정지선(백엔드와 무관하게 항상 동작) | `DEBUG_VIZ_STOPLINE` |
+| 빨간불 출발 | 10초 벌초 + 재출발 |
+| 재출발도 빨간불 | 추가 10초 벌초 + 원위치 재주행 |
+| 파란불 전환 후 1분 내 미출발 | **실격** |
+| 정지 후 1분 내 미재개 | **실격** |
+| 차량 터치 1회 | 5초 벌초(바퀴당 15회/60초 초과 시 **실격**) |
+| 라바콘 충돌 | 개당 3초 벌초 |
+| 라바콘 구간 1분 내 미통과 | **실격** |
+| 차선 이탈 | 이탈위치로 재주행 |
+| 방해차량 추돌(가해/피해 모두) | 각 10초 벌초 |
+| 3바퀴 총 주행시간 4분(벌초 제외) 초과 | **실격** |
+| 결승선 3회 통과(3바퀴 완주) | 경주 종료 |
+
+성적 산출: `총 주행시간 = 순수 주행시간 + 벌초 합계`. 오전/오후 중 더 짧은 기록으로 순위 결정.
+
+---
+
+## 2. 노드 실행 구조
+
+3개 ROS2 패키지:
+- `track_drive/` — 메인 제어 노드(FSM/인지/제어 전부).
+- `yolo_ros/` — 코드 패키지 아님. `.onnx`/`.pt` 가중치 + TensorRT 캐시만 보관하고,
+  `track_drive/perception/*.py`가 상대경로로 로드.
+- `xycar_device/` — 벤더 드라이버 패키지(`xycar_imu` 등).
+
+`track_drive.py`의 `control_loop()`는 20Hz(`create_timer(0.05, ...)`)로 돌며 매 틱 순서는:
+
+```
+perceive_all()
+  → _update_lap()
+  → run_mission_fsm()
+  → [디버그 시각화 — 전부 기본 OFF]
+  → if mission_state == S1_LANE_FOLLOW and _behavior_enabled and _shortcut_exit_kick_cnt <= 0:
+        run_behavior_fsm() + apply_behavior_override()
+    else:
+        behavior_state = B0_NORMAL
+  → pose_estimator.update()
+  → drive(ctrl_angle, ctrl_speed)
+  → [디버그 시각화/로그]
+```
+
+`xydrive.py`는 별도의 최소 스모크테스트 노드로, `xycar_motor`에 `angle=0, speed=DEFAULT_SPEED
+(5.0)`을 20Hz로 그대로 publish — `track_drive.py`를 전혀 거치지 않고 모터 드라이버 배선만
+검증하는 용도.
+
+---
+
+## 3. 미션 상태 머신 (MissionState)
+
+```python
+class MissionState(Enum):
+    S0_SIGNAL      = 0  # 4구 신호등 판단 (출발선/교차로 공용)
+    S1_LANE_FOLLOW = 1  # 차선주행 (B1/B2/B3는 이 상태 안에서 처리)
+    S4_FINISH      = 4  # 종료 (레이스 완주 판정은 사람 심판이 함 — 코드가 이 상태로 전이하지 않음)
+```
+
+(`S3_SHORTCUT`은 삭제됨 — 좌회전은 별도 상태 없이 S0_SIGNAL 진입 램프 + S1 안의 시간/거리
+트리거로 처리한다. §5 참고.)
+
+### `_s0_signal()`
+- `_checker_ramp_dist is not None` → `_do_checker_ramp_turn()` 진행 중(좌회전 진입 램프, §5).
+- 아니고 `_s2_commit_dist is not None` → 정상 주행하며 거리를 누적, `checker_pillar_trigger`
+  대기(§5). `CHECKER_PILLAR_LIDAR_TIMEOUT_SEC=5.0`초 안에 트리거가 안 뜨면 좌회전을 포기하고
+  직진으로 처리.
+- 둘 다 아니면 정지 상태로 신호 대기.
+
+### `_s1_lane_follow()`
+- `signal_left_confirmed` → `_change_state(S0_SIGNAL)` + `_s2_commit_dist=0.0`(좌회전 커밋
+  시작).
+- `signal_straight_confirmed` → S1 유지, `_behavior_enabled=True`로 켜고
+  `phase=Phase.LAVACON` + `_b2_passed`/`_b3_passed`/`_lavacon_engaged=False`로 리셋 —
+  이게 B1~B3의 유일한 재무장(rearm) 지점 중 하나(다른 하나는 좌회전 램프 완료 시, 아래).
+- 이후 B1/장애물 가드를 거쳐, 해당 없으면 `_lane_drive()`(일반 차선주행).
+
+### `_do_checker_ramp_turn()` 완료 시
+좌회전 램프가 끝나면 즉시:
+- `_behavior_enabled=True`, `phase=Phase.LAVACON`, b2/b3/lavacon 플래그 리셋(재무장)
+- `_change_state(S1_LANE_FOLLOW)` — 신호 대기 없이 곧장 차선주행 복귀
+- `_shortcut_exit_dist=0.0` 시작(지름길 탈출 킥 트리거용, §5)
+
+### `S4_FINISH`
+코드상 존재는 하지만(`ctrl_angle,ctrl_speed = 0, SPEED_STOP`) 아무것도 이 상태로 전이시키지
+않는다 — 레이스 완주 판정은 사람 심판의 외부 타이머로 이뤄지고, 코드는 관여하지 않는다.
+
+---
+
+## 4. 비헤이비어 FSM (BehaviorState / Phase)
+
+```python
+class BehaviorState(Enum):
+    B0_NORMAL   = 0  # 차선주행 출력 그대로
+    B1_LAVACON  = 1  # 라바콘 구간
+    B2_OBSTACLE = 2  # 고정장애물 회피
+    B3_VEHICLE  = 3  # 방해차량 추월
+
+class Phase(Enum):
+    LAVACON       = 0
+    OBSTACLE_ZONE = 1  # 고정장애물 + 방해차량 통합 구간(예전 FIXED_OBSTACLE/VEHICLE)
+    DONE          = 2  # B2+B3 둘 다 완료 — 이후 계속 B0로 일반 차선주행
+```
+
+`run_behavior_fsm()`이 `Phase`를 순차 진행(라바콘 → 장애물구간 → 완료, 우선순위 판단 불필요).
+정적/동적 장애물 구분은 Phase가 아니라 매 프레임 `obstacle_type`(라이다 실측 폭 기반)으로
+판단한다.
+
+### B1 (Phase.LAVACON, 라바콘)
+- **진입**: `lavacon_trigger`(라이다 좌우 클러스터 동시검출 AND YOLO 콘 검출,
+  `perc_lavacon_trigger()`) → `_lavacon_engaged=True` → `behavior_state=B1_LAVACON` →
+  `apply_behavior_override()`가 `_handle_lavacon()` 호출.
+- **조향**: 진입 확정 순간(rising edge) `LAVACON_KICK_ENABLED=True`면 고정
+  `LAVACON_KICK_ANGLE_DEG=-30.0`을 `LAVACON_KICK_DURATION_S=0.4`초 강제 유지. 이후
+  `LAVACON_STEER_MODE_DA_PUSH=True`로 `_lavacon_steer_da_push()`(da 경로 + 침범한 콘
+  반대쪽으로 밀기)가 담당:
+  - 안전마진: 좌 `LAVACON_PUSH_SAFETY_MARGIN_L_M=0.35`, 우 `_R_M=0.23`
+  - push 세기: `LAVACON_PUSH_GAIN=1.35`
+  - ROI: `LAVACON_PUSH_LON_MIN=-0.1`~`LON_MAX=0.25`(좌측만 `+0.1` 확장), `LAT_LIMIT=1.0`
+- **속도**: 일반 S1 주행과 동일한 `_update_speed()` 공유 — B1 전용 고정 속도 없음.
+- **탈출**: `lavacon_done`(넓은 ROI로 좌우 모두 비었음, `perc_lavacon.py`)이
+  `LAVACON_DONE_FRAMES=40`(약 2초) 연속 유지되면 `phase=Phase.OBSTACLE_ZONE`으로 전환.
+
+### B2/B3 (Phase.OBSTACLE_ZONE, 고정장애물/방해차량)
+- `behavior_state`는 항상 `B0_NORMAL`로 유지된다 — 실제 회피는 `ENABLE_OBSTACLE_CUT=True`
+  da-근접-컷(da near-cut)이 담당하며, `behavior_state`와 무관하게 항상 켜져 있다.
+- 메커니즘: `perc_obstacle_cut_trigger()`(라이다+YOLO 이중확인) → `obstacle_cut_active` →
+  `_clip_da_by_obstacle()`(`dl_lane.py`)가 da 경로를 장애물 쪽에서 잘라냄. 속도는
+  `SPEED_PRE_OBSTACLE_CAP=8.0`으로 사전 제한.
+- `run_behavior_fsm()`은 `obstacle_cut_active`의 진입/이탈만 관찰해 B2('fixed')/B3('vehicle')
+  태그를 붙이고 `_mark_behavior_passed()`를 호출하는 역할만 한다.
+- **트랙 순서 = B2가 먼저.** `_b3_armed()` = `_b2_passed and (now - _b2_passed_t) >=
+  B2_TO_B3_DELAY_SEC(3.0)` — B2 완료 후 3초 동안은 차량형 검출도 강제로 'B2'/콘 분류로
+  취급한다(방금 지나온 고정장애물을 B3로 오분류하는 것을 막는 가드).
+- `Phase.DONE`: B2+B3 둘 다 완료되면 `behavior_state=B0_NORMAL`로 일반 차선주행만 계속.
+
+---
+
+## 5. 지름길(좌회전) 파이프라인
+
+1. `signal_left_confirmed` → `S0_SIGNAL` 진입, `_s2_commit_dist=0.0`.
+2. 정상 주행하며 거리 누적. `perc_checker_pillar()`(라이다 좌우 기둥쌍 게이트) →
+   `checker_pillar_trigger` → `_begin_checker_ramp_turn()`. (5초 타임아웃 시 포기하고 직진
+   처리, §3)
+3. **진입 램프**: `_checker_turn_ramp_angle()` — `CHECKER_TURN_RAMP_START_ANGLE=0`에서
+   `END_ANGLE=-25.0`까지 `CHECKER_TURN_RAMP_DIST_M=2.5`m에 걸쳐 `'smoothstep'` 곡선으로
+   전개. 속도는 `TURN_SPEED=12.0`.
+4. 램프 완료 시 즉시 B1 재무장 + `S1_LANE_FOLLOW` 복귀 + `_shortcut_exit_dist=0.0` 시작(§3).
+5. 정상 S1 주행. `_s1_lane_follow()`가 `_shortcut_exit_dist`를 누적하다가
+   `SHORTCUT_EXIT_DIST_M=5.5`에 도달하면 `_begin_shortcut_exit_kick()`.
+6. **탈출 킥**(진입 램프와는 별개의, 시간 기반 메커니즘): `_do_shortcut_exit_kick()`이 고정
+   `SHORTCUT_EXIT_KICK_ANGLE_DEG=-20.0`을 `SHORTCUT_EXIT_KICK_DURATION_S=0.5`초 동안
+   `TURN_SPEED`로 유지. 이 동안 `control_loop()`는 비헤이비어 FSM 게이트 전체를 꺼서 다른
+   로직이 이 조향을 덮어쓰지 못하게 한다.
+7. 킥 완료는 Phase/B1~B3 상태를 건드리지 않는다 — 지름길은 결승선으로 곧장 이어지므로, 킥
+   이후 더 이상 B1/B2/B3가 나오지 않는 것을 전제로 한다.
+
+---
+
+## 6. 인지 스택
+
+### 차선/DA(주행가능영역)
+`LANE_DETECTOR_BACKEND='dl'`(기본값) → `DLLaneDetector`(`perception/dl_lane.py`)가
+`twinlitenetplus_kmu_v1.2.0.onnx`(TwinLiteNet+ 파인튜닝, da+ll 듀얼 세그멘테이션, 별도
+추론 스레드)를 사용. `'dl'` 초기화 실패 시 `'hough'`(`HoughLaneDetector`)로 자동 폴백.
+`'classic_cv'`는 보존용으로 남아있으나 현재 라이브 미검증.
+
+`_largest_da_component()`가 da 커넥티드컴포넌트 중 "내 차선"을 고를 때, 우선순위는
+① 시드(차량 위치와 맞닿은 덩어리) → ② 시간적 연속성(직전 프레임과 가장 가까운 덩어리) →
+③ 면적 범위(`DL_DA_MIN_COMPONENT_AREA`/`DL_DA_MAX_AREA_PX`, 위 둘 다 없을 때만 쓰는 최후
+폴백). 면적만으로 판단하는 방식은 실차 주행으로 검증했을 때 통하지 않았다.
+
+ll(차선) 인식이 프레임 전체에서 실패해 da가 두 차선을 뭉텅하게 병합하는 경우, 얇은 다리
+구조가 없어 침식(erosion)으로 못 끊어낸다 — 대신 ll 잔상(decay, 최근 확실했던 픽셀을 감쇠
+유지)과 기대 차로폭 기반 가상경계(`_clip_da_by_ll()`)로 대응한다.
+
+### YOLO 모델
+`perception/yolo_*.py`가 `yolo_ros/*.onnx`에서 상대경로로 로드(가중치는 이 저장소에
+`cone_best_n.onnx`만 포함, 나머지는 루트 README 안내대로 별도 다운로드):
+- `cone_best_n.onnx` — 라바콘(B1) 검출
+- `target_vehicle_best.onnx` — 방해차량(B3) 후방 검출
+- `signal_state_best_n.onnx` — 신호등 보드 위치 + 색상 상태 동시 예측(YOLOv8 파인튜닝)
+
+`_active_yolo_stage()`가 현재 `Phase`에 필요한 모델만 가동해 연산량을 줄인다. YOLO는 신호등/
+B1 진입/B2·B3 트리거 확인용으로만 쓰이고, 차선/DA 자체는 YOLO를 쓰지 않는다.
+
+### 신호등 인식
+옛 HSV/Hough Circle 기반 로직은 삭제됐고, `yolo_signal_state.py` 단일 모델
+(`signal_state_best_n.onnx`)이 보드 위치+색상 상태를 함께 예측한다. `SIG_CONFIRM_FRAMES=5`
+프레임 연속 확인 후 확정. `signal_left_confirmed`는 초록+빨강 동시 점등(좌회전/지름길 옵션),
+`signal_straight_confirmed`는 직진 신호.
+
+### 라이다 트리거
+- `perc_lavacon_trigger()` — B1(라바콘) 진입 트리거(좌우 클러스터 동시검출)
+- `perc_checker_pillar()` — 지름길 진입 게이트(좌우 기둥쌍 검출)
+- `perc_obstacle_cut_trigger()` — B2/B3 실제 회피 트리거(라이다+YOLO 이중확인)
+
+---
+
+## 7. 조향 컨트롤러 (Pure Pursuit)
+
+차선 추종(`_lane_steer()`)은 `PurePursuitController`(`controller/pure_pursuit.py`,
+기하학적·속도/커브 적응형 lookahead) 하나로 고정. 튜닝값은 전부 `config.py`의 `PP_*`.
+`_lane_drive()`(S1 차선주행)와 `_handle_lavacon()`(B1, 조향 파라미터를 차선주행과 동일하게
+씀)이 전부 이 컨트롤러를 거친다. LQR 컨트롤러는 제거됨(보존 안 함).
+
+핵심 파라미터(현재값, `config.py`):
+- `PP_WHEELBASE_PX = 49.64` — 그리드서치(`pp_tune_gridsearch.py`)로 재튜닝된 값(물리 기반
+  계산값 67.0이 아님, §11 참고)
+- `PP_TUNE_ACTIVE_PRESET = 'speed15'` — `SPEED_NORMAL=15.0`에 맞춰 그리드서치로 구한
+  프리셋 세트(`PP_ALPHA`/`PP_LD_FLOOR_PX`/`PP_DX_DEADZONE_PX` 등 일괄 적용)
+- `SPEED_NORMAL = 15.0`, `SPEED_CORNER_MIN = 8.0`
+- 코너 진입 시 회전반경 기반 감속 + curvature 기반 lookahead 축소가 기본 동작에 포함돼
+  있음(둘 다 pure_pursuit 전용)
+
+라바콘 push 중(B1)에는 `PP_WHEELBASE_PX_LAVACON=20.0` 등 라바콘 전용 파라미터 세트를 별도로
+쓴다(`config.py` 하단 라바콘 전용 절 참고).
+
+---
+
+## 8. VESC / IMU 연동
+
+### VESC (실측 속도)
+구동모터 실회전속도(VESC 홀센서)를 ROS1 변환 노드(`vesc_speed_bridge.py`, 워크스페이스
+바깥 noetic_ws에서 별도 실행)가 `std_msgs/Float32`(`/vesc_speed_erpm`)로 publish →
+`ros1_bridge`로 수신 → `cb_vesc()`가 `VESC_SPEED_TO_ERPM_GAIN=4614.0`(vesc.yaml 실측값)로
+나눠 `self.v_mps`로 변환. 속도 적응형 lookahead / `EncoderPoseEstimator`에 사용.
+생존 확인은 `DEBUG_VIZ_VESC` → `vesc_debug` 창(빨강 NEVER_RECEIVED/주황 STALE/초록 LIVE).
+
+### IMU (SparkFun 9DoF Razor IMU M0)
+`xycar_imu` 패키지(`xycar_device/xycar_imu/`)가 `/imu`를 publish. `cb_imu()`가
+`imu_yaw`(바퀴 카운트/랩 카운트용)와 `imu_yaw_rate`+`_imu_t`(코너 감쇠 보강용,
+`IMU_STALE_SEC=0.5`)를 뽑는다. `_update_lap()`은 휠 인코더가 아니라 IMU yaw 누적으로 바퀴를
+센다 — IMU가 죽어있으면(센서 하드웨어 장애, 코드 버그 아님) `imu_yaw`가 안 바뀌어 랩 카운트가
+0에 고정된 채 조용히 멈춘다. 에러 로그 없이 "값이 안 움직인다"로만 드러나므로 `[LAP] 누적=`
+로그로 간접 확인.
+
+두 센서 모두 `_*_t` 타임스탬프 + `*_STALE_SEC` 가드 패턴(`_vesc_live()` 등)으로 생존을
+체크한다 — 콜백이 안 불려도 크래시가 아니라 값이 직전값에 고정되는 형태로만 나타나므로, 새
+센서를 추가할 때도 이 패턴을 따를 것.
+
+---
+
+## 9. 디버그 시각화
+
+모든 `DEBUG_VIZ_*` 플래그는 기본 `False`(경기 준비 상태) — 창 코드는 남아있고 `config.py`
+"5. 디버깅 ON/OFF" 절에서 opt-in.
+
+| 기능 | 스위치 |
+|---|---|
+| 신호등 | `DEBUG_VIZ_SIGNAL` |
+| 차선 — `dl` 백엔드 | `DEBUG_VIZ_DL_LANE` |
+| 차선 — `hough` 백엔드 | `DEBUG_VIZ_HOUGH_LANE` |
+| 차선 — `classic_cv` 백엔드 | `DEBUG_VIZ_LANE` |
+| 정지선 | `DEBUG_VIZ_STOPLINE` |
 | 라이다 BEV(장애물) | `DEBUG_VIZ_LIDAR` |
-| 라이다 BEV(라바콘 트리거) | `DEBUG_VIZ_LAVACON` |
+| 라이다 BEV(라바콘) | `DEBUG_VIZ_LAVACON` |
+| da 근접 컷(B2/B3) | `DEBUG_VIZ_OBSTACLE_CUT` |
+| 좌회전 통합 | `DEBUG_VIZ_LEFT_TURN` |
+| VESC 생존 | `DEBUG_VIZ_VESC` |
 | 조향 컨트롤러 상태 | `DEBUG_VIZ_STEER` |
 
-> **YOLO 사용 범위:** 신호등/차선/고정장애물(B2)/방해차량(B3)은 카메라+라이다만 쓰고 YOLO를 안 씁니다.
-> 라바콘(B1) 진입 트리거만 `perception/yolo_cone.py`(YOLOv8n, `yolo_ros/cone_best_n.onnx`)로 카메라
-> 이중확인을 추가로 씁니다(§3 참고).
+---
+
+## 10. 알려진 한계
+
+- **라이다 장착 각도 드리프트 의심, 미해결.** `LIDAR_ANGLE_OFFSET_DEG=80.0`은 2026-07-22
+  실측값(정면에 사람을 세우고 컴퍼스로 확인)이지만, 이후 `measure_lidar_camera_offset.py`로
+  재확인했을 때 실제 최근접점이 인덱스 80이 아니라 88~89(약 6.5도 차이)에서 찍힌 단발
+  관찰이 있었다. 마운트가 미세하게 틀어졌을 가능성 — `config.py`는 아직 갱신 안 됨. 이 값을
+  바꾸면 B1/B2/B3 좌우 판정 전부에 영향이 크므로 재측정 시 반드시 재검증할 것.
+- **`speed=20` 이상은 `METERS_PER_SPEED_UNIT` 상수를 못 쓴다.** 5~15 구간에서 재측정한
+  `METERS_PER_SPEED_UNIT≈0.0848`은 이 구간 반복측정 기반 회귀값이고, `speed=20` 부근부터
+  이미 비선형(견인력 포화) 구간에 들어섰을 가능성이 있어 단일 상수로 표현할 수 없다.
+  `speed=25`는 하드웨어 신뢰성 문제(배터리/ESC/모터 의심)로 측정 자체가 보류 중.
+  (`실제속도측정.md` §0.1 참고)
+- **출발 초반 "틱틱거림/힘딸림"은 미해결.** 배터리 LVC 트립 가설(`SPEED_ACCEL_STEP` 완화)과
+  정지마찰 체류시간 가설(`SPEED_KICK_START` 도입) 둘 다 시도했으나 실차 재검증 결과 개선
+  체감이 없었고, 오히려 출발 성공률이 급락한 세션도 있었다. 소프트웨어 레버는 이미 적용된
+  상태이므로, 원인은 하드웨어(배터리 내부저항 열화/ESC 보호임계값/기계적 걸림/커넥터
+  접촉불량) 쪽일 가능성이 높다고 재평가됨 — 정상 배터리팩 교체 A/B 비교가 다음 점검 순서.
+- **da/BEV 관련 다수 파라미터가 실차 미검증 추정치.** `OBSTACLE_CUT_TRIGGER_Y_HALF_M`,
+  `OBSTACLE_CUT_HALF_WIDTH_SCALE_FIXED`, `B2_TO_B3_DELAY_SEC`, `LAVACON_KICK_ANGLE_DEG`의
+  부호(방향), `SHORTCUT_EXIT_DIST_M`/`SHORTCUT_EXIT_KICK_*` 등은 코드 리뷰 수준 또는
+  체감 기반 추정치로 설정된 뒤 아직 완전히 실차로 검증되지 않았다. 대회 전 최종 실차
+  주행에서 각 값이 기대대로 동작하는지 재확인 필요.
+- **B2가 항상 B3보다 먼저 나온다는 트랙 순서 전제.** `_b3_armed()`의 3초 지연 가드와
+  좌우 교차검증 veto 로직 모두 "B2가 B3보다 항상 먼저"라는 트랙 순서 전제 위에서 동작한다.
+  전제가 실제 트랙과 다르면(예: 배치가 바뀌면) 오분류 가드가 반대로 오작동할 수 있다.
+  현재 코드는 이 전제를 최종값으로 채택한 상태(과거 한 차례 반전 후 다시 원복됨).
+- **IMU `/imu` 연동은 launch 파일에서 여전히 주석 처리돼 있을 수 있다.** `xycar_imu`
+  패키지 자체는 저장소에 편입돼 있으나, `launch/track_drive.launch.py`의 `imu_include`가
+  주석 처리된 상태라면 빌드해도 `/imu`가 노드에 안 들어온다 — 실차 배포 시 반드시 확인.
 
 ---
 
-## 0. 차선인식 백엔드 선택
+## 11. 캘리브레이션/실측값
 
-`perc_lane()`은 `self.lane_detector.detect(frame) -> (valid, offset, lookahead, lane_center, path, debug_img)`
-인터페이스에만 의존하는 pluggable 구조라, 셋 중 하나를 자유롭게 골라 끼울 수 있습니다(config.py `LANE_DETECTOR_BACKEND`).
+**실측값**(직접 측정)과 **설계값**(값은 있지만 임의로 고른 것)을 구분합니다 — 헷갈리면 이미
+검증된 값으로 착각하고 재검증을 건너뛸 수 있습니다.
 
-| 값 | 구현 | 상태 |
-|---|---|---|
-| `'dl'` | `perception/dl_lane.py`의 `DLLaneDetector` (TwinLiteNet ONNX 세그멘테이션, 별도 스레드 추론) | **현재 기본값** |
-| `'hough'` | `perception/hough_lane.py`의 `HoughLaneDetector` | 대안, 실차 라바콘 테스트까지 검증됨. `'dl'` 초기화 실패 시 자동 폴백 |
-| `'classic_cv'` | `perception/lane_util.py`(`CameraProcessor`+`SlideWindow`) + `perception/perc_floor.py`(`LaneDetector`) 조립 | 보존용, 현재 라이브 미검증 |
-
-`'dl'` 선택 시 `onnxruntime` 미설치나 모델 파일 부재 등으로 초기화가 실패하면 `_build_lane_detector()`가
-에러를 로깅하고 자동으로 `'hough'`로 폴백합니다 — 노드 시작 로그에 `DL 차선인식 백엔드 초기화 실패,
-hough로 폴백합니다`가 찍혔는지 꼭 확인하세요.
-
----
-
-## 0.5 조향 컨트롤러 (Pure Pursuit)
-
-차선 추종(`_lane_steer()`)은 `self.pure_pursuit`(`controller/pure_pursuit.py`의 `PurePursuitController`,
-기하학적·속도/커브 적응형 lookahead) 하나로 고정돼 있습니다. 튜닝값은 전부 `config.py`의 `PP_*`에서
-가져옵니다. `_lane_drive()`(S1/S3 차선주행)와 `_handle_lavacon()`(B1 라바콘, 조향 파라미터를 라인주행과
-완전히 일치시킴)이 전부 이 하나를 거칩니다.
-
-**[2026-08-14] LQR 컨트롤러 제거:** `controller/lqr.py`와 `STEERING_CONTROLLER` 스위치를 완전히
-걷어냈습니다 — 실차 미검증 상태로 한 번도 켜본 적 없이 계속 `pure_pursuit`만 써왔던 죽은 분기였습니다.
-`LQR_WHEELBASE_M`(실측 축거, §6.7)만은 `EncoderPoseEstimator`도 쓰던 값이라 `WHEELBASE_M`으로 이름만
-바꿔 남겼습니다. LQR 설계 기록이 필요하면 `controller/lqr.py` 삭제 커밋 이전 git 히스토리를 볼 것.
-`EncoderPoseEstimator`(로컬라이제이션)는 이 제거와 무관하게 여전히 미배선 상태입니다.
-
-**디버그:** `DEBUG_VIZ_STEER = True`(기본값) → `steer_debug` 창에서 "직전값 유지"(주황)/"현재값 반영"(초록),
-조향각·lookahead/curvature·IMU curvature를 보여줍니다.
-
-### 0.5.1 코너 진입 시 회전반경 기반 감속 (`pure_pursuit` 전용)
-ROS2 Nav2의 Regulated Pure Pursuit과 동일한 방식 — `_corner_radius_speed_scale()`이 회전반경(1/curvature)이
-`CORNER_MIN_RADIUS_PX`(250px, 실차 미검증 추정치)보다 작아지면 그 비율만큼 목표속도를 깎습니다. 기존
-`turn_now`/`turn_preview` 기반 감속을 대체하는 게 아니라 "더 낮은 쪽을 채택"하는 추가 안전판입니다.
-
-### 0.5.2 코너 진입 시 lookahead 축소 (curvature 기반, `pure_pursuit` 전용)
-직전 프레임 위치가 아니라 매 프레임 고정 기준거리(`probe_px`)에서 새로 잰 `probe_curvature`로 lookahead를
-줄입니다(코너일수록 더 촘촘히 추종, Lee/Lee/Moon 2025 "가변 LAD" 아이디어의 반응형 변형). **2026-08-06
-버그(자기순환 lookahead 락업)**: 직전에 실제로 쓴(이미 줄어든) lookahead에서 나온 curvature를 damp 근거로
-재사용하면, ld가 짧아질수록 노이즈가 curvature로 더 증폭 → damp가 ld를 또 줄이는 무한루프에 빠져 직진
-복귀 후에도 lookahead가 하한(40px)에 눌린 채 안 풀리는 증상이 실차 영상(offset+1.5px인데 조향각 -65.7°가
-15초 고정)으로 확인됨 — "댐핑 적용 전 고정 기준으로 매 프레임 독립 재평가"하는 지금 방식으로 수정.
-`PP_LOOKAHEAD_CURVATURE_GAIN=100`/`PP_LOOKAHEAD_MIN_PX=40` 둘 다 실차 미검증.
-
-### 0.5.3 진동을 코너로 오인해 매번 감속하는 문제 (`pure_pursuit` 전용, 2026-08-06)
-차선 중앙 부근 진동("와리가리")은 부호만 계속 바뀌는데, 코너 감속 판단을 `abs(ctrl_angle)` 순간값으로
-하면 진동의 매 스윙이 급코너로 오인돼 속도가 팍팍 줄었다 늘었다 했습니다. 판단 신호를 조향각의 signed
-EMA(`self._corner_signal`, `CORNER_SIGN_EMA_ALPHA=0.15`)로 바꿔 — 진동(부호 반복)은 EMA 단계에서 상쇄되고
-실제 코너(부호 유지)만 남게 했습니다. `turn_for_speed`/`_corner_radius_speed_scale`/`_corner_hold`가 전부 이
-신호 하나를 공유합니다.
-**[2026-08-10] 회귀 이력:** 이 수정이 다른 커밋(`80aefe3`, 무관한 디버그창 작업)에 실수로 섞여 롤백됐다가
-같은 날 발견/복원됨 — 유사 회귀가 재발하지 않는지 코드 리뷰 시 주의할 것.
-
-### 0.5.4 VESC 실측속도를 lookahead 계산에 반영 (`pure_pursuit` 전용, 2026-08-06)
-속도 적응형 lookahead가 명령속도(`self._prev_speed`) 대신 VESC 실측(`self.v_mps`, §7)을 우선 사용하도록
-변경 — VESC가 살아있으면(`_vesc_live()`) 그 값을 명령속도와 같은 단위로 역환산해서 쓰고, 안 살아있으면
-기존처럼 명령속도로 폴백합니다.
-
-### 0.5.5 IMU 실측 curvature로 코너 감쇠 보강 (`pure_pursuit` 전용, 2026-08-06)
-IMU 요레이트(`imu_yaw_rate`, 저역통과 `IMU_YAW_RATE_EMA_ALPHA=0.3`)/VESC 실측속도로 구한 실제
-curvature(`_imu_curvature_px()`)를 비전 기반 `probe_curvature`와 절댓값 비교해 더 큰 쪽으로 감쇠를
-겁니다(비전이 못 본 코너를 IMU가 잡는 경우, 또는 반대 경우를 놓치지 않기 위한 보수적 선택) — IMU·VESC
-둘 다 살아있고 `dl+BEV` 조합일 때만 반영, 그 외엔 `probe_curvature` 단독 판단으로 자동 폴백합니다. IMU
-부호규약은 미검증이지만 `abs()`로만 쓰여 조향엔 영향 없습니다.
-
-### 0.5.6 속도를 올리면 진동이 심해지는 문제 — lookahead 상한 부족 (`pure_pursuit` 전용, 2026-08-07)
-`speed_lookahead_px = PP_LOOKAHEAD_BASE_PX + PP_LOOKAHEAD_SPEED_GAIN*speed` 공식이 `SPEED_NORMAL=5` 기준으로
-설계됐는데, `SPEED_NORMAL`이 이후 25까지 오르며 이론상 필요한 lookahead(190)가 구 상한(150)에 막혀
-속도 15 이상부터 lookahead가 더 안 늘어났습니다 — lookahead가 짧을수록 같은 픽셀오차가 조향각으로 더
-크게 증폭되므로(§0.5.2), 고속에서 과민반응→진동으로 이어짐. `PP_LOOKAHEAD_MAX_PX` 150→190(`SPEED_NORMAL=25`
-그대로 대입)으로 상향.
-
-### 0.5.7 직진 구간에서도 계속 진동 — 저역통과/데드존 강화 (`pure_pursuit` 전용, 2026-08-12)
-§0.5.3에서 다룬 구조적 진동이 코너 오인뿐 아니라 조향 출력 자체에도 남아있다는 재보고 — 이미 문서에
-남겨뒀던 레버(§0.5.6의 "PP_ALPHA를 낮추는 쪽을 볼 것")를 실제로 당김: `PATH_EMA_ALPHA` 0.4→0.25(경로
-자체의 프레임간 흔들림 억제), `PP_ALPHA` 0.5→0.35(조향각 저역통과 강화), `PP_DX_DEADZONE_PX` 6→15(중앙
-부근 잔떨림 무시폭 확대). 근본 대응은 §2.27(da/ll 밴드중심 자체를 안정화)과 병행 — 이 절은 pure_pursuit
-입력/출력단에서 흔들림을 누르는 대증요법.
-
-### 0.5.8 §0.5.7 진동억제 레버가 조용히 되돌아간 문제 재발견 (2026-08-17)
-8/13 재튜닝(`PP_WHEELBASE_PX`를 낮춰 조향 반응 자체를 줄이고, 노란선 흔들림 대응으로 데드존도 같이
-줄임 — `PP_ALPHA` 0.35→**0.60**, `PP_DX_DEADZONE_PX` 15→**5.0**)이 §0.5.7의 진동억제값을 의도치 않게
-원점 근처로 되돌려놨던 것을, "저속에서도 직진이 구불구불하다"는 재보고로 발견했습니다. 구조적 요인도
-겹칩니다 — `SPEED_NORMAL=3.0`(현재 저속 재튜닝값)에서는 lookahead가 하한(90px) 바로 위(≈102px)라
-`curvature=2·sin(α)/ld` 공식상 픽셀노이즈 증폭이 가장 심한 구간입니다(저속일수록 오히려 취약).
-**수정:** `PP_ALPHA` 0.60→0.35 원복, `PP_DX_DEADZONE_PX` 5.0→12.0(§0.5.7의 15와 8/13의 5 사이 절충 —
-`PP_WHEELBASE_PX=25.0`으로 조향 반응이 이미 약해진 상태를 감안). `probe_curvature`(pure_pursuit.py)는
-여전히 threshold 없이 연속값으로만 쓰입니다 — "직진/커브"를 이진 판정해 공유하는 로직은 §0.5.9에서 추가.
-
-### 0.5.9 명시적 "직진 모드" 도입 — 연속 N프레임 저곡률 확정 시 조향 데드존+코너감속 병합 (2026-08-17)
-**배경:** §0.5.8까지는 진동 억제가 전부 "연속값을 더 세게 누르는" 방식(저역통과 강화, 고정 데드존 확대)
-뿐이라 코너 반응성과 항상 트레이드오프였다. 다른 팀의 자율주행 캡스톤 후기(네이버 블로그, 참고용 —
-논문/벤치마크 아님)에서 "직진/완만한 커브/가파른 커브"를 이산적으로 분류해 직진 구간은 노이즈에 덜
-민감하게 처리한 사례를 참고해, 이미 있던 `probe_curvature`(코너 판단 신호)를 연속값 감쇠뿐 아니라
-**이산 상태 확정**에도 같이 쓰기로 했다.
-
-**구현 (`controller/pure_pursuit.py` `control()`):** 코너 감쇠에 이미 쓰던 `damp_curvature`(probe_curvature와
-IMU curvature 중 큰 쪽, §0.5.5 — 새 신호 추가 아님)가 `PP_STRAIGHT_CURVATURE_EPS`(0.001, 회전반경≈1000px
-이상) 미만인 프레임이 `PP_STRAIGHT_CONFIRM_FRAMES`(5, 20Hz 기준 0.25초) 연속되면 `self.is_straight=True`로
-확정한다 — 한 프레임이라도 벗어나면 즉시 해제(코너 진입 반응이 늦어지면 안 되므로 해제엔 디바운스를
-안 걺). `is_straight`인 동안만 dx 데드존을 평소(`PP_DX_DEADZONE_PX=12`)보다 넓은
-`PP_STRAIGHT_DEADZONE_PX`(20)로 키운다 — 코너 중에는 이 조건 자체가 안 걸리므로 코너 추종 감도는
-그대로다. `PP_ALPHA`(저역통과)는 안 건드렸다 — 데드존은 "차이가 이 값 미만이면 0"이라는 문턱이라
-계단형 반응만 생기고 이전 프레임 상태에 의존하는 필터가 아니라서, 자기순환 피드백(§0.5.2가 이미 한 번
-겪은 문제) 위험이 없다.
-
-**디버그:** `steer_debug` 창에 `직진모드: 확정(N프레임)/대기(n/M)` 한 줄 추가(`self.is_straight`,
-`self._straight_frames`).
-
-**[2026-08-17 후속] 코너 감속에도 병합 — 조향 데드존만이 아니라 속도까지.** 사용자 지적: "지금 급격한
-커브에서 속도를 줄이는 로직이 있는데, 그게 '직진/커브' 분류하고 합쳐져 있나?" 확인해보니 안 합쳐져
-있었다 — `_lane_drive()`의 `turn_for_speed`(3제곱 감속식 입력)와 `_corner_radius_speed_scale()`(회전반경
-기반 추가 감속)는 둘 다 `self._corner_signal`(조향각 signed EMA) 기반 연속값만 쓰고
-`pure_pursuit.is_straight`를 전혀 참조하지 않았다. `is_straight`는 조향 출력과는 독립된 신호(경로
-curvature+IMU)라 더 신뢰도가 높으므로, `_lane_drive()`가 `is_straight`인 프레임엔 `turn_for_speed=0.0`
-+ `corner_radius_scale=1.0`으로 강제해 잔여 노이즈로 인한 유령 감속을 없앴다(`is_straight`가 아닌
-프레임, 즉 코너 포함 전부는 기존 연속값 로직 그대로 — 코너 감속 감도 자체는 안 바뀜). `steer_debug`의
-`직진모드:` 줄에 `(조향+속도 적용)`을 덧붙여 지금 이 프레임에 두 로직 다 반영 중인지 표시한다.
-
-**[2026-08-17 후속2] eps 완화 — 실차 회피 주행 녹화(카카오톡 영상, 14:00)에서 위 우려("eps가 너무 작으면
-직진 확정 자체가 잘 안 걸림")가 실제로 확인됨.** 사용자 지적: 육안으론 명백한 직진 구간이 `result` 패널에
-계속 "커브대응"(주황)으로 표시됨. `probe_curvature=2*sin(alpha)/probe_ld` 공식상 기존
-`PP_STRAIGHT_CURVATURE_EPS=0.001`은 일반 주행 lookahead 범위(`probe_ld`≈90~150px)에서 dx 약 5~11px만
-넘어도 초과하는 값이었다 — 이 문서 §0.5.2 부근 `min_lookahead_px` 관련 실측 예("ld=42px, dx=3px, 육안으론
-거의 직진"조차 curvature≈0.0034)보다도 작은 dx로 넘는 문턱이라, 세그멘테이션의 프레임 간 픽셀 단위 잡음만
-으로도 상시 초과했을 개연성이 높다. 그 실측 예(0.0034, "거의 직진"으로 판정됨)를 기준 삼아
-`PP_STRAIGHT_CURVATURE_EPS`를 0.001 → **0.0035**로 3.5배 완화(`config.py`). 해제는 여전히 즉시(디바운스
-없음)라 실제 코너 진입 반응성엔 영향 없음 — 완화 자체가 "직진을 더 잘 인식"하는 방향으로만 작용한다.
-실차 재검증 전.
-
-**알려진 한계(실차 미검증):**
-- `PP_STRAIGHT_CURVATURE_EPS`(0.0035로 완화, 위 후속2)/`PP_STRAIGHT_CONFIRM_FRAMES`/
-  `PP_STRAIGHT_DEADZONE_PX` 전부 실차 미검증 추정치 — eps를 더 완화해야 할지, 아니면 이번 완화가 과했는지
-  (완만한 커브 진입 초반까지 직진으로 오판해 데드존이 넓은 채 남을 위험)는 실차에서 같이 확인할 것.
-- 확정에는 디바운스가 있지만 해제는 즉시라 — `probe_curvature`가 노이즈로 한 프레임만 튀어도 직진 모드가
-  풀렸다가 바로 다시 확정을 반복할 수 있다. 실차에서 `직진모드:`가 자주 깜빡이면 해제에도 약한 디바운스
-  추가를 고려할 것. 속도까지 이 상태를 참고하게 되면서, 이 깜빡임이 이제 조향뿐 아니라 목표속도까지
-  같이 들쭉날쭉하게 만들 수 있다 — 조향만 문제였을 때보다 체감 영향이 커질 수 있으니 실차에서 특히
-  주의 깊게 볼 것.
-- `turn_for_speed`를 0으로 강제하는 순간(직진 확정되는 바로 그 틱)과 확정 전 마지막 틱 사이에 목표속도가
-  계단형으로 튈 수 있다 — `SPEED_ACCEL_STEP` 가속 램프가 급가속은 걸러주지만, 그 반대(직진 중 우연히
-  해제→재확정을 반복하는 경우)는 램프 보호가 없는 감속 방향이라 완충이 덜 될 수 있다.
-- 참고한 블로그 사례는 커브가 급할수록 lookahead를 **늘리는** 방식이라 이 프로젝트(§0.5.2, 커브일수록
-  줄임)와 반대 방향이다 — 그 부분은 가져오지 않았고 "이산 분류로 직진 구간에 별도 처리를 준다"는
-  아이디어만 차용했다.
-
-**[2026-08-19] 기능 전체 제거(요청 반영: "직진모드, 커브모드는 빼자 — 파라미터는 모두 커브대응상태만
-남기고 날려줘").** 위 "알려진 한계"가 실차 검증 없이 계속 쌓여만 있었고, 명시적 2상태 분기 자체가
-복잡도만 늘린다는 판단으로 되돌렸다. `controller/pure_pursuit.py`에서 `is_straight`/`_straight_frames`/
-`_dx_bias_ema` 판정 로직과 `straight_*` 생성자 인자를 전부 삭제했고, `config.py`의
-`PP_STRAIGHT_CURVATURE_EPS`/`PP_STRAIGHT_CONFIRM_FRAMES`/`PP_STRAIGHT_DEADZONE_PX`/`PP_STRAIGHT_ALPHA`/
-`PP_STRAIGHT_BIAS_EMA_ALPHA`(top-level 기본값 + `PP_TUNE_PRESETS`의 9개 프리셋 전부)도 함께 삭제했다.
-이제 `PP_ALPHA`/`PP_DX_DEADZONE_PX` 하나씩만 남아 직진 포함 모든 상황에 상시 적용된다("커브대응" 값이
-유일한 값). `track_drive.py._lane_drive()`의 코너감속 `is_straight` 바이패스(`turn_for_speed=0.0`/
-`corner_radius_scale=1.0` 강제)도 제거해 항상 연속값 감속 로직만 쓴다. `steer_debug`/`dl_lane` 창의
-"직진모드"/"직진·커브대응" 표시도 함께 뺐다. **알려진 한계:** `pp_tune_gridsearch.py`는 아직
-`cfg.PP_STRAIGHT_*`와 `pp.is_straight`를 참조하는 옛 시뮬레이션 코드를 그대로 갖고 있어 이 삭제 이후
-그대로 실행하면 깨진다 — 다음에 그 스크립트를 쓸 일이 생기면 같이 정리할 것.
-
-### 0.5.10 증속(`SPEED_NORMAL` 3.0→10.0) + lookahead 상한 재계산 (2026-08-17)
-저속(3.0) 재튜닝값이 안정 검증된 뒤, 요청 반영으로 `SPEED_NORMAL`을 10.0으로 올림. §0.5.6과 같은 이유로
-`PP_LOOKAHEAD_MAX_PX`도 같이 재계산해야 한다 — `speed_lookahead_px = PP_LOOKAHEAD_BASE_PX +
-PP_LOOKAHEAD_SPEED_GAIN*speed` 공식의 설계 관례(상한 = BASE+GAIN*현재 SPEED_NORMAL)를 그대로 따라
-90+4*10=130으로 하향(구 190은 `SPEED_NORMAL=25` 시절 값이라 헤드룸이 남아돌던 상태).
-
-**의도적으로 비례 조정하지 않은 값들:**
-- `SPEED_CORNER_MIN`/`SPEED_LL_DEGRADED`/`SPEED_LANE_STALE`/`SPEED_AVOID_HOLD_BLOCKED` — 전부 모터
-  데드존(≈1.4) 근처의 "즉시 cap" 하한값으로, `SPEED_NORMAL`의 비율이 아니라 물리적 최저속 기준으로
-  잡힌 값(§2 상단 주석)이라 그대로 뒀다. 오히려 이번 증속으로 `_lane_drive()`의 코너 감속 3제곱식
-  (`SPEED_NORMAL*(1-0.9*turn³)`)이 `SPEED_CORNER_MIN=5.0`보다 낮은 목표속도를 실제로 낼 수 있게 돼
-  (구 `SPEED_NORMAL=3.0`에서는 5.0 floor가 항상 이겨서 이 3제곱식이 사실상 죽어있었음) 코너 감속이
-  이제야 정상 작동한다. 실차에서 코너 진입/탈출 속도 변화가 과하게 급하게 느껴지면 그때
-  `SPEED_CORNER_MIN`을 올리는 쪽으로 완화할 것(§2 상단 주석에도 동일 안내 있음).
-- `SPEED_ACCEL_STEP`(가속 램프, 0.4/주기) — 배터리 LVC 트립 방지용 전류 스파이크 억제가 목적(§79-124행
-  주석)이라 가/감속도(=전류) 자체와 관련된 값이지 목표속도 크기와는 무관. 그대로 두면 가속도는 이전과
-  동일하게 유지되고 단지 새 목표(10.0)까지 도달하는 데 걸리는 시간만 늘어난다(0→5.0: 약 0.625초 →
-  0→10.0: 약 1.25초, 20Hz 기준) — 전류 안전 측면에서는 오히려 이쪽이 더 보수적이라 안전.
-- `ANGLE_MAX`/`ANGLE_RATE_MAX`(조향각 하드웨어 한계), `PP_WHEELBASE_PX`/`PP_ALPHA`/`PP_DX_DEADZONE_PX`/
-  `PP_STRAIGHT_*`(조향 반응성/필터 튜닝) — 전부 `SPEED_NORMAL`의 함수가 아니라 서보 하드웨어 한계이거나
-  비전 노이즈 특성에 맞춘 독립 튜닝값이라, 증속 자체만으로 재계산할 공식이 없다. 실차에서 10.0 주행 시
-  진동/반응성이 달라지면 그때 별도로 재튜닝 필요(§0.5.6~§0.5.9의 방법 그대로 재적용).
-
-실차 재검증 전 — 특히 코너 감속이 이제 실제로 걸리기 시작하므로, 3.0 저속 검증 때는 안 보였던 코너
-진입/탈출 거동을 새로 확인할 것.
-
-### 0.5.11 증속(`SPEED_NORMAL` 10.0→15.0) + 코너 속도(`SPEED_CORNER_MIN` 5.0→10.0) 상향 (2026-08-17)
-요청 반영으로 재증속. §0.5.10과 동일 관례로 `PP_LOOKAHEAD_MAX_PX`를 90+4*15=150으로 재계산했다.
-이번엔 §0.5.10에서 "비례 조정하지 않는다"고 못박았던 `SPEED_CORNER_MIN`도 요청으로 5.0→10.0 상향—
-`SPEED_NORMAL(15.0) > SPEED_CORNER_MIN(10.0)` 관계는 유지되므로 §0.5.10에서 겪은 "floor가 항상 이겨
-코너 감속이 죽어있는" 문제는 재현되지 않지만, 코너 감속 폭이 15→10(33%)로 이전(10→5, 50%)보다
-완만해졌다는 점은 실차에서 코너 진입 느낌으로 확인할 것. `SPEED_LL_DEGRADED`/`SPEED_LANE_STALE`/
-`SPEED_AVOID_HOLD_BLOCKED`(전부 5.0)는 이번에도 요청받지 않아 그대로 뒀다 — §0.5.10이 설명한 대로
-`SPEED_CORNER_MIN`과 의미가 다른 독립 상수라 같이 올릴 필요는 없다(config.py 상단 주석 참고).
-
-### 0.5.12 `pp_tune_gridsearch.py` 재실행(SPEED_NORMAL=15.0) → PP_* 14개 값 일괄 교체 (2026-08-17)
-"그리드서치 돌려서 우리 파라미터값이 적당한지 판단"이라는 요청으로 `pp_tune_gridsearch.py --speeds
-15.0 10.0 --samples 400 --seed 0`을 실행. 결과: 직진은 baseline(§0.5.9~11 값)도 이미 최적(cte_rms
-0.6cm, 직진태그 100%)이었지만, 90도커브/S자커브는 cte_rms가 baseline 7~9cm에서 best 1~1.6cm로
-크게 개선됨(score 24.37→3.53 @speed=15, 19.08→4.86 @speed=10=SPEED_CORNER_MIN). 사용자 확인 후
-best_params(speed=15 기준) 14개를 전부 config.py에 반영:
-
-| 파라미터 | 이전 | 신규 |
-|---|---|---|
-| `PP_LOOKAHEAD_BASE_PX` | 90.0 | 65.26 |
-| `PP_LOOKAHEAD_SPEED_GAIN` | 4.0 | 3.305 |
-| `PP_LOOKAHEAD_MAX_PX` | 150.0 | 180.7 |
-| `PP_LOOKAHEAD_CURVATURE_GAIN` | 100.0 | 224.8 |
-| `PP_LOOKAHEAD_MIN_PX` | 40.0 | 62.61 |
-| `PP_WHEELBASE_PX` | 25.0 | 49.64 |
-| `PP_ALPHA` | 0.8 | 0.5244 |
-| `PP_MIN_LOOKAHEAD_PX` | 90.0 | 86.95 |
-| `PP_DX_DEADZONE_PX` | 6.0 | 4.445 |
-| `PP_STRAIGHT_CURVATURE_EPS` | 0.0035 | 0.003283 |
-| `PP_STRAIGHT_CONFIRM_FRAMES` | 5 | 10 |
-| `PP_STRAIGHT_DEADZONE_PX` | 20.0 | 21.64 |
-| `PP_STRAIGHT_ALPHA` | 0.4 | 0.5096 |
-| `PP_STRAIGHT_BIAS_EMA_ALPHA` | 0.15 | 0.06785 |
-
-가장 큰 기여는 `PP_WHEELBASE_PX`(25→49.64, 거의 2배) — `atan(curvature*wheelbase_px)` 조향 게인
-부족이 커브 추종 오차의 주 원인으로 나타남. **§0.5.6~§0.5.11이 지켜온 "PP_LOOKAHEAD_MAX_PX =
-BASE+GAIN*SPEED_NORMAL" 수식 관례는 여기서부터 끊긴다** — 그리드서치가 14개 값을 각각 독립
-샘플링한 조합이라 더 이상 그 공식이 성립하지 않는다. `SPEED_NORMAL`을 또 바꿀 땐 수식 재계산이
-아니라 이 그리드서치를 다시 돌릴 것.
-
-**★★★ 실차 완전 미검증 ★★★** — `pp_tune_gridsearch.py`는 화이트박스 합성 시뮬레이션(세그멘테이션
-잡음 1.5px 가정, 트랙 곡률 반경 1.2~1.3m 가정 등 전부 설계값, 스크립트 상단 주석 참고)이고,
-`PP_WHEELBASE_PX`는 과거 저속(`SPEED_NORMAL=3.0`) 구간에서 이보다 낮은 값(25.0)이 "진동(와리가리)
-감소" 목적으로 이미 실차 검증된 이력이 있다(§0.5.7, config.py `PP_WHEELBASE_PX` 2026-08-13 주석) —
-이번 상향이 새 속도(15.0)에서 그 진동을 다시 키우는지가 최우선 실차 확인 대상이다. 문제가 생기면
-config.py `PP_*` 블록 상단 주석에 남겨둔 "이 커밋 이전 값"으로 되돌릴 것.
-
-### 0.5.13 `PP_TUNE_ACTIVE_PRESET` 활성화 (None → 'speed15') (2026-08-17)
-요청 반영으로 §2.38/§0.5.12 이후 대기 중이던 `PP_TUNE_PRESETS['speed15']`(조향+코너감속
-커플링 통합 그리드서치, 2차 버전)를 실제로 켰다. `globals().update()`로 §0.5.12에서 적용한
-개별 PP_* 14개 값과 `SPEED_NORMAL`/`SPEED_CORNER_MIN`/`CORNER_*` 전부를 덮어쓴다.
-
-**가장 크게 바뀌는 두 값(실차 미검증 위험 요소):**
-- `SPEED_CORNER_MIN`: 10.0 → **14.05** — `SPEED_NORMAL`(15.0)과 거의 같아 사실상 "코너에서
-  거의 안 늦춤"을 뜻한다. 시뮬레이션이 가정한 트랙 곡률(반경 1.2~1.3m)보다 실제 코너가
-  급하면 위험할 수 있다.
-- `SPEED_ACCEL_STEP`: 0.4 → **1.014**(2.5배) — 배터리 LVC(저전압 보호) 트립 방지 목적으로
-  고정해뒀던 값인데, 그리드서치는 전류/배터리를 전혀 모델링하지 않는다(§0.5.12 논의 그대로).
-
-첫 실차 테스트는 서행 가능한 곳에서 즉시 개입 준비하고 진행할 것 — 문제가 생기면
-`PP_TUNE_ACTIVE_PRESET = None`으로 되돌리면 §0.5.12까지의 개별값(코너감속 미커플링 그리드서치
-결과)으로 즉시 복귀한다.
-
-### 0.5.14 `pp_tune_gridsearch.py`에 실전트랙 시나리오 + `PATH_EMA_ALPHA` 추가, 폐루프 앨리어싱 버그 2건 수정 (2026-08-17)
-지금까지 그리드서치는 직진/90도커브(가정 반경 1.2m)/S자커브(가정 반경 1.3m) 3개를 각각
-독립적으로(매번 정지상태에서 시작해 그 모드 하나만 겪음) 채점했다. 사용자가 트랙 도면(국민대
-자율주행 경진대회)을 제공해줘서 두 가지를 반영:
-- **실전트랙 시나리오 추가**: 도면 실측값(좌상단/좌하단 코너 R1,950mm 동일, 우측 지그재그 구간
-  R1,615/1,530/1,595/1,470mm 4원호)으로 직진→커브→직진→지그재그→직진→커브→직진이 이어지는
-  연속 경로(`build_track_path()`). 각 구간에 모드 라벨과 "전환구간"(모드 경계 앞뒤
-  `TRANSITION_ZONE_M`) 마스크를 같이 만들어(`_build_path_meta()`) 모드별 cte뿐 아니라 "코너/
-  지그재그로 전환되는 순간의 cte"를 따로 집계 — `score()`가 이 전환구간 cte에 특히 무거운
-  가중치를 준다(정상상태 추종은 괜찮은데 전환 찰나에만 튀는 조합을 잡아내기 위함). 지그재그
-  4원호의 회전각은 도면에 없어(반지름만 표기) `ZIGZAG_WIGGLE_DEG`로 임의 가정 — 실차 재검증 시
-  감안할 것.
-- **`PATH_EMA_ALPHA`(경로 스무딩) 그리드서치 포함**: 지금까지 시뮬레이터는 매 틱 새로 합성한
-  웨이포인트(디버깅창 노란선)를 pure_pursuit에 바로 넘겼는데, 실제 코드
-  (`perception/lane_util.py._update_path()`)는 이걸 직전 틱의 스무딩된 경로(디버깅창
-  자홍색/보라색 선, pure_pursuit이 실제로 추종하는 값)와 PATH_EMA_ALPHA로 블렌딩한 뒤에야
-  넘긴다 — 이 픽셀 좌표 블렌딩은 그 사이 차량이 이동한 만큼 보정하지 않아서, `PATH_EMA_ALPHA`
-  튜닝 이력(0.25→0.45→0.75→0.25, 이번 브랜치 직전 커밋)이 반복해서 겪은 "코너 추종 지연"의
-  근본 원인이다. 시뮬레이터도 동일한 근사로 매 틱 스무딩 상태를 갱신하도록 바꾸고,
-  `path_ema_alpha`를 그리드서치 대상에 추가했다(총 23개 파라미터).
-
-**작업 중 발견한 중대 버그(폐루프 앨리어싱) 2건 — 둘 다 수정 완료:**
-직진/90도커브/S자커브는 전부 "열린" 단일경로라 문제가 없었지만, 실전트랙은 폐루프라 경로상
-멀리 떨어진 두 구간이 (짧게 잡은 직선 길이 탓에) 월드좌표상으로는 가까워질 수 있다.
-1. `_nearest_point()`(구 `_cross_track_error()`)가 매 틱 경로 전체에서 전역 최근접점을 찾아서,
-   차량이 살짝만 벗어나도 "가장 가까운 점"이 실제로 달리는 구간이 아니라 공간적으로만 가까운
-   엉뚱한 구간으로 튀어 cte가 가짜로 폭증했다(재현: 첫 직진 구간에서 60cm대 cte로 오집계).
-2. 더 심각했던 것은 `_local_path_px()`(합성 센서 웨이포인트 생성) — forward/lateral 마스킹만
-   하고 경로상 위치는 전혀 제한하지 않아서, 두 번째 커브 구간의 점이 첫 직진 구간을 달리는
-   중에 "센서가 본 웨이포인트"로 섞여 들어가는 게 재현됐다(조향이 출발 직후 즉시 ±45도로
-   폭주 → cte 발산). 실차 카메라도 도로 반대편 구간을 뚫어볼 수 없는 것과 같은 이치.
-
-둘 다 `_nearest_point()`/`_local_path_px()`에 "직전 틱 인덱스 기준 탐색창"(`NEAREST_WINDOW_M`,
-두 함수가 공유)을 둬서 고쳤다 — 전역 탐색 대신 "지금까지 따라온 지점 근처"만 보게 한 것. 수정
-후 baseline이 실전트랙에서 정상적으로 완주하고(cte_rms 5~6cm, zigzag 구간이 가장 어려움으로
-나옴 — 직관과 일치), best(5샘플)에서도 score가 개선되는 정상적인 그리드서치 거동을 확인했다.
-
-**★★★ 아직 config.py에 미반영 ★★★** — 이번 커밋은 도구 자체(시뮬레이터)만 개선한 것이고,
-`--samples 400` 규모의 정식 재실행 및 사용자 확인 없이는 `PP_TUNE_PRESETS`에 새 프리셋을 추가하지
-않는다(§0.5.12/§0.5.13과 동일 절차 — 정식 실행 후 사용자 확인 후에만 config.py 반영).
-
-### 0.5.15 da 근접 컷(obstacle_cut_active) 진입 순간 `PP_LOOKAHEAD_CURVATURE_GAIN` 1초 부스트 (2026-08-21)
-요청 반영 — B2/B3 회피(da 근접 컷, §4/§5) 진입 순간 pure pursuit이 순간적으로 더 촘촘하게
-추종하도록, `obstacle_cut_active`가 켜지는 엣지에서 `lookahead_curvature_gain`을
-`PP_CURVATURE_BOOST_GAIN`(180.0, speed15 프리셋 기준 요청값)으로 `PP_CURVATURE_BOOST_SEC`
-(1.0초)간 올렸다가 원래 값(프리셋 적용 후의 `PP_LOOKAHEAD_CURVATURE_GAIN`, speed15=120)으로
-되돌린다. 게인이 커질수록 코너 curvature 감쇠가 세져 lookahead가 더 짧아진다(`control()`의
-`curvature_damp = 1/(1+gain*damp_curvature)` 공식, §0.5 상단 클래스 주석 참고) — 즉 회피
-기동 시작 순간에만 짧게 더 민감한 조향을 걸겠다는 의도.
-
-구현: `_update_obstacle_cut_hold()`가 `was_active→active` 전환(재진입 아닌 최초 진입)에서만
-`self._pp_curvature_boost_until_t = now + PP_CURVATURE_BOOST_SEC`를 찍고, `_lane_steer()`가
-매 틱 `pure_pursuit.control()` 호출 직전에 그 시각까지인지 보고
-`self.pure_pursuit.lookahead_curvature_gain`을 스위칭한다. `PurePursuitController` 인스턴스가
-`self.pure_pursuit` 하나뿐이라 `_handle_lavacon()` 등 다른 호출부에도 그대로 걸린다(당시
-obstacle_cut_active와 무관하게 부스트 중이면 적용됨 — 의도된 동작인지는 실차 재검증 필요).
-실차 미검증 — 부스트가 걸리는 순간 조향이 과민해지는지, 회피 중 오히려 흔들림을 키우는지
-먼저 서행/정지 개입 가능 상태로 확인할 것.
-
-### 0.5.16 [미정리] speed15 프리셋 추가 재튜닝 — 근거/커밋 미기록 (2026-08-24)
-`PP_LOOKAHEAD_BASE_PX`(205→180), `PP_WHEELBASE_PX`(45→20), `PP_DX_DEADZONE_PX`(7→5),
-`PP_LOOKAHEAD_CURVATURE_GAIN`(40→120), `PP_LOOKAHEAD_MIN_PX`(160→80),
-`SPEED_CORNER_STEER_GAIN`(0.30→0.50)이 xycar_ws 작업트리에 커밋 없이 값만 바뀐 채
-남아있음 — 직전 상태(코너 개선/직진 회귀, 위 주석에서 삭제됨)와 다른 숫자라 이번 값이
-그 회귀를 고친 건지, 새 실험인지 근거가 없다. 커밋/UMK 반영 전에 실차로 직진·코너 둘 다
-재확인할 것.
-
-### 0.5.17 상태별 조향/BEV 튜닝 분리(`_new_tuning_active`) 되돌림 (2026-08-25)
-같은 날 먼저 들어갔던 변경(커밋 961d2c9) — `speed15` 프리셋을 9e59bbf(완주성공 커밋) 값으로
-되돌리고, 재튜닝값(`PP_LOOKAHEAD_BASE_PX`=220/`PP_WHEELBASE_PX`=33/`PP_LOOKAHEAD_CURVATURE_GAIN`
-=80/`PP_LOOKAHEAD_MIN_PX`=140/`PP_WHEELBASE_BOOST_GAIN_PER_DEG`=0.14)은 `PP_*_FINAL` 상수로
-분리해서 `self._new_tuning_active` 플래그가 True인 3구간(직진 신호 확정~B1 진입 전 / 좌회전
-램프 완료~다음 신호 / B3 통과~다음 신호)에서만 쓰고, 그 외(B1 관여·B2/B3 회피 포함)는
-speed15 기본값(=9e59bbf, BEV 원거리크롭 0.7m)을 쓰던 구조였다 — 요청 반영으로 이 구간별
-분리를 전부 되돌렸다.
-
-지금은 `PP_*_FINAL`/`DL_BEV_FAR_LIMIT_M_FINAL` 값(220/33/80/140/0.14, BEV 1.0m)을 `speed15`
-프리셋 하나로 다시 합쳐서, B1(라바콘) 이외 전 구간(B2/B3 포함)이 항상 이 값만 쓴다.
-`config.py`: `speed15` 딕셔너리 5개 값 갱신 + `DL_BEV_FAR_LIMIT_M_NORMAL=1.0`(단일값) +
-`PP_*_FINAL` 상수 블록 삭제. `track_drive.py`: `self._new_tuning_active` 플래그와 6개
-set/reset 지점, `perc_lane()`의 `set_bev_mode()` 호출, `_lane_steer()`의 FINAL 분기 전부
-삭제. `perception/dl_lane.py`: `bev_far_mode` 파라미터/`set_bev_mode()`/
-`DL_BEV_FAR_CROP_ROW_FINAL` 삭제, 항상 `DL_BEV_FAR_CROP_ROW_NORMAL`(1.0m)만 씀. B1 전용
-`_LAVACON` 상수/`self.pure_pursuit_lavacon`은 완전히 별개라 이번 변경과 무관 — 안 건드림.
-실차 미검증 — 다음 주행에서 확인 예정.
-
-### 0.5.18 "차량 감지 시 lookahead 100px 고정" 로직 삭제 (2026-08-25)
-`avoid_hold`(§2.32) 새 트리거 시점에 `obstacle_type=='vehicle'`면 `PP_VEHICLE_LOOKAHEAD_FIX_SEC`
-(0.5초)간 `lookahead_px`를 `PP_VEHICLE_LOOKAHEAD_FIX_PX`(100.0)로 고정해 적응형 계산/저역통과를
-건너뛰던 로직(2026-08-21 도입, README 미기록)을 요청 반영으로 완전히 제거했다. 위 §0.5.15
-"da 근접 컷 진입 시 curvature 부스트"와는 별개 메커니즘 — 그건 lookahead의 코너감쇠 게인만
-일시적으로 세게 트는 것이고, 이건 lookahead 값 자체를 강제로 덮어쓰던 것이었다(이번엔 안
-건드린 §0.5.15는 그대로 살아있음).
-
-구현: `config.py`의 `PP_VEHICLE_LOOKAHEAD_FIX_PX`/`_SEC` 상수 삭제. `track_drive.py`의
-`self._pp_vehicle_lookahead_fix_until_t` 상태, `_update_avoid_hold()`의 트리거 지점(진입
-엣지에서 `obstacle_type=='vehicle'`면 세팅), `_lane_steer()`의 사용부(`vehicle_lookahead_fix`
-분기) 전부 삭제. `controller/pure_pursuit.py`의 `control()`에서도 이제 아무 호출부도 안 쓰는
-`lookahead_override_px` 파라미터와 `if/else` 고정-lookahead 분기를 걷어내고, 기존 적응형
-lookahead 계산(`probe_curvature` 기반 댐핑) 하나만 남겼다.
-
----
-
-## 1. 신호등 (`MissionState.S0_SIGNAL` — 출발/교차로 공용) — 통합 4구 신호등
-
-출발과 교차로 모두 `SignalDetector.detect_s2()`(`perception/traffic_signal.py`) 하나로 처리하고,
-[2026-08-20]부터는 미션 state 자체도 `S0_SIGNAL` 하나로 합쳐졌습니다(§1.12) — 출발 지점에선 초록
-(직진 위치)만 점등하면 출발, 교차로 재진입 시엔 초록만=직진 / 초록+빨강 동시=좌회전.
-`SIG_CONFIRM_FRAMES`(3프레임) 연속 확정돼야 `signal_straight_confirmed`/`signal_left_confirmed`로
-승격되는 디바운스가 있습니다.
-
-**수정할 곳:** `config.py` `START_STATE` (`MissionState.S0_SIGNAL`).
-
-**디버그:** `DEBUG_VIZ_SIGNAL`(기본 True) → `signal4_roi` 창(ROI 확대 + 판정에 쓰인 4개 원 표시),
-`signal4_board_search` 창(§1.1, 전체 프레임 위에 이번 프레임에 시도한 ROI 후보 전부 표시),
-`signal_status` 창(§1.11, 전체 카메라 원본 위에 "지금 어디를 보는지"+"확정값"을 한눈에 표시 —
-신호등 로직을 몰라도 인식이 잘 되는지만 빠르게 확인하고 싶을 때).
-`DEBUG_LOG_SIGNAL`(기본 True) → `[SIG-DEBUG]` 단계별 진단 로그(ROI/반지름/검출개수/실패사유 한글 힌트).
-
-**[2026-08-13] ROI 재튜닝(실차 랩 캡처 기반):** 오탐률/미검출 트레이드오프를 실측으로 절충해
-`SIG4_ROI_T,B=0.07,0.30` `SIG4_ROI_L,R=0.18,0.58` `SIG4_MIN/MAX_RADIUS=9,26`으로 확정 — 프레임 한 장
-기준이라 S0/S2 각각의 실제 정지 거리에서 실차 재확인 필요.
-
-### 1.1 흰 배경판 자동크롭 도입 — 그레이스케일 임계값 실패 → HSV(채도 제한)로 전환 후 부분 성공 (2026-08-18)
-
-**배경:** 위 §1의 `SIG4_ROI_*`는 프레임 한 장(frame_000055) 기준 고정 크롭이라는 한계가 있었다.
-사용자가 공유한 신호등 실물 사진을 보니 이 rig는 상용 신호등(어두운 박스)과 반대로 **흰 배경판 +
-검은 테두리 원통 램프 4개** 구조라, "어두운 박스를 찾는" 대신 "밝은 흰 사각형을 먼저 찾아 크롭 →
-그 안에서 기존 원 4개 패턴검사(`find_circles`/`shape_ok`/`pick_best_4`, 그대로 재사용)"가 이 rig
-생김새에 맞겠다고 판단해 구현했다(`SignalDetector._board_candidates()`).
-
-**구조(안전망 우선, 변경 없음):** `detect_s2()`가 ROI 후보 "리스트"를 순회한다 — 자동탐색 후보들
-(있으면) + 항상 마지막에 기존 `SIG4_ROI_*` 고정 크롭을 안전망으로 덧붙이고, 순서대로 원 4개
-패턴검사를 시도해 맨 처음 성공하는 후보에서 멈춘다. 자동탐색이 전부 실패해도 고정 크롭이 마지막에
-한 번 더 시도되므로 이 변경으로 인식률이 이전보다 나빠지진 않는다.
-
-**[1차 시도, 폐기] 그레이스케일 밝기 단일 임계값(V≥120)** — `lap_001`(640×480, 신호등이 실제로 찍힌
-frame_000020~089 구간) 랩 캡처로 검증한 결과 자동후보가 거의 항상 0개였다. 신호등이 카메라 바로 위
-천장 거치대에 달려있고 이 구간 전부 모션블러가 심해, 배경판(밝기 실측 ~158~164)과 천장 형광등(블러로
-번져 최대 255)이 하나의 거대한 연결성분(실측 87518px, 탐색범위의 54%)으로 뭉개져
-`SIG4_BOARD_MAX_AREA_PX`를 항상 초과했다. 밝기 구간을 90~230 사이 여러 조합으로 좁혀도 6~9만px대
-단일 블롭으로 그대로 뭉쳤다 — da/ll 병합을 침식으로 못 끊었던 [[da area-threshold selection unreliable|CLAUDE.md 기록]]과 같은 실패모드("두꺼운 병합은 임계값 하나로 안 풀린다")로 판단해 폐기.
-
-**[2차 시도, 채택] HSV로 전환, 채도(S) 제한 + MORPH_OPEN.** 배경판은 무채색(회백색, 채도 낮음)에
-가까운데 천장 형광등 주변 번짐은 채도가 더 들쭉날쭉하다는 점에 착안해 `S≤30 & V=[120,220]`로
-바꾸고, 가느다란 형광등 반사 줄무늬를 끊어내려고 `MORPH_CLOSE`(이어붙임, 역효과) 대신
-`MORPH_OPEN`으로 교체 — 병합 블롭이 다시 갈라져 최대 5000px대까지 줄었다(`SIG4_BOARD_MAX_AREA_PX`도
-60000→15000로 같이 좁힘). 같은 `lap_001` 70프레임(frame_000020~089)으로 재검증한 결과:
-
-| 결과 | 프레임 | 비고 |
-|---|---|---|
-| 자동후보로 성공(진짜 신호등) | 52, 53, 55, 56, 57 | **52·53은 기존 고정 크롭으론 원래 실패하던 프레임** — 새로 인식 성공 |
-| 자동후보로 성공(오탐) | 62 | 천장 조명만 있는 영역을 잘못 골랐는데 우연히 원 4개 패턴검사까지 통과 |
-| 전부 실패(고정 폴백도 실패) | 나머지 64프레임 | 신호등이 화면 밖이거나 원이 4개 안 잡힘 |
-
-`signal4_board_search`/`signal4_roi` 캡처로 프레임별 채택 박스와 원 4개 판정 결과를 직접 눈으로
-확인함(디버그 아티팩트에 캡처 첨부).
-
-**정밀도:** 자동후보 성공 6건 중 5건이 진짜 신호등(83%), 1건(frame 62)이 오탐. 실제 주행에서는
-`SIG_CONFIRM_FRAMES`(3연속 확정, `track_drive.py` `perc_signal()`) 디바운스가 이런 단발 오탐을
-걸러줄 것으로 기대하지만, 연속 프레임 오탐 지속 여부까지는 아직 확인 안 함(offline 단일 프레임
-검증까지만 거침).
-
-**알려진 한계 / 다음 단계:**
-- `lap_001`은 주행 중(모션블러 있음) 캡처다. 자동크롭이 진짜 필요한 상황(정지 위치가 매번 달라지는
-  S0)은 오히려 블러가 없는 조건이라, 이 결과가 그대로 옮겨갈지는 **정지 상태 S0 실차 캡처로
-  재검증 필요** — 블러가 없으면 정밀도가 더 좋아질 수도, 반대로 채도 임계값이 다른 조명에서 안 맞을
-  수도 있다.
-- `SIG4_BOARD_SAT_MAX`/`V_MIN`/`V_MAX`/`MAX_AREA_PX`는 전부 이 한 조명 환경(lap_001 촬영 당시)
-  기준 실측 재튜닝값 — 다른 조명(대회 당일 조명 등)에서는 재조정이 필요할 수 있다.
-- frame 62류 오탐이 연속 프레임에서도 재현되는지, `SIG_CONFIRM_FRAMES` 디바운스가 실제로 걸러주는지
-  실차/연속프레임 재생으로 확인 필요.
-
-### 1.2 원 탐색 엔진 대안 — FRST(Fast Radial Symmetry Transform) 도입 시도, 기본값은 Hough 유지 (2026-08-18)
-
-**배경:** §1.1의 Hough Circle이 후보 크롭 안에서 천장조명과 진짜 램프를 섞어 잘못된 4개 조합을
-통과시키는 사례(오염, frame_000052)가 있었다. 참고 문헌 조사(웹검색) 중 Loy & Zelinsky(2002)의
-FRST(그래디언트 방향이 한 점 주위로 얼마나 방사대칭인지에 투표하는 방식 — 뚜렷한 엣지 없이
-그래디언트 방향 통계만 맞아도 반응해서, 헤드라이트·신호등처럼 블러로 뭉개진 원형 광원 탐지에
-쓰이는 고전적 기법)를 찾아 `perception/frst.py`로 구현했다(C++ 원본 github.com/Xonxt/frst 참고,
-numpy로 포팅).
-
-**[1차 구현, 버그] 후보 크롭마다 FRST를 새로 돌림 → 오탐 급증.** `find_peaks()`의 채택 임계값
-(`SIG4_FRST_REL_THRESHOLD`)이 "그 크롭 자체의 최댓값" 대비 상대값이라, 크롭을 작게 자를수록
-진짜 램프가 없어도 "그 안에서 상대적으로 제일 강한 지점"이 항상 임계값을 넘어버렸다 —
-lap_001 70프레임 재검증 결과 44개가 "성공"으로 나왔는데 대부분 천장조명 오탐이었다(실측으로
-발견, 도입 전 3~6건 대비 대폭 악화).
-
-**[수정] 임계값을 탐색범위 전체 기준으로.** `_frst_band_peaks()`가 `SIG4_SEARCH_ROI_*` 전체에
-대해 FRST를 프레임당 딱 한 번만 계산하고, 후보 박스별로는 그 절대좌표 피크 목록을 범위로만
-필터링하도록 고쳤다(`find_circles_frst()`) — 크롭이 작다고 채택 기준이 느슨해지지 않는다.
-
-**수정 후 재측정 — 오탐은 줄었지만 재현율도 같이 크게 떨어짐.** 70프레임 중 성공 4건
-(047/048/055/071)뿐이었고, 그중 육안 확인 결과 진짜 신호등인 건 `frame_000055` 1건뿐 — 나머지
-3건은 여전히 4자리 중 한 자리가 천장조명/차량 후미등으로 채워진 부분오탐이었다. 반면 같은
-데이터에서 §1.1의 Hough+박스 조합은 정탐 4건(053/055/056/057)을 냈다 — **지금까지 실측 기준으로는
-Hough+박스가 FRST+박스보다 여전히 낫다.**
-
-**결론: `SIG4_CIRCLE_ENGINE` 기본값은 `'hough'`로 유지.** `'frst'`로 A/B 전환 가능하게
-`config.py`에 스위치를 남겨뒀다(`LANE_DETECTOR_BACKEND`/`DL_LL_ALGO`와 동일 관례). FRST 자체가
-쓸모없다고 결론 내린 건 아니다 — 단독 크롭 안에서 원을 정확히 찾는 능력 자체는 실측으로 확인됐고
-(frame_000052에서 Hough의 오염 없이 정확했음), 문제는 "후보 박스 하나로 좁힌 뒤 그 안에서 최선을
-찾는" 지금 구조 자체가 두 엔진 모두에게 힘들다는 쪽에 더 가까워 보인다. 다음으로 고려해볼 결합
-방식: **Hough와 FRST를 각각 독립적으로 돌려서 두 결과가 겹칠 때만 확정하는 교차검증** — 실측상
-두 엔진의 오탐 위치가 서로 달랐다(Hough는 의자 격자/천장조명, FRST는 바닥 체크무늬·차량
-후미등)는 점에서, 서로 다른 이유로 흔들리는 두 엔진이 우연히 같은 자리에서 동시에 틀릴 확률은
-낮을 것으로 기대된다 — 아직 구현/검증 전.
-
-### 1.3 `shape_ok()`에 등간격(gap uniformity) 검사 추가 — frame 62 오탐 제거, frame 52는 절반만 (2026-08-18)
-
-**배경:** 사용자 지적 — "원이 동일한 간격으로 떨어져있다는 사실을 사용 못하나?" 기존 `shape_ok()`는
-인접 원 간격이 전부 `SIG4_MIN_DIST` 이상인지만 봤지, **간격끼리 서로 비슷한지(등간격)는 전혀
-검사하지 않았다** — 실제 4구 신호등은 물리적으로 동일 간격이므로 이 자체가 강한 제약인데도
-안 쓰고 있었던 것.
-
-**실측(간격 최대/최소 비율):** Hough+박스 기준 정탐(frame_053/055/056/057)은 1.13~1.64인데,
-이미 알고 있던 오염(frame_052)/오탐(frame_062)은 2.22~2.64로 뚜렷이 갈렸다. 그 중간인
-`SIG4_GAP_UNIFORMITY_MAX_RATIO=2.0`으로 `shape_ok()`/`pick_best_4()`에 반영.
-
-**결과:** frame_062 오탐은 완전히 사라짐(이제 원 자체가 4개 미만으로 걸러짐), frame_053/055/056/057
-정탐은 회귀 없이 그대로 통과. **frame_052는 절반만 고쳐짐** — 등간격 조건까지 만족하는 "천장조명
-1개+진짜 램프 3개" 조합이 여전히 남아있어서, 이건 원 선택(`pick_best_4`) 단계가 아니라 **애초에
-그 프레임의 흰 배경판 후보 박스 자체가 천장까지 같이 포함할 만큼 넉넉하게 잡힌 게 근본 원인** —
-등간격 검사로는 못 막고, `_board_candidates()`가 더 타이트한 박스를 냈어야 막을 수 있는 문제다.
-
-**참고:** FRST 기준(§1.2)으로는 이 비율이 정탐(2.38)이 오탐(1.75)보다 오히려 더 높게 나와
-분리가 안 됐다 — FRST 피크 위치가 Hough의 원 중심보다 좌표 정밀도가 낮아서로 추정. 그래서
-`SIG4_GAP_UNIFORMITY_MAX_RATIO`는 `shape_ok()`에 엔진 무관하게 공통 적용되지만, 실측 검증은
-Hough 기준으로만 됐다는 점을 감안할 것 — `SIG4_CIRCLE_ENGINE='frst'`로 전환해 쓸 경우 이
-값이 오히려 정탐을 막을 수도 있다.
-
-**알려진 한계(미해결, §1 원 로직 자체):**
-- **좌회전(화살표) 램프 저평가**: 원 내부 평균 밝기로 점등 판정하는데 화살표는 원의 일부만 밝아 평균이
-  낮게 나와, 실제로 켜져 있어도 `lit=False`로 놓칠 수 있는 구조적 문제(직진 원형 램프는 문제없음).
-- Hough Circle이 원을 4개 미만 찾으면 그 프레임은 폴백 없이 인식 실패.
-- 색상(Hue) 대신 위치+밝기 대비로만 판정 — 반사광에 취약.
-
-### 1.4 오프라인 재검증 도구(`signal_offline_check.py`) 도입 + `_board_candidates()`에 Hue 밴드 추가 (2026-08-18)
-
-**배경:** 이 노트북엔 ROS2 툴체인이 없어 실시간 검증이 불가능하다(CLAUDE.md). §1.1~§1.3의
-"lap_001 70프레임 검증"은 그때그때 임시 스크립트로 했던 것이라 재사용 가능하게 남겨달라는
-요청으로, `signal_offline_check.py`(패키지 루트, `track_drive/track_drive/`)를 추가했다 —
-`~/Downloads/lap_001`(또는 `--frames-dir`로 지정한) PNG 시퀀스를 오프라인 재생하며
-`detect_s2()`만 반복 호출해 코드 수정 → 재실행 → 결과 비교를 반복할 수 있다.
-
-```
-python3 track_drive/track_drive/signal_offline_check.py --start 20 --end 89
-python3 track_drive/track_drive/signal_offline_check.py --start 20 --end 89 --save-viz /tmp/sig_check
-python3 track_drive/track_drive/signal_offline_check.py --start 20 --end 89 --show
-```
-
-프레임별로 채택 후보(auto/fallback/FAIL), 원 개수, 실패 사유, 밝기/점등 여부를 한 줄로 찍고
-끝에 요약(자동/폴백/실패 프레임 번호 목록)을 낸다. `--save-viz`는 디스플레이 없이도
-`signal4_roi`/`signal4_board_search` 창을 PNG로 저장하도록 `cv2.imshow`를 이 스크립트
-프로세스 안에서만 캡처용으로 바꿔치기한다(운영 코드는 그대로) — GUI가 있는 이 노트북에서
-직접 눈으로 넘겨보려면 `--show`.
-
-**Hue 밴드 추가(1차 수정):** 이 도구로 `_board_candidates()`가 고른 후보 블롭의 픽셀별 Hue
-히스토그램을 실측해보니(사용자 제안 — "Hue+HSV로 1차 수정") 진짜 배경판 픽셀은 H가
-80~110대에 좁게 몰리는 반면, 예전 오탐이었던 `frame_062`의 큰 병합 블롭은 H가
-0~10/30~70/160~170까지 넓게 퍼져 있었다. 정상 프레임(052/055)에서 이 배제 범위(H<20 또는
-H>160) 픽셀은 1% 미만이라 손실 없이 `SIG4_BOARD_HUE_MIN,MAX=20,160`으로 설정
-(`_board_candidates()`의 `cv2.inRange` 첫 채널을 0~179→20~160으로 제한, config.py 주석에
-히스토그램 근거 기록).
-
-**재검증 결과(lap_001 frame_000020~089, 70프레임):**
-
-| | Hue 밴드 적용 전 | 적용 후 |
-|---|---|---|
-| 자동크롭 성공 | 52,53,55,56,57 (5) | 52,53,55,56 (4) |
-| 고정폴백 성공 | 없음 | 57 (1) |
-| 합계 성공 | 5 | 5 (동일, 회귀 없음) |
-| frame_062 | 실패(이미 §1.3 등간격검사로 걸러짐) | 실패(동일) |
-
-성공 총 개수는 그대로고 `frame_057`만 자동후보 대신 고정폴백으로 잡히는 방식이 바뀌었을 뿐 —
-실사용(디텍션 성공 여부) 관점에선 회귀 없음. 블롭 단위로 보면 개선 신호도 확인됨:
-`frame_062`의 문제였던 큰 병합 블롭(면적 7990px, H표준편차 43.2)이 Hue 필터 후 더 작은 블롭
-둘로 갈라지며 표준편차도 25.5/30.1로 낮아졌고(완전히 분리되진 않음), `frame_053/055/056/057`
-에서 화면 하단(바닥 차선 추정, H~30대)에 있던 후보 블롭들이 후보 목록에서 아예 사라져
-`SIG4_BOARD_MAX_CANDIDATES` 예산을 진짜 배경판 후보에 더 쓸 수 있게 됐다.
-
-**알려진 한계:** `frame_052`의 잔여 오염(§1.3에서 등간격검사로도 못 잡은, 천장조명 1개+진짜
-램프 3개 조합)은 이번 수정으로 해결 안 됨 — 그 블롭 자체의 Hue 표준편차가 19.1→16.9로 소폭만
-줄었을 뿐 다른 후보로 안 갈렸다(config.py `SIG4_BOARD_HUE_MIN/MAX` 주석에도 명시). 단일 임계값
-하나로 병합을 완전히 못 끊는다는 건 CLAUDE.md의 da 병합 실패모드와 같은 맥락. 이 절 전체가
-lap_001(모션블러 있는 주행 중 캡처) 기준 검증이라 §1.1 한계("정지 상태 S0 실차 재검증 필요")도
-여전히 유효하다.
-
-**[시도 후 폐기] `SIG4_BOARD_MAX_AREA_PX` 15000→3500 축소:** Hue 밴드 적용 후
-`frame_052`/`frame_053`의 chosen 후보 면적이 각각 3844/3702로 15000 한도엔 안 걸려 조용히
-통과하고 있길래, 3500으로 좁혀 강제로 걸러지는지 `signal_offline_check.py`로 재검증했다.
-결과는 **순손실** — `frame_052`/`frame_053` 둘 다 대체할 더 작고 깨끗한 후보가 없어서
-자동후보뿐 아니라 고정폴백까지 전부 실패로 악화됐고, 정작 진짜 깨끗한 `frame_056`의 chosen
-후보 면적(4673)이 52/53의 "오염된" 후보보다 더 커서 같이 걸려 자동크롭을 잃었다(다행히
-고정폴백이 받아쳐서 검출 자체는 유지). 70프레임 성공 합계 5(52,53,55,56,57)→3(55,56,57)으로
-줄어 즉시 15000으로 되돌림. **이 데이터셋에서는 면적 크기가 오염 여부와 상관관계가 없다** —
-bbox의 y좌표(탐색범위 상단에 닿는지)도 확인했지만 52/53의 오염 후보(y=78/80)와 56의 깨끗한
-후보(y=0)가 오히려 뒤바뀐 패턴이라 이것도 판별 기준이 못 됐다. 다음 시도는 기하 정보보다
-색상(Hue) 쪽을 더 정교화하는 방향이 유망해 보이지만 아직 미착수.
-
-### 1.5 블롭 Hue 표준편차(균질성) 필터 추가 — frame_062 자동후보 자체를 원천 차단 (2026-08-18)
-
-**배경:** §1.4에서 면적/위치로는 오염 여부를 못 가른다는 게 확인된 뒤, 사용자 제안으로
-"블롭 안 색상이 얼마나 균질한가(표준편차)"를 대신 시도했다. lap_001 chosen 후보 기준
-Hue 표준편차를 실측해보니 정상(frame_052:16.9 053:17.2 055:16.5 056:19.8, 최댓값 19.8)과
-오염(예전 오탐 frame_062, Hue 밴드로 블롭이 쪼개진 뒤에도 25.5/30.1, 최솟값 25.5) 사이에
-뚜렷한 간격이 있어 `SIG4_BOARD_HUE_STD_MAX=22.0`으로 설정, `_board_candidates()`가 컨투어별로
-내부 픽셀(mask 통과분만) Hue 표준편차를 계산해 넘으면 그 후보 자체를 버리도록 추가했다.
-
-**재검증(lap_001 20~89):** 성공 5(52,53,55,56 auto + 57 fallback) 그대로, 회귀 없음.
-효과는 `frame_062`에서 확인됨 — 도입 전엔 오염 블롭이 후보로 넘어가 원 4개 패턴검사
-(`circle_count<4`)에서야 걸러졌는데, 도입 후엔 **자동후보 자체가 0개**로 줄어 그 단계까지도
-못 간다(`signal4_board_search` 캡처로 확인, "board candidates: 0 auto + 1 fallback"). 등간격
-검사(§1.3)가 "원의 배치"로 판정 마지막 단계에서 거르는 것과 달리 이건 "블롭의 색상 균질성"으로
-후보 제안 단계에서 먼저 거르는, 서로 다른 근거의 독립적 안전장치라 의미가 있다.
-
-**[시도 후 폐기] `SIG4_BOARD_HUE_MIN/MAX` 20~160 → 40~140 축소:** 정상 블롭들의 Hue가
-80~110대에 몰린다는 히스토그램(§1.4)에 맞춰 범위를 더 좁혀봤다. `signal_offline_check.py`
-재검증 결과 총 성공이 5→6(새로 `frame_035` 추가)으로 **늘었지만**, `--save-viz`로 그
-크롭을 직접 눈으로 확인해보니 `frame_035`는 신호등이 아니라 **벽/장비 모서리를 잘못 크롭한
-명백한 오탐**이었다(엉뚱한 곳을 `STATE:RED`로 오판). 범위를 좁히며 마스크가 다르게 쪼개져
-우연히 그 벽 영역이 원 4개 패턴검사까지 통과해버린 것 — 20~160으로 즉시 되돌렸다.
-**교훈: "성공 개수가 늘었다"는 지표만으론 안전을 보장 못 한다.** 새로 성공하는 프레임이
-생기면 반드시 `--save-viz`로 그 크롭이 실제 신호등이 맞는지 시각 확인해야 한다.
-
-### 1.6 전체 랩(2262프레임) 오탐 스윕 — 사람이 디바운스를 통과하는 실제 사례 발견 → aspect 하한으로 차단 (2026-08-18)
-
-**배경:** 지금까지 검증은 전부 `frame_000020~089`(신호등이 실제로 찍힌 구간)로만 했다 —
-`signal_offline_check.py`로 lap_001 **전체** 2262프레임을 처음 돌려봤다. 결과: 78프레임(58
-auto+20 fallback)이 "성공"으로 나왔고 45개 연속 구간으로 흩어져 있었다. 대표 프레임 9개를
-`--save-viz`로 직접 확인한 결과 진짜 신호등은 2건(기존 52~57 클러스터, 그리고 새로 발견한
-`frame_958~960` — 같은 물리적 rig가 랩 후반에 다시 잡힘)뿐이고 나머지 샘플(16·358·430·
-774·890·954·1221 등)은 전부 사람·의자·문·벽 등 클러터 오탐이었다.
-
-**중요한 완화 요인:** `detect_s2()`는 `perc_signal()`에서 `mission_state`가 `S0_SIGNAL`일 때만
-호출된다(`track_drive.py`) — 실주행의 대부분(S1 차선주행)에서는 이 함수 자체가 안 불려서 랩 전체에
-흩어진 오탐 대부분은 실제로 무해하다. 위험은 차량이 실제로 신호등 앞에 멈춰/지나가는 그 짧은 창에
-오탐이 우연히 겹칠 때뿐이다.
-
-**디바운스(`SIG_CONFIRM_FRAMES=3`) 시뮬레이션 — 실제로 뚫리는 사례 확인:** "연속 3프레임
-이상 같은 state"로 전체 랩을 스캔한 결과 단 2구간만 해당했다 — `frame_55~57`(STR, 진짜)과
-**`frame_1540~1542`(LEFT, 문가에 서있는 사람 — 완전한 오탐)**. `--save-viz`로 확인하니 사람의
-밝은 상의가 L/S 원으로, 뒤쪽 사무기기가 R/Y 원으로 잡혀 3프레임 연속 `reason=OK`가 나왔다 —
-§1.1에서 "디바운스가 단발 오탐을 걸러줄 것"이라 기대만 하고 확인 안 했던 부분이, 실제로는
-**뚫리는 사례가 존재한다**는 걸 최초로 실측 확인.
-
-**[시도 후 폐기] 프레임 간 위치 안정성으로 거르기:** 처음엔 "진짜 신호등은 위치가 고정,
-사람은 걸으니까 움직인다"는 가정으로 프레임 간 board 위치 이동거리를 재봤다. 결과는
-**정반대**였다 — 진짜(`55→56→57`)는 37.0px/34.7px씩 움직이는데(차량이 다가가며 원근이
-바뀌고, da/ll 파이프라인과 달리 이 board 탐색엔 프레임 간 앵커링이 없어 매 프레임 후보를
-새로 고름) 가짜(`1540→1541→1542`)는 3.4px/1.5px로 오히려 더 안정적이었다(사람이 짧은
-3프레임 동안 거의 안 움직였을 뿐). 이 방향대로 구현했으면 진짜를 걸러내고 가짜를 통과시키는
-정반대 결과가 났을 것 — 폐기.
-
-**[채택] `SIG4_BOARD_MIN_ASPECT` 1.3→2.0:** 같은 조사 중 훨씬 강한 신호를 찾음 — 사람의
-세로로 긴 몸통 때문에 `1540~1542`의 chosen 후보 raw aspect가 1.39~1.45였던 반면, 이 시점까지
-확인된 모든 진짜 chosen 후보(52:2.58 53:2.97 55:2.30 56:2.12)는 전부 2.12 이상이었다. 프레임
-간 비교가 필요 없는 "한 프레임만 봐도 되는" 조건이라 훨씬 실용적 — 1.45와 2.12 사이에 여유를
-두고 2.0으로 설정.
-
-**재검증 결과:**
-- `frame_000020~089`: 5(52,53,55,56 auto+57 fallback) 그대로, 회귀 없음.
-- `frame_958~960`(진짜 재등장): `960` auto 성공 유지, `958` fallback 성공 유지 — 회귀 없음.
-- 전체 랩 auto 성공 58→28로 감소(제거된 30건은 전부 클러터 오탐으로 추정, 표본 확인은 안 함).
-- **디바운스 재시뮬레이션: 전체 2262프레임에서 3연속 동일 state 구간이 `frame_55~57`(진짜)
-  단 하나만 남음.** `frame_1540~1542`는 더 이상 그 조건을 만족하지 않는다.
-
-**후속 전수조사 (2026-08-18, aspect 수정 후 재스윕한 48건 전부 육안 확인):** `--save-viz`로
-48건(auto 28+fallback 20) 전부를 직접 확인했다 — 진짜 신호등 **12건**(`52,53,55,56,57,958,
-960,1261,1262,1722,1998,2001` — 전부 동일한 물리적 rig, 랩을 여러 번 도는 동안 반복 통과하며
-잡힘)과 클러터 오탐 **나머지 전부**(사람·의자·문·사물함·천장조명·벽걸이 장비 등, `frame_1541`
-류의 사람 오탐이 다수 포함). 확인한 오탐 중 어느 것도 3프레임 연속으로 이어지지 않아
-디바운스(`SIG_CONFIRM_FRAMES=3`)를 통과하는 구간은 전체 2262프레임에서 여전히 `55~57`
-하나뿐임을 재확인 — §1.6 도입 시점의 "9개만 확인" 한계는 해소됨.
-
-**남은 한계:** 이 전수조사도 `frame_1540~1542` 발견이 나온 것과 같은 lap_001 한 번의 캡처
-안에서만 이뤄졌다 — aspect≥2.0 문턱이 사람이 다른 자세/거리/조명/의상에서도 항상 통하는지는
-이 데이터 하나로는 검증 범위 밖. 새 캡처(다른 날/다른 조명)가 생기면 같은 전수 확인을
-반복해볼 것.
-
-### 1.7 재현율 개선 시도 — Hough `param2` 완화, 원 노이즈 급증으로 폐기 (2026-08-18)
-
-**배경:** §1.4~§1.6은 전부 정밀도(오탐 감소) 개선이었지 재현율(놓치는 프레임 감소)은 안
-건드렸다 — `frame_000020~089`에서 여전히 65/70이 실패, 대부분 `no_circles`/`circle_count<4`로
-Hough가 원 자체를 못 찾는 경우다. "이제 §1.4~§1.6 3중 안전장치(등간격검사+Hue밴드/균질성+
-aspect)가 하류에서 오탐을 걸러줄 테니, Hough 자체를 더 느슨하게(`param2` 20→15) 해서 재현율을
-사려도 되지 않을까"라는 가설을 테스트했다. `find_circles()`에 하드코딩돼 있던 `param1`/`param2`를
-`SIG4_HOUGH_PARAM1`/`SIG4_HOUGH_PARAM2`로 config.py에 옮겨 튜닝 가능하게 만들고 20→15로 낮춤.
-
-**결과: 가설 기각.** `frame_000020~089` 성공이 5→34로 늘었지만 `--save-viz`로 새로 잡힌
-프레임(27/74/84 등)을 확인하니 전부 **천장 조명 텍스처가 만든 가짜 원**이었다 — 신호등
-자체가 화면에 없다. 게다가 원래 안정적으로 잡히던 `frame_056/057`까지 원이 너무 많이
-검출돼(`circle_count=13>10, too noisy`) 오히려 실패로 바뀌는 회귀까지 났다. 즉시 20으로 되돌림.
-
-**왜 가설이 틀렸는가:** §1.4~§1.6의 필터는 "완전히 다른 물체를 board로 잘못 고르는 것"(예:
-사람, 문, 벽)을 막는 **블롭/원배치 단위** 안전장치라, "진짜 board 크롭 안에서 Hough 자체가
-과민해져 노이즈 원이 늘어나는 것"은 전혀 못 막는다 — 서로 다른 실패 모드라 하류 필터가
-대신 못 해준다.
-
-**원 품질(엣지 서포트) 검증도 시도, 역시 기각:** 가짜 원은 천장 형광등의 별/X자 모양 번짐의
-가장자리를 Hough가 대충 원으로 근사한 것이라는 가설로, 원 둘레를 따라 실제 Canny 엣지가
-얼마나 있는지(`edge_support`, 36등분 샘플)를 측정해봤다. 진짜 원(52,53,55,56 chosen)은
-0.61~1.00, 가짜 원(27,74,84 일부)은 0.25~0.89로 **겹치는 구간이 넓어 단일 임계값으로 못
-가른다** — lap_001 전체가 모션블러 있는 캡처라 진짜 원의 경계도 함께 흐려져 있어서다.
-
-### 1.8 재현율 개선 2차 시도 — 언샤프 마스킹(unsharp mask)으로 블러 완화, 역시 폐기 (2026-08-18)
-
-**배경:** §1.7에서 "재현율을 올리려면 Hough 민감도가 아니라 화질/블러 자체를 손봐야 한다"고
-결론 낸 뒤, 사용자 제안으로 Hough 입력 전에 표준 언샤프 마스킹(`blur - amount·GaussianBlur
-(blur, sigma)`)을 넣어 모션블러를 완화하는 시도를 했다. `SIG4_UNSHARP_ENABLE/AMOUNT/SIGMA`를
-config.py에 추가하고 `find_circles()`에 전처리 단계로 연결.
-
-**결과: 또 기각.** `frame_000020~089` 성공이 5→14로 늘었지만 `--save-viz`로 새 성공 프레임
-(65/73/76/81/85/34/60/62/63)을 전부 확인하니 **§1.7과 똑같이 천장 조명 텍스처 오탐**이었다 —
-심지어 §1.3에서 등간격검사로 이미 막아뒀던 `frame_062`까지 다시 뚫렸다(샤프닝이 그 조명
-텍스처의 엣지를 더 뚜렷하게 만들어 Hough가 더 쉽게 원으로 오인식). 게다가 `frame_053`은
-원 형태가 미세하게 달라져(`no_valid_4subset`) 오히려 회귀했다. `SIG4_UNSHARP_ENABLE=False`로
-되돌림(스위치 자체는 `SIG4_CIRCLE_ENGINE`과 같은 관례로 A/B 실험용으로 남겨둠).
-
-**결론(§1.7+§1.8 공통):** **진짜 신호(모션블러로 흐려짐)와 조명 텍스처 노이즈를 이미지
-선명도만으로는 못 가른다** — 이미지를 선명하게 만들면 노이즈도 같이 선명해진다. 재현율을
-올리려는 시도 두 번(Hough 완화, 샤프닝) 모두 같은 실패 모드(천장조명 오탐)로 귀결됐다는 건,
-이 방향(입력 이미지/Hough 파라미터 조작)으로는 한계에 가깝다는 신호로 보인다. 남은 현실적인
-경로는 §1.1부터 반복된 한계 — **lap_001 자체가 모션블러 있는 주행 중 캡처라, 실제 정지 상태
-S0에서는 재현율이 이미 더 높을 수 있다**(새 캡처로만 확인 가능) — 뿐이다.
-
-### 1.9 새 캡처(`RAW/`) 도입 — 근접/저블러 데이터로 자동크롭 정밀도 재검증 + 원 단위 채도 필터 시도 (2026-08-18)
-
-**배경:** 사용자가 `RAW/` 폴더(671프레임, `NNNNNN_<timestamp>.jpg`, ~69초, lap_001과 다른
-캡처)를 제공 — §1.7/§1.8이 한계로 지목한 "lap_001은 모션블러 있는 캡처"라는 문제를 우회할
-새 데이터. `signal_offline_check.py`가 `frame_*.png`만 인식하던 걸 `*.jpg`(RAW류)도 같이
-지원하도록 `_list_frames()`를 확장했다(`--frames-dir RAW`로 사용).
-
-**정밀도 재검증(좋은 소식):** RAW는 신호등 rig가 카메라 바로 앞에서 조립되는 장면이라
-(추정: S0 출발선 준비 과정) lap_001보다 훨씬 가깝고 블러가 적다. 자동크롭 성공 6건
-(`110,112,113,115,117,130`)을 `--save-viz`로 전부 육안 확인한 결과 **6/6 전부 진짜** —
-§1.4~§1.6에서 만든 board 블롭 필터(Hue밴드/균질성/aspect)가 lap_001과 전혀 다른 카메라
-셋업·조명에서도 깨끗하게 동작함을 재확인했다.
-
-**고정폴백 오탐(다른 원인, §1.4~§1.8과는 성격이 다름):** fallback 성공 77건을 샘플 확인한
-결과 확인한 것 전부 천장 조명 오탐이었다. 원인은 §1.4~§1.8류의 "블롭/원 품질 문제"가 아니라
-— **`SIG4_ROI_*`(고정폴백 크롭)가 lap_001의 카메라 프레이밍 기준으로 튜닝된 퍼센트 좌표라,
-이 RAW의 다른 카메라 셋업에서는 그 좌표가 아예 천장을 가리킨다.** 자동크롭이 실패할 때마다
-이 완전히 엉뚱한 고정 위치를 마지막 안전망으로 시도하니 매번 천장이 걸린 것 — 이 문제는
-"조명을 더 잘 거르는" 필터로는 못 고치고, 카메라 셋업이 바뀔 때마다 `SIG4_ROI_*` 자체를
-재튜닝해야 하는 문제다(§1 원래 한계 "실차에서 재확인 필요"와 같은 맥락).
-
-**[시도 후 폐기] 원(circle) 단위 채도(S) 상한 40 추가:** §1.4~§1.6의 board 블롭 필터를
-통과한 크롭 안에서도 Hough가 개별 원을 잘못 잡는 경우(RAW의 천장조명 fallback 오탐들)를
-막아보려고, 원 내부 평균 채도로 필터링을 시도했다. RAW에서 진짜 램프 원(24개 표본, 대부분
-S 2~34)과 가짜 천장조명 원(56개 표본, S 17~96, 40 이상 20%)을 비교해 `SIG4_CIRCLE_SAT_MAX=40`
-으로 설정. **lap_001에 적용하니 오히려 진짜를 다 걸러버렸다** — lap_001의 진짜 램프 원은
-채도가 최대 64까지 올라간다(조명/노출/거리가 RAW와 다름). lap_001 20~89 성공이 5→1로
-급락해 즉시 폐기(`SIG4_CIRCLE_SAT_MAX=None`). **채도 절대값은 캡처마다(조명/노출/거리) 크게
-달라져서 한 데이터셋에서 뽑은 임계값이 다른 데이터셋에 안 옮겨간다** — §1.7/§1.8(모션블러)과
-원인은 다르지만 "단일 임계값 하나로는 두 조건 다른 캡처를 동시에 못 만족시킨다"는 결론은
-같다.
-
-**정리 — 지금까지 "조명 필터링" 시도 4연패(§1.7 Hough완화/§1.8 샤프닝/§1.9 원채도) + 이전
-세션의 위치안정성(§1.6)/엣지검증(§1.7 내)까지 포함하면 사실상 5개 아이디어 모두 단일
-데이터셋 안에서만 통했거나 아예 안 통했다.** 유일하게 두 데이터셋(lap_001, RAW) 모두에서
-일관되게 동작한 건 §1.4~§1.6의 **블롭(board 후보) 단위** 필터(Hue밴드/균질성/aspect)뿐이다 —
-"완전히 다른 물체를 board로 잘못 고르는 것"은 안정적으로 막아지는데, "진짜 board/원 크롭
-안에서 Hough가 개별적으로 잘못 튀는 것"은 아직 뾰족한 수가 없다. 다음에 시도해볼 만한
-방향(미착수): 원의 절대적 색/밝기 값이 아니라 **같은 프레임 안 4개(혹은 그 이상) 원들
-사이의 상대적 일관성**(예: 채도 표준편차, §1.5의 블롭 Hue표준편차와 같은 발상을 원 단위로) —
-캡처 조건이 달라도 "진짜 4개는 서로 비슷한 재질이라 채도가 고르고, 노이즈가 하나 섞이면
-그것만 확 튄다"는 상대적 관계는 유지될 가능성이 있다.
-
-### 1.10 고정폴백에 블롭 점유율 게이트 추가 — RAW 천장 오탐 77→5건 (94% 감소), 회귀 없음 (2026-08-18)
-
-**배경:** §1.6~§1.9에서 원(circle) 단위 특징(위치/채도/엣지/시간안정성)을 5번 시도해 전부
-실패한 뒤, 관점을 바꿨다 — RAW의 천장 오탐은 전부 **고정폴백(`SIG4_ROI_*`)** 경로에서
-나왔는데, 이 경로는 `_board_candidates()`의 마스크/컨투어 검사(§1.4~§1.6)를 전혀 안 거치고
-무조건 시도되고 있었다. auto 후보에게는 이미 하는 검사를 고정폴백에도 똑같이 적용해보자는
-아이디어 — 고정폴백 크롭 안에서 배경판 마스크의 **가장 큰 연결 블롭 하나가 크롭 면적의 몇
-%를 차지하는지**(`_dominant_blob_frac()`)를 재보니:
-
-| | 블롭 점유율 |
-|---|---|
-| 진짜(lap_001 frame_057/958, 고정폴백으로 신호등이 잡힌 경우) | 7.5%, 12.2% |
-| 가짜(RAW frame_018/033/050/070/085/100/108/111, 고정폴백이 천장을 찍은 경우) | 13.2%~38.5% (8건 전부 진짜 최댓값보다 큼) |
-
-§1.6~§1.9와 달리 **두 데이터셋 모두에서 진짜/가짜가 안 겹쳤다** — 진짜 배경판은 크롭 안에서
-여백을 두고 적당히만 차지하는데, 천장 형광등 패널은 넓게 이어져 크롭 대부분을 채우기
-때문으로 해석. 12.2%와 13.2% 사이에 여유를 두고 `SIG4_FALLBACK_MAX_BOARD_FRAC=0.15`로 설정,
-`detect_s2()`가 고정폴백을 후보 목록에 넣기 **전에** 이 게이트를 통과해야만 하도록 바꿨다
-(통과 못 하면 안전망 자체를 포기하고 그 프레임은 정직하게 실패 처리 — `no_board_candidates`
-사유로 남음).
-
-**재검증 결과:**
-- `lap_001 frame_000020~089`: 5(52,53,55,56 auto+57 fallback) 그대로, **회귀 없음**.
-- `lap_001` 전체(2262프레임) 알려진 진짜 12건 전부 유지, 알려진 가짜 중 2건(12, 1305) 추가로
-  걸러짐 — lap_001의 가짜 fallback은 사람/문 등 다양한 물체라 이 게이트 하나로는 대부분 못
-  잡지만(예상된 일 — 다른 오탐 유형은 §1.3 등간격검사/디바운스가 담당), 최소 손해는 없다.
-- **`RAW`: 고정폴백 오탐 77→5건 (94% 감소)**, auto 성공 6건(진짜) 그대로 유지. 남은 5건
-  (108/109/143/146 등)도 `--save-viz`로 확인 — 여전히 천장(경계값 0.13대로 문턱 바로 밑을
-  통과)이었지만 개수 자체가 크게 줄었다.
-- **디바운스 재시뮬레이션(양쪽 데이터셋 전체)**: lap_001은 여전히 `55~57`(진짜) 하나만
-  3연속 통과 가능. **RAW는 `115~117`(진짜, STR) 하나만 통과 가능** — 이 구간 3프레임을
-  전부 `--save-viz`로 확인한 결과 116(고정폴백 경로로 잡힘)도 우연히 이 순간 신호등 rig가
-  고정폴백 위치와 실제로 겹쳐서 **셋 다 진짜**였다.
-
-**정리:** §1.4~§1.6(board 블롭 단위)에 이어, 이번 것도 "원 하나하나"가 아니라 "크롭이라는
-영역 전체의 통계"로 판단하는 방식이라 두 데이터셋 모두에서 통했다 — §1.6~§1.9(원 단위 실패
-5연패)와 대비되는 패턴이 뚜렷하다: **이 문제에서는 개별 원보다 영역(블롭/크롭) 단위 통계가
-훨씬 안정적으로 일반화된다.**
-
-**알려진 한계:** `SIG4_FALLBACK_MAX_BOARD_FRAC` 임계값(0.15)도 결국 이 두 데이터셋(lap_001,
-RAW)에서 뽑은 값이라 완전히 다른 조명/거리 조건에서 다시 깨질 가능성은 있다 — 다만 §1.9의
-채도 임계값(절대 색상값)과 달리 이건 "크롭 대비 비율"이라 조명 밝기 자체에는 덜 민감할
-것으로 기대되지만 검증된 사실은 아니다. RAW에 남은 5건(경계값 근처)도 임계값을 더 좁히면
-잡힐 수 있지만, lap_001 진짜(957/958=12.2%)와의 여유가 이미 빠듯해 추가로 좁히는 건
-신중해야 한다.
-
-### 1.11 "한눈에 보기" 디버그 창(`signal_status`) 추가 (2026-08-18)
-
-**배경:** 사용자 요청 — "신호등 검출 잘 되는지 확인하는(현재 검출되는 부분과 검출 신호)
-디버그 창". 기존 `signal4_roi`/`signal4_board_search`(둘 다 `traffic_signal.py`,
-`SignalDetector` 내부)는 각각 "크롭 확대 + 원 판정 상세"와 "이번 프레임 후보 박스 전부"를
-보여주는 세밀한 창이라, 신호등 로직을 잘 모르는 채로 "지금 잘 잡히고 있나?"만 빠르게 보기엔
-정보가 많다. `track_drive.py`(FSM을 도는 노드 쪽)에 새 창 `signal_status`를 추가해
-`_debug_viz_signal_status()`가 그린다 — 전체 카메라 원본 위에:
-- **박스**: 이번 프레임에 채택/시도된 ROI(초록=성공, 빨강=실패)
-- **순간값**: 이번 프레임 R/S/L 판정
-- **확정값**: `SIG_CONFIRM_FRAMES` 디바운스를 통과한 실제 FSM 반영값(직진확정/좌회전확정) +
-  진행 카운터(`직진 n/3` `좌회전 n/3`)
-- 실패 시 사유(`s2_reject_reason`)까지 같은 창에 표시
-
-기존 두 창은 `SignalDetector` 내부 상태만 보여줘서 디바운스(확정) 여부는 안 나왔는데
-(그건 `track_drive.py` 쪽 상태라 `SignalDetector`가 모른다), 이 창은 그 둘을 합쳐서
-"인식됐다"와 "그래서 FSM이 실제로 확정 처리했다"를 구분해서 보여준다. `control_loop()`에서
-`DEBUG_VIZ_SIGNAL`이 켜져 있고 `mission_state`가 `S0_SIGNAL`일 때만 그린다(그 외 상태는
-`perc_signal()`이 `detect_s2()`를 아예 안 돌려서 표시할 값이 없음).
-
-**검증:** 이 환경엔 ROS2가 없어 노드 자체는 못 띄운다(CLAUDE.md) — `SimpleNamespace`로
-`self`를 흉내 내 `_debug_viz_signal_status()` 로직만 떼어내 lap_001 실제 프레임(성공:
-frame_055, 실패: frame_020 — 손으로 카메라를 가린 프레임)에 돌려 PNG로 저장해 눈으로
-확인했다. 한글 렌더링(`kr_text.put_text_kr_multi`) 포함 정상 동작.
-
-### 1.12 S2 커밋 구간(신호 확정 → 물리적 분기) — 시간 기반 → 거리 기반 (2026-08-18)
-
-`_s2_intersection()`이 신호 확정 직후 `S2_COMMIT_T`초(고정 시간) 동안 `APPROACH_SPEED`로
-직진만 유지하다가 실제 분기(직진 복귀 or 좌회전 스크립트) 방향을 실행하던 구조였는데, 이건
-"몇 초 동안 직진"이 물리적 분기 지점(신호 확정 지점에서 약 1m)과 대회 당일 실제 주행속도에
-따라 어긋날 수 있는 문제가 있었다(속도가 튜닝 시점보다 빠르면 분기 전에 방향 전환, 느리면
-지나쳐서 전환). `_do_left_turn()`의 `TURN_FRAMES`(좌회전 유지 프레임 수)도 같은 계열의
-open-loop 하드코딩이지만 이번엔 손대지 않음 — 이번 수정 범위는 커밋 구간 트리거만.
-
-**수정:** `config.py` `S2_COMMIT_T`(초) → `S2_COMMIT_DIST_M`(m, =1.0)으로 교체.
-`_s2_intersection()`이 매 제어주기(20Hz) VESC 실측(`self.v_mps`, m/s)을 적분해 누적 이동거리를
-채웠는지로 커밋 구간 종료를 판정한다(새 헬퍼 `_commit_speed_mps()`). VESC가 살아있으면
-(`_vesc_live()`) 실측값을 그대로 쓰므로 실제 이동거리 기준이라 속도 변화에 안 흔들리고,
-VESC가 죽어있을 때만 `APPROACH_SPEED * METERS_PER_SPEED_UNIT`으로 폴백한다(예전 시간
-기반이 암묵적으로 가정하던 것과 동일한 근사치라 센서 장애 시에도 이전과 같은 동작으로 열화).
-
-**알려진 한계:** `S2_COMMIT_DIST_M=1.0`은 config.py 기존 주석의 "약 1m" 추정치를 그대로
-가져온 것 — 실차에서 신호 확정 지점 ~ 실제 분기 지점 거리를 다시 재보지 않았다(미검증).
-좌회전 스크립트 자체의 open-loop 문제는 §1.13에서 이어서 처리.
-
-### 1.13 `_do_left_turn()` 종료 판정 — 프레임 카운트 → IMU yaw 실측 기반 (2026-08-18)
-
-§1.12와 같은 날 이어서 처리. `_do_left_turn()`이 `TURN_ANGLE`(조향각)/`TURN_SPEED`로
-`TURN_FRAMES`(고정 프레임 수, 20Hz 기준 2.0s)만큼 유지하다 끝내던 구조였는데, "그 각도·속도로
-N프레임 돌면 목표 회전각만큼 돌 것이다"라는 가정 하나에만 의존했다 — 배터리 전압 강하(§7.1
-참고)·노면·속도 변동으로 같은 명령이어도 실제 요레이트가 매번 달라질 수 있어 회전 부족/과회전
-가능성이 있었다.
-
-**수정:** `config.py`에 목표 회전각 `TURN_YAW_TARGET_DEG`/`TURN_EXIT_YAW_TARGET_DEG`(각 90.0)를
-추가. `_do_left_turn()`이 IMU 실측이 살아있으면(새 헬퍼 `_imu_live()`, `_vesc_live()`와 동일
-철학의 스테일 가드) `_begin_left_turn()`에서 기록해둔 `_turn_yaw_start` 대비 실제 회전각
-(`_yaw_delta()`)이 목표에 도달했을 때 좌회전을 끝낸다(closed-loop). `TURN_FRAMES`/
-`TURN_EXIT_FRAMES`는 더 이상 트리거가 아니라 IMU가 죽어있을 때만 걸리는 안전 타임아웃
-상한(무한 회전 방지 + 센서 장애 시 예전과 동일한 open-loop 동작으로 열화)이다.
-`_imu_curvature_px()`에 인라인돼 있던 IMU 스테일 체크도 이 `_imu_live()`로 통합.
-
-**알려진 한계:** `TURN_YAW_TARGET_DEG=90.0`은 미검증 추정치 — config.py 기존 주석에 분기가
-"직각이 아니라 커브로 열린다"는 기록이 있어 실제로는 90도가 아닐 수 있다. IMU yaw 부호규약도
-`pose_estimator.py`에 "실차 미검증"이라 적혀 있던 것과 같은 계열이라, 실차에서 좌회전 방향에
-맞게 부호가 맞는지 반드시 먼저 확인할 것.
-
-### 1.14 `MissionState.S0_WAIT_GREEN`/`S2_INTERSECTION` → `S0_SIGNAL` 통합 + Behavior 활성 시점 정정 (2026-08-20)
-
-**배경:** 출발선 신호등(구 S0)과 교차로 신호등(구 S2)이 로직상 완전히 같았다(같은
-`SignalDetector.detect_s2()`를 정지 상태에서 판독 → 직진/좌회전 확정) — `_s0_wait_green()`/
-`_s2_intersection()` 두 함수로 중복 구현돼 있던 걸 `_s0_signal()` 하나로 합쳤다. 이 state는 출발
-직후 1번, 이후 매 바퀴 트랙 중앙 분기점에서 재진입한다. §1.12/§1.13의 거리 기반 커밋 구간
-(`S2_COMMIT_DIST_M`/`_s2_commit_dist`)과 IMU yaw closed-loop 좌회전은 이 통합과 별개로 그대로
-적용된다 — `_s0_signal()`이 이름만 바뀐 옛 `_s2_intersection()`이다.
-
-**같이 바로잡은 규정 불일치:** 위 "대회 규정 요약"(§미션 순서, 공식 PDF 기준)을 다시 보면 실제 순서는
-"신호등 인식 출발 → 라바콘 → 차선 → 고정장애물 → 방해차량 → (2·3바퀴 중 한 번만) 지름길 분기 신호"다
-— Behavior(B1/B2/B3)는 **출발 직후부터** 활성화돼야 한다. 그런데 통합 전 코드는 `_behavior_enabled`를
-오직 구 S2(교차로) 직진 확정 시에만 True로 켜서, 첫 바퀴는 Behavior가 꺼진 채로 라바콘 구간을 그냥
-차선주행으로 지나치게 되어 있었다. 상태를 하나로 합치면서 "직진 확정 시 항상 `_behavior_enabled=True`"로
-통일해 이 문제도 같이 해결됐다.
-
-**"진짜 첫 출발" 구분:** state가 하나로 합쳐지면서 `prev_state == S0_WAIT_GREEN` 같은 비교로는 더 이상
-"이번이 출발인지 교차로 재진입인지"를 구분할 수 없다(둘 다 `S0_SIGNAL`). 바퀴 타이머/yaw 누적 기준점
-(`_lap_t0`/`_yaw_accum`)은 최초 1회만 리셋해야 하므로, `self._departed` 플래그로 직접 추적한다
-(`_change_state()` 참고).
-
-**알려진 한계 (실차 미검증):**
-- 통합으로 인해 출발 직후에도 `S2_COMMIT_DIST_M`(≈1m) 커밋 구간을 거치게 됐다(기존엔 즉시 S1 진입) —
-  출발선이 직선 구간이라 문제는 없을 것으로 보이나 실차로 확인 안 됨.
-- 이론상 출발선 신호등이 오검출로 좌회전 패턴(초록+빨강 동시)을 잠깐 보이면 출발 직후 좌회전 시퀀스가
-  시작될 위험이 있다 — `SIG_CONFIRM_FRAMES`(3연속) 디바운스로 완화되지만 실차 별도 검증 안 됨. 출발선
-  신호등에 실제로 좌회전 램프가 물리적으로 존재/점등되는지도 확인 필요.
-- `_debug_viz_imu()`의 좌회전 목표각 판별(`mission_state == S0_SIGNAL` → 진입 좌회전 / 그 외 → 진출
-  좌회전)도 이번 통합에 맞춰 갱신 — 병합 중 발견된 부분이라 별도 실차 재검증 필요.
-
-### 1.15 `_do_left_turn()` 종료 판정 — IMU yaw 실측 기반 → 실측거리 기반으로 되돌림 (2026-08-20)
-
-**배경:** §1.13에서 IMU yaw closed-loop로 바꾼 지 이틀 만에 다시 되돌린다. IMU 방식은 "실제로
-몇 도 돌았는가"를 직접 재는 장점이 있었지만, IMU yaw 부호 규약 자체가 `pose_estimator.py` 기준
-실차 미검증 상태였고(§1.13 "알려진 한계" 참고), 실차 튜닝 단계에서는 "정해진 조향각을 정해진
-거리만큼 유지"하는 단순한 open-loop 쪽이 대응하기 쉽다는 요청을 반영했다. 좌회전 진입 트리거
-지점(신호가 좌회전으로 확정되는 순간, `signal_left_confirmed`)부터 물리적 분기까지는 이미
-§1.12의 `S2_COMMIT_DIST_M` 커밋 구간이 VESC 실측 적분으로 거리 기반 처리 중이었으므로, 좌회전
-자체(조향을 트는 구간)도 같은 적분 패턴으로 통일했다.
-
-**수정:**
-- `config.py`: `TURN_YAW_TARGET_DEG`/`TURN_EXIT_YAW_TARGET_DEG`(목표 회전각)와
-  `TURN_FRAMES`/`TURN_EXIT_FRAMES`(IMU 죽었을 때만 쓰던 안전 타임아웃)를 삭제하고,
-  `TURN_DIST_M`/`TURN_EXIT_DIST_M`(조향각을 유지할 이동거리, m)로 대체. `TURN_ANGLE`/
-  `TURN_EXIT_ANGLE`(조향각, 실차 튜닝 대상 "`-a`")과 `TURN_SPEED`/`TURN_EXIT_SPEED`는 이름 그대로 유지.
-- `track_drive.py`: `_begin_left_turn()`이 `_turn_yaw_start`(IMU yaw 스냅샷) 대신
-  `_turn_dist = 0.0`으로 거리 누적을 시작한다. `_do_left_turn()`은 매 제어주기
-  `_turn_dist`에 실제 이동거리를 더해가다가(`_speed_mps_fallback()`, 아래 참고) 목표
-  거리(`TURN_DIST_M`/`TURN_EXIT_DIST_M`)에 도달하면 조향을 끝내고 `next_state`로 전환한다.
-  `_imu_live()`/`_yaw_delta()` 의존은 좌회전 로직에서 완전히 빠졌다(다른 곳— `_s3_shortcut()`
-  헤딩홀드, `_imu_corner_confirm_scale()` 등—에서는 계속 사용).
-- 거리 적분에 쓰던 `_commit_speed_mps()`(§1.12, S2 커밋 구간 전용)를 `_speed_mps_fallback(cmd_speed)`로
-  일반화 — VESC 실측(`_vesc_live()`)이 살아있으면 그 값, 죽어있으면 그 구간에서 명령 중인 속도
-  (`cmd_speed`)를 `METERS_PER_SPEED_UNIT`으로 환산해 폴백한다. 좌회전 구간은 `TURN_SPEED`/
-  `TURN_EXIT_SPEED`를 `cmd_speed`로 넘겨 재사용 — IMU 없이도 VESC 장애 시 거리 적분이 멈춰
-  무한 회전하는 상황이 없다(IMU 타임아웃 상한이 하던 안전판 역할을 이 폴백이 대신 흡수).
-- `_debug_viz_imu()`(IMU 창)에서 좌회전 진행상황 표시를 제거하고 `_debug_viz_vesc()`(VESC 창)로
-  옮김 — 이제 좌회전 진행 판정이 VESC 적분 기반이라 그쪽이 더 맞는 위치.
-
-**같이 없앤 것 — S1→S0 진입 정지 시퀀스 단순화:** 정지선 감지 후 `APPROACH_TIME`(1초) 동안
-서행하다가 `S0_SIGNAL`로 전환하던 단계(`_approach_t0`)도 함께 폐지했다(요청 반영: "정지"를
-별도 이벤트/타이머가 아니라 신호 상태만으로 결정되게). `START_STATE=S0_SIGNAL`이라 맨 처음
-출발도 이미 같은 경로를 타고 있었으므로, 출발 시점과 매 바퀴 교차로 재진입 시점의 동작이
-동일해졌다.
-
-**진입 트리거를 정지선에서 신호등 보드 인식으로 교체:** 위 정지 시퀀스 단순화 직후,
-"S0_SIGNAL 진입 트리거가 정지선이 아니라 신호등 인식이어야 하지 않냐"는 재확인을 받고
-추가로 수정했다. `perc_signal()`이 `SignalDetector.detect_s2()`를 **S0_SIGNAL 상태일 때만**
-돌리는 구조였기 때문에(신호등 색상 판독 자체가 이미 그 state 안에 있어야만 실행됨), 정지선을
-그대로 진입 트리거로 남겨두면 "신호등 자체를 인식하는 것"과 "그 인식을 시작하는 시점"이
-서로 다른 신호원(信號源)이 되는 모순이 있었다 — 정지선 인식이 어긋나면 신호가 이미 빨간불인데도
-차선주행 속도로 계속 접근하는 상황이 가능했다.
-
-**수정:** `perc_signal()`을 `S1_LANE_FOLLOW` 중에도 `detect_s2()`를 돌리도록 확장했다. S1 중엔
-색상은 아직 안 보고 "보드 자체가 잡혔는가"(`SignalDetector.s2_chosen_idx >= 0`, 색상 무관)만
-`SIG_CONFIRM_FRAMES` 연속 유지로 디바운스해 `signal_board_confirmed`로 승격시킨다(직진/좌회전
-색상 확정용 `_sig_straight_cnt`/`_sig_left_cnt`와 동일한 패턴, 새 카운터 `_sig_board_cnt`).
-`_s1_lane_follow()`는 이제 `self.stopline` 대신 `self.signal_board_confirmed`로 `S0_SIGNAL`
-전환을 트리거한다. 재진입 디바운스 쿨다운도 이름을 `STOPLINE_COOLDOWN` → `SIGNAL_REENTRY_COOLDOWN`,
-`_stopline_cooldown_t` → `_signal_reentry_cooldown_t`로 바꿔 실제 의미와 맞췄다(값 3.0초는
-그대로). `self.stopline`/`check_stopline()` 자체는 삭제하지 않았다 — 바퀴 카운트(`_update_lap()`)와
-지름길 진출 감지(`_shortcut_end()`)에는 여전히 쓰인다.
-
-**알려진 한계 (전부 실차 미검증):**
-- `TURN_DIST_M`/`TURN_EXIT_DIST_M`(둘 다 초기값 1.0m)은 지어낸 값 — 분기가 config.py 기존
-  주석대로 "직각이 아니라 커브로 열린다"는 점을 감안하면, 조향각(`TURN_ANGLE`)·속도(`TURN_SPEED`)
-  조합에 따라 "차선을 다시 잡기 충분한 거리"가 달라진다. 실차에서 `_debug_viz_vesc()` 창으로
-  진행거리를 보며 반복 튜닝 필요.
-- 신호등 보드 인식 즉시 `S0_SIGNAL`로 전환하는 방식은 서행 완충 구간이 없어, 인식 시점의
-  차량 속도가 높으면 실제 정지 위치가 신호등/정지선을 넘어설 수 있다 — 실차에서 접근 속도별로
-  확인할 것.
-- `detect_s2()`(4구 원 검출)는 원래 "가까이서 4개 원이 뚜렷이 보여야" 성공하도록 설계돼
-  있어서(§1.1~§1.10 참고), 아직 멀리서부터 안정적으로 "보드가 있다"만 판별하는 용도로
-  검증된 적은 없다 — S1 중 `s2_chosen_idx>=0`이 기대만큼 일찍(충분한 정지거리를 두고) 뜨는지
-  실차에서 `_debug_viz_signal_status()` 창(S1 중에도 표시하도록 이번에 확장)으로 확인 필요.
-  너무 늦게 뜨면 정지선 트리거 대비 오히려 정지 여유가 줄어들 수 있다.
-
-### 1.16 신호등 판단 소스 — "YOLO+HSV" 하이브리드 → YOLO 단독(색상상태 직접 예측)으로 전환 (2026-08-20)
-
-**배경:** §1.14까지의 신호등 판단은 배경판 위치를 `YOLO_SIGNAL_ENABLE`에 따라 YOLO 또는 HSV
-자동크롭으로 찾고, 점등 색상 자체는 항상 `traffic_signal.py`의 Hough Circle
-(`circle_brightness`/`shape_ok`/`pick_best_4`)로 판정하는 하이브리드였다("YOLO+HSV",
-`DEBUG_VIZ_SIGNAL` 창 제목). 별도로 `perception/yolo_signal_state.py`(YOLOv8n,
-`signal_state_best_n.onnx`, 클래스 `red`/`green_straight`/`green_left`)가 위치+색상을
-한 스테이지로 동시 예측하는 모델을 이미 갖추고 실차 비교 창에만 붙여둔 상태였다(§ 해당 파일
-헤더 주석). 요청으로 실제 주행 판단 소스를 이 YOLO 단독 모델로 교체했다.
-
-**수정:**
-- `config.py`: `SIGNAL_USE_YOLO_STATE_FOR_DECISION = True` 신규 추가(`YOLO_SIGNAL_STATE_*`
-  블록 바로 아래) — `perc_signal()`의 판단 소스를 고르는 유일한 스위치. `False`로 되돌리면
-  기존 Hough Circle(+YOLO_SIGNAL_ENABLE 하이브리드) 경로로 즉시 복귀한다.
-  `DEBUG_VIZ_SIGNAL`(YOLO+HSV 결과 창)은 이제 판단과 무관해져 `False`로 끄고,
-  `DEBUG_VIZ_YOLO_SIGNAL_STATE`(YOLO 단독 결과 창, `YOLO_신호등`)를 `True`로 켰다 — 되돌릴 때
-  이 두 값도 같이 원복할 것.
-- `track_drive.py`:
-  - `perceive_all()`에서 `perc_yolo_signal_state()`를 `perc_signal()`보다 먼저 돌도록 순서를
-    바꿨다(예전엔 뒤쪽에서 비교용으로만 호출). `perc_signal()`이 같은 틱에 갱신된
-    `self.signal_*_on_yolo`를 그대로 판단 소스로 쓰기 때문에, 순서를 안 바꾸면 1틱 지연이
-    추가로 생긴다.
-  - `perc_signal()`: `SIGNAL_USE_YOLO_STATE_FOR_DECISION`이 켜져 있고
-    `self.yolo_signal_state_detector`가 살아있으면 `self.signal_red/straight/left_on`을
-    `self.signal_*_on_yolo`에서 그대로 채우고 `detect_s2()` 자체를 호출하지 않는다(Hough
-    연산 자체가 안 돌아 그만큼 CPU 여유가 생긴다). `S1_LANE_FOLLOW` 중 `S0_SIGNAL` 진입
-    트리거용 `board_seen`은 기존 `s2_chosen_idx>=0` 대신 "색상 클래스 중 하나라도
-    검출됐는가"로 대체했다(단일 스테이지 모델이라 배경판 bbox를 별도로 안 줌).
-  - 검출기 초기화 실패(모델 파일 없음 등, `self.yolo_signal_state_detector is None`)면
-    스위치 값과 무관하게 자동으로 기존 Hough 경로로 안전 폴백한다 — 새 인식기가 없어도
-    주행 자체가 죽지 않는다.
-
-**알려진 한계 (실차 미검증):** `signal_state_best_n.onnx`는 §1.16 작성 시점 기준 실차 주행
-판단에 처음 연결된 것이라, 이전까지의 신뢰도 실측(§1.1~§1.15의 Hough/HSV 튜닝 이력)이 그대로
-적용되지 않는다. 특히 `board_seen`(S0_SIGNAL 진입 트리거)이 색상 클래스 검출 여부에서 파생되므로
-— 신호등이 꺼져있거나(점등 전) 아직 색상 신뢰도(`YOLO_SIGNAL_STATE_CONF_THRESHOLD=0.5`) 임계값을
-못 넘는 먼 거리에서는 `detect_s2()`의 "보드 자체 검출"보다 늦게 뜰 가능성이 있다 — 실차에서
-`DEBUG_VIZ_YOLO_SIGNAL_STATE`/`YOLO_신호등` 창으로 진입 시점을 확인할 것.
-
-### 1.17 YOLO 카메라 검출기 3종을 상시 동시가동 → mission_state/phase 기반 단일 가동으로 전환 (2026-08-20)
-
-**배경:** 콘(`YoloConeDetector`)/차량(`YoloVehicleDetector`, 근접컷 전용 인스턴스)/신호등
-색상상태(`YoloSignalStateDetector`) 3개 YOLO 모델이 각자 백그라운드 스레드에서 항상 동시에
-추론을 돌리고 있었다 — 실제로는 한 시점에 하나만 필요한데(예: 라바콘 구간에선 신호등/차량
-인식이 무의미) 셋 다 매 틱 GPU/CPU를 나눠 쓰고 있었던 것. 요청 반영으로, 지금
-mission_state/phase가 실제로 필요로 하는 모델 하나만 추론시키도록 바꿨다.
-
-**수정:** `perceive_all()`(track_drive.py) 맨 앞에서 `_active_yolo_stage()`를 한 번 계산해
-`'signal'`/`'cone'`/`'vehicle'`/`None` 중 하나를 얻고, 그 결과에 따라 `perc_yolo_signal_state()`/
-`perc_yolo_vehicle_cut()`/`perc_yolo_cone()` 중 해당하는 것만 호출한다(나머지는 호출 자체를
-건너뛰고 출력값만 `False`로 둔다). 매핑:
-
-| mission_state / phase | 가동 모델 |
-|---|---|
-| `S0_SIGNAL` | 신호등 |
-| `S1_LANE_FOLLOW` + `Phase.LAVACON` | 콘 (B1 진입 대기) |
-| `S1_LANE_FOLLOW` + `Phase.OBSTACLE_ZONE`, `_b2_passed=False` | 콘 (B2=라바콘 1개 대기, §4.3) |
-| `S1_LANE_FOLLOW` + `Phase.OBSTACLE_ZONE`, `_b2_passed=True` | 차량 (B3 대기) |
-| `S1_LANE_FOLLOW` + `Phase.DONE` | 신호등 (다음 교차로 보드 대기) |
-| `S3_SHORTCUT`/`S4_FINISH` | 없음(전부 끔) |
-
-**왜 호출을 건너뛰는 것만으로 추론이 꺼지는가:** `YoloConeDetector`/`YoloVehicleDetector`/
-`YoloSignalStateDetector` 전부 `detect(frame)`이 논블로킹으로 최신 프레임을 백그라운드
-스레드의 `_latest_frame`에 얹어두기만 하고, 그 스레드가 `_latest_frame is None`이면 그냥
-5ms씩 자며 노는 구조다(`perception/yolo_cone.py` `_worker()` 참고, 셋 다 동일 패턴) —
-그래서 `detect()` 호출 자체를 안 하면(=이번 틱에 새 프레임을 안 얹으면) 그 모델은 실제
-추론을 하지 않는다. 스레드/ONNX 세션은 계속 살아있으므로 다시 필요해지면 지연 없이
-바로 이어서 돈다.
-
-**부수 효과:** §4.3에서 `perc_obstacle_cut_trigger()`의 `obstacle_cut_type`을 "콘 YOLO
-OR 차량 YOLO 중 어느 쪽이 봤는가"로 정하도록 바꿨는데, 이 gating 덕분에 B2 구간에선
-차량 검출기가, B3 구간에선 콘 검출기가 애초에 안 돌아서(`False` 고정) 그 타입 판정이
-사실상 "어느 phase에 있는가"와 동어반복이 됐다 — 두 메커니즘이 서로를 보강한다.
-
-**같이 뒤집은 것:** §1.16은 신호등 YOLO를 "S3/S4 포함 항상 켜서 오탐률을 전체 구간에서
-로그로 본다"는 의도로 상시 가동시켰는데, 이번 변경으로 그 상시가동이 없어졌다 —
-상시 오탐 로깅보다 동시 추론 개수를 줄이는 쪽(연산 자원 절약)을 우선한 것. 오탐률을
-전체 구간에서 다시 보고 싶다면 `_active_yolo_stage()`와 무관하게
-`perc_yolo_signal_state()`를 매 틱 호출하도록 되돌리면 된다(§1.16 방식으로 복귀).
-
-**알려진 한계 (실차 미검증):** phase 전환 경계에서 한 모델이 꺼지고 다른 모델이 막 켜진
-직후 몇 틱은 그 모델의 `_latest_result`가 "꺼지기 전 마지막 추론 결과"로 남아있다가
-새 프레임이 들어와야 갱신된다 — 디바운스 프레임 수(`LAVACON_TRIGGER_FRAMES` 등)에 비해
-무시할 만한 지연으로 보이나 실차 확인 안 됨. 특히 `Phase.OBSTACLE_ZONE`에서 `_b2_passed`가
-막 True가 되는 순간 콘→차량으로 전환되는데, 그 직전 틱까지의 "콘이 보임" 잔상이 한두
-틱 안에 차량 검출값으로 안 덮이는 구간이 있을 수 있다.
-
-### 1.18 HSV/Hough Circle 기반 신호등 인식 삭제 — YOLO 단독(`yolo_signal_state.py`)만 남김 (2026-08-21)
-
-**배경:** §1.16에서 실제 주행 판단 소스는 이미 YOLO 단독 모델로 전환됐지만
-(`SIGNAL_USE_YOLO_STATE_FOR_DECISION=True`), 옛 HSV/Hough Circle 경로
-(`perception/traffic_signal.py`의 `SignalDetector.detect_s2()`, `perception/frst.py`의
-FRST 원 탐색 엔진)와 배경판 위치 전용 YOLO 하이브리드(`perception/yolo_signal.py`)는
-"플래그 하나로 언제든 되돌릴 수 있게" 코드로 남아 있었다. 요청으로 이 폴백 경로 자체를
-완전히 삭제하고, 신호등 인식을 YOLO 단독 하나로 정리했다.
-
-**삭제:**
-- `perception/traffic_signal.py`(`SignalDetector`, HSV 자동크롭 `_board_candidates()`/
-  Hough Circle `find_circles()`/배치검사 `shape_ok()`/`pick_best_4()` 전부 포함, §1.1~§1.15의
-  튜닝 이력이 담겨있던 파일)
-- `perception/frst.py`(FRST 원 탐색 엔진, §1.2)
-- `perception/yolo_signal.py`(배경판 위치 전용 YOLO 하이브리드, §1.16 이전 경로)
-- `signal_offline_check.py`(위 `SignalDetector.detect_s2()`를 랩 캡처로 오프라인 재검증하던
-  도구, §1.4 — 대상 코드가 없어져 같이 삭제)
-
-**config.py:** `SIG4_*`(약 30개, ROI/Hough 파라미터/HSV 배경판 임계값/FRST 파라미터),
-`YOLO_SIGNAL_ENABLE`/`YOLO_SIGNAL_INPUT_SIZE`/`YOLO_SIGNAL_CONF_THRESHOLD`/
-`YOLO_SIGNAL_MODEL_PATH`/`YOLO_SIGNAL_MAX_CANDIDATES`/`YOLO_SIGNAL_CROP_MARGIN`(배경판 위치
-전용 YOLO), `SIGNAL_USE_YOLO_STATE_FOR_DECISION`(판단 소스 스위치 — 이제 스위치가 아니라
-유일한 경로라 삭제), `DEBUG_VIZ_SIGNAL`/`DEBUG_VIZ_SIGNAL_DETAIL`/`DEBUG_LOG_SIGNAL`(HSV/Hough
-경로 전용 디버그 창·로그), `DEBUG_VIZ_YOLO_SIGNAL`(배경판 위치 YOLO 디버그 창)을 전부
-제거했다. `YOLO_SIGNAL_STATE_*`(위치+색상 동시 예측 YOLO 설정)와
-`DEBUG_VIZ_YOLO_SIGNAL_STATE`만 남는다.
-
-**track_drive.py:**
-- `self.signal_detector`/`self.yolo_signal_detector` 필드와 그 초기화 블록 삭제.
-  `self.yolo_signal_state_detector`만 남는다 — 초기화 실패 시(모델 파일 없음 등) 더 이상
-  안전 폴백이 없으므로, 신호등을 계속 "미검출"로만 보고한다(§1.16까지 있던 "폴백" 서술은
-  이제 유효하지 않음).
-- `self.signal_red/straight/left_on_yolo`(비교용 중간 변수) 삭제 — `perc_yolo_signal_state()`가
-  `self.signal_red/straight/left_on`을 직접 채운다.
-- `perc_signal()`은 이제 `detect_s2()` 호출 분기 없이, `perc_yolo_signal_state()`가 채워둔
-  값을 `SIG_CONFIRM_FRAMES` 디바운스만 적용해 확정값으로 승격시키는 역할만 한다.
-- `_debug_viz_signal_status()`("YOLO+HSV_신호등" 창)와 `_log_signal_debug()`(호출부가 이미
-  없어 죽어있던 코드였음) 삭제. `_print_debug()`의 `[SIG]` 요약 줄에서 `SignalDetector`
-  내부 필드(`s2_roi_px`/`s2_circle_count`/`s2_brightness`)를 찍던 부분도 같이 제거했다 —
-  신호등 상태는 `DEBUG_VIZ_YOLO_SIGNAL_STATE`(`YOLO_신호등` 창)로만 확인할 것.
-
-**알려진 한계:** 이 YOLO 모델이 커버 못 하는 조건(학습 데이터에 없는 조명/각도 등)에서
-신호등을 놓쳐도 되돌아갈 HSV/Hough 경로가 더 이상 없다 — §1.16의 "실차 미검증" 한계가
-그대로 유효하며, 이제는 유일한 경로이므로 실차 검증의 우선순위가 더 높다.
-
----
-
-### 1.19 체크무늬 게이트 라이다 기둥쌍 트리거(`perc_checker_pillar()`) 재조정 — ROI 전방 이동 + 근접노이즈 배제 + 검출조건 완화 (2026-08-22)
-
-**배경:** §2.55~2.60(고정장애물/방해차량) 튜닝과 별개로, `perc_checker_pillar()`
-(좌회전 진입 랜드마크 — 신호등 게이트 좌우 기둥쌍을 라이다로 직접 재는 트리거,
-`config.py` "좌회전 진입 랜드마크" 절 참고)는 `S0_SIGNAL` 'left' 커밋 중에만 쓰이는데,
-기둥쌍이 트리거 ROI 안에서 잘 안 잡힌다는 실차 보고로 재조정했다(요청 반영, 전부 실차
-미검증 — 다음 실차 테스트에서 `checker_pillar_bev` 창으로 확인 필요).
-
-**수정 (모두 `config.py` "좌회전 진입 랜드마크" 절):**
-- `CHECKER_PILLAR_LON_MIN/MAX`: 폭(0.7m) 유지한 채 전방으로 0.25m 이동
-  (`-0.4~0.3m` → `-0.15~0.55m`).
-- `CHECKER_PILLAR_MIN_RANGE_M`(신규, 0.1m): `perc_checker_pillar()`의 ROI 조건에
-  `r > CHECKER_PILLAR_MIN_RANGE_M`을 추가해 이 거리 이내로 찍힌 포인트(자기반사/노이즈로
-  추정)를 무시.
-- `CHECKER_PILLAR_CLUSTER_MIN_PTS`: 2 → 1. 좌/우 각각 연속 2포인트를 못 채우면 그
-  사이드째 "미검출"로 빠지던 문제 대응 — 1포인트만 찍혀도 그 사이드는 검출된 것으로 완화.
-- `lat_ok` 판정(`perc_checker_pillar()`): 대칭 허용오차(`|lat_dist - TARGET| <=
-  TOLERANCE`) → 하한만 있는 비교(`lat_dist >= CHECKER_PILLAR_LAT_TARGET_M`)로 변경.
-  사이드당 1포인트만으로 잡은 좌표는 덜 안정적이라, 상한까지 좁게 걸면 실제 기둥쌍인데도
-  근소하게 밀려나 놓칠 위험이 더 크다고 판단해 상한을 없앴다. 더 이상 안 쓰이는
-  `CHECKER_PILLAR_LAT_TOLERANCE_M`은 삭제(`_draw_checker_pillar_bev()` 표시 문구도
-  `target=X+-Y` → `target>=X`로 갱신).
-
-**알려진 한계:** `CHECKER_PILLAR_CLUSTER_MIN_PTS=1`+`lat_ok` 상한 제거는 오탐(엉뚱한
-장애물 쌍을 게이트로 오인) 위험을 늘리는 방향의 완화다 — `CHECKER_PILLAR_LAT_MAX=1.0`이
-그나마 좌우 거리를 물리적으로 2.0m 밑으로 막아주지만, 실차에서 오탐이 늘면 이번에 낮춘
-값들을 다시 올리는 쪽으로 재조정할 것.
-
-**[2026-08-22c 추가]** `CHECKER_PILLAR_LAT_TARGET_M`(위 `lat_ok`의 하한 기준)을 실측
-기둥 간격 0.98m → 0.5m로 추가 하향(요청 반영, 실차 미검증) — 위 "알려진 한계"의 오탐
-위험이 이만큼 더 커진 상태이므로, 실차에서 무관한 라이다 클러스터쌍을 게이트로 오인하지
-않는지 우선 확인할 것.
-
-**[2026-08-22d 추가]** 좌회전 중 속도가 계속 `SPEED_NORMAL`과 같은 15로 발행된다는 실차
-보고 — 원인은 실제 진입 좌회전 램프(`_do_checker_ramp_turn()`)가 `ctrl_speed`로
-`TURN_SPEED`를 그대로 쓰는데 그 값이 15.0이었던 것(진출 좌회전 `_do_left_turn()`의
-`TURN_EXIT_SPEED`도 마찬가지로 15.0). 둘 다 12.0으로 낮췄다(요청 반영, `config.py`
-"좌회전 공통" 절, 실차 재검증 필요).
-
-**[2026-08-22e 추가]** `CHECKER_PILLAR_MIN_RANGE_M`(위 극근접 무시 필터)이 0.1m로는
-실차에서 효과가 안 보인다는 보고로 0.3m로 상향(요청 반영, 실차 미검증) — 원인은
-미확정(실제 반사가 0.1~0.3m 대에서 잡히는 것일 수도 있음). ★주의★ 이 필터는
-`checker_pillar_bev` 창의 점 색상(회색=ROI 밖/무시, 초록·주황=검출됨)에만 영향을
-준다 — 무시된 점도 화면에는 여전히 회색 점으로 그려지므로(`_draw_checker_pillar_bev()`가
-`r>0`인 점을 전부 그림), "점이 안 사라진다"는 관찰만으로는 필터가 안 먹혔다고 단정할 수
-없다. 회색인지 색이 들어왔는지로 판단할 것 — 그래도 여전히 안 걸러지면 코드 경로 자체를
-재확인할 것. 같은 세션에 `checker_pillar_bev`에 이 데드존을 빨간 원으로 시각화하는 것도
-추가했다(`_draw_checker_pillar_bev()`).
-
-**[2026-08-22f 추가]** 좌회전 커밋 구간(`_s0_signal()` 'left' 분기)이 `checker_pillar_trigger`가
-뜨기 전까지 `angle=0, speed=APPROACH_SPEED`로 뻣뻣하게 직진만 하던 것을, S1과 동일한
-`_lane_drive()` 차선주행으로 바꿨다(요청 반영, 실차 미검증) — "커밋 구간엔 비전을 끈다"는
-'straight' 분기의 설계 근거(신호 확정 지점≠물리적 분기 지점, da 쏠림 위험, §1.12 주석)는
-애초에 "거리(S2_COMMIT_DIST_M) 기반으로 커밋을 끝낸다"는 전제와 묶여 있었는데, 좌회전은
-이미 §1.19에서 거리 대신 `checker_pillar_trigger`(라이다 실측)로 커밋 종료를 판정하도록
-바뀌어 있어 그 전제가 적용되지 않는다 — 신호 확정 지점과 실제 좌회전 분기 사이에 커브가
-있으면 뻣뻣한 직진이 오히려 트랙 이탈 위험이라는 우려로 변경. 트리거가 뜨는 순간부터는
-기존과 동일하게 `_begin_checker_ramp_turn()`이 조향을 넘겨받는다. `_s0_signal()` 독스트링
-4/5번 항목도 같이 갱신.
-
-### 1.19b `MissionState.S3_SHORTCUT` 삭제 — 좌회전 진입 램프 완료 후 곧장 S1_LANE_FOLLOW로 복귀 (2026-08-22)
-
-**배경:** S3_SHORTCUT은 원래 "지름길은 신호등 없는 별도 구간이라 직진 유지 + 끝에서
-정지선 검출로 탈출 좌회전을 스크립트로 실행해야 한다"는 전제로 만들어진 전용 state였다.
-실차 트랙을 다시 확인한 결과, 지름길도 물리적으로는 그냥 트랙의 일반 구간이고 — B3
-방해차량 회피를 마친 뒤 다음 교차로 신호등을 기다리며 차선주행하는 상태(Phase.DONE,
-`_active_yolo_stage()`의 `Phase.DONE` 분기 참고)와 동일하다는 판단(요청 반영) — 별도
-탈출 스크립트가 있어야 한다는 전제 자체가 더 이상 유효하지 않다.
-
-**수정:**
-- `_do_checker_ramp_turn()`(§1.19 도입) 램프 완료 시 전환할 state를
-  `MissionState.S3_SHORTCUT` → `MissionState.S1_LANE_FOLLOW`로 변경. 'straight' 커밋
-  완료(`_s0_signal()`)와 동일하게 `self._behavior_enabled = True`도 같이 세팅해 B1→B2→B3
-  Behavior를 다시 연다(이미 `Phase.DONE`이면 `run_behavior_fsm()`이 그대로 무시하므로
-  안전).
-- `_s3_shortcut()`/`_shortcut_end()`/`_begin_left_turn()`/`_do_left_turn()` 전부 삭제 —
-  전부 S3_SHORTCUT 전용이었고(`_do_left_turn()`의 S3 진입 분기는 §1.19에서 이미 죽어있던
-  코드, 진출 분기가 이번에 마지막 호출부를 잃음), `MissionState.S3_SHORTCUT` enum 값도
-  같이 삭제(값 3은 재사용 안 함).
-- `config.py`: `TURN_ANGLE`/`TURN_DIST_M`/`TURN_EXIT_ANGLE`/`TURN_EXIT_SPEED`/
-  `TURN_EXIT_DIST_M`/`APPROACH_EXIT_SPEED`/`APPROACH_EXIT_TIME`/`SHORTCUT_MIN_T`/
-  `SHORTCUT_MAX_T`/`SHORTCUT_VISION_CUTOFF_T` 삭제(전부 위 삭제된 함수들 전용).
-  `TURN_SPEED`는 `_do_checker_ramp_turn()`이 계속 쓰므로 유지.
-- `track_drive.py`: `self._turn_dist`/`self._exit_approach_t0`/`self._shortcut_t0`/
-  `self._shortcut_ref_yaw` 필드, `run_mission_fsm()` 디스패치 테이블의 S3 항목,
-  `_change_state()`의 S3 진입 초기화 블록, `_current_stage_label()`/`_active_yolo_stage()`/
-  `_debug_viz_vesc()`의 S3 관련 분기·주석 삭제.
-
-**알려진 한계:** 지름길 끝(본선 합류부)에 실제로 신호등이 있고 정상적으로 인식된다는
-전제가 이 변경의 핵심이다 — 만약 그 지점에 신호등이 없거나 인식이 잘 안 되면(§1.19b
-이전 설계가 애초에 그 문제를 피하려고 정지선+시간 기반 대안을 썼던 이유), 지름길을
-빠져나온 뒤 차선주행이 아무 전환 없이 계속 이어지기만 하고 다음 교차로 판단으로 못
-넘어갈 수 있다 — 실차에서 지름길 통과 후 정상적으로 다음 신호등을 인식/판단하는지
-반드시 확인할 것.
-
-### 1.19c `DEBUG_VIZ_YOLO_SIGNAL_STATE` 끄기 + `obstacle_cut_debug` 창에 좌회전 진입 램프 상태 표시 (2026-08-22)
-
-**수정:**
-- `config.py`: `DEBUG_VIZ_YOLO_SIGNAL_STATE`(신호등 위치+색상 YOLO 검출창, `YOLO_신호등`)
-  `True → False`(요청 반영) — 필요하면 다시 켤 것.
-- `track_drive.py` `_current_stage_label()`(`obstacle_cut_debug` 창 상단 헤드라인 헬퍼,
-  §2.56/2026-08-22 도입): `self._checker_ramp_dist is not None`(체크무늬 게이트 라이다
-  임계값을 넘어 `_do_checker_ramp_turn()`의 -10°→-30° 조향 램프로 넘어간 상태)일 때
-  `좌회전 진입 중 (게이트 통과, 조향 X.X°, d/D m)`을 최우선으로 보여주도록 분기 추가(요청
-  반영) — `mission_state`는 램프가 끝날 때까지 계속 `S0_SIGNAL`이라, 원래 있던
-  `S0_SIGNAL` 분기("신호등 판독 대기")보다 먼저 걸러야 실제로 좌회전 중임이 창에 드러난다.
-
-### 1.19d 직진 확정 시 커밋 구간(`APPROACH_SPEED`) 완전 삭제 — 곧장 S1 유지 (2026-08-22)
-
-**배경:** 신호가 'straight'로 확정되면 `_s1_lane_follow()`가 `S0_SIGNAL`로 전환해
-물리적 분기까지 `angle=0, speed=APPROACH_SPEED(2.0)`로 강제 저속 직진하는 커밋 구간
-(§1.12)을 거쳤다. 실차에서 "카메라가 신호를 인식(직진 확정)하면 속도가 2로 고정된다"는
-증상으로 드러났는데, 사용자가 이미 지웠다고 기억하던 게 B1/B2/B3 TargetPassing 핸들러
-(behavior_state가 항상 B0_NORMAL로 고정돼 실제로는 안 불림, §5.5)였을 뿐 이 커밋 구간은
-살아있었다 — 좌회전(§1.19f)만 이 구간을 비전 주행으로 바꿨지 직진 쪽은 그대로였다.
-직진은 애초에 좌회전과 달리 물리적 분기 판정이 필요한 이유(신호가 보이는 지점≠물리적
-분기 지점, da 쏠림 위험)가 없다는 요청 반영으로, 커밋 구간 자체를 없앴다.
-
-**수정:**
-- `track_drive.py` `_s1_lane_follow()`: `signal_straight_confirmed` 분기에서
-  `_change_state(S0_SIGNAL)` + `_s2_commit_dist` 세팅을 제거하고, `_behavior_enabled =
-  True` + `_signal_reentry_cooldown_t` 세팅만 남김(요청 반영) — 상태 전환 없이 S1을
-  그대로 유지한 채 다음 바퀴(B1 라바콘부터) 준비만 한다.
-- `_s0_signal()`: 진입 즉시 정지 분기의 `signal_straight_confirmed` 케이스도 동일하게
-  단순화(커밋 없이 곧장 `_change_state(S1_LANE_FOLLOW)`). 커밋 구간 처리 블록에서
-  `_s2_commit_dir == 'left'` 분기를 제거하고 좌회전 로직만 남김(이제 `_s2_commit_dir`는
-  `'left'`만 들어옴) — `angle=0, speed=APPROACH_SPEED`로 밀던 옛 'straight' 블록 전체
-  삭제. 독스트링도 갱신.
-- `config.py`: `APPROACH_SPEED`/`S2_COMMIT_DIST_M` 삭제(둘 다 이 'straight' 커밋
-  구간 전용이었고, 다른 파일에서 참조 없음을 확인).
-
-**영향:** 직진 신호가 확정되는 즉시 정상 주행 속도로 복귀 — 더 이상 물리적 분기까지
-speed=2로 저속 직진하지 않는다. 좌회전(§1.19f) 경로는 이번 변경과 무관, 그대로 유지.
-
-**알려진 한계:** 실차 미검증. 원래 이 커밋 구간이 있던 이유(§1.12)가 "신호 확정 지점과
-물리적 분기 지점이 떨어져 있어 그 사이 비전을 켜면 da가 반대 갈래로 끌려간다"는 교차로
-실측이었는데, 직진은 애초에 방향이 갈리지 않으니(비전이 어느 쪽으로 끌려가도 결과가
-같음) 적용 안 된다는 판단으로 지웠다 — 만약 실제 트랙에서 직진 신호 확정 지점 직후에도
-갈림길처럼 보이는 구간이 있다면 재검토 필요.
-
-### 1.19e 좌회전 진입 램프(`_checker_turn_ramp_angle()`) 거리 상향 + 곡선(smoothstep) 전환 (2026-08-22)
-
-**배경:** §1.19가 도입한 -10°→-30° 조향 램프(`CHECKER_TURN_RAMP_DIST_M`, 원래 0.5m)가
-`SPEED_NORMAL` 3→10 상향(README 별도 기록) 이후 실차에서 약 3프레임 만에 끝나버린다는
-보고 — 속도가 오른 만큼 같은 0.5m를 훨씬 빨리 주파해버린 것. 또한 `CHECKER_TURN_RAMP_CURVE`
-기본값이 `'linear'`였던 것을 곡선으로 바꿔달라는 요청(둘 다 요청 반영).
-
-**수정 (`config.py` "좌회전 진입 — 체크무늬 게이트 통과 후 완만한 조향 램프" 절):**
-- `CHECKER_TURN_RAMP_DIST_M`: 0.5 → 2.0. 시간(`time.time()`) 기반이 아니라 거리 기반을
-  그대로 유지한 이유 — 조향각과 거리의 관계가 실제 주행 궤적의 곡률(회전반경)을
-  결정하므로, 속도가 달라져도(예: 이번 SPEED_NORMAL 변경, 추후 재튜닝) 같은 거리 기준을
-  쓰면 게이트를 통과하는 물리적 곡선 모양이 그대로 유지된다 — 시간 기준이었다면 속도가
-  오를수록 궤적상 곡선 구간 자체가 늘어져 버려 속도 튜닝 때마다 궤적이 달라지는 부작용이
-  있었을 것.
-- `CHECKER_TURN_RAMP_CURVE` 기본값: `'linear'` → `'smoothstep'`(`_checker_turn_ramp_angle()`에
-  `t*t*(3-2t)` 추가). 기존 `'ease_in'`(t²)은 램프 시작(t=0)에서만 완만하고, 램프가 끝나
-  `CHECKER_TURN_RAMP_END_ANGLE` 고정값으로 넘어가는 지점(t=1)에서는 기울기가 0이 아니라
-  거기서 뚝 끊기는 저크가 있었다 — `ease_in` 옵션은 삭제하고, 양끝(t=0, t=1) 모두 기울기
-  0인 `smoothstep`으로 교체해 램프 시작과 끝 모두 저크 없는 S자 곡선이 되도록 했다.
-  `'linear'`는 비교/폴백용으로 남겨둠.
-
-**알려진 한계:** 2.0m는 실측 없이 고른 초기값(3프레임 관찰로 역산한 대략치일 뿐) —
-실차에서 게이트를 지나 램프가 끝나는 지점이 여전히 너무 이르거나(값을 더 키울 것) 지나치게
-길게 조향이 붙잡혀 있으면(값을 줄일 것) `left_turn_debug` 창의 진행률 표시(§1.19f)로
-확인 후 재조정할 것. (원래 `obstacle_cut_debug` 창의 진행률 표시(§1.19c)로 확인하라고
-적었으나, §1.19f에서 그 창을 껐다 — 아래 참고.)
-
-### 1.19f 좌회전 통합 디버그 창(`left_turn_debug`) 신설 + 차선인식 외 나머지 디버그 창 전부 끔 (2026-08-22)
-
-**배경:** 좌회전(체크무늬 게이트 진입) 관련 상태 — 실행중/실행끝/발행각도/라이다감지 —
-가 `obstacle_cut_debug`(`_current_stage_label()` 헤드라인, §1.19c)와
-`checker_pillar_bev`(§1.19 도입) 두 창에 나눠져 있어 한눈에 보기 불편하다는 요청으로,
-좌회전 전용 통합 창을 새로 만들고 나머지 디버그 창(차선인식용 `DEBUG_VIZ_DL_LANE` 제외)을
-전부 껐다(요청 반영: "차선인식이랑 지금 만든 디버그창 빼고 다 꺼줘").
-
-**수정:**
-- `track_drive.py` `_debug_viz_left_turn()`(신규) — `control_loop()`에서 `self.drive()`
-  호출 **이후**에 그린다(다른 디버그 창들은 behavior override 이전 시점이라 "발행각도"가
-  이번 틱에 실제로 발행된 값과 어긋날 수 있어, 이 창만 발행 시점 이후로 옮김). 표시 내용:
-  - **실행중**: `self._checker_ramp_dist is not None` (램프 진행 중이면 초록)
-  - **실행끝**: 새로 추가한 `self._left_turn_last_done_t`(`_do_checker_ramp_turn()`의
-    `done` 분기에서 `time.time()`으로 세팅) 기준 마지막 완료 후 경과시간 — 3초 이내면
-    강조색(하늘색)으로 "방금 완료" 표시, 그 이후엔 회색으로 계속 경과시간 표시(한 번도
-    완료 안 했으면 "아직 없음").
-  - **발행각도**: `self.ctrl_angle` — 램프 진행 중이면 START→END 각도 범위와
-    `{진행거리}/{CHECKER_TURN_RAMP_DIST_M}m`, 커브 종류(`CHECKER_TURN_RAMP_CURVE`)도 같이 표시.
-  - **라이다감지**: `checker_pillar_trigger` + 디바운스 카운터(`_checker_pillar_trigger_cnt`/
-    `CHECKER_PILLAR_CONFIRM_FRAMES`) + 좌/우 개별 검출 여부 + 실측 간격(`checker_pillar_lat_dist_m`).
-- `config.py`: `DEBUG_VIZ_LEFT_TURN`(신규, `True`) 추가. 아래를 전부 `False`로 내림 —
-  `DEBUG_VIZ_IMU`, `DEBUG_VIZ_CHECKER_GATE`, `DEBUG_VIZ_DASH_COUNTER`,
-  `DEBUG_VIZ_CHECKER_PILLAR`, `DEBUG_VIZ_YOLO_CONE`, `DEBUG_VIZ_OBSTACLE_CUT`,
-  `DEBUG_VIZ_YOLO_VEHICLE`. `DEBUG_VIZ_DL_LANE`(차선인식)만 그대로 `True` 유지. 이미
-  `False`였던 나머지(`DEBUG_VIZ_LIDAR`/`LAVACON`류/`STEER`/`VESC`/`HOUGH_LANE`/`LANE`/
-  `STOPLINE`/`YOLO_SIGNAL_STATE`/`AVOID_HOLD`)는 그대로 둠. `DEBUG_LOG`(CLI 텍스트 로그,
-  cv2 창이 아님)는 이번 정리 대상이 아니라 그대로 유지.
-
-**알려진 한계:** 실차 미검증. 다른 창을 꺼둔 동안 그 창들이 잡아주던 이상 징후(예: 라바콘
-EMA 클러스터링 오검출, avoid-hold 유예 오작동)는 눈으로 못 본다 — 해당 기동을 다시
-디버깅해야 할 때는 그 창의 `DEBUG_VIZ_*`를 개별적으로 다시 `True`로 켤 것(서로 독립
-스위치라 다른 항목엔 영향 없음, config.py "5. 디버깅 ON/OFF" 절 관례).
-
----
-
-### 1.19g `_signal_yolo_off`를 좌회전 확정에도 적용 — 직진/좌회전 확정 즉시(한 곳에서) 신호등 YOLO 끔 (2026-08-23)
-
-**배경:** 실차에서 "신호등 인식 → (좌회전 확정 후) 좌우 라이다 기둥쌍도 검출되는데 좌회전
-램프로 안 넘어간다"는 증상 진단 요청 — `left_turn_debug` 창으로 짚어보기 전에, 사용자가
-먼저 "신호등이 한 번 정확한 값을 찍으면 YOLO가 죽게 되어 있어서 확정(`SIG_CONFIRM_FRAMES`
-연속 프레임)까지 못 간다"고 지목. 코드를 보니 정확히는 반대 방향 비대칭이 있었다:
-`_signal_yolo_off`는 원래 **직진** 확정 전용으로만 도입됐던 플래그(§주석,
-`_s1_lane_follow()`)라 **좌회전** 확정 경로에는 아예 없었고, 그 결과
-`_active_yolo_stage()`의 `MissionState.S0_SIGNAL` 분기가 이 플래그를 보지도 않고
-무조건 `'signal'`을 반환해 — 좌회전 확정 후 커밋구간(`_s2_commit_dist`)/게이트 램프
-(`_checker_ramp_dist`) 내내 신호등 YOLO 추론이 계속 돌고 있었다. 색은 이미 확정된
-뒤라 더 볼 필요가 없는 불필요한 추론일 뿐 그 자체가 좌회전 미전환의 직접 원인은
-아니었지만(그 라인은 별도 §1.19 라이다 기둥쌍 조건과 무관), 요청대로 직진과 동일하게
-"확정되는 즉시 딱 한 번, 같은 방식으로" 끄도록 통일했다.
-
-**수정:** `track_drive.py`
-- `perc_signal()` 끝에 `if self.signal_straight_confirmed or self.signal_left_confirmed:
-  self._signal_yolo_off = True` 추가 — 직진/좌회전 확정 판정이 나는 그 틱에 한 곳에서
-  공통으로 끈다. `_s1_lane_follow()`의 직진 확정 분기에 개별로 있던
-  `self._signal_yolo_off = True`는 중복이라 제거(주석만 남김).
-- `_active_yolo_stage()`의 `MissionState.S0_SIGNAL` 분기를 `return 'signal'` →
-  `return None if self._signal_yolo_off else 'signal'`로 변경 — 출발선에서 아직 색을
-  못 읽어 대기 중일 때(`_signal_yolo_off=False`)는 그대로 켜두고, 좌회전 확정 뒤
-  커밋구간/램프 구간(`_signal_yolo_off=True`)에서는 실제로 추론이 멈춘다.
-- 리셋 시점은 기존과 동일 — `_update_lap()`의 `RESET_PHASE_EACH_LAP` 분기
-  (`self._signal_yolo_off = False`, 다음 바퀴 시작 시 해제)를 그대로 재사용.
-
-**알려진 한계:** 실차 미검증. 이 변경은 불필요한 YOLO 추론을 끄는 것뿐이라 "좌회전으로
-안 넘어간다"는 원 증상 자체의 근본 원인(체크무늬 게이트 라이다 기둥쌍 `checker_pillar_trigger`
-조건 — 좌우 개별 검출은 되는데 간격이 `CHECKER_PILLAR_LAT_TARGET_M`=0.98m 미달일
-가능성이 가장 유력, §1.19 참고)은 아직 안 건드렸다. `left_turn_debug` 창의 "라이다감지"
-줄(간격 실측값)로 별도 확인 필요.
-
----
-
-### 1.19h `TEST_SIGNAL_LOOP` — "주행 중 신호등 만남" 반복 격리 테스트 모드 신설 (2026-08-23)
-
-**배경:** §1.19g 직후, "직진 신호를 몇 번을 확정받아도 B1이 절대 안 켜진다"는 증상이
-그 사이(8/22~23) 잠깐 걸어뒀던 "B3 통과 후 신호등 대기" 단독 검증용 override
-(`START_STATE=S1_LANE_FOLLOW` + `Phase.DONE`/`_b2_passed`=`_b3_passed`=`True`)가 원복 안
-된 채 남아있던 게 원인으로 진단됨 — `Phase.DONE`이면 `run_behavior_fsm()`이
-`Phase.LAVACON` 분기 자체에 안 들어가 라바콘 트리거 검사를 아예 안 하기 때문. 일단
-`START_STATE=S0_SIGNAL`/`Phase.LAVACON`/`False`/`False` 정상 플로우로 원복했다가,
-바로 이어서 "주행 중 신호등 만났을 때 좌회전/직진 판단"을 실차에서 **반복** 테스트하고
-싶다는 요청이 들어와 — 매번 결승선까지 실제로 완주해야 다음 시도를 할 수 있으면 비효율
-적이므로, 같은 모양의 override를 다시 걸되 이번엔 반복 루프가 되게 전용 스위치
-(`TEST_SIGNAL_LOOP`)로 감쌌다.
-
-**수정:** `config.py`
-- `TEST_SIGNAL_LOOP`(신규, `True`) — "6. 미션 State" 절에 `TEST_FORCE_BEHAVIOR` 옆에 추가.
-- `START_STATE = MissionState.S1_LANE_FOLLOW`로 다시 변경.
-
-`track_drive.py`
-- `__init__`: `self.phase = Phase.DONE`, `_b2_passed = _b3_passed = True`로 다시 변경
-  (§1.19g 이전, 8/23 초반 override와 동일한 값 — "B1/B2/B3 이미 통과, 다음 교차로
-  신호등 대기" 상태로 바로 시작).
-- `_s1_lane_follow()` 직진 확정(`signal_straight_confirmed`) 분기: `TEST_SIGNAL_LOOP`가
-  켜져 있으면 그 자리에서 바로 `phase=Phase.LAVACON`, `_b2_passed`/`_b3_passed`/
-  `_lavacon_engaged`/`_lavacon_empty_cnt`/`_lavacon_trigger_cnt`를 리셋 — 정상 레이스라면
-  이 리셋은 결승선을 통과해야(`_update_lap()`) 일어나지만, 신호 판단만 테스트할 땐 결승선
-  까지 안 가고 바로 B1이 다음 순서로 대기하게 만든다.
-- `_do_checker_ramp_turn()` 좌회전 램프 완료 분기: `TEST_SIGNAL_LOOP`가 켜져 있고
-  `phase==Phase.DONE`(=이 좌회전이 신호 판단 테스트 대기 상태에서 시작된 것)이면
-  `_signal_yolo_off=False`로 되돌려 신호등 YOLO를 재개 — "좌회전 발행 후 다시 아까
-  대기 상태로 복귀"해서 다음 시도를 바로 이어갈 수 있게. `phase`가 `LAVACON`/
-  `OBSTACLE_ZONE`(=실제 레이스 중 좌회전)이면 이 리셋을 안 해 정상 동작(다음 바퀴
-  리셋 전까지 신호등 YOLO 꺼둠, §1.19g)을 그대로 지킨다.
-- 직진 쪽은 되돌아가는 게 아니라 B1로 전진하는 흐름이라(위 참고) `_signal_yolo_off`를
-  따로 안 풀어도 된다 — 다음 신호는 애초에 그 다음 바퀴에나 나온다.
-
-**알려진 한계:** 실차 미검증. `TEST_SIGNAL_LOOP=True`인 채로 실제 3바퀴 레이스를 뛰면
-신호 확정 시점에 phase가 조기 리셋되어 버리므로, **검증이 끝나면 반드시**
-`TEST_SIGNAL_LOOP=False` + `START_STATE=S0_SIGNAL` + `track_drive.py __init__`의
-`phase=Phase.LAVACON`/`_b2_passed=_b3_passed=False`로 같이 되돌릴 것(8/23 안에 이
-override가 벌써 두 번째로 원복 대상이 됐다는 점을 특히 유의 — 다음에도 검증 끝나면
-바로 되돌릴 것).
-
----
-
-### 1.19i 신호 확정 후 YOLO 끄는 시점에 `SIGNAL_YOLO_OFF_HOLD_FRAMES` 유예 추가 (2026-08-23)
-
-**배경:** §1.19h 테스트 모드로 좌회전을 실차에서 확인하던 중 "`YOLO_신호등` 디버그창엔
-좌회전이 분명히 찍혔는데 확정 표시가 안 된다"는 보고 — 원인은 검출 실패가 아니라
-타이밍이었다. 좌회전 확정은 같은 틱에 곧장 `MissionState.S0_SIGNAL`로 전환되고,
-`_change_state()`가 `S0_SIGNAL` 진입 처리에서 `signal_left_confirmed`/`signal_left_on`/
-`_sig_left_cnt`를 그 자리에서 즉시 0/`False`로 리셋한다(S0_SIGNAL이 새로 판독을 시작하기
-위한 정상 동작). 그런데 §1.19g에서 넣은 "확정되면 즉시 `_signal_yolo_off=True`" 로직이
-같은 틱에 걸리면서, 그 다음 틱부터 `_active_yolo_stage()`가 YOLO 자체를 꺼버려 — 결과적으로
-확정된 순간 딱 1프레임만 반짝 보이고 검출/확정 표시가 통째로 사라져 육안·디버그창으로
-확인할 틈이 없었다.
-
-**수정:** `track_drive.py`
-- `__init__`에 `self._signal_off_hold_cnt = None` 신규 — `_change_state()`가 안 건드리는
-  별도 필드라 S0_SIGNAL 진입 리셋에 영향받지 않는다.
-- `perc_signal()`: 확정되는 순간 바로 `_signal_yolo_off=True`를 세우는 대신, 확정되면
-  `_signal_off_hold_cnt`를 0부터 세기 시작해 `SIGNAL_YOLO_OFF_HOLD_FRAMES`(신규,
-  `config.py`, 기본 10=20Hz 기준 0.5초)에 도달해야 그때 끈다.
-- `_update_lap()`(매 바퀴 리셋)와 `_do_checker_ramp_turn()`(TEST_SIGNAL_LOOP 좌회전 루프
-  복귀) 두 곳의 기존 `_signal_yolo_off=False` 리셋 옆에 `_signal_off_hold_cnt=None`도
-  같이 추가 — 안 하면 두 번째 신호부터는 유예 없이 바로 꺼진다.
-
-`config.py`
-- `SIGNAL_YOLO_OFF_HOLD_FRAMES = 10` 신규.
-- `SIG_CONFIRM_FRAMES`(§1.19g에서 1로 낮췄던 값) 주석 갱신 — 그 증상의 진짜 원인이
-  검출 불안정이 아니라 이 즉시-끔 타이밍이었다는 게 재확인됐으니, 유예가 생긴 지금은
-  다시 3 근처로 올려도 될 가능성이 있다고 기록(값 자체는 이 시점엔 아직 1 유지, §1.19j
-  에서 실제로 3으로 원복함).
-
-**알려진 한계:** 실차 미검증. FSM 상태전환(좌회전이면 `S0_SIGNAL` 진입, 직진이면
-`_behavior_enabled` 재활성화)은 확정되는 그 틱에 이미 끝나므로 이 유예는 FSM 반응
-속도와 무관 — 순수하게 "YOLO를 몇 프레임 더 돌려 디버그창에서 확인 가능하게" 하는
-것뿐이다. `SIGNAL_YOLO_OFF_HOLD_FRAMES`를 늘리면 그만큼 확정 후에도 불필요한 추론이
-더 오래 돈다.
-
----
-
-### 1.19j §1.19i 유예를 넣었는데도 좌회전이 `left_turn_debug`엔 안 찍힘 — 진짜 원인은 `SIG_CONFIRM_FRAMES=1`의 단발 오검출 (2026-08-23)
-
-**배경:** §1.19i 수정 후에도 "`YOLO_신호등` 창엔 좌회전이 확실히 떴는데
-`left_turn_debug`(확정 L/S 줄)엔 전혀 안 찍힌다"는 재보고 — 유예 프레임 문제가 아니라
-아예 처음부터 신호등 YOLO 자체가 안 불리고 있었던 것으로 재진단. 경로: TEST_SIGNAL_LOOP
-모드로 좌회전 테스트 전에(또는 같은 세션에서) 신호판이 "green_left"로 완전히 안정되기
-전 과도 상태에서 `green_straight`로 잠깐 오검출되는 프레임이 하나라도 섞이면,
-`SIG_CONFIRM_FRAMES=1`이라 그 한 프레임만으로 즉시 `signal_straight_confirmed`가
-확정된다. `_s1_lane_follow()`의 `TEST_SIGNAL_LOOP` 직진 분기(§1.19h)가 그 순간
-`self.phase`를 곧장 `Phase.LAVACON`으로 돌려버리고, 그 뒤로는 `_active_yolo_stage()`가
-`Phase.LAVACON`이면 `'cone'`만 리턴하므로 신호등 YOLO(`perc_yolo_signal_state()`) 자체가
-더 이상 호출되지 않는다 — `signal_left_on`은 영원히 `False`로 고정. 이 시점 이후로
-아무리 진짜 좌회전 화살표를 보여줘도 FSM은 그걸 보지도 못한다. 그런데 `YOLO_신호등`
-디버그창은 (오검출 전) 마지막으로 성공했던 추론 프레임이 그대로 얼어붙어 있는 것뿐이라
-(백그라운드 워커가 새 프레임을 못 받으면 유휴 상태로 대기, `yolo_signal_state.py`
-`_worker()` 참고) — 사용자 눈엔 "지금도 검출되고 있다"로 보이는 착시였다.
-
-**수정:** `config.py`
-- `SIG_CONFIRM_FRAMES` 1 → 3 원복 — §1.19i의 유예(`SIGNAL_YOLO_OFF_HOLD_FRAMES`)로
-  "확정 직후 바로 꺼져서 안 보인다"는 원래 문제는 이미 해결됐으므로, 단발 오검출에
-  취약한 N=1을 유지할 이유가 없어졌다.
-
-`track_drive.py`
-- `_debug_viz_left_turn()`에 `phase=... 활성 YOLO=...` 줄 신규 추가 — `_active_yolo_stage()`
-  결과가 `'signal'`이 아니면 빨간 계열 색 + "← 신호등 YOLO 꺼짐, 위 확정 안 뜸" 문구로
-  바로 원인이 드러나게 했다. 이제 `YOLO_신호등` 창과 `left_turn_debug`가 서로 다른
-  걸 보여줘도 이 줄만 보면 "신호등 YOLO가 지금 이 틱에 실제로 도는지"를 바로 구분할 수
-  있다.
-
-**알려진 한계:** 실차 미검증. `TEST_SIGNAL_LOOP` 모드 자체가 가진 구조적 약점은 여전함 —
-`phase`가 한 번 `Phase.DONE`을 벗어나면(직진 오검출 포함) 그 세션 안에서 되돌아올 방법이
-없다(실제 B1/B2/B3를 다 통과하거나 노드 재시작만 가능). 지금 노드가 떠 있는 상태에서
-이미 이 오검출을 겪었다면 `phase`가 `Phase.LAVACON`/`OBSTACLE_ZONE`에 멈춰있을 수 있으니,
-좌회전을 다시 테스트하기 전에 위 새 디버그 줄로 `phase=DONE`인지 먼저 확인하거나 노드를
-재시작할 것.
-
----
-
-### 1.19k `YOLO_SIGNAL_STATE_CONF_THRESHOLD` 0.8→0.5 원복 + `SIG_CONFIRM_FRAMES` 1→3 재상향 (2026-08-23, 사용자 지시)
-
-**배경:** §1.19j의 "직진 오검출 1프레임 → phase 조기 이탈" 문제가 실차에서 계속
-재현됨 — 사용자가 "`green_left`가 잘 안 잡히고 죄다 `green_straight`로 읽힌다"고
-관찰. 원인으로 두 가지가 겹쳐있던 것으로 판단됨: (1) `YOLO_SIGNAL_STATE_CONF_THRESHOLD`가
-그 전날 0.5→0.8로 올라가 있어서, `green_left`(화살표라 판형이 작고 인식이 상대적으로
-까다로움)가 유독 그 문턱을 못 넘어 잘 안 잡히고 `green_straight`/`red`만 쉽게 통과하는
-쪽으로 편향, (2) `SIG_CONFIRM_FRAMES=1`이라 그렇게 통과한 단발 오검출이 디바운스 없이
-그 즉시 확정으로 승격. 둘이 겹쳐서 "좌회전을 보여줘도 그 전에 잠깐 스친 직진 오검출이
-먼저 확정돼버리고, `TEST_SIGNAL_LOOP` 특성상 그 뒤로는 신호등 YOLO 자체가 멈춰버리는"
-현상으로 나타남.
-
-**수정:** `config.py`
-- `YOLO_SIGNAL_STATE_CONF_THRESHOLD` 0.8 → 0.5 원복.
-- `SIG_CONFIRM_FRAMES` 1 → 3 재상향.
-- 방어선을 "신뢰도 문턱을 높여서 거르기"가 아니라 "문턱은 낮춰서 잘 잡되, 여러 프레임
-  연속으로 확인해서 거르기" 쪽으로 재배치 — 이번엔 사용자가 직접 지시한 값이니
-  다음에 임의로 다시 바꾸지 말 것(§SIG_CONFIRM_FRAMES 주석 참고, 이전에 확인 없이
-  바꿨다가 문제가 됐음).
-
-**알려진 한계:** 실차 미검증. `green_left`의 실제 평균 신뢰도가 몇인지는 아직 실측
-안 됨 — `YOLO_신호등` 창의 박스 위 conf 숫자로 확인 후 필요하면 임계값을 더 조정할 것.
-
----
-
-### 1.19l 정리 — "좌회전 신호 검출실패" 디버깅 세션에서 기억해둘 것 (2026-08-23)
-
-§1.19g~k에 걸쳐 세션 하나에서 계속 파고든 이슈라, 다음에 다시 손댈 때 바로 감을
-잡을 수 있게 핵심만 따로 정리해둔다. 개별 변경 이력/근거는 위 §1.19g~k 참고.
-
-**지금 실제 코드 상태(2026-08-23 기준, 값 재확인은 `config.py`에서):**
-- `SIG_CONFIRM_FRAMES = 100`(20Hz 기준 5초) — 원래 3이었다가 이 세션에서
-  1→3→10→200→100으로 계속 조정된 값. **연속** 프레임 기준이라 한 프레임이라도
-  신호가 끊기면 카운트가 0으로 리셋된다(`perc_signal()`) — 확정까지 체감이 꽤
-  오래 걸릴 수 있다는 뜻. "확정이 안 된다"는 보고가 다시 들어오면 이 값과 카운트
-  리셋 방식(연속 vs sliding-window)부터 의심할 것.
-- `YOLO_SIGNAL_STATE_CONF_THRESHOLD = 0.5`(원래 값 — 한때 0.8이었다가 원복).
-- `TEST_SIGNAL_LOOP = True`, `START_STATE = MissionState.S1_LANE_FOLLOW`,
-  `track_drive.py __init__`의 `phase = Phase.DONE`/`_b2_passed = _b3_passed = True`
-  — **실차 레이스용이 아니라 신호 판단(직진/좌회전) 반복 격리 테스트 전용 상태다.**
-  이 상태로 실제 3바퀴 레이스를 뛰면 안 된다(§1.19h "알려진 한계" 참고) — 검증
-  끝나면 `START_STATE=S0_SIGNAL`/`phase=Phase.LAVACON`/`_b2_passed=_b3_passed=False`/
-  `TEST_SIGNAL_LOOP=False`로 반드시 되돌릴 것.
-- `TEST_FORCE_SIGNAL_YOLO = True` — 신호등 YOLO를 FSM 상태와 무관하게 항상 켜서
-  검출 단독 테스트하는 플래그. 이것도 켜진 채로 레이스 뛰면 cone/vehicle YOLO가
-  전혀 안 돈다(B1/B2/B3 검증 불가) — 검증 끝나면 `False`로.
-
-**증상과 진짜 원인이 어긋났던 지점들(다음에 비슷한 보고가 오면 먼저 의심할 것):**
-1. "욜로창엔 찍혔는데 확정이 안 뜬다" → 대부분 `_change_state()`가 S0_SIGNAL 진입
-   시 `signal_left_confirmed`/`_sig_left_cnt`를 그 자리에서 리셋해버려 생기는
-   **디버그 표시상의 착시**였다. FSM 반응 자체는 확정되는 그 틱에 이미 끝나 있다.
-2. "좌회전을 보여줘도 반응이 없다" → `TEST_SIGNAL_LOOP` 모드에서 `phase`가 한 번
-   `Phase.LAVACON`으로 넘어가면(직진 오검출 단 1프레임으로도 가능) 그 세션 안에서
-   되돌아올 방법이 없어(`_active_yolo_stage()`가 `'cone'`만 리턴) 신호등 YOLO
-   자체가 죽어버린다. **`left_turn_debug`의 `phase=... 활성 YOLO=...` 줄부터
-   확인** — `phase != DONE`이면 노드 재시작 외엔 답이 없다.
-3. "욜로창이 얼어붙어서 옛날 프레임만 보여준다" → 위 2번과 같은 원인. YOLO
-   백그라운드 워커는 `detect()`가 안 불리면 그냥 유휴 상태로 대기만 하고 마지막
-   프레임을 그대로 들고 있는다(`yolo_signal_state.py` `_worker()`).
-4. **근본 원인은 결국 모델의 프레임 단위 불안정성이었다** — `green_left`가
-   `green_straight`보다 평균 신뢰도가 낮고, 순간 프레임만 끊어보면 둘이 동시에
-   뜨기도 하며, 연속으로 몇 초 관찰하면 안정된다는 게 실차로 확인됨. 로직 버그가
-   아니라 **디바운스(SIG_CONFIRM_FRAMES)로 시간을 들여 걸러내야 하는 종류의
-   문제**라 계속 값을 올리는 방향으로 대응했다 — 모델 자체를 재학습/교체하기
-   전까지는 이 트레이드오프(확정까지 오래 걸림 vs 오검출 방지)가 근본적인
-   한계로 남는다.
-
----
-
-### 1.19m `SIG_CONFIRM_FRAMES` 100→10 재조정 + `TEST_FORCE_LEFT_TURN_SIGNAL` 임시 스위치 신설 (2026-08-23, ★중대·반드시 원복★)
-
-**배경:** §1.19k에서 100(5초)까지 올렸던 `SIG_CONFIRM_FRAMES`가 오검출엔 강하지만 확정까지
-체감이 너무 느려진다는 판단 — 1(오검출에 바로 걸림)과 100(너무 느림) 사이 중간값으로
-`config.py`에서 **10**(20Hz 기준 0.5초)으로 재조정. 아직 실차 미검증.
-
-**★★★ 아주 중대한 임시 디버그 스위치 — 반드시 나중에 원복! ★★★** 신호등 인식과 완전히
-분리해서 "좌회전 로직 자체"(커밋 구간 진입 → `perc_checker_pillar()` 좌우 라이다 기둥쌍
-검출 → `_begin_checker_ramp_turn()` 조향 램프)만 단독 검증하고 싶다는 테스트 요청 —
-`config.py`에 `TEST_FORCE_LEFT_TURN_SIGNAL = True` 신설, `track_drive.py` `perc_signal()`이
-매 틱 `signal_left_confirmed`를 실제 YOLO 판독 결과와 무관하게 무조건 `True`로 덮어쓴다.
-`_s1_lane_follow()`가 이걸 보고 즉시 S0_SIGNAL 'left' 커밋 구간으로 전환하고, 이후 판단은
-전적으로 라이다 기둥쌍 검출(`checker_pillar_trigger`) 하나에만 달려있게 된다.
-`TEST_SIGNAL_LOOP=True`와 맞물려 램프 완료 후 S1로 복귀하자마자 다시 강제 확정되므로,
-게이트를 지날 때마다 계속 반복 진입한다(의도된 반복 검증 동작).
-
-**⚠️⚠️⚠️ 검증 끝나면 `TEST_FORCE_LEFT_TURN_SIGNAL`을 반드시 `False`로 되돌릴 것.** 이게
-켜진 채로 실제 레이스를 뛰면 신호등이 빨간불이든 직진이든 무조건 좌회전으로 우겨서 코스를
-완전히 이탈한다 — 이 세션의 다른 `TEST_*` 플래그들(`TEST_SIGNAL_LOOP`,
-`TEST_FORCE_SIGNAL_YOLO`, `START_STATE=S1_LANE_FOLLOW`, `phase=Phase.DONE`)과 함께
-§1.19l 체크리스트에 실전 복귀 전 원복 대상으로 추가할 것.
-
-### 1.19n §1.19q(구 코드 주석 번호) 되돌림 — 좌회전 램프 완료 후 S0_SIGNAL 재진입 제거, 곧장 S1 복귀 (2026-08-23)
-
-**증상(사용자 확인):** 좌회전(지름길) 신호를 받아 체크무늬 게이트 램프까지 완료한 뒤, 차량이
-속도 0으로 완전히 굳어서 "신호등 판독 대기" 상태에 영원히 머무름.
-
-**원인:** `_do_checker_ramp_turn()`이 램프 완료 시 `MissionState.S0_SIGNAL`로 돌아가도록
-돼 있었다("좌회전 직후 Phase가 아직 LAVACON이면 B1이 검증 없이 곧장 발동한다"는 실차 문제
-대응으로 넣었던 것) — `_s0_signal()`은 커밋/램프 둘 다 아니면 `ctrl_speed=SPEED_STOP`으로
-정지한 채 다음 신호 확정을 기다리는데(`_s0_signal()` 참고), **이 트랙은 좌회전(지름길) 직후
-곧바로 차선주행 구간으로 이어지고 그 사이엔 읽을 신호등 자체가 없다**(사용자 확인) — 그래서
-확정될 수 없는 신호를 무한 대기하며 완전히 정지해버린 것.
-
-**수정:** `_do_checker_ramp_turn()`을 그 이전(§1.19g 이전) 동작으로 되돌림 — 램프 완료 시
-곧장 `_behavior_enabled=True` + `MissionState.S1_LANE_FOLLOW`로 복귀(`_s0_signal()`의
-직진 확정 분기와 동일한 처리). `TEST_SIGNAL_LOOP` 격리 테스트용 `_signal_yolo_off` 리셋
-분기(`phase==Phase.DONE`일 때만)도 함께 복원.
-
-**알려진 한계:** 이 되돌림이 우려했던 "좌회전 직후 Phase.LAVACON 상태에서 B1 오발동" 문제가
-재발할 가능성은 남아있음 — 다만 그 문제가 실차에서 처음 확인된 시점과 라이다 유령 점 마스킹
-(`perc_lavacon.py` `GHOST_POINT_*`, 2026-08-22 작업기록 참고) 적용 시점이 겹쳐서, 유령 점이
-B1 오발동의 실제 원인이었을 가능성이 있음(미확인). 다음 실차 테스트에서 좌회전 직후 B1이
-부당하게 곧장 켜지는지 반드시 재확인할 것 — 재발하면 이 되돌림 대신 좌회전 완료 후 몇 초간만
-B1 감지를 유예하는 방향(`_signal_reentry_cooldown_t`와 같은 타임스탬프 가드 패턴)으로 갈 것.
-
-### 1.19o 지름길 출구 T자 교차로 — 거리 트리거 + 시간 기반 강제 좌회전 킥 신설 (2026-08-24)
-
-**배경:** 지름길(§1.19b 이후 좌회전 진입 램프로 처리)을 빠져나오는 지점이 T자 교차로라,
-da/차선인식만으로는 직진(벽)/좌회전/우회전 중 어느 쪽이 맞는지 판단할 방법이 없다 — 이
-트랙은 반시계방향이라 항상 좌회전이어야 하지만 da는 그 규칙을 모른다. 사용자 확인: 이
-T자엔 라이다 랜드마크도 정지선도 없어 §1.19의 체크무늬 게이트 같은 물리 트리거를 못 쓴다.
-또한 지름길을 빠져나오면 B1/B2/B3 없이 곧장 결승선으로 이어지는 트랙이라(사용자 확인),
-출구 이후엔 Phase/Behavior를 다시 신경 쓸 필요가 없다. 결승선은 통과시점을 심판이 재는
-방식이라(사용자 확인) 별도 정차 로직도 불필요.
-
-**설계:**
-- **트리거**: 입구 램프 완료 시점(`_do_checker_ramp_turn()`의 `done` 분기)부터
-  `self._shortcut_exit_dist`를 `_s2_commit_dist`와 동일한 VESC 거리적분 패턴으로 누적,
-  `SHORTCUT_EXIT_DIST_M=6.3m`(실측 직선거리 5.8m + 곡선분/슬립 여유, config.py 주석 참고)
-  도달 시 발동. `_s1_lane_follow()`가 `_lane_drive()` 다음에 매틱 누적(VESC 끊기면 1초
-  디바운스 경고 로그).
-- **조향**: 처음엔 입구와 같은 `_checker_turn_ramp_angle()`(거리기반 smoothstep 램프)을
-  재사용했으나, 입구/출구를 서로 독립된 메커니즘으로 가져가자는 요청으로
-  `SHORTCUT_EXIT_KICK_ANGLE_DEG=-20°`를 `SHORTCUT_EXIT_KICK_DURATION_S=0.5초` 동안 그대로
-  꽂는 시간 기반 오픈루프 킥으로 교체(`_do_shortcut_exit_kick()`, `LAVACON_KICK_*`와 동일
-  패턴 — 프레임수 카운트다운).
-- **Phase 비변경**: 입구 램프 완료는 Phase를 `LAVACON`으로 리셋해 다음 구간 B1을 다시
-  여는데, 출구 킥 완료는 Phase/`_b2_passed`/`_b3_passed`/`_lavacon_engaged`를 전혀 안
-  건드린다 — 출구 뒤엔 더 볼 Behavior가 없어서(위 참고) 리셋하면 오히려 불필요한 B1 콘
-  YOLO 재가동 등 부작용만 생긴다.
-- **근접 안전정지 도입 후 삭제**: `obstacle_front`/`obstacle_dist` 기반 근접 정지
-  (`SHORTCUT_EXIT_WALL_STOP_M`)를 한 번 넣었다가 삭제했다 — 대회 규정상 코스 이탈/충돌
-  시 사람이 차량을 코스 안으로 복귀시키는 절차가 있어 소프트웨어로 막을 필요가 없다는
-  판단(요청 반영). 지금은 거리 트리거 단독 판단.
-
-**버그수정(같은 세션):** 출구 킥은 입구 램프와 달리 `mission_state`가 계속
-`S1_LANE_FOLLOW`인 채로 돈다(입구는 `S0_SIGNAL`로 빠짐) — `control_loop()`의 Behavior
-게이트 조건(`mission_state==S1_LANE_FOLLOW`)에 그대로 걸려서, 이 가드가 없으면
-`run_behavior_fsm()`/`apply_behavior_override()`가 킥 도중에도 계속 돌아 만에 하나 B1이
-오검출되면 강제 좌회전 조향을 그대로 덮어쓸 수 있는 구멍이 있었다 — "벽 피하려고 강제로
-꺾는" 바로 그 순간에 조향을 뺏기는 셈이라 위험도가 높다고 판단해, `control_loop()`에
-`self._shortcut_exit_kick_cnt <= 0` 조건을 추가해 킥 도중엔 Behavior FSM 자체를 끈다.
-
-**알려진 한계:** `SHORTCUT_EXIT_DIST_M`/`SHORTCUT_EXIT_KICK_ANGLE_DEG`/
-`SHORTCUT_EXIT_KICK_DURATION_S` 전부 실차 미검증 초기값 — 특히 거리 트리거는 VESC
-적분의 슬립/누적오차와 "직선거리로 측정했지만 실제 주행경로는 입구 램프의 곡선분만큼 더
-길다"는 시스템적 편향(항상 "조금 이르게" 트리거되는 방향)을 안고 있어, 처음 실차 테스트
-결과에 따라 가장 먼저 조정할 값이다.
-
----
-
-## 2. 라인트래킹 (차선주행, S1)
-
-**수정할 곳:** `START_STATE=S1_LANE_FOLLOW`, `TEST_FORCE_BEHAVIOR=False`.
-
-**디버그:** `DEBUG_VIZ_DL_LANE=True` → da(초록/주황=면적상한 차선책/청록=ll클리핑 스킵)+ll(빨강) 오버레이 +
-밴드별 중심점(흰=ll채택/노랑=da폴백) + 피팅 경로 + offset 스파크라인. CLI: `[LANE] lane=offset(valid)
-side=... obs=... lava=...`.
-
-### da/ll 파이프라인 발전 요약 (§2.1~§2.29, 상세 경위는 git 히스토리)
-- **da 덩어리 선택**: 면적순위 → 직전 프레임과의 근접성(연속성) → **시드(차량 위치와 맞닿은 덩어리) 최우선**
-  순으로 발전. **면적 임계값만으로 최선의 da를 고르는 방식은 실차 검증 결과 포기**(CLAUDE.md에도 기록) —
-  지금은 위치/연속성 근거가 있을 때만 통과 기준으로 쓰고, 순수 면적순위는 최후 폴백.
-- **da 밴드 중심**: 무게중심 → 좌우 경계중점(Voronoi 근사) 시도 → **다시 무게중심으로 롤백**(§2.16) — 경계
-  중점이 노이즈 픽셀 하나에 통째로 쏠리는 "S자 좌우 왔다갔다" 진동이 실차로 재현됨.
-- **da 옆차선 병합 방어**: ll이 프레임 전체에서 안 보이는 경우(da 자체가 두 차선을 구분 못 하고 통째로
-  나옴) **침식(erosion)은 이 경우엔 안 통해서 폐기**(병합 지점이 얇은 다리가 아니라 뭉텅하게 넓어서, 실차
-  확인·CLAUDE.md 기록) — **ll 잔상(decay) + 기대 차로폭 기반 가상경계**로 대응(§2.14).
-- **ll 밴드 추출**: 반쪽 전체 무게중심 → 좁은 고정폭 슬라이딩 윈도우 → 좌/우 완전 독립 추적 → **노란
-  중앙선 기준 + 한쪽 흰선**(편도 1차로는 흰-노-흰 구성이라 "좌우 흰선 둘 다"를 기다리면 구조적으로 거의
-  항상 실패한다는 게 실차로 확인돼 재설계, §2.17) 순으로 발전.
-- **경로 생성**: 2차 다항식 피팅+외삽 → **구간별 선형보간**(`np.interp`)으로 교체 — 저차 다항식이 실측
-  없는 근거리 구간을 곡선으로 외삽해 튀는 문제를 외삽 자체를 없애 근본 차단(§2.10).
-- **da/ll/corridor 공통 안정화 패턴**(§2.20/§2.27): 밴드 간 속도예측(EMA) + 프레임 간 앵커링 + 연속
-  미검출 시 탐색창 확장 — "탐색을 예측 위치 근방으로 제한"하는 같은 아이디어를 세 모드 각각의 구조에
-  맞게 적용, pure_pursuit 입력단 노이즈 감소에 기여(§0.5.7의 "근본 대응"으로 인용됨).
-
-### 2.1~2.6 da 인식 안정화 1차 (2026-08-06)
-S자 연속 커브에서 da 최대 덩어리가 면적 상한/하한에 걸려 경로가 얼어붙고 조향 포화→정지로 이어지던
-문제 대응: ①상한 초과 시 곧장 무효 처리 대신 범위 안의 다음 크기 덩어리를 차선책으로 채택(2.1), ②원거리
-ll이 BEV 원근확대로 blur까지 두꺼워져 da를 과클리핑하는 문제를 `DL_LL_FG_THRESHOLD=0.7`(da용과 분리)+
-클리핑 결과 부실 시 스킵으로 완화(2.2), ③코너 감속 하한(`SPEED_CORNER_MIN`)이 모터 데드존(≈1.4)보다
-낮아 급커브 지속 시 정지하던 걸 이름 있는 상수로 분리해 상향(2.3, 현재 5.0), ④`SPEED_NORMAL` 8→25
-재설정(2.4, §6.5 실측 범위 밖 외삽이라 재검증 필요), ⑤`DL_BEV_FAR_LIMIT_M=0.7m`보다 먼 BEV 캔버스
-영역을 크롭해 blur 심한 원거리를 아예 배제(2.5), ⑥면적 상한을 비율(`DL_DA_MAX_AREA_RATIO`) 대신 직선
-구간 실측(13,219px 평균) 기반 절대값 `DL_DA_MAX_AREA_PX=13700`으로 교체(2.6).
-
-### 2.7~2.15 da/ll 파이프라인 정비 (2026-08-06~07)
-`DL_CENTER_MODE`로 da 단독/`ll_da`(ll+da 하이브리드) 전환 가능하게 분리(2.7). da 차선책 선택을
-면적순위→직전 채택 덩어리와의 근접성으로(2.8, 비슷한 크기 덩어리 사이 순위 뒤집힘으로 인한 흔들림
-대응). ll 탐색을 반쪽 전체→좁은 고정폭 창(2.9)+좌우 완전 독립 추적(2.13)으로. 경로 생성을 다항식→
-선형보간으로(2.10). da 시드(차량 위치 접한 덩어리) 최우선 채택 추가(2.11, 직전 오판에 영향 안 받는
-자체교정 신호). da 밴드 중심을 경계중점으로 시도(2.12, §2.16에서 롤백됨). da 옆차선 병합 방어를 ll
-잔상+가상경계로(2.14). ll 이진화 임계값 0.7→0.5(2.15, blur 방지 목적을 넘어 정상 신뢰도 픽셀까지
-걸러내고 있었음이 실차 영상 분석으로 확인).
-
-### 2.16~2.21 da 롤백 + ll 알고리즘 재설계 (2026-08-10)
-da 경계중점 진동 재현으로 무게중심 롤백 + 면적상한 체크 제거(병합 방어는 §2.14 클리핑으로 역할 이전).
-`ll_da`는 "corridor"(ll로 도로 경계를 규정, 장애물 없는 열린구간 탐색, 팀원 이지유), `ll`은 "노란/흰선
-색상투표 분리 + 5단계 폴백"(팀원 yunyunsung)으로 서로 다른 팀원이 독립 개발한 알고리즘 도입, main 기본을
-`DL_CENTER_MODE='ll'`로 전환(2.16~2.17). 실차 영상에서 조향각이 급격히 튄 사고(흰-노 간격 EMA가 노이즈로
-부풀어 얼어붙음) 분석 후 클램프+3분기 재설계(2.18). 같은 날 두 브랜치가 독립적으로 `ll` 로직을 재작성해
-병합충돌 — 둘 다 보존하고 `DL_LL_ALGO`(`'yw'`=main기본/`'lr'`=대안)로 A/B 전환 가능하게(2.19). `'lr'`에
-적응형 탐색창+프레임간 앵커링 추가(2.20). 파라미터 전용 디버그 창은 화면만 차지한다는 판단으로 다음날
-삭제, offset 스파크라인만 `dl_lane` 창에 유지(2.21).
-
-### 2.22~2.24 조향 경로 안정성 버그 3건 (2026-08-10~11)
-급조향 후 직진 복귀 구간 흔들림 조사 중 발견: ①실제 조향에 쓰이는 `lane_path`가 `lane_offset`이 거치는
-3프레임 안정성 검증(`valid`)을 우회하고 있던 비대칭 수정(2.22). ②탐색창 seed(`ref_x`)가 디바운스로
-지연돼 급조향 복귀를 못 따라가는 문제를 `DL_STABLE_FRAME_MIN` 3→2 + `'yw'`에도 탐색창 확장 이식으로
-완화(2.23). ③DL 추론이 논블로킹 백그라운드 스레드라 "느려서 재사용 중"과 "고장으로 안 갱신"을 구분 못
-하던 문제 — `result_seq` 카운터 + `LANE_STALE_SEC`(0.5→2.0 상향) 가드 추가, stale이면
-`SPEED_LANE_STALE=5.0`로 제한(2.24, VESC/IMU의 `_*_t`+`*_STALE_SEC` 패턴과 동일).
-
-### 2.25~2.26, 2.29 DL 세그멘테이션 모델 교체 (2026-08-11~13)
-자체 fine-tune 모델로 순차 교체: `small_bootstrap_v2`(134장) → `medium_v2`(1068장, da mIoU 0.937/ll IOU
-0.567) → **`kmu_v1.2.0`(현재 기본, 3446장 = bootstrap_v2 1016 + 지그재그 주행 데이터 lap_005 2430장,
-비평행 각도 상황 보강) — da IoU 0.957/ll IoU 0.599**. 전부 정적 이미지 정량비교만 거쳤고 실차 미검증.
-**실차 배포 PC(AMD Ryzen 7 5700U, ROCm 미지원)는 CPU 추론만 가능해 ~10.8fps** — 20Hz 제어루프 대비
-병목 여부 미확인.
-
-### 2.27~2.28 S자 커브 대응 + corridor 재설계 (2026-08-12)
-`da`(신규 `_da_slice_centers_windowed()`)/`ll`(main `'yw'`)/`ll_da`(corridor) 세 모드 전부에 밴드 간
-속도예측+프레임간 앵커링 적용(2.27, 위 "공통 안정화 패턴" 참고). corridor 경계 판정을 "밴드당 선
-정확히 3개 필요한 위치순서 방식"(흰선 하나만 잡히는 흔한 경우도 드롭됨)에서 노란선/좌우흰선 각각
-독립 슬라이딩 윈도우 + 5단계 우선순위(`LR`/`L+Y`/`R+Y`/`L+W`/`R+W`/`Y`/`LOST`)로 재설계 — 노란선이 안
-보여도 흰선 하나로 계속 주행 가능(2.28). 같은 날 추정 분기 재앵커링 누락 버그(좌우 트래커가 어긋나
-최악의 경우 좌우가 뒤바뀔 위험)도 수정.
-
-### 2.30 da 안전마진(장애물 회피) — 카메라+da 침식 적용, 라이다결합은 미착수 (2026-08-14)
-S1(da 기반) 차선주행이 우연히 장애물을 피해가는 부작용을 관찰 — da 중심선 계산에 차량 폭 개념이 아예
-없었음(라이다 쪽 Hybrid A*는 이미 있음). 순수 카메라 침식은 `DL_PIXELS_PER_METER`가 실측 아닌 설계값이라
-"몇 cm 여유"를 보장 못한다는 한계를 인지한 채로, 더 정확할 것으로 예상되는 라이다-카메라 결합안 대신
-**먼저 단순 카메라+da 침식을 실차 테스트**하기로 결정 — `DL_DA_APPLY_VEHICLE_MARGIN=True`,
-`DL_DA_VEHICLE_MARGIN_M=0.05`, 과침식 시 원본 마스크로 폴백.
-
-**미착수/미해결로 남은 것:**
-- 라이다-카메라 오프셋 실측 도구(`measure_lidar_camera_offset.py`)는 만들었지만, 라이다 장애물 상자를
-  실제로 da에 투영해 깎는 로직은 미구현.
-- **라이다 인덱스↔각도 변환이 "360포인트" 가정인데 실제 라이다는 500포인트일 가능성** — 이 도구만
-  `_index_to_deg()`로 수정했고, **프로덕션 코드(`track_drive.py`의 `perc_obstacle()`/
-  `perc_lavacon_trigger()`)는 아직 안 고침.** 사실이면 뒤쪽 약 100° 사각지대 + 정면에서 멀수록 각도
-  오차 누적 가능성 — B1/B2/B3 좌우 판정 전반에 영향 있을 수 있는 다음 단계.
-- `LIDAR_ANGLE_OFFSET_DEG=80`이 드리프트했을 가능성 관찰(§6.2)도 미반영.
-
-### 2.31 TensorRT 최초 엔진 빌드에 멈춰 DA/LL 인식이 전혀 안 되던 문제 → CUDA EP 우선 전환 (2026-08-14)
-모델 교체(§2.29) 후 TensorRT 캐시가 없는 상태에서 최초 엔진 빌드가 4분 넘게 안 끝나(개발 PC 실측), 짧은
-재시작 주기의 실차 테스트에서는 "빌드 완료 순간 자체가 안 옴" → 디버그 창도 안 뜨고 인식도 안 되는
-것처럼 보였음. `perception/dl_lane.py`의 provider 우선순위에서 TensorRT를 완전히 제외(CUDA 우선) — CUDA
-기준 개발PC 실측 ~5.7fps로 안정 동작 확인. **이 모델의 TensorRT 빌드가 결국 성공하는지 자체는 끝까지
-확인 안 함**(향후 여유 있을 때 재확인 가치 있음 — 성공한다면 CUDA보다 빠를 수 있어 되돌리는 것도 고려).
-Jetson 실차 fps는 별도 확인 필요.
-
-### 2.32~2.33 회피 "복귀 유예"(avoid-hold) — 장애물 통과 직후 이른 복귀 방지 (2026-08-14~15)
-카메라가 차량 앞코에 있어 장애물을 지나치는 순간 da가 즉시 원래 폭으로 돌아와 중심선도 바로 원래
-차선으로 복귀함 — 방해차량(B3)처럼 계속 주행 중인 장애물이면 지나친 직후 옆/뒤에 바짝 붙은 채로 너무
-이른 복귀가 충돌로 이어질 위험. `_update_avoid_hold()`(`track_drive.py`)가 라이다 `obstacle_front`(1.5m
-이내) 기준으로 유예 타이머를 관리, 유예 중엔 평소 꺼둔 `_clip_da_by_ll()`(§2.14의 ll클리핑)을 한시적으로
-되살려 da가 raw 폭 그대로 안 쓰이게 함.
-
-**§2.33 개선(오픈소스 사례 조사 후 4개 적용, 상세 설계는 `avoid_hold_improvement_proposal.md`):**
-①가변 유예시간(접근 속도 기반)+거리기반 조기해제, ②da 면적 급증을 라이다와 OR 결합한 보조 트리거
-(사각지대 보완), ③`choose_side()` 방향 힌트(ll/잔상 없는 최후수단 분기에서만), ④양쪽 다 막히면
-(`choose_side()==0`) 강제 감속(`SPEED_AVOID_HOLD_BLOCKED`). 디버그 창 `DEBUG_VIZ_AVOID_HOLD` 신규.
-
-**미실측 파라미터 6개**(`AVOID_HOLD_RATE_GAIN`/`SEC_MAX`/`RELEASE_DIST_M`/`DA_AREA_JUMP_RATIO`/
-`DIR_BIAS_PX`/`SPEED_AVOID_HOLD_BLOCKED`)는 `avoid_hold_measurement_todo.md`에 측정 절차 대기 중 —
-전부 실차 미검증. `choose_side()`가 이번에 avoid-hold 경로에서 처음 실제로 호출되기 시작한, 원래 B2/B3
-FSM으로는 한 번도 안 불려본 함수라는 리스크도 남아있음.
-
-### 2.34 `Phase.FIXED_OBSTACLE`/`VEHICLE` → `Phase.OBSTACLE_ZONE` 통합 (2026-08-15)
-avoid-hold+da 안전마진으로 정적/동적 회피 기동 자체가 매 프레임 연속 반응하는 쪽으로 바뀌면서, "커밋형
-기동을 잘못 고르는 위험" 때문에 Phase로 미리 순서를 나눠야 했던 원래 이유가 약해졌다고 판단 — 한 Phase
-안에서 매 프레임 `obstacle_type`(라이다 실측 폭)으로 B2/B3를 그때그때 가르도록 통합. `_b2_passed`/
-`_b3_passed` 둘 다 True가 돼야 `Phase.DONE`(순서 무관, `RESET_PHASE_EACH_LAP`으로 매 바퀴 리셋).
-`TEST_DISABLE_B2_B3`는 그대로 동작. **`da_unaware_of_obstacle=True` 하드코딩(§4)은 이번에 안 건드림 —
-B2는 여전히 항상 `TargetPassing`으로 폴백.**
-
-### 2.35 [중대 버그] `DLLaneDetector.roi_w`가 실제 경로 좌표계와 다른 폭으로 고정돼 조향에
-상시 좌편향이 있던 문제 — raw 카메라 데이터셋 재생 검증으로 발견 (2026-08-17)
-
-**배경:** 사용자 요청으로 실제 lap 주행 raw 카메라 프레임(`lap_005`, 2734장 — fine-tune 저장소의
-학습 데이터 원본)을 `track_drive` 패키지를 ROS2 없이 standalone 임포트해서(§2.30/§2.31이 이미 쓴
-방식과 동일, `TwinLiteNetEngine`+`DLSlideWindow`를 직접 호출) 실제로 돌려보며 pure_pursuit
-파이프라인이 잘 동작하는지 검증하던 중 발견.
-
-**증상/원인:** `DLLaneDetector.__init__()`가 `self.roi_w = DL_INPUT_W`(640, 모델 입력 고정폭)로
-설정해두는데, 실제 `path`/`yellow_centers`는 `DLSlideWindow.roi_w`(BEV 캔버스 실측폭,
-`DL_USE_BEV=True`인 현재 기본값 기준 **585**, `da_mask.shape`에서 나옴) 좌표계다. 이 둘이 원래
-초기화 시점에만 값이 다를 뿐 이후 동기화되는 줄이 없어서(`yellow_centers`는 매 추론마다
-`self._slide.yellow_centers`로 갱신되는데 `roi_w`만 빠져있었음), `_lane_steer()`의
-`vehicle_x = self.lane_detector.roi_w/2.0`(320)와 `_update_lane_side()`의 판정 기준
-(`ld.roi_w/2.0`, 320)이 매 프레임 계속 틀린 값(640/2)을 썼다 — 실제 차량 중심은 585/2=**292.5**여야
-했다. 27.5px(≈13.75cm, `DL_PIXELS_PER_METER=200px/m` 기준) 만큼 조향 기준점이 어긋난 채로
-`DL_USE_BEV`가 실차 검증에 들어간 2026-08-05부터 계속 있었을 가능성이 높다.
-
-**실측(raw 카메라 재생 검증):** `lap_005` 2734프레임 중 304장 균등샘플로 `TwinLiteNetEngine`+
-`DLSlideWindow`를 실제로 돌려 `path`를 뽑고, 같은 `path`를 `vehicle_x=292.5`(정상)와
-`vehicle_x=320`(버그)로 각각 `PurePursuitController.control()`에 넣어 비교 — **238개 유효 프레임에서
-조향각 차이 평균 +24.05°, 표준편차 5.45°, 최대 +38.11°**(정상 기준 대비 버그 코드가 그만큼
-왼쪽으로 더 꺾도록 명령). 정상 계산 기준으로는 대부분 0°(차선 중앙에 있다고 올바르게 판단)인
-프레임에서 버그 코드는 -20~-30°대의 좌회전을 계속 명령하고 있었다.
-
-**수정:** `DLLaneDetector._worker()`가 매 추론마다 `self.roi_w = self._slide.roi_w`로 동기화하도록
-한 줄 추가(`yellow_centers`/`da_area_jump`와 동일한 관례). `__init__`의 `self.roi_w = DL_INPUT_W`는
-첫 프레임 처리 전까지만 쓰이는 초기 플레이스홀더로 남겨두되 주석으로 명시. 수정 후 같은
-standalone 검증 스크립트로 `DLLaneDetector.roi_w`가 첫 프레임부터 585로 정확히 갱신되는 것을
-확인했다.
-
-**영향 범위:** `LANE_DETECTOR_BACKEND='dl'`(현재 기본값) 전용 — `hough`/`classic_cv` 백엔드는 각자
-`roi_w`를 실제 처리 이미지 shape에서 직접 얻어써서 이 문제가 없다(`perception/hough_lane.py`/
-`perc_floor.py` 확인함). `_lane_steer()`(S1/S3 차선주행, B1 라바콘 — §3에서 동일 함수 재사용)와
-`_update_lane_side()`(회피 방향 판정, §4) 둘 다 `self.lane_detector.roi_w`를 쓰므로 이 수정 하나로
-같이 고쳐진다.
-
-**알려진 한계:**
-- 아직 실차 재검증 전이다 — 이번 검증은 raw 카메라 프레임을 오프라인 재생한 것이라 실제 피드백
-  루프(잘못된 조향이 다시 카메라 프레임을 바꾸는 폐루프 동역학)까지는 반영하지 못한다. 다만 버그
-  자체는 프레임 내용과 무관한 순수 상수 오차라, 폐루프에서도 방향(좌편향)과 대략적 크기는
-  그대로일 가능성이 높다.
-- 이 버그가 그동안 §0.5.x/§2.x에서 다뤄온 "진동"/"흔들림" 계열 증상들과 실제로 얼마나 섞여
-  있었는지는 분리해서 확인된 바 없다 — 이 수정 이후 실차 재테스트에서 기존 진동 대응
-  튜닝값(`PP_ALPHA`/`PP_DX_DEADZONE_PX`/§0.5.9 직진모드 임계값 등)이 여전히 최적인지 같이
-  재검토할 것. 상시 편향(이번 버그)과 프레임간 잔떨림(기존 진동 이슈)은 서로 다른 종류의
-  문제라 원래는 구분해서 봐야 하는데, 지금까지는 이 편향이 깔린 채로 진동만 따로 잡으려던
-  것일 수 있다.
-
-### 2.36 [중대 버그] 회피 중 근접 밴드 미검출 몇 프레임 사이 `self.path`가 몰래 흘러가다
-룩어헤드가 한 틱 만에 점프해 벽 충돌 — 카카오톡 회피 녹화로 발견 (2026-08-17)
-
-**배경:** 사용자가 공유한 실차 회피 녹화(`KakaoTalk_Video_2026-08-17-13-03-53.mp4`)에서
-17초경부터 사물/차량 회피 기동이 시작됐고, 21초경 `dl_lane` 디버그창의 룩어헤드 표시점
-(`ld:XXpx`)이 그 직전 프레임과 전혀 다른 위치로 순간이동한 직후 그대로 벽에 충돌.
-`ffmpeg`로 해당 구간을 프레임 단위 추출해 확인 — offset/lane_center 표시값이 정상 범위
-(+5.8~+25.9)에서 갑자기 정확히 0.0/292.5(=roi_w/2, "화면 정중앙")로 튀는 순간과 룩어헤드
-점프 시점이 일치했다.
-
-**원인:** `DLSlideWindow.detect()`에서 `lane_valid`(근접 밴드 중심 `near_center` 존재 +
-`ll_coverage` sanity 통과)와 `self.path`를 갱신하는 `_fit_and_sample_path()`/
-`_update_path()`가 서로 다른 조건으로 동작했다 — `_fit_and_sample_path()`는 근접 밴드가
-없어도 원거리 밴드만 2개 이상 있으면 경로를 만들어내므로, `lane_valid=False`인 프레임에도
-`self.path`는 계속 EMA로 움직이고 있었다. 반면 track_drive.py `perc_lane()`은
-`if valid and path: self.lane_path = path`로 **디바운스된 `lane_valid`가 True일 때만**
-실제 조향에 쓰는 `self.lane_path`를 갱신한다(2026-08-10 커밋에서 명시적으로 의도한
-"무효 구간엔 마지막 경로 유지" 정책, 위 §2.35 인접 커밋 참고). 즉 외부(`self.lane_path`)는
-얼려서 보관 중인데 내부(`self.path`)는 몰래 계속 흘러가는 이원화 상태였다 — 회피 중
-장애물이 근접 밴드를 몇 프레임 가리는 동안 이 상태가 지속되다가, 근접 밴드가 다시 잡혀
-`lane_valid`가 True로 복귀하는 순간 `self.lane_path`가 그동안 몰래 흘러간 `self.path`
-값으로 EMA 완충 없이 한 틱 만에 통째로 점프했다. `_update_path()` 자체의 `PATH_EMA_ALPHA`
-블렌딩은 "매 프레임 새로 피팅된 경로"에는 완충 효과가 있지만, "여러 프레임 누적된 채
-얼려뒀다가 한 번에 노출되는 값"에는 완충이 전혀 되지 않는다는 게 맹점이었다.
-
-**수정:** `perception/dl_lane.py` `DLSlideWindow.detect()`에서 `_update_path(fitted_path)`
-호출을 `if lane_valid:`로 감쌌다 — 이번 프레임 `lane_valid`가 False면 내부 `self.path`도
-갱신을 건너뛰어 외부 `self.lane_path`와 동일한 시점에 얼어붙는다. 이러면 무효 구간이 끝난
-후에도 `_update_path()`가 "마지막으로 얼어붙은 값 → 새 값" 사이를 원래 의도대로
-`PATH_EMA_ALPHA`로 한 프레임씩 완충하며 따라가므로, 다시 한 번에 점프하는 대신 매끄럽게
-수렴한다.
-
-**알려진 한계:**
-- 실차 재검증 전이다(오프라인 코드 리뷰 + 녹화 재생 기반 진단). ROS2 툴체인이 이 환경에
-  없어 `python3 -m py_compile`까지만 확인했다(`CLAUDE.md` "이 환경엔 ROS2 툴체인이 없음"
-  참고).
-- 이번 진단은 "무엇이 룩어헤드를 점프시켰는지"에 집중했고, 애초에 근접 밴드가 몇 프레임
-  동안 안 잡힌 근본 원인(장애물 자체의 시야 가림인지, avoid-hold da 처리와 상호작용인지)은
-  따로 확인하지 않았다 — `DL_DA_SKIP_LL_CLIP=True`(현재 기본값, §해당 config.py 주석)라
-  이번 녹화 구간에서 avoid-hold의 `_clip_da_by_ll()` 강제 클리핑 자체는 매 프레임
-  건너뛰어지고 있었을 가능성이 높아, 밴드 미검출은 da 세그멘테이션 자체의 순간적 실패일
-  개연성이 크다(단, `avoid_hold_active` 중 `DL_DA_SKIP_LL_CLIP` 예외를 되살릴지는 별개
-  판단 필요 — 위 config.py `avoid_hold_improvement_proposal.md` 참고).
-- `dl_lane` 디버그창에 avoid-hold ll클리핑이 밴드별로 실제 몇 px를 잘랐는지 보여주는
-  시각화(초록/주황 세로선 + 바이어스 px 텍스트, `visualize()`)와, 화면의 빨간 세로선이
-  `_lane_steer()`의 `vehicle_x` 기준점과 동일한 값임을 알려주는 `vehicle_x` 라벨을 이번에
-  같이 추가했다 — 둘 다 실차 미검증 순수 디버그 오버레이(판단 로직에는 영향 없음).
-
-### 2.37 §2.35가 되돌린 `roi_w/2.0`(292.5) 자체도 진짜 차량 중심이 아니었던 문제 — BEV
-사다리꼴 실측 기하로 재계산 (2026-08-17)
-
-**배경:** 사용자가 `ll` 디버그창의 빨간 세로선(차량 중심 표시, 위 §2.36에서 `vehicle_x`
-라벨을 붙인 바로 그 선)이 실제로 어떤 기준으로 그려지는지 질문 — 확인해보니 §2.35가
-"정상값"으로 되돌린 292.5(`DL_BEV_CANVAS_W/2.0`)도 캔버스 폭을 단순히 반으로 나눈 값일
-뿐, `DL_BEV_SRC_PX`(좌/우 백선을 실측으로 손으로 찍은 4점, `config.py DL_BEV_SRC_PX_RAW`
-참고)가 카메라 광축 기준 좌우 대칭이란 보장은 어디에도 없었다는 걸 재확인했다.
-
-**증상/원인:** 실제 `DL_BEV_SRC_PX_RAW` 4점(TL=[246,257], TR=[455,257], BR=[635,333],
-BL=[60,333], 원본 640px 프레임 기준)을 찍어보면 근거리 변(BL–BR)조차 화면 중앙(x=320)
-기준으로 왼쪽 260px/오른쪽 315px로 비대칭이다 — 즉 `roi_w/2.0`은 "BEV 캔버스의 기하학적
-중점"일 뿐 "차량이 실제로 도로 위 어디 있는지"와는 애초에 별개 값이었다. 조향/시각화 전부
-이 캔버스 중점을 차량 중심으로 가정하고 있었다(`DLSlideWindow.detect()`의
-`offset`/`lookahead`/`lane_center`, `visualize()`의 빨간선, `_lane_steer()`/
-`_update_lane_side()`의 `roi_w/2.0`).
-
-**수정:** 사다리꼴의 "가까운 변"(BR–BL, 차량 바로 앞)의 중점을 `DL_BEV_SRC_PX→DL_BEV_DST_PX`
-워프에 그대로 통과시켜, 그 변환이 실제로 만들어내는 캔버스 x좌표를 차량 중심
-(`DL_BEV_VEHICLE_CENTER_X`, `perception/dl_lane.py` 모듈 상수)으로 쓰도록 바꿨다.
-`DLSlideWindow.detect()`가 매 프레임 `self.vehicle_center_x`로 노출하고, `DLLaneDetector`가
-`roi_w`와 동일한 방식(`_worker()`에서 동기화)으로 이걸 그대로 복사해 노출한다.
-`_lane_steer()`/`_update_lane_side()`는 `getattr(ld, 'vehicle_center_x', None)`으로 이 값을
-우선 쓰고, 없으면(`hough`/`classic_cv` 백엔드) 기존처럼 `roi_w/2.0`로 폴백한다. 위 §2.36의
-`vehicle_x` 빨간선/라벨도 이제 이 값을 그대로 가리키도록 같이 옮겼다.
-
-**실측(계산값):** `DL_BEV_CANVAS_W=585`(§2.35와 동일) 기준, 새로 계산한
-`DL_BEV_VEHICLE_CENTER_X ≈ 320.18` — §2.35가 "버그"라고 되돌렸던 `DL_INPUT_W/2=320`과
-공교롭게도 거의 일치하고, §2.35가 "정상"이라고 되돌린 `292.5`와는 오히려 **27.7px
-(≈13.8cm)** 떨어져 있다. 즉 §2.35의 버그(우연히 640/2를 쓴 것)가 이 트랙 캘리브레이션
-기준으로는 292.5보다 실제 차량 중심에 더 가까웠을 가능성이 있다 — 다만 이건 지금 실측된
-`DL_BEV_SRC_PX_RAW` 4점에 한정된 우연이라 일반화하면 안 된다(카메라를 다시 마운트하거나
-4점을 재실측하면 이 값도 같이 바뀐다).
-
-**영향 범위:** §2.35와 동일 — `LANE_DETECTOR_BACKEND='dl'`(현재 기본값) 전용.
-
-**알려진 한계:**
-- 아직 실차/raw 재생 재검증 전이다. §2.35 때 썼던 `lap_005` standalone 재생 스크립트로
-  `vehicle_x=292.5`(구) vs `vehicle_x≈320.18`(신) 조향각 차이를 다시 비교해볼 것.
-- `DL_BEV_SRC_PX_RAW` 4점 자체가 재실측되면(§6.3) `DL_BEV_VEHICLE_CENTER_X`도 코드 재실행만으로
-  자동 재계산되지만, 그 4점이 애초에 정확한지(카메라가 차량 중심에 마운트됐는지, 백선이 실제
-  도로 중앙선 기준으로 평행한지)는 이 수정으로 검증되지 않는다 — 여전히 "실측 4점이 맞다"는
-  전제 위에서의 기하 보정일 뿐이다.
-
-### 2.38 da 안전마진(§2.30) 등방 → 속도비례 비등방(세로만) 확장 + `dl_lane` 창 yellow 패널 → 속도 패널 (2026-08-17)
-"방해차량의 좌우 마진과 뒤 마진이 같은가"라는 질문에서 출발 — 확인 결과 §2.30의 `_apply_vehicle_margin()`
-침식 커널이 `cv2.MORPH_ELLIPSE`를 정사각형(가로반경=세로반경=`VEHICLE_WIDTH_M/2+DL_DA_VEHICLE_MARGIN_M`)
-으로 만들어 써서, 좌우와 전/후("방해차량 뒤" 포함) 마진이 항상 같은 값이었다(등방). 요청 반영으로
-세로(진행방향, BEV 캔버스 row축) 반경만 현재 속도(`v_mps`)에 비례해 추가로 늘리도록 변경 —
-`_dl_da_margin_kernel(v_mps)`(`perception/dl_lane.py`)가 `extra_m = min(DL_DA_REAR_MARGIN_REACT_SEC *
-v_mps, DL_DA_REAR_MARGIN_MAX_M)`만큼 세로 반경만 키운 타원 커널을 매 프레임 새로 만든다(가로=좌우는
-`DL_DA_VEHICLE_MARGIN_M` 그대로, 속도와 무관). `DL_DA_REAR_MARGIN_REACT_SEC=0.2`/`MAX_M=0.5`는 둘 다
-설계값(실측 아님) — config.py 주석 참고. `v_mps`는 `track_drive.py`가 매 틱
-`lane_detector.set_speed(self.v_mps)`로 넘기고(`set_avoid_hold()`와 동일한 락+워커 전달 관례),
-`DLSlideWindow.detect(..., v_mps=...)` → `_apply_vehicle_margin(da_mask, v_mps)`로 흘러간다.
-
-같은 요청에서 `dl_lane` 디버그 창(`show_debug_windows()`) 맨 아래 노란선(yellow) 전용 패널도 제거하고
-같은 자리에 현재 속도 + 직진/커브대응 상태(`is_straight`, §0.5.10d와 동일 텍스트/색)를 표시하도록
-바꿨다 — 노란선 자체는 result 패널에 이미 오버레이로 보이므로 정보 손실은 없다.
-
-**실차 미검증** — `DL_DA_REAR_MARGIN_REACT_SEC`/`MAX_M`은 첫 추정치. 코너에서 da가 §2.30이 이미 갖고
-있던 "과침식 시 원본 폴백"에 자주 걸리면(=da가 자주 무효 처리되면) 두 값을 낮출 것. §0.5.11의
-`SPEED_NORMAL=15.0` 증속과 함께 실차에서 같이 검증 필요.
-
-### 2.39 [중대 버그] `speed15` 프리셋 실차 테스트 중 재현된 두 위험 — LVC 트립 / 무감속 트랙 이탈 (2026-08-17)
-`pp_tune_gridsearch.py`가 찾은 `speed15` 프리셋(§8)을 실차에 켠 뒤 두 가지 문제가 카카오톡 영상으로
-보고됨.
-
-**① LVC(저전압 보호) 트립 재발.** 프리셋의 `SPEED_ACCEL_STEP=1.014`(기존 검증값 0.4의 2.5배)가
-2026-08-07에 이미 한 번 진단됐던 것과 동일한 패턴을 재현했다 — 영상 로그에서 `[INFO] ... spd=14.1`
-(커맨드 속도)이 계속 발행되는 동안 같은 시각 `dl_lane` 창의 `speed: +0.00 m/s`(VESC 실측 `v_mps`)는
-0에 멈춰있었다. 판단 로직이 속도를 낮춘 게 아니라 배터리 전압 강하로 ESC/VESC가 보호 트립된 뒤
-전류부하가 없어지며 전압이 회복 → 살아있던 고속 커맨드가 그대로 먹혀 급출발하는 "훅 멈췄다 확
-튀어나가는" 패턴. `config.py` §2 `SPEED_ACCEL_STEP` 주석(2026-08-07)에 이미 있던 근본원인 그대로.
-**수정:** 프리셋의 `SPEED_ACCEL_STEP`을 검증된 0.4로 되돌림.
-
-**② 커브 진입 중 da 밴드 핏 반복 실패 + 무감속 → 트랙 이탈.** 같은 영상 13~15초 구간에서 `dl_lane`
-경로(자홍색)가 통째로 사라졌다 나타나길 반복했다(좌회전 진입부, `offset`이 매 프레임
-`roi_w/2`(무효 폴백값)로 고정되는 패턴으로 확인) — da 세그멘테이션 자체는 화면상 멀쩡해 보이는데
-밴드 핏에 필요한 유효 슬라이스(2개 이상)를 몇 틱 연속 못 채운 것으로 보임. 이 "워커는 살아있지만
-결과가 계속 무효"인 실패모드는 기존 `lane_stale`(워커가 완전히 죽었을 때만 감지, `LANE_STALE_SEC`
-기반)로는 전혀 안 잡혔고, 하필 프리셋의 `SPEED_CORNER_MIN=14.05`(`SPEED_NORMAL=15`와 거의 같음)가
-코너 감속을 사실상 무력화해둔 상태라 이 블라인드 구간을 거의 무감속으로 통과하다 트랙 밖으로
-튀어나갔다.
-
-**수정 (두 갈래):**
-- 프리셋의 `SPEED_CORNER_MIN`을 프리셋 활성화 전 baseline이었던 10.0으로 되돌림(즉효, 수치 조정).
-- 구조적 보강 — `track_drive.py`에 `self._lane_invalid_streak`(연속 무효 프레임 카운터)와
-  `self.lane_unstable` 플래그 추가. `perc_lane()`이 매 틱 `lane_valid`가 False일 때마다 증가시키고
-  `LANE_UNSTABLE_FRAMES`(신규, `config.py`, 10프레임≈20Hz 기준 0.5초 — `LANE_STALE_SEC`의 2.0초보다
-  훨씬 짧게 잡아 "워커 고장"보다 훨씬 흔할 "이번 프레임을 못 믿겠다" 상황에 더 빨리 반응) 이상이면
-  `_lane_drive()`가 `lane_stale`과 동일하게 `SPEED_LANE_STALE`로 감속을 건다. `lane_stale`과
-  `lane_unstable`은 서로 다른 조건(워커 사망 vs 결과 연속 무효)이라 독립적으로 둘 다 확인한다.
-
-**알려진 한계:** 둘 다 실차 미검증 첫 수정이다. `LANE_UNSTABLE_FRAMES=10`이 실제로 이 실패모드를
-충분히 빨리 잡는지, 정상적인 1~2프레임짜리 디바운스 흔들림까지 오탐하진 않는지 실차에서 확인할
-것. 애초에 da 밴드 핏이 그 좌회전 진입부에서 왜 반복 실패했는지(세그멘테이션 자체 약점인지 속도
-상승에 따른 모션블러인지)는 이번에 원인 규명을 안 했다 — 재발하면 `DEBUG_VIZ_DL_LANE` 창을 그
-구간에서 직접 보고 원인을 좁힐 것.
-
-### 2.40 §2.39②의 실제 원인 확인 — 근접 밴드만 없었을 뿐 원거리는 있었는데도 경로가 통째로 얼어붙던 문제 (2026-08-17)
-§2.39②에서 "da 밴드 핏 반복 실패"라고 뭉뚱그렸던 것을 `DEBUG_VIZ_DL_LANE` 화면으로 다시 확인 —
-da 세그멘테이션 자체는 화면 아래쪽(근접, 차량 바로 앞)엔 비어있고 위쪽(원거리)에만 잡혀있었다.
-급좌회전 진입 중 차량 헤딩이 아직 도로 헤딩과 안 맞아서, 카메라 BEV의 근접 영역이 실제로 노면이
-아닌 걸 보고 있던 것으로 추정(세그멘테이션 모델 결함이 아니라 그 순간 근접 시야 자체에 도로가
-없었을 가능성).
-
-**진짜 원인은 §2.36 크래시 수정 자체에 있었다.** `_fit_and_sample_path()`는 원래 근접 없이 원거리
-점 2개만 있어도 경로를 만들 수 있는데(np.interp가 근접 구간은 가장 가까운 실측점 값으로 유지),
-§2.36에서 내부 `self.path` 갱신을 `lane_valid`(근접 밴드 `near_center` 필수)로 가드해버려서, 이런
-"근접만 없고 원거리는 있는" 상황에서도 원거리 정보를 아예 활용 못 하고 경로 전체가 얼어붙었다 —
-2초 넘게 아무 갱신도 없는 채로 실제로는 계속 움직이는 차량 위에 예전 경로가 그대로 남아있는
-꼴이었다.
-
-**수정:** `lane_valid`(offset/lane_center 전용, 근접 필수 유지)와 별도로 `path_ok`를 새로 뒀다 —
-근접 OR 원거리 둘 중 하나만 있어도(+ll sanity 통과) 참이 되는 raw 신호를, offset과 동일한 강도
-(`DL_STABLE_FRAME_MIN` 연속 확인)로 디바운스한다(`DLSlideWindow._debounce_path_ok()`,
-`perception/dl_lane.py`). §2.36이 막으려 했던 문제(내부 `self.path`와 외부
-`track_drive.py`의 `self.lane_path`가 서로 다른 조건으로 얼고 풀려 한 틱에 점프하는 것)는, 이제
-둘 다 같은 `path_ok` 값으로 가드하게 만들어서(`DLLaneDetector`가 `da_area_jump`와 동일한 관례로
-노출 → `perc_lane()`이 `getattr(..., 'path_ok', valid)`로 읽음) 재발 여지 없이 그대로 막힌다 —
-"근접 필수"라는 조건 자체를 완화한 것이지, §2.36의 안전장치(안팎 조건 일치)를 되돌린 게 아니다.
-
-**알려진 한계:** 실차 미검증. `path_ok`가 원거리만으로 통과되는 프레임에서 만들어지는 경로가
-실제로 조향에 안전한 품질인지(근접 없이 원거리 기울기만으로 외삽하는 셈이라 커브 곡률을
-과소/과대평가할 여지) 실차에서 확인할 것 — 문제가 보이면 `_debounce_path_ok()`의
-`stable_frame_min`을 늘리거나, `path_ok_raw` 조건에 원거리 슬라이스 개수 하한을 추가하는 걸
-고려할 것.
-
-### 2.41 [중대 버그] `speed15` 프리셋 — 좌우 진동("술 취한 듯한" 주행)의 진짜 원인은 `PP_WHEELBASE_PX` (2026-08-17)
-§2.39/§2.40 수정 이후에도 실차에서 새 증상이 보고됨 — 정지할 이유 없는 구간에서 차량이 좌우로 크게
-왔다갔다하는 진동(카카오톡 영상 2026-08-17 16:31, 사용자 표현 "술 취한 사람처럼"). `dl_lane`의
-`offset`이 프레임마다 -25.8 → 0.0 → 0.0 → -13.5로 튀고, 로그의 커맨드 속도(`spd`)도 9.7 → 5.6 →
-7.6 → 10.0 → 5.0으로 같이 출렁였다(조향 진동 → `_corner_signal` EMA → 코너 감속까지 같이 흔들림).
-
-**시행착오:** 먼저 `PATH_EMA_ALPHA`를 의심해 0.25 → 0.9(빠릿빠릿하게, §2.36/§2.40 논의 중)까지
-올려봤다가, 그 값에서 §2.40의 "근접만 없어도 경로가 얼어붙는" 문제가 도드라져 다시 낮추는 과정에서
-`SPEED_CORNER_MIN 10.0→7.0`/`PATH_EMA_ALPHA 0.75→0.25`로 재조정(2026-08-17j, xycar_ws 작업
-사본과 동기화)됐다. 그런데 **0.75에서도 0.25에서도 진동이 똑같이 재현**됨 — 즉 EMA 값과 무관하게
-진동하고 있었다는 뜻이라, alpha는 범인이 아니었다.
-
-**진짜 원인:** `speed15` 프리셋의 `PP_WHEELBASE_PX=47.36`(검증됐던 25.0의 거의 2배) — "곡률→조향각"
-변환 게인이라 크면 같은 인식 오차(dx)에도 조향각이 그만큼 세게 나간다. `pp_tune_gridsearch.py`
-화이트박스 시뮬레이션(§8)이 모터/서보 반응 지연이나 카메라 파이프라인 지연을 전혀 모델링하지
-않았는데, **지연이 있는 제어 루프에 게인을 너무 세게 걸면 진동/발산한다는 건 제어이론의 전형적인
-실패모드**다 — 시뮬레이션상 "더 정확했던" 조합이 실차에서는 지연과 만나 오히려 불안정해진 것.
-EMA(경로 반응속도)를 아무리 조정해도 게인 자체가 문제면 안 잡히는 게 당연하다.
-
-**수정:** `speed15` 프리셋의 `PP_WHEELBASE_PX`를 47.36 → 25.0(검증값)으로 되돌림. 프리셋의 나머지
-값(lookahead 스케일링 등)은 진동과 직접 관련이 적어 보여 그대로 유지 — 통째로 끄는 대신 이 게인
-하나만 되돌리는 수술적 접근을 택함.
-
-**알려진 한계:** 실차 재검증 전. `PP_WHEELBASE_PX`를 되돌려도 진동이 안 잡히면 다음 용의자는
-`PP_LOOKAHEAD_CURVATURE_GAIN=214.5`(기존 100.0의 2배 이상, 역시 그리드서치 산출물이라 같은
-"실차 지연 미반영" 위험을 안고 있음)다. 근본적으로는, `pp_tune_gridsearch.py` 시뮬레이션이
-제어 루프 지연을 아예 모델링하지 않는다는 게 이번에 드러난 설계 공백이다 — 나중에 이 툴을 다시
-쓸 일이 있으면 지연 모델(예: 조향 명령을 N틱 지연시켜 반영)을 추가하는 걸 고려할 것.
-
-### 2.42 `SPEED_LL_DEGRADED` 로직 삭제 — `DL_CENTER_MODE='ll'` 자체를 더 이상 안 씀 (2026-08-18)
-`SPEED_LL_DEGRADED`(2026-08-10 도입, §2절 "차량 속도/조향 기본값")는 `DL_CENTER_MODE=='ll'`
-조건이 걸려 있을 때만 발동하는 속도 상한이었다. `DL_CENTER_MODE`는 2026-08-13에 이미 `'da'`로
-전환됐고(§2.19 병합 이후 계속 `'da'` 유지) 이후로 되돌아간 적이 없어서, 이 조건 자체가 실질적으로
-계속 죽어있던 코드였다 — "속도 5 고정" 디버깅 중 확인. 차선(ll) 기반 주행을 더 이상 쓰지 않기로
-확정(요청 반영)해 아예 삭제:
-- `config.py`: `SPEED_LL_DEGRADED` 상수 삭제.
-- `track_drive.py`: `_lane_drive()`의 `target_speed = min(target_speed, SPEED_LL_DEGRADED)` 캡
-  블록, `_debug_viz_steer()`의 `LL 차선:...` 표시 블록 삭제.
-
-`DL_CENTER_MODE='ll'`/`'ll_da'` 옵션 자체와 `perception/dl_lane.py`의 `ll_degraded` 플래그 계산(밴드
-단위 저신뢰 추정 태깅)은 그대로 남겨뒀다 — 후자는 `_clip_da_by_ll()`류 da 클리핑/디버그 요약 태그
-(`[LL_DEGRADED]`)에서 여전히 쓰이는 별개 코드경로라 이번 삭제 범위 밖.
-
-### 2.43 [중대 버그] `SPEED_AVOID_HOLD_BLOCKED`가 "속도 5 고정"의 실제 원인 — 삭제 (2026-08-18)
-카카오톡 영상(2026-08-18 11:12) 프레임 분석으로 실차에서 속도가 5로 고정된 채 안 올라가는 증상의
-원인을 특정함. `avoid_hold_side==0`(좌우 다 안 비었다고 판정), `obstacle_front=True`(전방 장애물
-~1~1.14m)가 40초 넘게 지속되며 `_lane_drive()`의 §2.32 "적용4" 안전판이 계속 걸려있었다.
-
-**진짜 원인:** `config.py`에 `TEST_DISABLE_B2_B3 = True`로 실제 옆차선 회피 기동(B2/B3 dispatch)이
-꺼져있는데, `_update_avoid_hold()`/`SPEED_AVOID_HOLD_BLOCKED` 캡은 이 플래그와 무관하게 계속
-돈다(주석에 "TEST_DISABLE_B2_B3와 무관하게 매 틱 갱신"이라고 의도적으로 그렇게 적혀있었음). 회피
-기동이 실행됐다면 차량이 움직여 장애물과의 관계(거리/좌우 클리어)가 바뀌면서 유예가 자연히
-풀렸겠지만, 기동 자체가 꺼져있으니 상태를 바꿀 수단이 없어 무한정 5.0에 고정되는 구조였다.
-
-**수정:** `_lane_drive()`의 `if self.avoid_hold_active and self.avoid_hold_side == 0: target_speed
-= min(...)` 캡 블록과 `config.py`의 `SPEED_AVOID_HOLD_BLOCKED` 상수를 삭제(요청 반영: "필요없으면
-제거"). `_update_avoid_hold()` 타이머(`avoid_hold_active`/`avoid_hold_side`) 자체와, 그걸 입력으로
-쓰는 DA 클리핑 방향 편향(적용3, `perception/dl_lane.py` `set_avoid_hold()`/`_clip_da_by_ll()`,
-`AVOID_HOLD_DIR_BIAS_PX`)은 별개 기능이라 그대로 유지 — 속도캡 소비부만 제거.
-
-**알려진 한계:** 실차 재검증 전. 이 캡이 없어졌다는 건 "장애물에 근접 + 양옆 다 막힘" 상황에서
-더 이상 자동으로 감속하지 않는다는 뜻이다 — 지금은 `TEST_DISABLE_B2_B3=True`라 실질적 안전
-행동(회피 기동)이 어차피 없어서 감속만 남겨봐야 의미가 없다는 판단이지만, 나중에 B2/B3를 다시
-켜면 이 안전판 없이 근접 상황에서 속도를 그대로 유지한 채 회피를 시도하게 된다 — 그때 재검토할 것.
-또한 `avoid_hold_side==0`이 왜 그렇게 오래 지속됐는지(라이다 오탐 vs 실제 협소 구간 vs 차량이
-차선 중심을 벗어나 있었을 가능성)는 이번 조치로 해소되지 않은 별개 질문으로 남아있다.
-
-### 2.44 [중대 버그] 회피 시작 순간 waypoint가 근접부터 치우쳐 시작 — `_reject_outliers()`가
-정상인 근접 밴드를 오판 (2026-08-19)
-
-`avoid_hold_debug`/`dl_lane` 디버그 캡처(2026-08-19 10:45 캡처, `ll_bands:0/8`)로 방해차량 회피
-시작 순간 자홍색 waypoint(`self.path`)가 차량 중앙이 아니라 이미 한쪽으로 치우친 지점에서 시작하는
-증상을 확인 — 그 결과 Pure Pursuit의 lookahead 타겟점이 우연히 차량 중앙선 근처에 찍혀 조향이
-회피 방향으로 걸리지 않는 2차 증상까지 이어짐(단, 이 lookahead 단일점 샘플링 자체의 구조적 약점은
-이번 수정 범위 밖 — 아래 "알려진 한계" 참고).
-
-**원인:** `_da_slice_centers_windowed()`는 밴드별 독립 계산이라, 장애물이 원거리~중간 밴드만
-정당하게 옆으로 밀 때 근접 밴드는 아직 정상(중앙)이다 — 여기까진 의도된 동작. 문제는 바로 다음
-`_reject_outliers()`(`lane_util.py`) 단계: 근접 밴드를 검사할 때도 "나머지 전체 밴드"(이미 옆으로
-밀린 원거리 포함)로 leave-one-out 직선 추세선을 맞추는데, 원거리가 회피 규모(`PASS_OFFSET=80px`
-수준)만큼 밀리면 그 추세선 자체가 기울어져 **아직 정상인 근접 밴드가 오히려 그 추세에서 벗어난
-"이상치"로 오판**된다(`LANE_SLICE_OUTLIER_MAX=40px`는 이 정도 휨엔 쉽게 넘김). 근접 밴드가
-`None` 처리되면 `_fit_and_sample_path()`의 `np.interp`는 실측 범위 밖을 외삽하지 않고 "가장 가까운
-유효 밴드"(이미 치우친 중간 밴드)의 x값을 차량 위치까지 그대로 hold — waypoint 시작점이 근거 없이
-그 값을 물려받는다. 임계값을 넘기는 순간의 이산적 사건이라 "이전 프레임까진 중앙, 장애물 뜨자마자
-치우침"으로 관찰된다.
-
-**수정 (`_reject_outliers()` 오판 차단 + hold 타임아웃 2단계):**
-- ① `lane_util.py` `_reject_outliers()`에 `protect_indices` 인자 추가 — 이 인덱스는 이상치 검사
-  대상에서 제외(다른 밴드 판정의 "나머지"로는 계속 쓰임). `perception/dl_lane.py` `detect()`가
-  `DL_CENTER_MODE='da'`일 때만 `near_slices` 인덱스를 넘겨 근접 밴드를 보호한다('ll'/'ll_da'는
-  기존과 동일하게 전부 검사).
-- ② ①을 통과하고도 근접 밴드가 진짜로 비면(순간 미검출 등), `_da_prev_band_x[i]`(그 밴드가 마지막
-  으로 실제 찾았던 위치 — 못 찾은 프레임엔 갱신 안 되므로 자연히 "마지막 확인값"을 들고 있음)로
-  `DL_NEAR_HOLD_MAX_FRAMES`(신규, 3프레임≈0.15s) 프레임까지만 대신 채운다. 넘기면 포기하고 기존
-  spatial-hold 동작으로 자연 폴백 + `near_band_stale=True` 노출 → `track_drive.py` `_lane_drive()`가
-  `lane_stale`/`lane_unstable`과 동일하게 `SPEED_LANE_STALE`급 감속을 건다. 디버그 태그
-  `[NEAR_HELD]`(hold 중)/`[NEAR_STALE]`(타임아웃, `dl_lane` 창 상단 텍스트).
-
-**설계 근거:** ①이 근본 원인(오판)을 직접 차단하므로 ②는 드물게만(진짜 근접 소실) 발동해야 정상 —
-②를 "중앙 강제 고정"이 아니라 "직전 근접값 임시 유지 + 짧은 타임아웃"으로 설계한 이유는, 근접이
-사라지는 게 정말로 장애물이 코앞까지 온 경우(§2.30이 막으려는 "앞코가 뒷꽁지를 긁는" 상황)일 수도
-있어서다 — 중앙으로 강제 고정하면 그 위험 신호 자체를 지워버린다. 타임아웃을 짧게(3프레임) 잡은
-것도 같은 이유 — 오래 붙잡을수록 진짜 위험을 오래 숨기게 된다.
-
-**알려진 한계:** `DL_NEAR_HOLD_MAX_FRAMES=3`은 `SIDE_CLEAR_CONFIRM_FRAMES`/
-`AVOID_HOLD_RELEASE_CONFIRM_FRAMES` 등 비슷한 목적의 기존 상수(3~4프레임대)에 맞춰 추정한
-값으로 실차 미검증. 또한 이번 수정은 "근접이 근거 없이 원거리 값을 물려받는" 문제만 없앨 뿐,
-장애물이 실제로 커서 원거리~근접 전체가 정당하게 크게 휘는 경우 Pure Pursuit
-(`controller/pure_pursuit.py` `_target_point()`)이 호길이 기준 단일점만 보고 조향을 결정하는
-구조적 약점은 그대로 남아있다 — 경로가 S자로 중앙을 스치는 시점에 lookahead가 우연히 그 근처를
-찍으면 여전히 조향이 죽을 수 있다(별도 과제로 남김).
-
-### 2.45 da 안전마진 좌우/전후 분리 — `DL_DA_SIDE_MARGIN_M` 신설 (2026-08-19)
-
-§2.38까지도 `_apply_vehicle_margin()`의 좌우(rx) 반경과 전후(ry) 기본 반경이 `DL_DA_VEHICLE_MARGIN_M`
-하나를 공유했다(ry는 그 위에 속도비례 "뒤" 방향 추가분만 별도) — "방해차량 옆으로 지나갈 때 여유를
-조금만 더 주고 싶다"는 요청을 반영하려면 좌우만 독립적으로 조정할 수 있어야 하는데, 지금 구조로는
-그 값을 올리면 전후 기본값까지 같이 딸려 올라가는 부작용이 있었다.
-
-**수정:** `config.py`에 `DL_DA_SIDE_MARGIN_M`(좌우 전용)을 신설. `perception/dl_lane.py`
-`_dl_da_margin_kernel()`이 `rx`는 `DL_DA_SIDE_MARGIN_M`, `ry` 기본값은 `DL_DA_VEHICLE_MARGIN_M`
-(+속도비례 추가분, 기존과 동일)에서 각각 독립적으로 계산하도록 변경. 분리 직후엔 기존과 동일한 0.05로
-시작했다가, **같은 날 실차 테스트로 0.1m이 "딱 적당하게 잘 주행"함을 확인해 그 값으로 교체**(아래
-§2.46이 이 값을 올리며 같이 드러난 2차 증상).
-
-**알려진 한계:** `_apply_vehicle_margin()`은 여전히 da 마스크의 모든 경계(장애물 실루엣이든 트랙
-가장자리든)에 등방으로 적용된다 — `DL_DA_SIDE_MARGIN_M`을 올리면 "장애물 옆"만이 아니라 커브 등
-트랙 가장자리 여유도 같이 넓어진다(장애물 전용으로 고르는 기능은 없음). 너무 키우면 좁은 커브에서
-da가 `DL_DA_MIN_COMPONENT_AREA` 밑으로 꺼져 그 프레임이 무효 처리될 수 있으니, 값을 올릴 땐 가장
-좁은 커브 구간부터 `DEBUG_VIZ_DL_LANE`으로 확인할 것 — 0.1m 자체는 위 실차 확인을 거쳤지만
-`DL_DA_MIN_COMPONENT_AREA` 무효화 여부까지 전 구간 확인된 건 아님.
-
-### 2.46 근접 장애물 앞 Pure Pursuit 조향이 완만하게만 걸려 충돌 — 목표점 선택을
-"구간 내 최대편차점"으로 (2026-08-19)
-
-§2.45에서 `DL_DA_SIDE_MARGIN_M`을 0.1로 올린 뒤 실차 테스트 중, 근접 장애물 앞에서 경로가 근접부는
-급하게 옆차선 쪽으로 꺾이고 그 뒤로는 완만해지는(비단조적) 모양이 될 때 차량이 급하게 차선을
-바꿔야 하는데도 완만하게만 돌아 충돌하는 증상 확인.
-
-**원인:** `pure_pursuit.py` `_target_point()`는 "차량~lookahead_px 호길이 지점 딱 한 점"만 보고
-그 점까지의 각도(alpha)로 곡률(`2*sin(alpha)/ld`)을 계산한다. 근접부가 아무리 급하게 꺾여도 lookahead
-지점(그 뒤 완만해진 구간)의 각도는 작고 ld(거리)는 커서, curvature가 작게 나와 조향이 약하게만
-걸린다 — 정작 지금 당장 크게 틀어야 하는 근접 급커브 정보가 "먼 점 하나"에 희석되어 사라진다.
-
-**수정:** `pure_pursuit.py`에 `_target_point_max_deviation()` 신설 — `_target_point()`와 동일하게
-차량~lookahead_px 구간을 훑되, "호길이가 lookahead_px에 도달하는 딱 한 점"이 아니라 **그 구간 안에서
-가로편차(|x-vehicle_x|)가 가장 큰 점**을 목표점으로 삼는다. `control()`에 `near_obstacle=False`
-기본값 인자를 추가해 이 인자를 안 넘기는 기존 호출부는 전과 완전히 동일하게 동작하고,
-`track_drive.py` `_lane_steer()`가 `path` 인자를 명시로 안 받는 분기(=평상시 S1 차선주행,
-`_lane_drive()`가 씀)에서만 `obstacle_front and obstacle_dist < AVOID_HOLD_TRIGGER_DIST_M`(1.5m,
-기존 상수 재사용)일 때 `near_obstacle=True`로 넘긴다. `_handle_lavacon()` 등 `path`를 명시로 넘기는
-호출부는 이 분기 자체를 안 타므로 구조적으로 이번 변경과 무관하다.
-
-**"평상시 주행은 절대 안 건드린다"는 제약을 만족시키는 설계 근거:**
-- `near_obstacle=False`(기본값)일 때 `control()`은 `_target_point()`를 그대로 호출 — 코드 경로가
-  기존과 바이트 단위로 동일.
-- `near_obstacle=True`가 되어도, 경로가 단조롭게 휘는 보통 커브(장애물 유무 무관)라면 편차가 거리에
-  비례해 커지므로 최대편차점은 결국 `_target_point()`가 고르는 가장 먼 점과 같아진다 — 실제 결과가
-  달라지는 건 경로가 진짜 비단조적으로 꺾여있을 때뿐이다.
-- 트랙 벽이 급커브에서 라이다 전방 ROI에 걸려 `obstacle_front`가 오탐되더라도(가능성 있음, 코너
-  안쪽에 고정 장애물이 실제로 배치되는 트랙 설계 참고), 그 커브가 단조롭다면 위 근거로 결과가 거의
-  안 바뀐다.
-
-**알려진 한계:** ①"단조 커브면 무해하다"는 논리적 추론이지 실차 검증은 아직 안 됨 — 급커브
-구간(특히 코너 안쪽 고정장애물이 있는 구간)에서 오작동 여부를 별도로 확인할 것(사용자 요청,
-"우선 이거 구현하고 커브에서도 오작동하는지 검사"). ②근접 밴드 프레임 노이즈가 순간적으로 큰 편차를
-만들면 그게 "최대편차"로 잘못 잡힐 수 있음 — §2.44 근접밴드 hold(A+C)가 어느 정도 완화하지만
-완전히 없애진 못함. ③댐핑용 `probe_curvature` 계산(같은 `control()` 안의 `probe_tx/probe_ty`)은
-의도적으로 그대로 `_target_point()`를 쓴다 — lookahead 축소량 자체를 바꾸는 게 아니라 "목표점
-선택"만 바꾸는 것으로 범위를 좁혀 회귀 위험을 최소화하기 위한 결정.
-
-### 2.47 `DEBUG_VIZ_AVOID_HOLD` 창에 "avoid_hold가 어떤 라이다 클러스터를 보고 판단했는지"
-BEV 시각화 추가 (2026-08-19)
-
-**배경:** `avoid_hold_debug` 창은 지금까지 `front=True dist=1.2m` 같은 숫자만 보여줬는데, 같은 전방
-ROI에 벽/다른 물체 점이 같이 잡혀도 실제로 트리거 판단에 쓰인 게 어느 점 묶음(클러스터)인지는 알 수
-없었음(요청: "avoid_hold가 활성화될 때 어떤 라이다 클러스터를 보고 결정했는지 디버그창에 띄워달라").
-
-**수정:** `perc_obstacle()`가 전방 ROI 안에서 인접 인덱스로 묶은 클러스터 중 최근접 하나(`tgt`, 기존
-로직 그대로)를 고를 때, 그 클러스터 원본 좌표(`self._obstacle_cluster_x/y`)와 같은 ROI의 나머지 점
-(`self._obstacle_front_all_x/y`, 비교용 배경)을 매 틱 같이 저장하도록 함. `_debug_viz_avoid_hold()`가
-이 라이브 값을 작은 BEV 패널(빨강=현재 판정에 쓰이는 클러스터, 회색=같은 ROI의 미사용 점)로 매 프레임
-그린다 — 전방 ROI에 아무 점도 없으면 패널도 정직하게 비워두고 "(전방 ROI에 점 없음)"이라고 표시한다.
-
-**시행착오:** 처음엔 `_update_avoid_hold()`의 "새 트리거" 분기(target_speed_est 스냅샷과 같은 자리)
-에서 클러스터 좌표를 한 번만 복사해 그 유예(hold) 구간 내내 고정 표시하는 방식으로 만들었다 — 장애물이
-멀어져도 "왜 트리거됐는지"가 계속 보이게 하려는 의도였는데, 실차에서 "창이 한번 켜지고 업데이트 안 됨"
-으로 보고됨. 원인은 두 가지: ①설계 자체가 "다시 트리거되기 전까진 고정 표시"라 매 프레임 갱신되는
-다른 창들과 다르게 보였고, ②`perc_obstacle()`가 장애물을 더 이상 못 볼 때 `obstacle_dist` 등은
-리셋하면서 새로 추가한 클러스터 좌표 배열은 리셋을 빠뜨려 예전 점이 계속 남아있었다(실제 버그). 라이브
-표시로 바꾸고 리셋 누락을 고쳐서 해결 — "왜 아직 유예 중인지" 설명용 트리거 시점 값
-(`self._avoid_hold_trigger_*`, 원인/클러스터점개수/거리/폭/종류/횡위치)은 텍스트로만 별도 유지.
-
-**알려진 한계:** 실차 미검증(오프라인 코드 작성 + `py_compile`/synthetic 데이터로 렌더링 로직 단위
-테스트까지만 확인) — 실제 라이다 프레임에서 BEV 패널 축척(`PPM`)이 겹치는 클러스터를 구분해 보여주기
-충분한지는 실차에서 확인 필요.
-
-### 2.48 da 근접 컷("obstacle-cut") 도입 배경 — Pure Pursuit lookahead 확장을 검토했다가 폐기 (2026-08-20)
-
-**배경:** 장애물/방해차량 근처에서 회피 반응이 너무 완만하다는 문제(§2.30 da 안전마진의 국소 침식만으로는
-장애물 바로 앞에서만 살짝 밀리고 끝남)를 놓고, 처음엔 Pure Pursuit lookahead를 늘려 더 멀리서부터
-목표점을 보게 하는 방향을 검토했다. 하지만 `curvature = 2·sin(α)/ld` 공식상 목표점까지 거리(ld)가
-커질수록 같은 횡편차(dx)라도 곡률 추정이 `dx/ld²`로 오히려 희석되는 역효과가 있음을 확인(개념 검토
-단계에서 폐기, 코드 반영 안 함) — 특히 da 안전마진이 만드는 경로는 "가까이는 거의 안 밀리다가 장애물
-근처서야 확 밀리는" 모양이라, lookahead를 늘리면 아직 안 꺾인 초반 구간을 목표점으로 잡아버려 반응이
-더 죽는 역설이 있었다.
-
-**전환한 방향:** 목표점 선택을 손보는 대신, **da 마스크 자체를 차량↔장애물 사이 구간에서 장애물 쪽
-절반만 통째로 잘라("근접 컷") 갈림길을 뚜렷하게 만드는** 방식으로 바꿨다 — 이러면 Pure Pursuit이
-평소 코너/분기를 따라가듯 자연스럽게 이른 조향을 낸다. 컷의 방향(장애물→원거리로 자를지, 차량→장애물
-사이를 자를지)도 논의 끝에 후자로 확정했다 — 전자는 컷의 가까운 경계가 여전히 장애물 위치에 고정돼
-있어 차량이 물리적으로 접근해야만 lookahead 안에 들어오므로, 반응 타이밍이 실제로는 하나도 안 당겨지는
-문제가 있었다.
-
-**da BEV 캔버스의 표현 한계**: `DL_BEV_FAR_LIMIT_M=0.7m`(원거리 크롭, §"6.3 DL 백엔드 BEV 캘리브레이션"
-참고)보다 먼 거리는 da 안에 애초에 존재하지 않는다 — 그래서 컷의 "먼 경계"는 장애물 실측거리로 계산할
-필요 없이 그냥 캔버스 자체의 끝으로 고정해도 된다(아래 §2.51 참고). 트리거 거리(`OBSTACLE_CUT_TRIGGER_X_MAX_M=1.0m`)는 이 0.7m보다 살짝 여유를 둬서, 라이다+YOLO 디바운스가 끝나는 시점이 da가 실제로
-컷을 보여줄 수 있는 경계 바로 앞에 오도록 확정했다.
-
-**물리적 여유 검토**: 필요 최소 횡이동(차폭 절반+장애물 반폭+여유 ≈0.3m)을 원호 기하로 계산하면,
-실측 축거(`WHEELBASE_M=0.335m`) 기준 조향각 20°대 후반~30° 근방이 나와야 하고 그게 겨우 0.7m 안에
-들어오는 수준(15°는 0.82m 필요해서 못 들어옴) — 여유가 얇다. `ANGLE_RATE_MAX` 램프업 시간까지 감안하면
-더 줄어든다. 그래서 `obstacle_cut_active` 동안 전용 속도 캡(`SPEED_OBSTACLE_CUT`)을 추가했다 — 거리를
-늘릴 순 없어도 속도를 낮추면 같은 거리를 지나는 데 걸리는 시간이 늘어 램프업 여유가 커진다.
-
-**알려진 한계:** 전부 개념 검토/계산 단계 결론이라 실차 미검증. `ENABLE_OBSTACLE_CUT=False`가 기본값 —
-아래 §2.49~§2.51의 부호규약·트리거·유지타이머가 실차에서 저속으로 먼저 검증돼야 켤 수 있다.
-
-### 2.49 da 근접 컷 진입 트리거 — 라이다 AND YOLO 이중확인, 독립 ROI (2026-08-20)
-
-**설계:** `perc_lavacon_trigger()`(§3.1)와 동일한 "라이다 클러스터 AND YOLO 카메라 검출" 이중확인
-패턴을 재사용했다 — 라이다 단독 판정은 벽 모서리 등에서 오검출 여지가 있어서다. 다만
-`perc_obstacle()`의 공유 ROI(`FRONT_X_MAX`/`FRONT_Y_HALF`, B2/B3/avoid_hold와 공유)는 그대로 두고,
-이 트리거 전용의 독립 라이다 ROI(`OBSTACLE_CUT_TRIGGER_X_MAX_M=1.0m`/`OBSTACLE_CUT_TRIGGER_Y_HALF_M=0.55m`)를
-`perc_obstacle_cut_trigger()`가 자기완결적으로 새로 계산한다 — 나중에 그 공유 소비처들의 튜닝이 이
-트리거와 갈라져도 서로 간섭하지 않게 하려는 목적.
-
-**YOLO 차량 검출기**: 전용 파인튜닝 모델 없이, `fix/da-corridor-near-band-margin` 브랜치(커밋
-`3be0fb6`)에서 `perception/yolo_vehicle.py` + `yolo_ros/yolov8n_car.onnx`를 그대로 이식했다 — COCO
-사전학습 `yolov8n.pt`를 ONNX(nms=True)로 내보낸 뒤 `car`(class_id=2) 클래스만 필터링해 쓴다. 이식
-브랜치에서 raw 캡처로 육안 확인한 결과 신뢰도 0.15~0.78 범위로 실제 방해차량(RC카 모형)이 정확히
-박싱됨을 확인했고, `truck` 클래스는 카트/의자를 최고 신뢰도(0.81)로 오탐해 제외됐다. YOLO 검출기 초기화
-실패 시(`onnxruntime` 미설치, opset 18 비호환 등) 라이다 단독 판정으로 자동 폴백한다.
-
-**범위 한계(의도적):** YOLO가 `car` 클래스만 봐서 B3(방해차량)만 커버한다. B2(고정장애물, 실측
-20×41×16cm 발포블록)는 매칭되는 COCO 클래스가 없어 이 트리거가 반응하지 않는다 — 라이다 단독으로는
-`obstacle_front`가 잡혀도 카메라 AND 조건을 못 채워 `obstacle_cut_trigger`가 확정되지 않는다. 전용
-모델 학습 전까지는 알려진 갭으로 남긴다.
-
-**알려진 한계:** `OBSTACLE_CUT_TRIGGER_Y_HALF_M=0.55m`는 실차 미검증 추정치(`LANE_WIDTH_M=0.4m` 기준
-한 차선+여유). `yolov8n_car.onnx`는 opset=12로 변환 시도했으나 실패해 실제로는 opset=18로 내보내졌다
-— Jetson `onnxruntime` 버전이 이를 지원 못 하면 로드 자체가 실패할 수 있음(실패 시 라이다 단독 폴백은
-이미 설계돼 있음).
-
-### 2.50 da 근접 컷 유지/해제 타이머 — "카메라 소실 ≠ 회피 종료" (2026-08-20)
-
-**배경(요청 원문):** "회피하다가 카메라에 자동차가 사라지면 회피 모드가 바로 꺼지나? 회피하고 바로
-복귀하는 게 아니라 꺼지는 로직도 작동시켜서 차선 복귀에 어느 정도 시간이 걸리게 해야 한다." 조사 결과,
-정확히 이 문제를 풀려고 만든 기존 메커니즘(`avoid_hold`, §2.32~§2.33)이 이미 있었지만, `TargetPassing`
-(B2/B3 FSM)의 복귀 판단에는 전혀 연결돼 있지 않고 카메라/da 중심선 클리핑 경로에만 쓰이고 있었다 —
-그리고 새로 만드는 이 근접 컷 메커니즘에는 당연히 아직 아무 타이머도 없었다.
-
-**설계:** `avoid_hold`와 정확히 같은 이유(§2.32: "카메라가 차량 앞코에 있어 장애물을 지나치는 순간
-즉시 원래 폭으로 돌아와... 너무 이른 복귀가 충돌로 이어질 위험")를 이 근접 컷에도 그대로 적용하되,
-`avoid_hold_active`를 재사용하지 않고 완전히 독립된 상태(`obstacle_cut_active`, `_update_obstacle_cut_hold()`)로
-분리했다 — `avoid_hold_active`는 이미 다른 소비처(DL 워커의 `_clip_da_by_ll()` 재활성화)에 쓰이고 있어
-재사용하면 두 메커니즘이 뒤섞인다.
-- **진입** — `perc_obstacle_cut_trigger()`가 디바운스 통과시키는 순간 hold-start 시각을 찍는다.
-- **최소유지(floor)** — `OBSTACLE_CUT_HOLD_SEC_MIN`(2.0s) 동안은 라이다/YOLO가 뭐라 하든 무조건 유지.
-- **해제** — floor를 넘긴 뒤, **진입과 동일한 전용 트리거 ROI**로 재계산한 "clear" 상태가
-  `OBSTACLE_CUT_RELEASE_CONFIRM_FRAMES`(4프레임) 연속 유지돼야 해제한다. **일부러 YOLO는 해제 판단에서
-  다시 안 본다** — 방해차량이 옆/뒤로 빠져 카메라 FOV에서 자연히 사라지는 건 정상 현상이지 "회피가
-  끝났다"는 근거가 아니므로, YOLO는 진입 확신에만 쓰고 퇴장 판단에는 관여시키지 않는다.
-- **해제 ROI 일치 주의** — `perc_obstacle()`의 공유 `obstacle_front`/`obstacle_dist`(범위가 다름,
-  5.0m/1.5m)를 재사용하지 않고 진입과 같은 독립 ROI로 다시 계산한다(`_obstacle_cut_roi_clear()`) —
-  범위가 다르면 해제 타이밍이 설계 의도와 어긋난다.
-
-**속도 캡과의 관계**: `SPEED_AVOID_HOLD_BLOCKED`가 "속도 5 고정" 버그의 원인이었던 전례(§2.43 — 풀
-방법 없이 무한정 고정되는 캡)를 반면교사 삼아, `SPEED_OBSTACLE_CUT` 캡은 `obstacle_cut_active`가
-스스로 해제되는 경로(위 floor+release 디바운스)를 갖고 있는 상태에만 걸리게 했다 — 같은 함정 재발
-방지.
-
-**알려진 한계:** `OBSTACLE_CUT_HOLD_SEC_MIN`/`OBSTACLE_CUT_RELEASE_DIST_M`/`OBSTACLE_CUT_RELEASE_CONFIRM_FRAMES`
-전부 실차 미검증 추정치(`avoid_hold`가 6개 미실측 파라미터로 시작했던 것과 같은 상황). 방해차량을
-확정 트리거한 뒤 카메라 FOV 밖으로 빠지는 상황을 실차에서 재현해, 컷이 즉시 안 풀리고 유지되다가 라이다로
-진짜 클리어된 뒤에야 풀리는지 확인하는 게 이번 작업 전체의 핵심 검증 항목.
-
-### 2.51 `_clip_da_by_obstacle()` — da 근접 컷 클리핑 메커니즘 (2026-08-20)
-
-**구현:** `perception/dl_lane.py`의 `_clip_da_by_ll()`(§2.14 ll 잔상+가상경계)/`_apply_vehicle_margin()`
-(§2.30 차폭 안전마진)에 이은 세 번째 "근거(픽셀) 없이 강제로 da를 클리핑"하는 함수 — 다만 여기서는
-근거가 픽셀이 아니라 라이다+YOLO로 확정된 외부 신호(§2.49의 `obstacle_cut_trigger`)다. `detect()` 안에서
-`_clip_da_by_ll()` 이후, `_apply_vehicle_margin()` 이전에 적용해 레이어가 자연스럽게 쌓이게 했다.
-좌우 어느 절반을 자를지는 `obstacle_y_m`(라이다 실측, +좌측) 부호로 결정한다.
-
-**da 완전 소실 방지 안전장치:** 클리핑 후 열린(반대) 쪽에 남는 da 폭이 `OBSTACLE_CUT_MIN_REMAIN_PX`
-미만이면 컷 자체를 건너뛰고 원본을 그대로 반환한다 — 안 그러면 da가 그 구간에서 완전히 비어
-`pure_pursuit.control()`의 "path 없으면 직전 조향각 유지(held)" 폴백이 걸려, 회피가 가장 필요한 순간
-조향이 오히려 얼어붙는 위험이 있다(세션 초반 lookahead 논의에서 다룬 그 hold 메커니즘). `_apply_vehicle_margin()`
-의 "침식으로 da가 통째로 비면 원본 반환" 폴백과 동일 원칙.
-
-**최상위 스위치:** `ENABLE_OBSTACLE_CUT=False`가 기본값이다 — `ENABLE_BEHAVIOR`/`TEST_DISABLE_B2_B3`와
-무관하게 독립적으로 켜고 끌 수 있다(이 기능은 `perc_lane()`/`detect()` 안, 즉 매 틱 상시 도는 차선인식
-경로에 있어 미션/Behavior 플래그로는 안 꺼짐 — 그래서 별도 최상위 스위치가 필요했다). 꺼져 있으면
-`perc_obstacle_cut_trigger()`가 항상 `False`를 반환해 `_clip_da_by_obstacle()`이 사실상 아무 일도
-안 한다.
-
-**★부호규약 — 실차 첫 검증 필수★:** `obstacle_y_m>0`(라이다 좌측)이면 da BEV 캔버스에서 작은 x(왼쪽)
-절반을 자른다(이미지 좌표계라 x가 클수록 화면 오른쪽=물리적 우측이라는 가정). 반대로 자르면 열린 쪽이
-아니라 장애물 쪽으로 조향하게 되는 치명적 버그이니, 반드시 정지/저속 상태에서 `obstacle_cut_debug`/
-`dl_lane` 창으로 컷 사각형이 장애물 쪽에 나오는지부터 확인할 것.
-
-**알려진 한계:** `OBSTACLE_CUT_NEAR_M`(0.3m)/`OBSTACLE_CUT_LANE_HALF_WIDTH_PX`(None이면 `LANE_WIDTH_M`
-기반 계산)/`OBSTACLE_CUT_MIN_REMAIN_PX`(40px) 전부 실차 미검증 추정치. 컷 폭을 "차로 절반"으로 고정해
-뒀는데, 대회 규정상 노란 중앙선 침범 허용 범위에 맞춰 재조정이 필요할 수 있음. 해제 시 컷 경계를
-즉시 스냅(0/1)하는 방식으로 구현했다 — 지수감쇠(taper)로 서서히 되돌리는 방식도 검토했으나, 실차에서
-스냅이 실제로 조향 튐을 만드는지 먼저 확인한 뒤 필요하면 후속 작업으로 넣기로 함(TargetPassing의
-`LATERAL_ALPHA_BACK`과 같은 원리를 적용할 수 있음).
-
-### 2.52 실차 검증 시작 — `ENABLE_OBSTACLE_CUT=True` 전환 + `dl_lane` 창에 컷 상태 상시 표시 (2026-08-20)
-
-**전환:** §2.48~§2.51 구현 직후, 스케일카(RC카)라 사람이 직접 지켜보며 저속으로 검증하겠다는 판단하에
-`ENABLE_OBSTACLE_CUT`/`DEBUG_VIZ_OBSTACLE_CUT`/`DEBUG_VIZ_YOLO_VEHICLE`를 전부 `True`로 켰다. §2.51의
-"실차 첫 검증 필수" 항목(부호규약)을 사람이 직접 눈으로 확인하는 걸 전제로 한 결정 — 아직 코드 자체가
-그 확인을 자동으로 대신해주진 않는다.
-
-**디버그 시인성 개선:** 운전하면서 흘끗 봐도 "지금 자르고 있는지"를 바로 알아챌 수 있어야 한다는
-요청으로, `dl_lane` 창(`_clip_da_by_obstacle()`이 그리던 마젠타 윤곽선)을 반투명 채움 + 굵은 "CUT"
-라벨로 강화했다. 컷이 안 걸린 프레임에도 좌상단에 "OBSTACLE CUT: enabled(대기)/off" 한 줄을 항상 띄워,
-기능 자체가 켜져 있는지부터(트리거가 아직 안 걸린 것인지, 애초에 꺼져 있는 것인지 구분) 확인 가능하게
-했다. `obstacle_cut_debug`(텍스트 상태창)와 같이 보는 걸 권장 — 텍스트창은 라이다/YOLO 원시값과
-디바운스 진행 상황을, `dl_lane` 창은 "그래서 실제로 da가 잘렸는지"를 보여준다.
-
-**남은 절차:** 정지 상태에서 장애물을 옆에 두고 컷 방향(부호규약) 확인 → 저속 통과 테스트 →
-`SPEED_OBSTACLE_CUT`/`OBSTACLE_CUT_TRIGGER_Y_HALF_M` 등 실측 튜닝 순서로 진행 예정(§2.51 "알려진 한계"
-그대로 유효).
-
-### 2.53 `dl_lane` 디버그창 4패널(result/da/ll/speed) → result 1개로 간소화 + DA 추론 TensorRT 재시도 (2026-08-20)
-
-**배경:** ①실차 GPU 부하를 줄이려고 디버그창을 최소화하는 김에, `dl_lane` 창이 세로로 4패널(result/da/
-ll/speed)+스파크라인까지 붙어 있던 걸 "da 파랑+경로가 이미 다 그려진 result 패널 1개만 남기고 조향/
-발행 speed는 텍스트로 얹어달라"는 요청 반영. ②`ENABLE_BEHAVIOR=False`인데도 라바콘 YOLO
-(`perc_yolo_cone()`)가 매 프레임 백그라운드에서 계속 돌고 있어 순전한 오버헤드였음 — `YOLO_SIGNAL_ENABLE`과
-동일 패턴으로 `YOLO_CONE_ENABLE` 게이트 추가, 기본 `False`. ③§2.31에서 DA 추론(TwinLiteNetPlus)을
-TensorRT 최초 엔진 빌드가 4분 넘게 안 끝나 CUDA EP로 강제 전환했었는데, 그 이전 모델
-(`twinlitenetplus_medium_v2.onnx`)에서는 TensorRT가 정상 동작했던 전례가 있어("저번에 잘됐었는데") 이번
-모델(`twinlitenetplus_kmu_v1.2.0.onnx`)도 trt_cache만 한 번 완성되면 될 가능성이 있다고 보고 재시도.
-
-**수정:**
-- `perception/dl_lane.py` `show_debug_windows()` — da/ll 원본 이진마스크 패널·speed 전용 패널·
-  offset 스파크라인의 `vconcat` 스택을 제거하고 result 패널(`self.vis`, 이미 da 파랑 오버레이+경로+
-  offset/lane_center 텍스트 포함) 하나만 `cv2.imshow('dl_lane', vis)`. 기존 ll 패널 상단에 있던
-  "조향 원본→최종" 텍스트와 speed 패널의 속도 텍스트를 이 result 패널 하단으로 옮김. speed 표시값도
-  실측 `v_mps` 대신 **지금 실제로 모터에 발행 중인 명령값** `self.ctrl_speed`로 교체(요청: "발행되고
-  있는 spd").
-- `config.py`/`track_drive.py` — `YOLO_CONE_ENABLE`(기본 `False`) 신설, `False`면
-  `self.yolo_cone_detector`를 아예 생성하지 않음(`perc_yolo_cone()`은 `None` 체크로 조용히 스킵).
-  라바콘 실차 테스트 재개 시 `True`로 되돌릴 것.
-- `perception/dl_lane.py` `TwinLiteNetEngine.__init__()` — provider 우선순위를
-  `['CUDAExecutionProvider', 'CPUExecutionProvider']` → `['TensorrtExecutionProvider',
-  'CUDAExecutionProvider', 'CPUExecutionProvider']`로 되돌림.
-
-**알려진 한계 / 주의:** DA TensorRT 재시도는 **실차 미검증**. `models/trt_cache/`가 비어 있는 상태에서
-첫 실행은 엔진 빌드에 §2.31 실측(4분+)보다 오래 걸릴 수 있고, 그 사이 DA/LL 디버그창이 하나도 안 뜨는
-게 정상이다 — `xydrive`처럼 프로세스를 매 재시도마다 `kill -9` 후 새로 띄우는 방식이면 **빌드 완료 전에
-계속 재시작될 경우 trt_cache가 영영 안 만들어져 매번 이 지연을 반복**하게 되니, 첫 실행만은 절대 중간에
-죽이지 말고 끝까지 기다릴 것. 몇 분 넘게 첫 추론이 안 끝나면 `cone_best_n.onnx`와 같은 `TRT-16198`류
-실패로 보고 §2.31 방식(CUDA 우선)으로 되돌릴 것 — 이 경우 `models/trt_cache/`에 남은 미완성 캐시도
-같이 지우고 되돌리는 게 안전하다(다음 로드가 그 캐시를 재사용 시도하다 다시 멈출 수 있음).
-
-### 2.54 §2.53 TensorRT 재시도 실차 확인 → `DEBUG_VIZ_DL_LANE` 재활성화 (2026-08-20)
-
-**확인:** 실차 노드 기동 로그에서 `[dl_lane] TwinLiteNet ONNX 세션 로드 완료 |
-최우선 provider=TensorrtExecutionProvider (요청순위=['TensorrtExecutionProvider',
-'CUDAExecutionProvider', 'CPUExecutionProvider'])`를 확인 — §2.53에서 우려했던 최초 빌드 지연 없이
-즉시 로드됐는데, 이는 8/14(§2.31) 당시 시도가 실제로는 백그라운드에서 끝까지 완주해 `trt_cache/`에
-`.engine`이 남아있었고 이번에 그 캐시를 재사용했기 때문으로 파악됨(신호등 `yolo_signal`/
-`yolo_signal_state`는 원래부터 TensorRT를 요청하지 않는 `[CUDA, CPU]` 우선순위라 무관 — 콘 검출
-모델의 `TRT-16198` 실패 전례 때문에 처음부터 예방적으로 제외돼 있었음, §2.31 문단 참고).
-
-**후속 조치:** §2.48(디버그창 정리) 때 다 같이 꺼뒀던 `DEBUG_VIZ_DL_LANE`을 다시 `True`로 켬 —
-TensorRT 전환이 잘 됐는지 확인했으니 `dl_lane` result 패널(§2.53에서 1개로 간소화한 그 창)로 실주행
-중 da/조향/발행speed를 계속 눈으로 확인하기 위함. 나머지 `DEBUG_VIZ_*`는 §2.48 요청("일단 모든
-디버그창 꺼줘") 그대로 꺼진 채 유지.
-
-### 2.55 YOLO 검출기 4종 로그 스팸 억제 + da 근접 컷 시각화 색상 충돌 수정 (2026-08-20)
-
-**로그 스팸:** `yolo_vehicle`/`yolo_cone`/`yolo_signal`/`yolo_signal_state` 4개 모듈이 전부 같은
-구조라(각 `_worker()`) 매 프레임 추론 예외를 로그하고, 검출 여부와 무관하게 몇 초마다 FPS 로그를
-찍고 있어 로그창이 그걸로 도배돼 다른 로그가 안 보인다는 요청 반영. 추론 예외는 인스턴스당 최초 1회만
-로그(이후 계속 조용히 스킵, 완전히 숨기진 않음), 주기 로그는 이번 프레임에 실제로 검출된 경우에만
-찍히도록 4개 파일 동일하게 수정.
-
-**시각화 요청:** "obstacle_cut 텍스트 디버그창 말고, 실제 BEV에 원래 da가 뭐였고/어디를 잘랐는지/
-way가 어떻게 찍히는지/lookahead가 어떻게 생기는지 보고 싶다" — 확인해보니 이 넷은 이미 전부
-`dl_lane` 창 하나(§2.53에서 result 패널로 간소화한 그 창)에 그려지고 있었다: 파랑=`da_mask_all_roi`
-(컷/클리핑 전 원본 da 전체), 초록/주황/청록=`da_mask_roi`(최종 채택 da, 컷 이후), 빨강 반투명
-사각형+"CUT"=`_clip_da_by_obstacle()`이 실제로 잘라낸 열(px) 범위, 자홍색 폴리라인=`draw_path()`가
-그리는 최종 경로(way), 노란 십자+원=`show_debug_windows()`의 lookahead 마커. 다만 컷 사각형이
-경로선과 **똑같은 자홍색**(255,0,255)이라 컷 영역을 지나는 경로선이 반투명 채움에 묻혀 안 보이는
-버그가 있었다 — 컷 색만 빨강(0,0,255)으로 바꿔 경로선이 항상 위에 또렷하게 구분되게 했다
-(`perception/dl_lane.py` `visualize()`, 컷이 경로보다 먼저 그려져 나중에 그려지는 경로가 자연히
-그 위에 덧그려짐).
-
-### 2.56 `obstacle_cut_debug` 창에 YOLO 차량검출 카메라 프레임 + 트리거 라이다 ROI를 합침 (2026-08-20)
-
-**요청 배경:** da 근접 컷(`ENABLE_OBSTACLE_CUT`)의 진입 트리거는 "라이다 근접 AND YOLO 차량검출"인데,
-기존엔 YOLO 원시 박스가 `yolo_vehicle_result`라는 별도 창, 라이다 근접 여부는 `obstacle_cut_debug`
-창의 텍스트 한 줄(`라이다 근접=True/False`)로만 나뉘어 있었다 — AND 조건 중 어느 쪽이 안 잡혀서
-트리거가 안 걸리는지(카메라가 못 봤는지/라이다 ROI에 안 잡혔는지) 확인하려면 창 두 개를 오가며
-대조해야 했다.
-
-**수정:** `yolo_vehicle.py`의 `YoloVehicleDetector.show_debug_windows()`(전용 `cv2.imshow` 창)를
-`get_latest_debug_frame()`(그리기만 된 프레임을 스레드세이프하게 반환, imshow는 안 함)으로 교체하고,
-`track_drive.py`의 `perc_yolo_vehicle_cut()`에서 더 이상 전용 창을 안 띄운다. 대신 `_debug_viz_obstacle_cut()`
-하나가:
-- **좌측**에 YOLO 카메라 프레임(원본+검출박스, `get_latest_debug_frame()`으로 가져와 표시용으로만
-  종횡비 무시 리사이즈 — `yolo_vehicle.py` `preprocess()`와 동일 관례)을,
-- **우측**에 실제 트리거에 쓰이는 라이다 ROI를 `avoid_hold_debug`(§2.47)와 같은 미니 BEV 패널
-  구조로 — `OBSTACLE_CUT_TRIGGER_X_MAX_M`×`OBSTACLE_CUT_TRIGGER_Y_HALF_M` 박스(청록 테두리)를
-  "검증범위"로 그대로 그리고, 그 안에 실제로 잡힌 점(빨강)과 표시범위(박스보다 약간 넓게 잡은
-  여백, 박스 밖 점이 왜 트리거가 안 됐는지도 보이게) 안의 나머지 배경점(회색)을 매틱 갱신해서
-  같이 보여준다,
-- **하단**에 기존 텍스트 상태 줄(active/idle, 해제 사유, AND확정 카운터, 컷 열 범위, 미검증
-  파라미터 목록 등, §2.49~§2.52에서 만든 그대로)을 그대로 이어붙인다.
-
-`perc_obstacle_cut_trigger()`가 `_obstacle_cut_bg_x/y`(표시범위 내 배경점)·`_obstacle_cut_roi_x/y`
-(실제 트리거 ROI 안 점)를 `avoid_hold`의 `_obstacle_front_all_x/y`/`_obstacle_cluster_x/y`(§2.47)와
-동일한 패턴으로 매틱 갱신해 인스턴스 속성에 남기고, `_debug_viz_obstacle_cut()`이 이를 그대로
-그린다.
-
-**알려진 한계:** 카메라 프레임을 `CAM_W×CAM_H`로 단순 리사이즈해 원본 종횡비가 살짝 왜곡된다 —
-박스 위치/모양이 아주 약간 눌려 보일 수 있지만 "검출 여부"를 눈으로 확인하는 용도라 지금은 문제
-삼지 않는다.
-
-### 2.57 YOLO 방해차량 검출을 전용 파인튜닝 모델(`target_vehicle_best.onnx`)로 교체 — nms=False export, 직접 디코딩+NMS (2026-08-20)
-
-**배경:** §2.49에서 이식한 `yolov8n_car.onnx`는 COCO 사전학습 `yolov8n.pt`를 그대로 쓴 것이라
-`car`(class_id=2) 클래스 전반을 잡을 뿐 대회에서 실제로 회피해야 하는 그 방해차량 한 대(#46,
-TRAXXAS 검정/연두)에 특화돼 있지 않았고, 신뢰도도 낮았다(실측 0.15~0.78, 평균 0.3대). 별도
-저장소(`yolo-V8-KMU-xycar`)에서 그 차량 뒷모습 전용으로 YOLOv8n을 파인튜닝(시드 라벨링 →
-bootstrap 반복, 클래스 1개 `target_vehicle`)해 `best.onnx`를 만들었고, 이를 `yolo_ros/`에
-`target_vehicle_best.onnx`로 추가해 기본 모델로 전환했다(`yolov8n_car.onnx`는 롤백/비교용으로
-그대로 보존).
-
-**export 방식이 달라진 점(핵심):** 기존 두 모델(`cone_best_n.onnx`, `yolov8n_car.onnx`)은 모두
-`nms=True`로 export돼 그래프 안에 `NonMaxSuppression`이 포함돼 있었는데, 이 레이어가
-TensorRT 빌드를 항상 실패시키는 것으로 실차에서 확인됐다(TRT-16198, "빈 텐서 처리 실패" — §2.53
-근처 `yolo_cone.py` 주석 참고, 확인까지 약 7~8분 소요돼 노드 기동마다 지연이 반복됨). 이번
-`target_vehicle_best.onnx`는 처음부터 **`nms=False`로 export**해 이 문제를 export 단계에서
-피했다 — 그 대가로 `output0`가 이미 NMS·필터링된 `[x1,y1,x2,y2,conf,cls]`가 아니라 raw
-`[1, 4+nc, num_anchors]` = `[1, 5, 8400]`(`cx,cy,w,h` + 클래스점수, nc=1)이 나온다.
-
-**코드 수정 (`perception/yolo_vehicle.py`):**
-- `YoloVehicleEngine.infer()` — raw 출력을 직접 디코딩(`cx,cy,w,h`→`x1,y1,x2,y2`) 후
-  `cv2.dnn.NMSBoxes`로 NMS까지 수행하도록 전면 교체(기존 `[1,N,6]` 파싱 코드는 이 모델과
-  호환 안 됨). 콘/구 차량 모델의 "conf 필터링만" 패턴에서 벗어난 첫 사례.
-- `_default_model_path()` — 기본 탐색 파일명을 `yolov8n_car.onnx` → `target_vehicle_best.onnx`로 변경.
-- provider 우선순위 — 그래프에 NMS가 없어 TRT-16198이 발생할 여지가 없으므로
-  `['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']`로 TensorRT를
-  다시 최우선으로 시도하도록 변경(콘/구 차량 모델은 여전히 CUDA 직행 유지, 이 모델만 다름).
-
-**`config.py` 변경:** `YOLO_VEHICLE_CLASS_ID` `2`(COCO `car`)→`0`(`target_vehicle`, nc=1이라 0부터
-시작), `YOLO_VEHICLE_MODEL_PATH`는 `None` 유지(자동 탐색 경로가 위 기본 파일명 변경으로 이미
-새 모델을 가리킴), 새 파라미터 `YOLO_VEHICLE_NMS_IOU_THRESHOLD=0.45` 추가(직접 NMS에 필요).
-
-**검증 상태:** onnxruntime CPU provider로 입출력 shape(`[1,5,8400]`)과 디코딩+NMS 파이프라인
-전체를 무작위 이미지로 실행해 예외 없이 동작함은 확인했다(개발 환경, 실제 차량 이미지 아님).
-**실차 미검증 항목**:
-1. `YOLO_VEHICLE_CONF_THRESHOLD=0.5`(ultralytics 기본값) — 새 모델 신뢰도 분포를 실측하지
-   않은 상태의 임시값. 구 모델의 `0.3`(실측 0.15~0.78 하한 근처)처럼 정적 이미지/실차 재추론으로
-   재조정 필요.
-2. TensorRT provider가 이 모델에서 실제로 빌드에 성공하는지(Jetson Orin NX, JetPack 6) — 첫 로드
-   시 `trt_cache`가 비어있어 엔진 빌드로 수 분 걸릴 수 있음. 실패하면 콘 모델과 동일하게 CUDA
-   직행으로 되돌릴 것.
-3. `DEBUG_VIZ_YOLO_VEHICLE=True` 상태로 저속 실차 테스트 — 바운딩박스가 실제 그 차량에 잘
-   붙는지, 다른 물체(다른 색 RC카, 사람 등) 오탐은 없는지 확인(§2.49 배포 체크리스트와 동일 항목).
-
-### 2.58 `target_vehicle_best.onnx` 가중치를 v1.0.0 → v1.1.0으로 교체 (2026-08-20)
-
-**배경:** §2.57에서 처음 붙인 가중치는 `yolo-V8-KMU-xycar` 저장소 [v1.0.0](https://github.com/mastic-choi/yolo-V8-KMU-xycar/releases/tag/v1.0.0)
-(`seed_labeled` 2,127장, mAP50-95=0.974)이었다. 그 저장소가 이후 의사라벨(pseudo-label)
-2차 라운드로 학습 데이터를 6,041장까지 늘려 재학습한 [v1.1.0](https://github.com/mastic-choi/yolo-V8-KMU-xycar/releases/tag/v1.1.0)
-(mAP50-95=0.985)을 냈고, 이번에 그 최신 가중치로 교체했다(요청 반영).
-
-**수정:** `gh release download v1.1.0 --repo mastic-choi/yolo-V8-KMU-xycar -p best.onnx`로
-받은 파일을 `yolo_ros/target_vehicle_best.onnx`(파일명 그대로, `xycar_ws/src/yolo_ros/`와
-`UMK/yolo_ros/` 양쪽 다 — [[xycar_ws 경로 컨벤션]] 참고)에 덮어썼다. 클래스 스키마(nc=1,
-`class_id=0`)와 export 방식(`nms=False`, 출력 `[1,5,8400]`)이 v1.0.0과 동일해서 — onnxruntime로
-입출력 shape 재확인 완료 — `config.py`/`perception/yolo_vehicle.py`는 코드 변경 없이 파일
-교체만으로 적용된다.
-
-**알려진 한계:** 위 §2.57 "실차 미검증 항목" 3가지(신뢰도 임계값 재조정, TensorRT provider
-빌드 성공 여부, 실차 오탐 확인)가 v1.1.0에도 그대로 적용된다 — mAP는 v1.0.0보다 높지만 이건
-정적 검증셋 지표라, 실차 카메라 조건(조명/각도/모션블러)에서의 실측 신뢰도 분포는 아직 없다.
-
-### 2.59 `target_vehicle`/`signal_state` 둘 다 v1.2.0 — NMS 내장 ONNX export로 §2.57 우회 코드 제거 (2026-08-21)
-
-**배경:** §2.57에서 "`ultralytics model.export(..., nms=True)`를 줬는데도 output0가
-raw `[1,5,8400]`로 나온다"는 문제를 `perception/yolo_vehicle.py`가 직접 좌표 디코딩 +
-`cv2.dnn.NMSBoxes`를 수행하는 방식으로 우회했었다. `yolo-V8-KMU-xycar` 저장소에서
-원인을 다시 파봤더니 — **ultralytics 8.3.0의 `DetectionModel` ONNX export 경로가
-`nms` 인자를 아예 참조하지 않는다.** 그 옵션은 CoreML export 전용이고, 일반
-ONNX export(우리가 쓰는 경로)에는 적용된 적이 없었다(export 시 에러/경고도 없이
-조용히 무시됨). `signal_state`(`yolo_signal_state.py`)는 원래부터 다른(더 오래된)
-export로 만들어져 있어서 이 문제를 안 겪었었는데, 이번에 같은 wrapper로 재export하며
-동일 증상이 재현되는 것까지 확인됐다.
-
-**수정:** `torchvision.ops.batched_nms`를 `forward()`에 심은 커스텀 export
-스크립트(`export_onnx_with_nms.py`, conf 임계값 필터링→xywh→xyxy 변환→batched
-NMS→`[x1,y1,x2,y2,conf,cls]` 6열 고정 출력까지 그래프 안에서 처리)로 두 모델 다
-재export. **가중치 자체는 안 바뀜**(target_vehicle=v1.1.0과 동일, signal_state도
-직전과 동일) — export 방식만 교체.
-- [target_vehicle v1.2.0](https://github.com/mastic-choi/yolo-V8-KMU-xycar/releases/tag/v1.2.0),
-  [signal_state v1.2.0](https://github.com/mastic-choi/yolo-V8-KMU-xycar/releases/tag/v1.2.0-signal_state)
-  의 `best_nms.onnx`를 각각 `yolo_ros/target_vehicle_best.onnx`,
-  `yolo_ros/signal_state_best_n.onnx`로 교체. sha256 체크섬 일치 + onnxruntime로 실제
-  추론해 output shape `[1,N,6]`(N=검출개수) 확인 완료.
-- `perception/yolo_vehicle.py` `infer()`를 §2.57 이전의 단순 파싱(`for x1,y1,x2,y2,conf,cls
-  in dets`)으로 되돌림 — 좌표 디코딩/`cv2.dnn.NMSBoxes` 우회 코드 삭제.
-- `config.py` `YOLO_VEHICLE_NMS_IOU_THRESHOLD` 삭제(더 이상 안 씀). `signal_state`
-  쪽은 애초에 파싱 코드가 `[1,N,6]` 전제였어서 코드 변경 없음, 주석만 갱신.
-
-**알려진 한계:** input shape이 이전엔 고정 `(1,3,640,640)`이었는데 이번 export는
-동적(`batch/height/width`)으로 나온다 — 실제 추론 시 640×640으로 넣으면 동일하게
-동작함은 확인했지만(위 검증), onnxruntime provider(특히 TensorRT)가 동적 shape을
-얼마나 잘 받아들이는지는 아직 실차에서 안 봤다. TensorRT provider 빌드가 이번 변경으로
-전보다 나빠지거나 나아지는지도 미확인 — §2.57의 "TensorRT provider 빌드 성공 여부"
-항목과 합쳐서 다음 실차 테스트 때 같이 확인할 것.
-
-### 2.60 `YOLO_VEHICLE_CONF_THRESHOLD` 0.5 → 0.6 상향 (2026-08-21)
-
-v1.2.0 실측 결과 신뢰도가 0.7 밑으로 안 내려가는 것으로 확인돼(요청 반영), 오탐 여유를
-두면서도 정탐은 그대로 다 통과시키도록 0.5 → 0.6으로 올렸다. 정확히 0.7로 맞추면
-여유가 없어 경계선 프레임을 놓칠 위험이 있어 한 단계 낮춰 잡음. 실차 재검증 필요.
-
----
-
-## 3. 라바콘 (B1_LAVACON)
-
-**수정할 곳:** `START_STATE=S1_LANE_FOLLOW`, `TEST_FORCE_BEHAVIOR=True`(`self.phase` 기본이 `LAVACON`).
-
-진입: (YOLO 카메라 콘 검출 AND 라이다 좌우 클러스터) `LAVACON_TRIGGER_FRAMES`(5) 연속 — YOLO 초기화 실패
-시 라이다 단독 판정으로 자동 폴백.
-
-**[2026-08-11] 조향이 라인주행과 완전히 동일한 Pure Pursuit/파라미터를 공유**하도록 변경
-(`_lane_steer(path=self.lavacon_path)`) — 예전 전용 P게인(`LAVACON_KP`) 방식 폐기.
-
-**디버그:** `DEBUG_VIZ_LAVACON` → `lavacon_bev` 창(트리거 ROI+조향 경로), `DEBUG_VIZ_YOLO_CONE` → 콘 검출
-박스.
-
-### 3.1 경로생성 방식 교체 — 보로노이 → 좌우 콘 클러스터 중앙 페어링 (2026-08-19)
-`perc_lavacon.py`의 `process_lavacon()`이 콘 점군 전체로 `scipy.spatial.Voronoi`를 계산해 그 정점을
-중심선으로 쓰던 방식을 폐기하고, 일반 차선주행(da 중앙 추종)과 구조를 통일한 방식으로 교체:
-좌(y>0)/우(y<0) 콘 후보 점을 라이다 인덱스 인접성으로 클러스터링(`perc_obstacle()`/
-`perc_lavacon_trigger()`와 동일 패턴) → 콘 하나당 중심점 하나로 압축 → 양쪽을 전방거리(x) 오름차순
-정렬 후 가까운 순서대로 페어링 → 각 페어의 중점을 경로점으로 채택(`MAX_GATES=6`까지). "좌우에 찍히는
-가장 가까운 포인트들 위주로 경로생성" 요구를 그대로 반영한 것 — scipy 의존성도 제거됨. 출력 형식
-(`offset`/`done`/`path_m`)은 기존과 동일하게 유지해 `track_drive.py` 호출부(`perc_lavacon()`,
-`_handle_lavacon()`)는 변경 없음. 좌우 콘 개수가 다르면(급커브) 적은 쪽 개수만큼만 페어링하고 남는
-먼 쪽 콘은 버림 — Pure Pursuit이 근거리 경로점 위주로 조향을 결정하므로 영향이 작다는 가정, 실차
-미검증. `MAX_GATES`/페어링 순서 기반 매칭(같은 순번끼리 짝짓기, 최근접 탐색 아님)도 실차 미검증
-초기값.
-
-### 3.2 페어링을 "같은 순번끼리" → "차량 정면 기준선 위 최근접 이웃"으로 교체 (2026-08-19)
-§3.1의 페어링(좌/우 각각 x 오름차순 정렬 후 같은 순번끼리 묶기)은 좌우 콘 개수/간격이 비대칭이면
-(급커브 등) i번째로 가까운 좌측 콘과 i번째로 가까운 우측 콘이 물리적으로 가깝다는 보장이 없어 중점이
-트랙 중앙에서 벗어날 위험이 있었다. `dl_lane.py`의 `vehicle_center_x`(차량이 자기 위치/정면이라 믿는
-빨간 세로선, 그 선 기준으로 좌우 차선을 판단하는 구조)와 동일한 개념을 적용해, 라이다 기준 차량
-정면 방향(y=0, 전방 x축)을 기준선으로 삼고 그 선 위에서 가까운 좌측 콘부터 훑으며, 그 시점에 아직
-안 쓰인 우측 콘 중 유클리드 거리가 가장 가까운 것을 짝으로 찾는 최근접 이웃 방식(`_pair_nearest()`)
-으로 교체했다. `lavacon_bev` 창에도 이 기준선을 빨간 직선(`vehicle_x (y=0)`)으로 시각화 추가. 출력
-형식(`offset`/`done`/`path_m`)은 동일하게 유지. 실차 미검증.
-
-### 3.3 페어링을 "유클리드 최근접 이웃" → "박스 스택"으로 교체 (2026-08-19)
-
-§3.2의 유클리드 최근접 이웃 페어링(`_pair_nearest()`)은 좌측 콘부터 순서대로 훑으며 "그 시점에
-남은 우측 콘 중 물리적으로 가장 가까운 것"을 짝짓는데, 이 기준이 급커브에서는 오히려 위험할 수
-있다는 지적(사용자) — 트랙을 가로지르는 두 콘(예: 내 차로 안쪽 콘과 그 너머 바깥쪽 콘)이 실제로는
-서로 다른 경계에 속하는데도 단순히 "유클리드 거리가 가깝다"는 이유만으로 짝지어질 위험이 있었다.
-
-**수정:** `perc_lavacon_trigger()`의 진입 트리거 박스(전방 0.3~0.5m 좁은 구간에서 좌우 클러스터
-유무만 확인)와 완전히 같은 발상으로 되돌아갔다. 그 박스와 같은 폭(`BOX_LON_WIDTH=0.2m`,
-`BOX_LON_START=0.3m`)의 박스를 전방으로 `CONE_LON_MAX(4.0m)`까지 쭉 쌓아올리고, 각 박스 "안에서만"
-좌(y>0)/우(y<0) 각 1점(그 박스 안에서 라이다 반사거리가 가장 짧은 점)을 뽑아 중점을 그 박스의
-경로점으로 삼는다(`_pick_boxed_centers()`, 좌우 콘 클러스터링(`_cluster_cone_side()`)과 유클리드
-페어링(`_pair_nearest()`)은 폐기). 짝짓기 후보 자체가 같은 좁은 종방향 구간 안으로 국한되므로
-§3.2의 "먼 트랙 구간 콘과 잘못 짝지어지는" 문제가 구조적으로 불가능해진다. 박스를 전방 순서대로
-훑으므로 결과가 자연히 x 오름차순이라 별도 정렬도 불필요해짐(§3.2에서 하던 최종 재정렬 단계 삭제).
-`lavacon_bev`의 `vehicle_x (y=0)` 빨간 기준선(§3.2가 추가한, 유클리드 페어링 전용 시각화)은 더 이상
-알고리즘과 무관해져서 제거했다.
-
-같은 요청으로 `perc_lavacon.py`의 콘 후보 횡방향 한계도 `CONE_LAT_LIMIT` 2.5m→1.8m로 축소했고,
-`lavacon_bev`에 이 한계를 흰색 가로선(`cone ROI lat=+-1.8m`)으로 표시하도록 추가했다(값을 바꾸면
-선도 같이 움직이도록 `track_drive.py`가 `perc_lavacon.py`에서 이 상수를 직접 import).
-
-**알려진 한계:** 실차 미검증(2026-08-19, 코드 리뷰 수준). 박스 폭(0.2m)이 트리거 박스와 값을
-공유하도록 의도적으로 맞췄지만 실측 검증은 안 됨 — 콘 간격이 넓은 코스에서 다수의 박스가 "한쪽만
-있음"으로 건너뛰어져 경로점이 듬성듬성해질 가능성 있음, `lavacon_bev`의 노란 경로점 개수(`n=`)를
-보고 필요하면 `BOX_LON_WIDTH`를 넓히는 걸 검토할 것.
-
-**[2026-08-13, 구조적 한계로 남음]** `YoloConeDetector` 초기화가 노드 `__init__`에서 동기 호출돼, 특정
-ONNX 모델이 TensorRT 빌드에 실패하면(당시 `cone_best_n.onnx`, `TRT-16198`) 노드 기동 자체가 7~8분
-블로킹됐던 사례가 있었음 — 이번 모델은 provider에서 TensorRT를 빼서 우회했지만, 백그라운드 스레드로
-옮기는 근본 대응은 아직 안 함(다른 모델/provider에서 재발 가능).
-
-**알려진 한계:** `LAVACON_DONE_FRAMES=80`/`YOLO_CONE_CONF_THRESHOLD=0.5` 등 실차 미검증 초기값.
-
-### 3.4 B1 실제 회피조향은 끄고 진입/탈출 트리거만 남김 — 구간 내부는 S1 차선주행으로 통과 (2026-08-20)
-
-**배경:** 상태전환 정비 작업(README §1) 중 요청 반영 — 처음엔 진입 트리거만 만나면 그
-자리에서 즉시 통과 처리하는 안으로 갔다가, "진입/탈출 두 트리거는 그대로 남기고 그 사이
-구간만 S1 라인플로우로 하자"로 정정됐다. 즉 구간의 시작/끝은 여전히 실측 트리거로 판정하되,
-그 안에서 실제 콘 회피 조향(`_handle_lavacon()`, §3.1~§3.3의 박스 스택 경로생성)은 지금
-단계에서 쓰지 않는다. 추가 로직은 나중 단계에서 다시 붙일 수 있게 구현 자체는 그대로
-남겨뒀다.
-
-**수정:**
-- `run_behavior_fsm()`(track_drive.py)의 `Phase.LAVACON` 분기 — 진입은 그대로
-  `lavacon_trigger` → `self._lavacon_engaged=True` latch. 탈출은 `process_lavacon()`이
-  매 틱 계산해두는 `lavacon_done`(우측 콘 연속 미검출)이 `LAVACON_DONE_FRAMES`만큼
-  유지되면 확정 — 이 exit 판정 블록은 원래 `_handle_lavacon()` 안에 있던 걸 그대로
-  옮겨왔다. `behavior_state`는 진입~탈출 사이에도 계속 `B0_NORMAL`로 유지한다(예전엔
-  `_lavacon_engaged`값에 따라 `B1_LAVACON`으로 바뀌었음).
-- `behavior_state`가 `B1_LAVACON`이 되는 경로 자체가 없어져서 `apply_behavior_override()`가
-  `_handle_lavacon()`을 호출하지 않는다 — 대신 `_handle_lavacon()`은 이제 값이 다시
-  살아나기 전까지 죽은 코드(unreachable)다.
-- `_s1_lane_follow()`의 Mission PID 스킵 가드도 `phase==LAVACON and _lavacon_engaged`
-  기준에서 `behavior_state==B1_LAVACON` 기준으로 바꿨다 — 안 바꾸면 `_lavacon_engaged`가
-  구간 추적용으로 다시 True가 될 때 이 가드가 오작동으로 `_lane_drive()`를 건너뛰어
-  버린다(behavior_state가 B0_NORMAL이라 조향을 대신 계산해줄 곳도 없어서 직전 각도가
-  고정된 채 멈추는 위험한 상태가 됨). 가드를 behavior_state 기준으로 바꾼 덕에
-  `_lane_drive()`가 라바콘 구간에서도 끊기지 않고 계속 돈다 — 사실상 "라바콘 구간을
-  일반 차선주행으로 통과"하는 동작.
-- `_handle_lavacon()` 내부의 exit 판정 블록(중복)은 제거하고 docstring에 "지금은
-  안 불림 + 되살릴 때 주의사항"을 남겼다.
-
-**되돌리는 법:** `_handle_lavacon()`/`process_lavacon()`/§3.1~§3.3 경로생성 코드는 전부
-그대로 남아있다. 되살리려면: (1) `run_behavior_fsm()`의 `Phase.LAVACON` 분기에서
-`behavior_state`를 `_lavacon_engaged` 값으로 `B1_LAVACON`/`B0_NORMAL` 분기하도록 되돌리고,
-(2) exit 판정 블록을 `_handle_lavacon()` 쪽으로 다시 옮기거나 최소한 한쪽에서만 돌게 하고,
-(3) `_s1_lane_follow()`의 PID 스킵 가드를 필요하면 원래 조건으로 되돌린다(behavior_state
-기준으로 남겨둬도 동작은 동일하므로 필수는 아님).
-
-**알려진 한계 → §3.5에서 안전판 추가로 완화:** 라바콘 구간을 실제로는 회피하지 않고 일반
-차선 PID로만 지나가므로, 콘이 차선 폭 안쪽까지 침범해 있으면 충돌 위험이 있다 — 실차
-트랙에서 콘 배치가 차선 폭을 벗어나지 않는 구간에서만 임시로 쓸 것. 탈출 판정
-(`lavacon_done`)은 `process_lavacon()`의 우측 콘 검출에 의존하므로, 회피 조향 없이 차선
-중앙으로만 지나가도 그 검출 자체는 §3.1~§3.3과 동일하게 라이다 원시값 기준이라 계속
-유효할 것으로 보이나 실차 미검증.
-
-### 3.5 da 차선주행 위에 라이다 근접 push 안전판 추가 — 카메라 재확인 게이트 제거 (2026-08-21)
-
-**배경:** §3.4의 "알려진 한계"(회피조향 없이 일반 차선 PID로만 지나가서, 콘이 차선 폭
-안쪽까지 침범하면 충돌 위험) 대응. 사용자 실차 관찰: da 세그멘테이션이 콘을 주행가능영역
-밖으로 잘 잡아줘서 일반 차선주행만으로도 대부분 잘 피하지만, 안전판이 하나 있었으면 함.
-기존에 이미 구현돼 있던 `_lavacon_steer_da_push()`(§3.3 이후 도입, da 경로 + 콘이 안전마진
-안으로 침범하면 그만큼 반대쪽으로 경로를 밀어 Pure Pursuit에 넘기는 방식)가 정확히 이
-용도였는데, `_handle_lavacon()`(behavior_state=B1_LAVACON 전용, §3.4로 이미 죽은 코드)
-안에서만 호출돼서 실제로는 전혀 동작하지 않고 있었다.
-
-또한 그 함수 내부에 `self.cone_detected_yolo`(그 프레임 카메라 재확인)가 True일 때만
-push를 켜는 게이트가 있었는데, 실차에서 라이다 클러스터는 선명하게 잡히는데도 카메라가
-그 프레임에 콘을 놓쳐 push가 안 걸리는 경우가 잦다는 게 사용자 실측으로 확인됨.
-
-**수정:**
-- `_lane_drive()`(S1/S3 공통 조향 함수)가 `self._lavacon_engaged`(진입 트리거로 이미 확정된
-  "지금 라바콘 구간 안" latch, §3.4에서 계속 관리)가 True인 동안만
-  `self.ctrl_angle = self._lavacon_steer_da_push()`로 바꿔 쓰도록 수정. `behavior_state`는
-  여전히 B0_NORMAL로 유지(§3.4 결정 그대로, B2/B3 단독 검증에 영향 없음) — `_handle_lavacon()`
-  자체를 되살린 게 아니라, §4.3 da 근접 컷과 같은 패턴으로 "behavior_state와 무관하게 상시로
-  도는 안전 보정"을 하나 얹은 것.
-- `_lavacon_steer_da_push()` 내부의 `if self.cone_detected_yolo:` 매 프레임 재확인 게이트를
-  제거 — 이 함수가 이제 `_lavacon_engaged`(라이다 AND YOLO 이중확인을 이미 거친 진입 트리거)
-  가 True일 때만 불리므로, "지금 라바콘 구간 안"이라는 전제가 이미 보장돼 있어 매 프레임
-  카메라 재확인 없이 라이다 근접만으로 push를 켠다. 진입 판정(perc_lavacon_trigger()) 자체의
-  이중확인은 그대로 유지 — 오검출 방지가 없어진 게 아니라 진입 시점에 이미 끝난 것.
-
-**알려진 한계:** 라이다 단독으로 근접만 보므로, 라바콘 구간 안에서 라이다가 벽/기타 반사를
-콘으로 오인해 근접이라 판단하면(§2.11/§2.14류 실패모드) 불필요한 push가 걸릴 수 있다 —
-`LAVACON_PUSH_LON_MIN/MAX`(0.2~1.5m)/`LAVACON_PUSH_LAT_LIMIT`(1.0m) ROI가 좁아 급커브가
-아니면 벽이 이 범위에 들어올 가능성은 낮다고 보지만 실차 미검증. 1바퀴째는 `Phase.OBSTACLE_ZONE`
-에서 바로 시작하는 임시조치(§5.4 관련, track_drive.py `__init__` 참고)가 아직 살아있어
-`_lavacon_engaged`가 1바퀴째는 True가 될 기회 자체가 없다 — 이 안전판은 `RESET_PHASE_EACH_LAP`
-로 `Phase.LAVACON`이 다시 도는 2바퀴째부터만 실제로 걸린다.
-
-### 3.6 라바콘 디버그창 2개(`lavacon_bev`/`lavacon_ema_bev`) → 하나로 통합 (2026-08-22)
-
-**배경:** 요청 반영. 트리거 ROI/좌우 클러스터 전용 창(`DEBUG_VIZ_LAVACON`, `_draw_lavacon_bev()`)과
-박스 스택 클러스터링+프레임간 EMA 전용 창(`DEBUG_VIZ_LAVACON_EMA`, `_draw_lavacon_ema_bev()`)이
-따로 떠 있어서 같이 보려면 창 두 개를 번갈아 봐야 했다. 둘 다 같은 축척(`PPM=80`)/원점을
-쓰던 창이라 그대로 한 캔버스에 겹쳐 그릴 수 있었다.
-
-**수정:**
-- `_draw_lavacon_ema_bev()`를 삭제하고 그 내용(박스별 좌/우 반투명 채움, EMA 좌/우 차선,
-  `boxes=`/`temporal_ema=`/`line_continuity=` 텍스트)을 `_draw_lavacon_bev()` 안으로 옮겨,
-  트리거 ROI 점구름·데드존·박스 경계선과 같은 창(`'lavacon_bev'`)에 겹쳐 그린다
-  (track_drive.py `_draw_lavacon_bev()`).
-- 호출부도 통합 — `perc_lavacon()`(박스/경로 계산)은 더 이상 직접 그리지 않고, 같은 틱
-  뒤에 도는 `perc_lavacon_trigger()`가 `self._lavacon_boxes_prev`/`self._lavacon_path_m`을
-  같이 넘겨서 한 번에 그린다. `process_lavacon()`이 라이다 입력이 아직 불충분할 때
-  `boxes=None`을 반환할 수 있어(`perc_lavacon.py` 참고) 호출부에서 빈 리스트로 폴백한다.
-- `DEBUG_VIZ_LAVACON_EMA` 스위치는 삭제 — `DEBUG_VIZ_LAVACON` 하나로 통합 창 전체를 켜고 끈다
-  (config.py).
-
-**되돌리는 법:** 필요하면 git 이력에서 `_draw_lavacon_ema_bev()`/`DEBUG_VIZ_LAVACON_EMA`를
-되살리고, `perc_lavacon()`의 호출부를 원래 자리로 되돌리면 된다 — 통합 전후로 그리는 내용
-자체는 동일해서 로직 손실은 없다.
-
-### 3.7 트리거/검출 ROI 폭 축소 + 디버그 배율 조정 (2026-08-22k)
-
-**배경:** 요청 반영. 좌우 라이다 클러스터 트리거(`perc_lavacon_trigger()`의 `LAT_MAX`,
-2.0m)와 좌우 콘 검출 박스(`perc_lavacon.py`의 `CONE_LAT_LIMIT`, 1.0m)가 서로 다른 폭이라
-`lavacon_bev` 창에서 트리거 박스(청록)와 검출 박스(초록/주황) 사이에 안 쓰이는 빈 공간이
-남아 있었다. 실차 확인 결과 두 ROI 모두 좌우 0.5m(총 1m)로 좁혀도 충분하다고 판단.
-
-**수정:**
-- `LAT_MAX`(track_drive.py `perc_lavacon_trigger()`) 2.0 → 0.5.
-- `CONE_LAT_LIMIT`(perc_lavacon.py) 1.0 → 0.5 — 두 값을 같게 맞춰 트리거 박스와 검출
-  박스가 같은 폭이 되므로 빈 공간이 없어진다(종방향 길이는 원래부터 좌/우 대칭이라 그대로).
-- `_draw_lavacon_bev()`의 `PPM`(축척) 80 → 100 — ROI가 좁아진 만큼 확대. 100으로 잡은
-  이유는 `CONE_LON_MAX`(4.0m, 박스 스택 전체 깊이)가 창 위로 잘리지 않는 한도 근방이기
-  때문(`ORIGIN_EY=460px`이므로 460/100=4.6m로 여유 0.6m 확보 — 더 키우면 원거리 박스/경로가
-  잘릴 수 있음).
-
-**실차 미검증** — 좌우 0.5m ROI가 실제 콘 간격/차폭 대비 너무 좁지 않은지, `lavacon_bev`
-창에서 새 배율이 보기 편한지 확인할 것.
-
-**[2026-08-22k 후속] 요청 반영으로 `LAT_MAX`만 0.5 → 0.75(좌우, 총 1.5m)로 재조정.**
-`CONE_LAT_LIMIT`(perc_lavacon.py)은 0.5 그대로 — §3.8에서 박스 스택 시각화(둘을 맞출
-이유였던 "빈 공간" 문제)를 지우면서 두 값을 같이 맞출 필요가 없어졌다.
-
-### 3.8 `lavacon_bev` 창에서 안 쓰이는 박스 스택 시각화 삭제, push ROI 추가 (2026-08-22k)
-
-**배경:** 요청 반영. `lavacon_bev` 창의 초록/주황 이어지는 선(박스 스택 페어링 EMA 차선)과
-노란 경로선(`path_m`)이 실제로는 §3.4(2026-08-20, `_handle_lavacon()` 자체가 안 불림)+§3.3
-이전 이력으로 이미 조향에 안 쓰이는 잔존 시각화라는 게 대화 중 확인됨 — 화면엔 계속
-그려지고 있어서 "지금 저게 실제로 쓰이는 로직이냐"는 질문이 나왔다. 사용자 요청: 지금 실제
-쓰이는 정보(①트리거 검출박스 ②전면 좌우 라바콘 검출박스) 위주로 다시 그리기.
-
-**수정 (`track_drive.py` `_draw_lavacon_bev()`):**
-- 삭제 — 박스 스택 반투명 채움(초록/주황), 흰 `cone ROI lat` 경계선, 파란 박스 경계선,
-  좌/우 EMA 이어짐 선(`_draw_lane()`), 노란 `path_m` 경로선(`DEBUG_VIZ_LAVACON_SHOW_PATH`,
-  스위치 자체도 config.py에서 삭제 — 더는 아무것도 안 그려서). 이제 안 쓰는
-  `LAVACON_PATH_LON_MAX`/`LAVACON_PATH_LAT_LIMIT`/`LAVACON_BOX_LON_START` import 별칭도 정리
-  (`LAVACON_BOX_LON_WIDTH`는 자차 마커 위치 계산에 여전히 쓰여 유지).
-- 추가 — **push ROI**(자홍 박스, `LAVACON_PUSH_LON_MIN~MAX × ±LAVACON_PUSH_LAT_LIMIT`):
-  `_lane_drive()`가 `self._lavacon_engaged`일 때 매 틱 부르는 `_lavacon_steer_da_push()`가
-  실제로 보는 좌우 최근접 콘 ROI. `nearest_cone_lateral()`을 시각화 전용으로 다시 호출해서
-  좌/우 검출 y값을 가로 눈금선으로 표시(그 함수가 x는 안 줘서 ROI 폭 전체에 걸쳐 그림 —
-  정확한 종방향 위치가 아니라 "ROI 안 어딘가"라는 뜻), 안전마진(`LAVACON_PUSH_SAFETY_MARGIN_M`)
-  경계선, 마진 침범 시 파랑으로 강조. 텍스트로 `L_y`/`R_y`/현재 `push` 량·방향/
-  `self._lavacon_engaged` 상태까지 표시.
-- 유지 — 트리거 ROI(노란/청록 박스, `LAT_MAX`), ROI 점구름(초록/주황/회색), 자기가림
-  데드존 부채꼴, 자기가림 구간 원본 magenta 점, 자차 마커, L/R pts·run/YOLO 콘/트리거
-  카운터 텍스트.
-
-**참고:** `perc_lavacon()`(박스 스택 계산 자체, `lavacon_done` 종료판정용으로 여전히 필요)은
-안 건드림 — 계산은 계속 매 틱 돌지만 이제 그 결과(`boxes`/`path_m`)를 시각화로 넘기지 않을
-뿐. `mission_realcar_test_checklist.md`의 `DEBUG_VIZ_LAVACON_SHOW_PATH` 언급도 갱신.
-
-### 3.9 디버그창 스위치 — `DEBUG_VIZ_LIDAR` 끄고 `DEBUG_VIZ_LAVACON` 켬 (2026-08-22k)
-
-**배경:** `DEBUG_VIZ_LAVACON`이 2026-08-11 이후 계속 `False`로 꺼져 있던 게 이번 세션에서
-드러났다(§3.7 트리거 ROI를 고쳐도 화면엔 반영이 안 보였던 원인) — 당시 "라바콘 실차
-테스트 중엔 라이다 창(`DEBUG_VIZ_LIDAR`, B2/B3 전용)만 보고 싶다"는 요청으로 꺼둔 게 그대로
-남아있었다. 지금은 반대로 라바콘 검출 확인이 목적이라 요청 반영으로 전환.
-
-**수정 (`config.py`):** `DEBUG_VIZ_LIDAR` True→False, `DEBUG_VIZ_LAVACON` False→True.
-B2/B3(`lidar_bev`) 디버깅이 다시 필요하면 `DEBUG_VIZ_LIDAR`를 다시 True로 되돌릴 것 — 서로
-독립 스위치라 다른 항목엔 영향 없음.
-
-### 3.10 진입 확정 후 cone YOLO 정지, 탈출 시 재개 (2026-08-23)
-
-**배경:** `_active_yolo_stage()`가 `Phase.LAVACON`인 동안엔 진입 전/후 구분 없이
-`perc_yolo_cone()`을 계속 호출해왔는데, 라바콘 사이를 실제로 통과 주행하는 동안엔 콘이
-카메라 시야를 가려 프레임이 제대로 안 나온다는 실차 관찰(요청 반영) — 이 구간엔 추론을
-계속 돌릴 실익이 없다.
-
-**수정 (`track_drive.py` `_active_yolo_stage()`):** `Phase.LAVACON` 분기를
-`self._lavacon_engaged` 기준으로 나눴다 — 진입 확정 전(트리거 대기 중, `perc_lavacon_trigger()`
-의 `cone_confirmed_cam` 판정에 여전히 필요)엔 그대로 `'cone'`을 반환하고, 진입 확정 후엔
-`None`을 반환해 `perc_yolo_cone()` 호출을 스킵(`perceive_all()`이 `self.cone_detected_yolo`를
-`False`로 리셋)한다. 탈출(`lavacon_done` 확정 → `Phase.OBSTACLE_ZONE` 전환) 시점부터는 별도
-처리 없이 기존 `Phase.OBSTACLE_ZONE` 분기(`'cone' if not self._b2_passed else 'vehicle'`)가
-그대로 다시 켜서, B2(고정장애물) 판정용 cone YOLO가 자동 재개된다.
-
-**알려진 한계:** `lavacon_done`(탈출 판정, `process_lavacon()`)은 원래부터 라이다만 쓰고
-YOLO에 의존하지 않으므로 이 변경으로 탈출 판정 자체엔 영향 없음 — 실차 미검증(요청 시점
-기준).
-
-### 3.11 진입 확정 직후 임시 강제조향 "킥" 실험 (`LAVACON_KICK_ENABLED`, 2026-08-23, 실차 미검증)
-
-**배경:** B1 진입이 확정되는 순간(`_lavacon_engaged` False→True) 0.5초간 -20도 고정
-조향각을 강제로 걸어보고 싶다는 실험 요청 — "초반 자세를 확 잡아준다"는 아이디어를 빠르게
-실차로 테스트해보기 위한 임시 스위치.
-
-**구현:**
-- `config.py`: `LAVACON_KICK_ENABLED`(True), `LAVACON_KICK_DURATION_S`(0.5),
-  `LAVACON_KICK_ANGLE_DEG`(-20.0) 신설.
-- `track_drive.py` `run_behavior_fsm()`의 `Phase.LAVACON` 분기 — `_lavacon_engaged`
-  상승엣지(`was_engaged` 스냅샷과 비교)를 딱 한 번만 감지해
-  `_lavacon_kick_cnt = LAVACON_KICK_DURATION_S / 0.05`(20Hz 고정주기 기준 프레임수)로 채운다.
-- `_handle_lavacon()` — `_lavacon_kick_cnt > 0`인 동안은 매 틱 1씩 깎으면서
-  `_lavacon_steer_da_push()`/차선조향 계산을 건너뛰고 `ctrl_angle`에
-  `LAVACON_KICK_ANGLE_DEG`를 그대로 대입(push 디버그 표시 플래그도 같이 꺼서
-  lavacon_bev/DA 창에 "이번 틱은 안 밀림"으로 보이게 함). 속도(`_update_speed()`)는
-  건드리지 않아 킥 구간에서도 평소와 동일하게 동작.
-
-**알려진 한계:** 실차 미검증 — 방향 부호(-20도가 좌/우 어느 쪽인지)도 실차에서 처음
-확인해야 함. 효과가 없거나 오히려 나쁘면 `LAVACON_KICK_ENABLED = False`로 되돌리면
-이 블록 전체가 비활성화되고 기존 push 조향 그대로 동작한다(다른 곳 되돌릴 필요 없음).
-
-**[2026-08-24]** 1단계 직후 반대 방향으로 되꺾는 2단계 킥(`LAVACON_KICK2_*`,
-`_lavacon_kick2_cnt`)을 잠깐 추가했다가 요청으로 삭제 — 되돌릴 경우 git 이력에서 복원할 것.
-
----
-
-## 4. 사물회피 (B2_OBSTACLE, 고정장애물)
-
-> **코드 주석 주의:** `track_drive.py`의 "재설계 예정" 주석은 낡았음 — 실제로는 `TargetPassing`
-> (SHIFT→ALONGSIDE→RETURN 3단계 옆차선 통과 기동)이 이미 붙어 있음.
-
-**수정할 곳:** `TEST_DISABLE_B2_B3=False`, `self.phase=Phase.OBSTACLE_ZONE`(§2.34로 통합됨 — 방해차량
-폭 미만 장애물만 두면 B2로 분류).
-
-**진입 게이트 `_da_avoidance_failed()`(2026-08-11):** da가 알아서 피하고 있다고 믿을 수 있으면(경로 안정
-+ da가 장애물을 반영) `TargetPassing` 개입 없이 lane-follow를 그대로 두고, 실패로 판단될 때만 override.
-**`da_unaware_of_obstacle`이 아직 하드코딩 `True`라 사실상 게이트가 항상 열려 있음(=매번 TargetPassing)**
-— da가 장애물 인지형으로 바뀌기 전까지는 실질적으로 게이트 도입 전과 동일 동작.
-
-**동작:** IDLE(방향 선택: 타겟 없는 차선→비어있는 쪽→노란선 건너편, 양쪽 다 막히면 서행 재시도) →
-SHIFT(`PASS_OFFSET=80px`, §6.1 실측 기반) → ALONGSIDE(장애물 안 보임 6프레임 유지) → RETURN. Hybrid A*
-대안은 2026-08-11에 삭제(B3만 유지, §5.1).
-
-### 4.1 정적/동적 교차확인 로그 (2026-08-11)
-`_cross_check_obstacle_motion()`이 Phase 기준 분류(순차 미션 설계 전제)가 실제 라이다 접근율과 어긋나면
-경고 로그만 남김(판단 자체는 안 바꿈, VESC 죽으면 스킵) — 실차에서 경고가 잦으면 게이팅 재검토 근거로
-쓸 것.
-
-### 4.2 좌/우 차선 공간 판정에 4단계 안정화 파이프라인 추가 (2026-08-13)
-`left_clear`/`right_clear`(회피 방향 결정 입력)가 라이다 노이즈로 흔들리던 문제를 **최대 연속길이(run)
-→ EMA 스무딩 → 히스테리시스(비대칭 이중임계값) → 디바운스(비었다=3프레임 확정/막혔다=즉시)** 4단계로
-안정화(`perc_obstacle()`). 디버그: `lidar_bev` 창에 4단계 전부 표시(`run L:7->6.2 R:3->2.8`,
-`L:CLR(2/3)`, `confirmed L:CLR R:BLK`).
-
-**알려진 한계:** `LEFT_BLOCK_TH=8`/`RIGHT_BLOCK_TH=5`(및 `_CLEAR_TH`)는 원래 "총 개수" 기준으로 잡힌
-값인데 이제 "연속길이" 기준이라 **재조정이 필요할 가능성이 높음** — 실차에서 `lidar_bev`의 `run L:`
-값을 보고 재조정할 것. `SIDE_CLEAR_CONFIRM_FRAMES=3` 등 나머지도 실차 미검증.
-
-### 4.3 B2 실제 처리를 TargetPassing → da 근접 컷(obstacle_cut)으로 이관 (2026-08-20)
-
-**배경:** 이번 대회 B2(고정장애물)의 실물이 **발포블록이 아니라 라바콘 1개**로 바뀌었다(요청
-반영). §2.49에서 "B2는 매칭되는 COCO 클래스가 없어 da 근접 컷 트리거가 반응 안 한다"고 남겨둔
-갭이, 물리적 대상이 콘으로 바뀌면서 자동으로 해소됐다 — 이미 B1(라바콘) 진입 트리거용으로
-쓰고 있던 `YoloConeDetector`를 그대로 재사용하면 B2도 똑같이 "라이다 근접 AND YOLO 카메라
-이중확인" 패턴으로 잡을 수 있다는 판단.
-
-**수정:**
-- `perc_obstacle_cut_trigger()`: 카메라 확인을 "차량 YOLO 단독"에서 "콘 YOLO OR 차량 YOLO"로
-  확장하고, 어느 쪽이 확정시켰는지로 `self.obstacle_cut_type`('fixed'=B2 / 'vehicle'=B3)을
-  기록한다. 둘 다 잡히거나 둘 다 카메라 폴백(초기화 실패)인 드문 경우엔 `perc_obstacle()`의
-  라이다 폭 기반 `obstacle_type`으로 타이브레이크, 그것도 미확정이면 트랙 순서상 먼저 나오는
-  `'fixed'`를 기본값으로 둔다.
-- `perceive_all()`: `perc_yolo_cone()`(콘 카메라 검출)을 `perc_obstacle_cut_trigger()`보다
-  앞으로 옮겼다 — 안 옮기면 그 트리거가 1틱 지연된(직전 프레임) 콘 검출값을 쓰게 된다.
-- `run_behavior_fsm()`의 `Phase.OBSTACLE_ZONE` 분기 — §3.4에서 B1에 적용한 것과 똑같은
-  패턴으로 재작성했다. `obstacle_cut_active`(라이다+YOLO AND 트리거의 hold/release 결과)가
-  True로 바뀌는 순간을 진입으로 보고 `self.obstacle_cut_type`을 스냅샷해 `_obscut_zone_tag`에
-  latch(`'fixed'`→'B2'/`'vehicle'`→'B3', §5.2의 "B2 전이면 무조건 B2" 순서 게이트도 그대로
-  적용), 다시 False로 돌아오는 순간을 탈출로 보고 `_mark_behavior_passed(tag)`를 부른다.
-  `behavior_state`는 B1처럼 계속 `B0_NORMAL`로 유지 — 실제 회피 조향/감속은
-  `perception/dl_lane.py`의 `_clip_da_by_obstacle()`(da 클리핑)과 `_lane_drive()`의
-  `SPEED_OBSTACLE_CUT` 속도캡이 behavior_state와 무관하게 이미 상시로 처리하고 있으므로,
-  `apply_behavior_override()`가 `_handle_fixed_obstacle()`/`_handle_overtake()`
-  (TargetPassing 기반)를 더 이상 호출하지 않아도 된다.
-- `_handle_fixed_obstacle()`/`_handle_overtake()`/`obstacle_avoidance.py`(TargetPassing)는
-  코드 그대로 보존 — behavior_state가 B2_OBSTACLE/B3_VEHICLE이 되는 경로가 없어져서 지금은
-  단순히 호출되지 않는 상태(unreachable)다. 되살리는 법은 각 함수 docstring 및 §5.2 참고.
-
-**전제:** `ENABLE_OBSTACLE_CUT=True`로 켜야 이 경로 전체가 동작한다(기본값 `False`) — 꺼져
-있으면 `obstacle_cut_trigger`/`obstacle_cut_active`가 항상 `False`라 Phase가 OBSTACLE_ZONE에서
-영원히 못 벗어난다(§4.1의 `TEST_DISABLE_B2_B3`와는 별개 스위치, §2.51 참고).
-
-**알려진 한계 (전부 실차 미검증):** B2(콘 1개)가 §2.49의 `OBSTACLE_CUT_TRIGGER_Y_HALF_M=0.55m`/
-`OBSTACLE_CUT_TRIGGER_X_MAX_M=1.0m` ROI 안에서 B3(RC카 모형)와 비슷한 시점에 라이다로
-잡히는지, 콘 하나만으로도 `YoloConeDetector`(원래 B1 다수 콘 검출용으로 튜닝된 신뢰도 임계값)가
-안정적으로 반응하는지 확인 안 됨. 두 대상의 물리적 크기가 달라 `OBSTACLE_CUT_NEAR_M`/컷 폭 등
-기존 §2.51 파라미터가 B2/B3 양쪽에 동시에 맞는 값인지도 재검증 필요.
-
-### 4.4 B2(고정장애물) 전용 최소유지시간 단축 (2026-08-21)
-요청 반영 — B2는 정지해 있는 콘이라 회피가 끝나면 바로 지나쳐가는데, B3(방해차량)와 같은
-`OBSTACLE_CUT_HOLD_SEC_MIN`(2.0초)을 그대로 쓰면 이미 다 지나간 뒤에도 컷이 한참 남아있었다
-(요청 원문: cut이 "등장했다가 사라지는" 게 너무 길다). 새 상수 `OBSTACLE_CUT_HOLD_SEC_MIN_FIXED`
-(0.5초)를 추가하고, `_update_obstacle_cut_hold()`가 새 진입 순간(`self._obstacle_cut_until_t <= now`)
-`self.obstacle_cut_type`('fixed'면 0.5초, 그 외는 기존 2.0초)로 최소유지시간을 골라
-`self._obstacle_cut_hold_sec_min`에 저장 — 이후 `floor_elapsed` 판정과 `obstacle_cut_debug`
-디버그창의 `floor=` 표시 모두 이 값을 쓴다. `perc_obstacle_cut_trigger()`가 같은 틱 안에서 먼저
-`obstacle_cut_type`을 확정해두므로(`perceive_all()` 호출 순서) 진입 순간 바로 읽어도 안전하다.
-해제 디바운스(`OBSTACLE_CUT_RELEASE_CONFIRM_FRAMES`)는 B2/B3 공용으로 그대로 유지 — 이번 변경은
-"floor"(최소 유지 시간)만 낮춘 것. 실차 미검증.
-
-### 4.5 전방 장애물 ROI 횡방향 반폭 — 축소했다가 원복 (2026-08-22k)
-
-**배경:** 요청 반영. `lidar_bev` 디버그창의 노란(청록, BGR `(0,220,220)`) FRONT ROI 박스가
-좌우 ±1.5m(총 3m)로 커 보인다는 지적으로 §3.7(라바콘 트리거 ROI 축소)과 함께 0.5m로
-좁혔다가, 이 값은 `lavacon_bev`가 아니라 `lidar_bev`(B2/B3 전용)에 속한 별개 ROI라는 게
-확인되면서 다시 1.5m로 원복(요청 반영).
-
-**수정:** `perc_obstacle()`의 `FRONT_Y_HALF` 1.5 → 0.5 → **1.5로 원복** (track_drive.py:892).
-라바콘 쪽(§3.7의 `perc_lavacon_trigger()` `LAT_MAX`, `perc_lavacon.py` `CONE_LAT_LIMIT`, 둘 다
-0.5)은 원복 대상이 아니고 그대로 유지.
-
-**참고:** 이 값은 표시 전용이 아니라 `front_mask`(→ `obstacle_front`/`obstacle_dist`/
-`obstacle_type`/`obstacle_width`) 전부의 입력이라 B2/B3 회피 판정 자체에 직접 영향을 준다 —
-`SIDE_X_MIN/MAX`, `LEFT/RIGHT_Y_MIN/MAX`(좌우 차선공간 판정용, §4.2)는 애초에 건드린 적 없음.
-
----
-
-## 5. 차량회피/추월 (B3_VEHICLE)
-
-> **[2026-08-20] §4.3 참고:** 아래 §5 본문(`perc_vehicle_trigger()`/`OVERTAKE_TRIGGER`/
-> `TargetPassing`/`_handle_overtake()`)은 실제로는 더 이상 호출되지 않는 예전 경로다 — B3의
-> 실제 진입~처리는 지금 §4.3에서 설명한 da 근접 컷(`obstacle_cut_active`, YOLO 차량+라이다 AND
-> 트리거)으로 이관됐다. 이 절은 되살릴 때를 위해 그대로 남겨둔다.
-
-**수정할 곳:** `TEST_DISABLE_B2_B3=False`, `self.phase=Phase.OBSTACLE_ZONE`(폭 `OBSTACLE_VEHICLE_WIDTH_M`
-이상 타겟만 B3로 분류).
-
-진입: 라이다 단독, 전방 장애물+거리<`OVERTAKE_TRIGGER=6.5m`가 5프레임 연속. B2와 동일 `TargetPassing`을
-`moving=True`로 재사용 — 타겟이 통과 방향으로 `SWITCH_FRAMES`(8) 연속 넘어오면 반대쪽이 비었을 때만
-방향 재평가(`_target_cuts_in()`).
-
-**알려진 한계:** 카메라/YOLO 이중확인 없이 라이다 근접만으로 트리거돼 콘을 방해차량으로 오인 진입할
-여지 있음(격리 테스트 시 특히 주의, §4.1 로그로 감지만 함) — §4.3 이관 이후로는 이 갭이 da 근접 컷
-쪽의 YOLO 차량 이중확인으로 대체돼 더 이상 실질적 위험은 아니다.
-
-### 5.1 Hybrid A* 대안 — 동적 장애물용 (`USE_HYBRID_ASTAR_FOR_B3`, 2026-08-11)
-B2와 달리 "그리드/충돌검사는 매틱, 전체 재탐색은 트리거 기반"(경로 무효화/타겟 진입/주기적 4틱)으로
-설계 — 방해차량이 짧은 시간에 차선을 넘어올 수 있어 B2식 "1초 재사용"은 위험하기 때문
-(`_handle_overtake_astar()`). 탐색 실패가 `ASTAR_B3_FAIL_GRACE_TICKS`(3틱) 넘으면 검증된
-`TargetPassing`으로 폴백. 방향은 `TargetPassing.choose_side()`를 재사용(중복 구현 방지). 차량
-풋프린트를 실측값(`VEHICLE_WIDTH_M=0.31`/`LENGTH_M=0.64`)+여유(`ASTAR_VEHICLE_MARGIN_M=0.05`)로
-교체(하드코딩 0.45/0.70이었던 것, B2/B3 공유). 기본값 `False`(B2조차 아직 미검증이라 순서상 B2 먼저
-검증 필요) — 실차 미검증.
-
-### 5.2 B3 트리거에 "B2 통과 후" 순서 게이트 추가 (2026-08-20)
-
-**배경:** §2.34(Phase.OBSTACLE_ZONE 통합) 당시엔 "정적/동적 구분 없이 매 프레임 obstacle_type으로
-그때그때 판단하고, 어느 쪽이 먼저 끝나도 상관없다"는 전제로 설계했다. 이번에 대회 트랙 순서가
-"고정장애물(B2) → 이동장애물(B3)"로 항상 고정이라는 걸 확인받아, 그 전제가 더 강하게 좁혀졌다.
-
-기존 방식은 `obstacle_type=='vehicle'`이면 `self._b2_passed`와 무관하게 곧바로 B3로 분류했는데,
-트리거 발동 초반 몇 프레임은 `obstacle_type`/`vehicle_trigger` 디바운스 타이밍이 안 맞아 사실은
-고정장애물인데 잠깐 vehicle로 오분류될 위험이 있었다(§5 "알려진 한계"와 연결되는 문제).
-
-**수정:** `run_behavior_fsm()`(track_drive.py)에서 `triggered_vehicle` 판정에
-`self._b2_passed` 조건을 추가 — B2를 아직 한 번도 통과하지 못한 상태면 `obstacle_type`이
-`'vehicle'`로 나와도 B3로 넘어가지 않고 B2 트리거(`triggered_fixed`)만 받아들인다. 트랙 순서가
-고정이라 "B2 전이면 지금 보이는 건 무조건 B2"로 못박아 초반 오분류를 원천 차단하는 방식.
-Phase.DONE 전환 조건(`_mark_behavior_passed()` — B2/B3 둘 다 완료돼야 함)은 그대로 유지.
-
-**알려진 한계 (실차 미검증):** 이 게이트는 "B2 전에 B3가 절대 안 나온다"는 전제가 확실할 때만
-안전하다 — 실제 대회 트랙에서 예외적으로 두 장애물이 근접 배치되거나 순서가 바뀌는 경우가 있다면
-B3 진입 자체가 막혀버리는 역효과가 날 수 있으니 실차에서 순서를 재확인할 것.
-
-### 5.3 좌우 교차검증 veto를 "불일치=취소"에서 "YOLO 쪽에 라이다 점 없음=취소"로 완화 (2026-08-21)
-§0.5.15/직전 커밋(2026-08-21)에서 추가한 라이다-YOLO 좌우 교차검증(`perc_obstacle_cut_trigger()`)이
-너무 엄격했다 — 라이다 ROI 안의 "가장 가까운 점 하나"만으로 `lidar_side`를 정하다 보니, 실제로는
-장애물이 라이다에 양쪽(예: 차체 여러 지점이 좌우로 걸쳐 잡히는 경우)으로 찍히는데 그중 가장 가까운
-점이 우연히 YOLO 반대쪽이면 진짜 방해차량인데도 `vehicle_seen`이 통째로 취소됐다(요청 반영).
-
-**수정:** `lidar_side != yolo_side`로 어긋나도 곧바로 veto하지 않는다 — 먼저 트리거 ROI
-(`roi_mask`) 안에 YOLO가 가리키는 쪽(`y>0`=L / `y<0`=R)에 라이다 점이 실제로 있는지 다시 확인해서:
-- **있으면(=좌우 양쪽 다 찍힌 경우)**: veto하지 않고, YOLO가 가리키는 쪽 점들 중 가장 가까운 점으로
-  `self._obstacle_cut_y`를 다시 골라 컷 방향 자체를 YOLO 검출 방향으로 맞춘다(이 값이 그대로
-  `perc_lane()`→`set_obstacle()`로 넘어가 실제 da 클리핑 방향을 결정, §4.3 참고).
-  `self._obstacle_cut_lidar_side`도 `yolo_side`로 갱신해 디버그창엔 "일치"로 보인다.
-- **없으면(=YOLO가 가리키는 쪽엔 라이다 점이 아예 없음)**: 기존과 동일하게 진짜 불일치로 보고
-  `vehicle_seen=False` + `_obstacle_cut_side_veto=True`.
-
-즉 이제 veto는 "둘 다 뭔가 봤는데 서로 다른 자리를 보고 있다"가 아니라 "YOLO가 가리키는 자리엔
-라이다가 아무것도 못 봤다"는 진짜 불일치일 때만 발동한다. 실차 미검증.
-
-### 5.4 트랙 순서 게이트 반전 — "B2 먼저"에서 "B3(방해차량) 먼저"로 (2026-08-21)
-§5.2(2026-08-20)에서 "대회 트랙은 고정장애물(B2)이 항상 이동장애물(B3)보다 먼저 나온다"는 확인을
-받아 B2 통과 전엔 vehicle 타입도 B2로 취급하는 게이트를 넣었었다. 이번 요청으로 그 순서가
-반대(B3가 먼저)로 뒤집혀, 게이트 자체를 반전시켰다 — §5.2를 대체하는 게 아니라 그 구조를 그대로
-반대 방향에 적용한 것.
-
-**수정한 곳:**
-- `run_behavior_fsm()`의 `Phase.OBSTACLE_ZONE` 분기: `obstacle_cut_type=='vehicle' and
-  self._b2_passed` → `'B3'`(§5.2 이전) 였던 조건을 `obstacle_cut_type=='fixed' and
-  self._b3_passed` → `'B2'`로 뒤집었다. 즉 `_b3_passed`가 아직 `False`면 `obstacle_cut_type`이
-  `'fixed'`로 잡혀도 `'B3'`로 취급 — B3를 먼저 확정 짓기 전엔 B2로 오분류돼 먼저 통과 처리되는
-  사고를 막는다(§5.2와 대칭 원리, 대상만 바뀜).
-- `_active_yolo_stage()`: `Phase.OBSTACLE_ZONE`에서 `'cone' if not self._b2_passed else
-  'vehicle'` → `'vehicle' if not self._b3_passed else 'cone'`로 반전 — B3가 지나기 전까진
-  차량 YOLO만 돌리고(콘 카메라는 유휴), B3가 끝난 뒤에야 콘 YOLO로 전환된다.
-- `__init__`의 `self._b2_passed`/`self._b3_passed` 초기화 주변 주석, `_debug_viz_obstacle_cut()`
-  주석도 새 순서에 맞춰 갱신.
-
-**영향받지 않는 것:** `_mark_behavior_passed()`/Phase.DONE 전환 조건(`_b2_passed and
-_b3_passed` 둘 다 필요)은 순서와 무관해 그대로. `_b2_passed`/`_b3_passed`를 매 바퀴 리셋하는
-`RESET_PHASE_EACH_LAP` 경로도 대칭이라 손댈 필요 없음.
-
-**알려진 한계 (실차 미검증):** §5.2와 마찬가지로 "B3가 B2보다 항상 먼저 나온다"는 전제가 확실할
-때만 안전 — 트랙 순서가 실제로 바뀌었는지, 혹은 상황(예: 코스 구성 변경)에 따라 다시 바뀔 수
-있는지 실차에서 재확인할 것.
-
-### 5.5 트랙 순서 게이트 재반전 — "B3 먼저"에서 다시 "B2(고정장애물) 먼저"로, 단계 표시창 추가 (2026-08-22)
-
-**배경:** §5.4에서 "B3(방해차량) → B2(고정장애물)"로 뒤집었던 게 실제 대회 트랙 순서와
-맞지 않는다는 요청으로, 원래 순서(§5.2) "B1(라바콘) → B2(고정장애물) → B3(방해차량)"로
-되돌렸다 — §5.4를 대체하는 게 아니라 그 반전을 다시 반전시킨 것(§5.2와 동일 코드로 복귀).
-
-**수정한 곳:** §5.4가 건드렸던 지점을 전부 원복.
-- `run_behavior_fsm()`의 `Phase.OBSTACLE_ZONE` 분기: `'fixed' and self._b3_passed → 'B2'`를
-  `'vehicle' and self._b2_passed → 'B3'`(그 외엔 `'B2'`)로 되돌림.
-- `_active_yolo_stage()`: `Phase.OBSTACLE_ZONE`에서 `'vehicle' if not self._b3_passed else
-  'cone'`을 `'cone' if not self._b2_passed else 'vehicle'`로 되돌림 — B2가 지나기 전까진
-  콘 YOLO만 돌고, B2가 끝난 뒤에야 차량 YOLO로 전환된다.
-- `__init__`의 `self._b2_passed`/`self._b3_passed` 초기화 주변 주석, `_debug_viz_obstacle_cut()`
-  주석도 원래 순서에 맞춰 갱신.
-
-**함께 추가:** "지금 B1/B2/B3 중 어느 단계고 뭘 기다리는지"가 그동안 `_print_debug()`의
-터미널 `[{mission_state}|{behavior_state}|{phase}]` 요약 줄로만 나와서 실시간 상황 대응 중
-알아보기 어렵다는 요청으로 두 곳에 표시를 추가했다:
-- `obstacle_cut_debug` 창 상단 상태 줄(`_current_stage_label()`, track_drive.py) — 한글
-  설명형: `Phase.LAVACON`은 "B1 라바콘 — 진행 중(탈출 대기)"/"대기 중(좌우 동시검출 트리거
-  대기)", `Phase.OBSTACLE_ZONE`은 `_b2_passed`가 False면 "B2 고정장애물", 아니면 "B3
-  방해차량" 뒤에 "감지됨(회피/통과 중)"(`_obscut_zone_tag`가 그 태그와 일치)/"대기 중",
-  `Phase.DONE`은 "B1/B2/B3 모두 통과 — 다음 교차로 대기". 색상은 초록=감지/진행 중,
-  주황=대기 중, 회색=해당 없음/종료로 다른 디버그 창(`signal4_roi`, `avoid_hold_debug`)과
-  관례를 맞췄다.
-- [2026-08-22 추가 수정] 사용자가 실제로 원한 자리는 이 창이 아니라 터미널 `_print_debug()`
-  요약 줄의 가운데 칸(`[mission|behavior|phase]`)이었다 — 그 칸은 `self.behavior_state.name`
-  을 그대로 찍는데, `run_behavior_fsm()`이 실제 회피를 `obstacle_cut_active`로 넘기면서
-  이 필드는 거의 항상 `B0_NORMAL`로 고정돼 있어(위 "배경" 참고) 그것만 봐선 진행 단계를
-  알 수 없었다. `self.behavior_state` 자체를 B1/B2/B3로 바꾸면
-  `apply_behavior_override()`가 옛 `_handle_lavacon()`/`_handle_fixed_obstacle()`/
-  `_handle_overtake()`(TargetPassing 기반, 지금은 안 쓰는 실제 조향 핸들러)를 다시 불러버려
-  주행이 깨지므로, 표시 전용 헬퍼 `_behavior_progress_tag()`를 새로 만들어 그 칸에서만
-  `self.behavior_state.name` 대신 이걸 쓰게 했다(`self.behavior_state` 자체는 그대로 항상
-  `B0_NORMAL`). `_current_stage_label()`과 같은 근거(`_lavacon_engaged`/`_b2_passed`/
-  `_b3_passed`/`_obscut_zone_tag`)로 `B1_LAVACON`/`B2_OBSTACLE`/`B3_VEHICLE`/`B0_NORMAL`을
-  반환하고, 그 단계가 지금 실제로 감지/진행 중이면 `+`를 붙인다(예: `B2_OBSTACLE+`).
-
-**영향받지 않는 것:** §5.4와 동일 — `_mark_behavior_passed()`/Phase.DONE 전환 조건, `RESET_
-PHASE_EACH_LAP` 리셋 경로.
-
-**알려진 한계 (실차 미검증):** 다시 "B2가 B3보다 항상 먼저 나온다"는 전제로 돌아간 것이라
-§5.2의 한계가 그대로 적용된다 — 실제 트랙에서 예외적으로 순서가 섞이면 오분류 위험. 단계
-표시창(`obstacle_cut_debug`)은 `DEBUG_VIZ_OBSTACLE_CUT=True`일 때만 보이므로, 꺼둔 상태라면
-여전히 터미널 로그로만 확인 가능.
-
-### 5.6 `DEBUG_VIZ_OBSTACLE_CUT` 재점등 + `dl_lane` 창 경로선을 "밀린 경로"일 때 주황으로 (2026-08-22)
-
-**배경:** 지금 실제 회피(B2/B3)는 `BehaviorState`가 아니라 da 근접 컷(`ENABLE_OBSTACLE_CUT`,
-§2.48~§2.52)이 라이다로 장애물을 가까이서 잡으면 da(주행가능영역) 자체를 클리핑해 경로를
-미는 방식이다 — 이걸 실차에서 바로 확인할 디버그 창이 필요하다는 요청. 라이다 쪽
-"검출범위"를 보여주는 창은 §2.56에서 이미 `obstacle_cut_debug`(`_debug_viz_obstacle_cut()`)의
-"LIDAR TRIGGER ROI" BEV 패널로 구현돼 있었는데, §1.19c(2026-08-22)에서 좌회전 디버깅에
-집중하려고 `DEBUG_VIZ_OBSTACLE_CUT=False`로 꺼둔 상태였다 — 새 창을 만드는 대신 이걸 다시
-켰다. 반면 da 쪽 "지금 추종 중인 경로가 밀렸는지"는 기존 `dl_lane` 창에 아예 표시가
-없었다(§2.52에서 컷 사각형만 빨강으로 표시, 경로선은 켜져 있든 아니든 항상 자홍색 고정) —
-이 부분만 새로 추가.
-
-**수정한 곳:**
-- `config.py` `DEBUG_VIZ_OBSTACLE_CUT`: `False → True`. `obstacle_cut_debug` 창의 "LIDAR
-  TRIGGER ROI" BEV 패널(노란 테두리 사각형 = `OBSTACLE_CUT_TRIGGER_X_MAX_M` x
-  `OBSTACLE_CUT_TRIGGER_Y_HALF_M` 검출범위, 빨간 점 = 그 범위 안에 실제로 잡힌 라이다 점,
-  회색 점 = 표시범위 안이지만 트리거 밖)가 이 창의 라이다 검출범위 표시 그 자체다 — 새로
-  만들 필요 없이 기존 구현을 다시 켠 것.
-- `perception/lane_util.py` `SlideWindow.draw_path()`: `self.obstacle_cut_active`(DL 백엔드
-  전용 속성, 비-DL `SlideWindow`엔 없어 `getattr(..., False)`로 안전 처리)가 True인
-  프레임엔 경로선/점 색을 자홍색(`(255,0,255)`) 대신 주황(`(0,140,255)`)으로 그린다. 이
-  저장소 관례상 주황은 이미 `da_fallback_used`/가상경계 ll 클리핑 등 "정상 경로가 아니라
-  차선책"을 뜻하는 색이라, 별도 색을 새로 고르지 않고 그 의미를 그대로 재사용했다. 컷
-  사각형(빨강, §2.52)과는 색이 달라 그때 고친 "경로선이 채움에 묻히는" 문제와도 계속
-  호환된다.
-- `perception/dl_lane.py` `visualize()` 위 주석: 경로 색이 이제 고정이 아니라
-  `obstacle_cut_active`에 따라 바뀐다는 점을 반영해 갱신.
-
-**영향받지 않는 것:** 실제 회피 로직(`_clip_da_by_obstacle()`, 클리핑 폭/트리거/유지타이머)은
-전혀 안 건드림 — 순수 시각화(디버그 창 on/off, 경로선 색상 분기)만 바꿨다.
-
-**알려진 한계:** `ENABLE_OBSTACLE_CUT`의 부호규약 자체가 실차 미검증이라는 §2.52의 경고가
-그대로 적용된다 — 이번 변경은 "밀렸을 때 이렇게 보인다"만 보여줄 뿐, 미는 방향이 실제로
-장애물 반대쪽인지는 이 디버그 창만으로 확인 안 됨(직접 정지/저속 주행 관찰 필요).
-
----
-
-### 5.7 라바콘 push 시 `dl_lane` 창에 밀리기 전(보라) 원본 경로도 같이 표시 (2026-08-22)
-
-**배경:** §5.6에서 `lavacon_push_active`가 True일 때 경로선을 주황으로 바꿨는데, B1 라바콘
-케이스는 B2 da 근접 컷과 달리 `path`(=`DLSlideWindow.self.path`) 자체는 전혀 안 밀린다 —
-`_lavacon_steer_da_push()`(track_drive.py)가 `self.lane_path`를 **별도 복사본**
-(`shifted_path`)으로만 밀어서 조향에 쓰고, da 피팅 결과인 `self.path`는 원본 그대로 둔다.
-그래서 지금까진 주황으로 바뀌어도 선 좌표는 그대로라 "밀린 티"만 나고 실제로 얼마나
-밀었는지는 안 보였다 — 게인(안전마진/밀기 비율) 튜닝에 참고하려면 밀리기 전/후를 같이
-봐야 한다는 요청.
-
-**수정한 곳:**
-- `track_drive.py` `_lavacon_steer_da_push()`: `push_px` 계산 직후 `self._lavacon_push_px`에
-  같이 저장(부호 규약은 `shifted_path` 계산과 동일 — 우측+). `run_behavior_fsm()`의 라바콘
-  진입/탈출 리셋 지점, `__init__`에도 `0.0` 초기화 추가(`_lavacon_push_active`와 항상 짝
-  맞춰 리셋).
-- `track_drive.py` `perc_lane()`: `set_lavacon_push()` 호출에 `self._lavacon_push_px`도
-  같이 전달.
-- `perception/dl_lane.py` `DLLaneDetector`: `set_lavacon_push(active, push_px=0.0)`으로
-  시그니처 확장, `_latest_lavacon_push_px`로 저장 → `_worker()`가 매 프레임 같이 읽어
-  `DLSlideWindow.detect(..., lavacon_push_px=...)`로 전달 → `self.lavacon_push_px`에 대입
-  (`lavacon_push_active`와 동일 관례).
-- `perception/lane_util.py` `SlideWindow.draw_path()`: `lavacon_push_active`가 True고
-  `lavacon_push_px != 0`이면, 원본 `path`를 보라(`(238,130,238)`)로 그리고 이어서 x좌표에
-  `push_px`를 더한 경로를 주황(`(0,140,255)`)으로 나란히 그린다 — 두 선의 가로 간격이 곧
-  `push_px`다. da 근접 컷(`obstacle_cut_active`) 케이스는 `path` 자체가 이미 클리핑된
-  결과라 비교할 원본이 없으므로 그대로 단일 주황선 유지.
-
-**영향받지 않는 것:** 실제 조향에 쓰이는 `shifted_path`/`_lane_steer()` 로직은 전혀
-안 건드림 — 순수 시각화(디버그 창에 두 번째 폴리라인 추가)만 바꿨다. B2 근접 컷 쪽 색상
-분기(§5.6)도 그대로.
-
-**알려진 한계:** `push_px`는 `_lavacon_steer_da_push()`가 계산한 이번 틱 값을 다음 추론
-틱에 반영하는 구조라(`set_avoid_hold()` 등과 동일한 1틱 지연 관례) 엄밀히는 한 프레임
-어긋날 수 있다 — 디버깅 목적엔 무시 가능한 수준.
-
----
-
-### 5.8 디버그 창 3개(`dl_lane`/`lavacon_bev`/`obstacle_cut_debug`)가 겹쳐서 뜨는 문제 — `cv2.moveWindow`로 위치 고정 (2026-08-22)
-
-**배경:** 지금 기본으로 켜진 디버그창(`DEBUG_VIZ_DL_LANE`/`DEBUG_VIZ_LAVACON`/
-`DEBUG_VIZ_OBSTACLE_CUT` 세 개, config.py 참고)이 전부 OS 기본 위치(대개 화면 좌상단
-근처)에 뜨면서 서로 겹쳐 나온다는 요청 — `xydrive`로 실행할 때마다 매번 손으로 옮겨야
-했다.
-
-**수정한 곳:**
-- `config.py`: `DEBUG_WIN_POS_DL_LANE`/`DEBUG_WIN_POS_LAVACON`/`DEBUG_WIN_POS_OBSTACLE_CUT`
-  좌표(스크린 픽셀, 창 좌상단 기준) 추가 — 기본 `(0,0)`/`(650,0)`/`(0,650)`로 3분할
-  배치. 해상도에 안 맞으면 이 값만 바꾸면 됨.
-- `track_drive.py` `__init__`: `self._dbg_windows_positioned`(set) 추가 — 창 이름을
-  기록해 `cv2.moveWindow`를 프레임마다 부르지 않고 창당 딱 한 번만 부르기 위한 가드
-  (매 프레임 호출하면 사용자가 직접 옮겨놔도 다음 프레임에 도로 스냅백됨).
-  `_draw_lavacon_bev()`/`_debug_viz_obstacle_cut()`에서 `cv2.imshow` 직전에 이 가드로
-  `cv2.namedWindow(..., cv2.WINDOW_AUTOSIZE)` + `cv2.moveWindow(...)` 호출.
-- `perception/dl_lane.py` `DLLaneDetector`: 동일 패턴으로 `self._dbg_win_positioned`(bool)
-  추가, `show_debug_windows()`의 `cv2.imshow('dl_lane', ...)` 직전에 위치 고정.
-- **[2026-08-22 수정]** 처음엔 `cv2.WINDOW_NORMAL`로 만들었다가 `dl_lane` 창이 잘려서/
-  비율 깨져서 나오는 회귀가 생김 — `WINDOW_NORMAL`은 OS가 임의로 잡은 기본 창 크기로
-  고정되고 그 크기에 이미지를 억지로 맞춰 늘이거나 잘라내기 때문(원래는 `namedWindow`를
-  안 불러서 `cv2.imshow`가 이미지 크기에 자동으로 딱 맞는 `WINDOW_AUTOSIZE`로 창을
-  만들던 것과 다른 동작). `WINDOW_AUTOSIZE`로 바꿔 위치는 고정하되 원본 이미지 크기/
-  비율 그대로 표시하도록 되돌림.
-
-**영향받지 않는 것:** 세 창의 그리기 로직/내용은 전혀 안 바꿈 — 창이 처음 뜨는 위치만
-잡아준다. `WINDOW_AUTOSIZE`라 창 크기는 이전과 동일하게 이미지에 자동으로 맞춰지고,
-위치는 사용자가 직접 옮겨도 유지된다(다음 프레임에 다시 스냅백 안 함). 단 `AUTOSIZE`는
-사용자가 마우스로 창 크기를 조절하는 건 불가능(OpenCV 제약, 원래도 그랬음).
-
-**알려진 한계:** 좌표는 특정 개발 PC 화면 기준 추정치(실측 아님) — 모니터 해상도가
-다르면 창이 화면 밖으로 나가거나 다시 겹칠 수 있어 `DEBUG_WIN_POS_*` 값을 실제 환경에
-맞게 조정할 것.
-
----
-
-### 5.9 [미해결 의심] B1 라바콘 push가 침범한 콘 쪽으로 밀리는 것처럼 보임 — `dl_lane` 창에 방향 라벨 추가 (2026-08-22)
-
-**배경:** 실차 주행 녹화 리뷰 중, 라이다가 우측 콘 침범을 잡은 프레임(`lavacon_bev`:
-`R_y=-0.08m`, `margin=0.26m` 기준 `push=-0.13m`)에서 `dl_lane` 창의 경로가 오히려
-콘이 있는 오른쪽으로 밀리는 것처럼 보인다는 문제 제기(사용자 육안 확인). `push_m` 부호
-규약상(`_lavacon_steer_da_push()`, "우측 콘 침범 → 좌측(-)으로") 이 프레임은 경로가
-왼쪽으로 밀려야 정상이라 코드 의도와 반대로 보인 것 — 아직 원인 미확정.
-
-**점검한 것:** `DL_BEV_SRC_PX_RAW`(config.py, TL/TR/BL/BR 4점)는 x좌표가 좌<우로
-정상 배열돼 있어 "캘리브레이션 점을 좌우 반대로 찍은" 단순 실수는 아닌 것으로 보임.
-다만 `_clip_da_by_obstacle()`(B2) docstring이 이미 "★부호규약 주의(실차 미검증)★ —
-반대로 자르면 치명적 버그"라고 자체 경고해둔 "DA BEV 캔버스 x가 클수록 물리적 우측"
-가정을 B1 push도 동일하게 전제한다 — 이 가정 자체가 아직 실차로 확인된 적이 없다.
-카메라 자체가 미러링돼 있을 가능성도 배제 못 함(`cv2.flip` 호출은 코드베이스 어디에도
-없어 소프트웨어 반전은 아님 — 하드웨어/드라이버 단 미러링 가능성만 남음).
-
-**임시 조치:** `perception/lane_util.py` `SlideWindow.draw_path()` — `lavacon_push_active`
-경로에 `PUSH RIGHT-> {px}` / `PUSH <-LEFT {px}` 텍스트 라벨 추가(주황, 밀린 경로
-시작점 근처). 사다리꼴 원근 때문에 좌/우를 눈대중으로 헷갈리기 쉬웠던 문제를 없애,
-다음 실차 테스트에서 "라이다가 어느 쪽 콘을 잡았는지"와 "이 라벨이 가리키는 방향"을
-바로 대조할 수 있게 한다.
-
-**다음 확인 단계(실차, 저속):** 콘 하나만 차량 우측 가까이에 두고 정지 상태에서
-`lavacon_bev`의 `push=` 부호와 `dl_lane`의 `PUSH ->`/`<-` 라벨을 대조 — 라벨이
-`<-LEFT`인데도 실제 조향이 우측(콘 쪽)으로 나가면 `_lane_steer()`~`pure_pursuit.control()`
-사이나 `drive()`의 각도 부호 어딘가에 반전이 있다는 뜻이고, 라벨 자체가 `RIGHT->`로
-나온다면 이 문서 위 단락의 BEV 좌우 가정이 실제로 틀렸다는 뜻이니 `DL_BEV_SRC_PX_RAW`
-재측정(좌우 물리적으로 재확인) 또는 `push_px` 부호 반전으로 고칠 것.
-
-### 5.10 [임시완화, 실차확인] push ROI 안 특정 위치의 반복 유령 라이다 점 — 좌표 지정 원형 마스크 추가 (2026-08-22)
-
-**배경:** §5.9 조사 중 사용자가 `lavacon_bev` 스크린샷에서 push 판정을 만든 점의 정확한 위치를
-지목 — range=0.11m, `R_y=-0.08m`(→ x≈0.075m, 라이다 원점 기준 우측 아주 가까운 지점). 실제로는
-아무 물체도 없는 위치이고, 오히려 라이다로 잘 안 찍혀야 할 음영구간인데도 반복적으로 점이
-찍힌다는 사용자 확인. 같은 지점이 신호등 인식 검증 때도 문제가 됐다고 함 — 특정 물리 위치에서
-반복되는 것으로 보아 하드웨어성 원인(마운트 반사 등)일 가능성이 높다는 판단.
-
-**조치(근본원인 조사 전 임시 완화):** `perception/perc_lavacon.py` `_lidar_to_xy()`에
-`GHOST_POINT_X_M=0.075`/`GHOST_POINT_Y_M=-0.08`/`GHOST_POINT_RADIUS_M=0.04`(4cm) 원형 무효
-구역 추가 — 이 구역 안의 라이다 점은 `ranges=0`으로 처리해 `nearest_cone_lateral()`(push
-판정)과 `process_lavacon()`(박스 스택) 둘 다에서 자동으로 제외된다(둘 다 `_lidar_to_xy()`를
-공유). 반경을 최소한(4cm)만 잡은 이유: 이 구역을 넓히면 그 근처의 진짜 라바콘 반사점까지 같이
-지워버릴 수 있어서.
-
-**주의:** 이건 증상 완화지 원인 제거가 아니다 — §해당 작업기록("다음 작업")에 정리된 근본 원인
-후보(라이다 각도 오프셋 드리프트 §6.2, 자기가림 데드존 경계, 멀티패스/차체 반사) 조사는 여전히
-필요. 다른 위치에서 유령 점이 또 나타나면 같은 좌표+반경을 계속 추가하기보다 그 조사부터 할 것 —
-좌표를 하나씩 땜질하는 방식은 확장 안 됨.
-
-**[2026-08-22 22:5x 확정]** `lavacon_bev`에 마스킹 원(빨강, 정확한 중심좌표 텍스트 포함)을
-띄워 눈대중 대신 숫자로 대조할 수 있게 한 뒤, 사용자가 실차에서 직접 `GHOST_POINT_X_M`을
-`0.080` → **`-0.05`**로 보정(`GHOST_POINT_Y_M=-0.075`/`GHOST_POINT_RADIUS_M=0.06`은 그대로,
-`perception/perc_lavacon.py` 158번 줄) — **이 좌표에서 해당 위치 유령 점이 실차에서 완전히
-가려지는 것을 확인함.** 근본 원인(차체/마운트 자기반사로 사실상 확정 — 차체를 들어올리면
-점이 사라짐을 확인) 조사 자체는 여전히 미완료.
-
-### 5.11 push 안전마진 좌우 폭 2배 + push 세기 2배 (2026-08-22b, 실차 미검증)
-
-**배경:** 사용자가 `lavacon_bev` 디버그창에서 "인접하면 민다"고 판정하는 보라색 안전마진
-라인(±`LAVACON_PUSH_SAFETY_MARGIN_M`) 구간이 좁아 보인다며 좌우 폭을 2배로, 동시에 실제
-미는 세기(`push_m`)도 2배로 늘려달라고 요청.
-
-**조치:** `config.py`
-- `LAVACON_PUSH_SAFETY_MARGIN_M`: `0.13` → `0.26`(공교롭게도 §3.5의 "0.26→0.13 절반 축소"
-  직전 값으로 정확히 복귀) — margin이 좌우 대칭이라 이 값을 2배 하면 "인접 판정" 구간의
-  좌우 폭이 그대로 2배가 된다.
-- `LAVACON_PUSH_GAIN`(신설, `2.0`) — margin 침범량(`push_m`)에 곱하는 배율. margin 폭
-  확대와는 별개 축으로, "밀리는 정도 자체"를 키우는 게 목적이라 분리했다.
-
-`track_drive.py`
-- `_lavacon_steer_da_push()`: `push_m` 계산 직후(`push_px` 환산 전) `push_m *= LAVACON_PUSH_GAIN`.
-- `_draw_lavacon_bev()`(디버그 표시용 `push_m` 재계산 블록): 위와 동일하게 `LAVACON_PUSH_GAIN`을
-  곱해 실제 조향에 쓰이는 값과 표시값을 동기화(안 하면 디버그창 숫자만 옛날 세기로 보임). 하단
-  `margin=...` 텍스트에 `gain=...x`도 같이 표시하도록 추가.
-
-**알려진 한계:** 실차 미검증 — margin을 넓힌 만큼 콘에 더 일찍 반응하고, gain까지 곱해져
-조향이 더 세게 걸린다. 너무 이르게/세게 꺾이면 §3.5 사례처럼 각각 다시 낮출 것(두 값은
-독립적으로 튜닝 가능).
-
-### 5.12 B1 진입 전 `near_obstacle`(근접 장애물 급회피) 오발동 — `_lane_steer()`에 `Phase.LAVACON` 가드 추가 (2026-08-22)
-
-**증상:** 사용자가 "B1(라바콘) 진입 전에 B2(고정장애물회피)가 먼저 발동되는 것 같다"고 실차에서 보고.
-
-**원인:** `_lane_steer()`(`_lane_drive()`가 매 틱 호출하는 일반 S1 차선주행 조향)가 `path`를
-명시로 안 받는 분기에서 `near_obstacle = self.obstacle_front and self.obstacle_dist <
-AVOID_HOLD_TRIGGER_DIST_M`(§2.46)을 계산할 때 `self.phase`를 전혀 보지 않았다.
-`perc_obstacle()`의 전방 ROI(5m×1.5m 반폭)는 Phase와 무관하게 매 틱 갱신되므로, B1 라바콘
-구간에 접근하는 동안(아직 `lavacon_trigger`가 안 걸려 `_lavacon_engaged=False`인 대기
-구간 — `_s1_lane_follow()`가 그대로 `_lane_drive()`를 돌리는 시점) 콘 자체가 "전방
-고정장애물"로 잡혀 `obstacle_front=True`+`obstacle_dist`가 `AVOID_HOLD_TRIGGER_DIST_M`
-아래로 떨어지면 `near_obstacle=True`가 되고, `pure_pursuit.control()`의 목표점 선택이
-`_target_point_max_deviation()`(장애물 회피 전용 로직, §2.46)으로 전환돼 급조향이 나갔다 —
-B2 FSM(`behavior_state==B2_OBSTACLE`) 자체가 켜진 건 아니지만(그 경로는 §4.3 이후 이미
-죽어있음, `run_behavior_fsm()` 참고) 회피 조향이라는 결과물만 놓고 보면 "B2가 라바콘보다
-먼저 발동"한 것처럼 보였다. `perc_obstacle_cut_trigger()`/`_update_obstacle_cut_hold()`는
-이미 `self.phase == Phase.LAVACON`이면 트리거를 죽이도록 가드가 걸려 있었는데(각 함수
-주석 참고), `_lane_steer()`의 이 분기만 같은 가드가 빠져 있었다.
-
-**수정:** `track_drive.py` `_lane_steer()` — `near_obstacle` 계산에
-`self.phase != Phase.LAVACON` 조건을 AND로 추가. `Phase.OBSTACLE_ZONE`(=B1 완료,
-`run_behavior_fsm()`의 `Phase.LAVACON→OBSTACLE_ZONE` 전환 이후)부터만 이 근접회피가
-실제로 발동한다.
-
-**알려진 한계:** 실차 재검증 필요 — 이번 수정으로 B1 대기/진행 구간에서 콘으로 인한
-급조향은 없어지지만, `perc_obstacle()`의 전방 ROI 자체는 여전히 라바콘을 "고정장애물"로
-계속 인식해 `obstacle_front`/`obstacle_type` 값이 채워진다(표시/스냅샷용이라 무해 —
-avoid_hold의 실제 조향 개입인 `_clip_da_by_ll()`의 방향 힌트는 현재
-`DL_CENTER_MODE='da'`+`DL_DA_SKIP_LL_CLIP=True`라 비활성 상태).
-
----
-
-### 5.13 회피 중 속도 캡을 "감지 전" 구간으로 이동 — `SPEED_OBSTACLE_CUT` 삭제, `SPEED_PRE_OBSTACLE_CAP` 신설 (2026-08-23, 요청 반영)
-
-**요청:** 라바콘 탈출 후 장애물을 감지하기 전까지는 속도를 8로 유지하다가, 장애물을
-감지해 회피 조향(`obstacle_cut_active`)이 들어가는 순간 속도를 일반 주행속도로 올려서
-주행하게 해달라는 요청.
-
-**이전 동작:** 정확히 반대 방향이었다 — `_update_speed()`가 `obstacle_cut_active=True`
-"동안"(=회피 조향이 실제로 나가는 중)에만 `SPEED_OBSTACLE_CUT`(12.0, da 가시범위 0.7m
-기준 원호 기하 계산상 회피 여유 확보 목적으로 §4.x에서 도입)으로 감속시켰고,
-`Phase.OBSTACLE_ZONE`에 진입했지만 아직 아무것도 감지 못한 구간(=B1 탈출 직후 ~ B2/B3
-트리거 전, 또는 B2 통과 후 B3 트리거 전 공백)은 별도 캡 없이 일반 코너감속 로직(최대
-`SPEED_NORMAL`)이 그대로 적용됐다.
-
-**수정:** `config.py` — `SPEED_OBSTACLE_CUT`(12.0) 삭제, `SPEED_PRE_OBSTACLE_CAP = 8.0`
-신설. `track_drive.py` `_update_speed()` — 캡 조건을 `self.obstacle_cut_active`(회피 중)
-에서 `self.phase == Phase.OBSTACLE_ZONE and not self.obstacle_cut_active`(감지 전)로
-뒤집었다. 결과적으로:
-- `Phase.OBSTACLE_ZONE` 진입(라바콘 탈출) 직후 ~ `obstacle_cut_active`가 처음 True가
-  되기 전까지: 목표속도가 `SPEED_PRE_OBSTACLE_CAP`(8.0)로 상한.
-- `obstacle_cut_active`가 True로 바뀌는 순간(회피 조향 진입 엣지): 캡이 즉시 풀리고
-  일반 코너감속 로직이 계산한 `target_speed`(=`SPEED_NORMAL` 기반)를 그대로 쓴다 —
-  `SPEED_LAVACON_CAP`(B1용, §변경 없음)과 동일하게 `accel_step` 램프 위에 min()으로만
-  얹는 방식이라 급감속/급가속으로 "턱"지지 않고 부드럽게 캡 경계를 오간다.
-- B2 통과 후 B3 트리거 전 공백처럼 `obstacle_cut_active`가 다시 False로 풀리는 구간에도
-  같은 조건이 다시 걸려 속도가 8로 되돌아간다(요청 문구 "장애물을 감지하기 전까지"를
-  B2/B3 각각에 동일하게 적용한 해석 — 트랙 전체에서 한 번만 적용하는 게 아님).
-
-**알려진 한계:** 실차 미검증. 옛 `SPEED_OBSTACLE_CUT`이 있던 이유(회피 조향 중 da
-가시범위 안에서 필요한 횡이동을 확보하려면 여유가 얇다는 원호 기하 계산, §708 옛 주석)는
-이번 변경으로 더 이상 반영되지 않는다 — 회피 기동 중 불안정하면 이 속도캡을 되살리기보다
-회피 조향 로직(da 근접 컷) 자체의 여유(`OBSTACLE_CUT_TRIGGER_X_MAX_M` 등)를 먼저 볼 것.
-
-### 5.14 `_clip_da_by_obstacle()` 컷 좌우폭을 B2/B3 타입별로 분리 — B2만 10%↓ (2026-08-23, 요청 반영)
-
-**요청 배경:** 실차 체감상 B2(고정장애물)/B3(방해차량) 회피 조향이 너무 크다는 피드백 —
-우선 B2 컷 좌우폭만 10% 줄이고, B3는 아직 실차 미검증 상태 그대로 유지해달라는 요청
-(둘을 따로 튜닝할 수 있어야 한다는 전제도 같이 반영).
-
-**이전 동작:** §2.51에서 만든 `_clip_da_by_obstacle()`은 `OBSTACLE_CUT_LANE_HALF_WIDTH_PX`
-단일 상수(`None`이면 `LANE_WIDTH_M(0.4m)*DL_PIXELS_PER_METER(200px/m)=80px`)로 B2/B3
-구분 없이 동일한 컷 좌우폭을 썼다.
-
-**수정:** `config.py` — `OBSTACLE_CUT_LANE_HALF_WIDTH_PX`를
-`OBSTACLE_CUT_LANE_HALF_WIDTH_PX_FIXED`(B2)/`OBSTACLE_CUT_LANE_HALF_WIDTH_PX_VEHICLE`(B3)
-둘로 분리(둘 다 `None`이 기본값)하고, `OBSTACLE_CUT_HALF_WIDTH_SCALE_FIXED=0.9`를 신설해
-B2가 `None`일 때 `80px * 0.9 = 72px`을 쓰도록 했다. B3는 배율 없이 기존과 동일한 80px 유지.
-`track_drive.py`의 `perc_obstacle_cut_trigger()`가 이미 판정해 두는 `self.obstacle_cut_type`
-('fixed'/'vehicle')을 `set_obstacle()` 호출부에 실어 `DLLaneDetector.set_obstacle()` →
-`_worker()` → `DLSlideWindow.detect()` → `_clip_da_by_obstacle()`까지 그대로 흘려보내는
-방식으로 배선했다(`set_avoid_hold()`/`set_speed()`와 동일한 "락으로 최신값만 스냅샷" 관례).
-`cut_type='vehicle'`이면 B3 폭, 그 외('fixed' 및 미분류 'none' 폴백)는 B2 폭을 쓴다.
-
-**알려진 한계:** 실차 미검증. 10%라는 배율 자체가 체감 기반 추정치라 실차에서 여전히
-크면 `OBSTACLE_CUT_HALF_WIDTH_SCALE_FIXED`를 더 낮추거나, 확실한 값을 알면
-`OBSTACLE_CUT_LANE_HALF_WIDTH_PX_FIXED`에 px 절대값을 직접 지정할 것. B3(방해차량) 쪽
-조향도 크다면 `OBSTACLE_CUT_LANE_HALF_WIDTH_PX_VEHICLE`을 같은 방식으로 낮추면 되지만,
-이번 요청 범위에서는 의도적으로 보류.
-
----
-
-### 5.15 YOLO 카메라 검출조건 — "박스 존재"에서 "최대 박스면적 ≥ 임계값"으로 강화 (2026-08-23, 요청 반영)
-
-**요청 배경:** B1(라바콘)/B2(고정장애물)/B3(방해차량)의 YOLO 카메라 이중확인이 지금까지
-"이번 프레임에 박스가 하나라도 찍히면 검출"이었는데, 멀리서 작게(또는 배경 오탐으로)
-찍힌 박스까지 그대로 검출로 인정돼버리는 게 문제라는 지적 — 라이다 AND 조건은 그대로
-두고, YOLO 쪽만 "이번 프레임 검출된 박스들 중 가장 큰 것의 면적이 일정 값 이상"으로
-조건을 걸어달라는 요청. 판정에 쓰인 최대 면적값을 `obstacle_cut_debug` 창에서 실시간으로
-볼 수 있게 해달라는 요청도 함께 반영.
-
-**수정:**
-- `perception/yolo_cone.py`/`perception/yolo_vehicle.py` — 각 `_worker()`가 매 프레임
-  `engine.infer()`가 돌려주는 검출 박스 리스트에서 `max((x2-x1)*(y2-y1) for ...)`로
-  최대 면적(px², 640 입력 스케일)을 계산해, 엔진의 원시 `*_detected_raw`(박스 1개 이상)와
-  `max_area >= YOLO_CONE_MIN_BOX_AREA_PX`/`YOLO_VEHICLE_MIN_BOX_AREA_PX`(config.py 신설)를
-  AND로 묶은 값을 `detect()`가 반환하는 최종 검출값으로 바꿨다. 새 `get_latest_max_area()`
-  getter로 이 면적값도 스레드 세이프하게 꺼내올 수 있게 함.
-- `cone_detected_yolo`/`vehicle_detected_yolo_cut`(둘 다 `detect()`를 그대로 호출)이
-  B1(`perc_lavacon_trigger()`)·B2/B3(`perc_obstacle_cut_trigger()`)의 카메라 확인
-  변수라 코드 수정 없이 세 구간 모두에 새 조건이 자동 적용된다(라이다와의 AND 결합
-  구조 자체는 그대로).
-- `track_drive.py` — `self.cone_max_box_area`/`self.vehicle_max_box_area_cut`을 신설해
-  `perc_yolo_cone()`/`perc_yolo_vehicle_cut()`이 매 틱 `get_latest_max_area()`로 채운다.
-  `_debug_viz_obstacle_cut()`에 `YOLO {cone|car} 최대 박스면적=...px² (임계값 ...px² 이상)`
-  줄을 추가(임계값 충족 시 초록, 아니면 회색) — 현재 활성 스테이지(`_active_yolo_stage()`,
-  B2면 콘, B3면 차량)에 맞는 값을 자동으로 보여준다.
-
-**알려진 한계:** 최초 버전은 `YOLO_CONE_MIN_BOX_AREA_PX`/`YOLO_VEHICLE_MIN_BOX_AREA_PX`
-단일 상수를 B1/B2가 공유했다 — 바로 아래 §5.16에서 B1/B2/B3 셋으로 분리됨.
-`obstacle_cut_debug` 창은 현재 활성 스테이지(콘 또는 차량) 하나만 보여주므로, B1(라바콘)
-진입 전 트리거 단계에서 콘 면적값을 확인하려면 `_active_yolo_stage()`가 `'cone'`을
-반환하는 구간(`Phase.LAVACON` 진입 확정 전, §3.10)에서 봐야 한다.
-
-### 5.16 §5.15의 면적 임계값을 B1/B2/B3 각자 다른 변수로 분리 (2026-08-23, 요청 반영)
-
-**요청 배경:** §5.15에서 콘 검출 면적 임계값(`YOLO_CONE_MIN_BOX_AREA_PX`)을 B1(라바콘
-진입 트리거)·B2(고정장애물)가 공유했는데, "그 크기값을 B1/B2/B3마다 다른 변수로 보도록"
-해달라는 요청 — 같은 콘 검출기를 공유하더라도 B1(아직 진입 전, 먼 거리에서부터 판단)과
-B2(이미 진입해 지나치는 중, 가까운 거리)는 콘까지의 체감 거리가 달라 임계값도 따로
-튜닝할 수 있어야 한다는 취지.
-
-**수정:**
-- `config.py` — `YOLO_CONE_MIN_BOX_AREA_PX`를 `YOLO_CONE_MIN_BOX_AREA_PX_B1`(라바콘 진입
-  트리거)/`YOLO_CONE_MIN_BOX_AREA_PX_B2`(고정장애물)로 분리하고, `YOLO_VEHICLE_MIN_BOX_AREA_PX`는
-  `YOLO_VEHICLE_MIN_BOX_AREA_PX_B3`로 이름만 맞춰 정렬(B3 전용이라 나눌 필요는 없음).
-  셋 다 기존과 동일하게 2500px²(=50x50px 상당)에서 시작 — 값 자체는 안 바뀜.
-- `perception/yolo_cone.py`/`perception/yolo_vehicle.py` — 면적 게이트를 검출기
-  내부(`_worker()`)에서 다시 빼냈다. 검출기는 "지금 몇 개가 어떤 크기로 찍혔는지"만 알고
-  "이게 B1 문의인지 B2 문의인지"는 모르므로(같은 인스턴스를 두 곳이 공유), 임계값 비교를
-  검출기가 아니라 그 문맥을 아는 호출부로 옮겼다 — `detect()`는 다시 §5.15 이전과 동일한
-  "박스 1개 이상이면 True" 원시값을 반환하고, `get_latest_max_area()`로 면적만 별도로
-  꺼내가게 한다.
-- `track_drive.py` — 실제 게이트는 이제 호출부 두 곳에서 각자 건다:
-  `perc_lavacon_trigger()`(B1)의 `cone_confirmed_cam`이
-  `self.cone_detected_yolo and self.cone_max_box_area >= YOLO_CONE_MIN_BOX_AREA_PX_B1`로,
-  `perc_obstacle_cut_trigger()`(B2/B3)의 `cone_seen`/`vehicle_seen`이 각각
-  `YOLO_CONE_MIN_BOX_AREA_PX_B2`/`YOLO_VEHICLE_MIN_BOX_AREA_PX_B3`로 게이트한다.
-  `_debug_viz_obstacle_cut()`도 콘 스테이지일 때 `self.phase`로 B1/B2를 구분해(`Phase.LAVACON`
-  이면 B1, 아니면 B2) 맞는 임계값을 보여주고, 면적 줄 앞에 `[B1]`/`[B2]`/`[B3]` 태그를 붙여
-  지금 어느 임계값이 적용 중인지 바로 보이게 했다.
-
-**알려진 한계 → [2026-08-23 밤, §5.17 실측 창으로 실차 실측 완료] 해소:** 셋 다 서로 다른
-값으로 실측 확정됨 — `YOLO_CONE_MIN_BOX_AREA_PX_B1=5000.0`,
-`YOLO_CONE_MIN_BOX_AREA_PX_B2=2500.0`, `YOLO_VEHICLE_MIN_BOX_AREA_PX_B3=4500.0`
-(placeholder 아님, 실차 실측치).
-
-### 5.17 B1/B2/B3 박스면적 실측 전용 디버그 창 3개 신설 (2026-08-23, 요청 반영, ★실측 후 삭제 예정★)
-
-**요청 배경:** §5.16까지로 면적 게이트 구조는 갖춰졌으니, `YOLO_CONE_MIN_BOX_AREA_PX_B1`/
-`_B2`, `YOLO_VEHICLE_MIN_BOX_AREA_PX_B3` 값을 실차에서 실측해야 하는 단계 — "카메라 화면 +
-그 순간 가장 크게 찍히는 박스 면적 숫자"를 한 창에서 보여주는 B1/B2/B3 전용 디버그 창
-3개를 만들어달라는 요청. 노드를 실행하면(Phase 등 FSM 상태와 무관하게) 항상 돌아가야
-하지만, 셋을 동시에 켜면 카메라 프레임 렌더링이 겹쳐 랙이 걸린다는 실측 피드백으로 기본은
-전부 꺼두고 한 번에 하나씩만 켜서 보는 것으로 함.
-
-**수정 (`track_drive.py`):**
-- 공용 헬퍼 `_debug_viz_box_area_cam_window(win_name, win_pos, title_kr, title_en, cam_frame,
-  max_area, min_area, threshold_name)` — 320x240 카메라 프레임(검출기의
-  `get_latest_debug_frame()`, 박스 그려진 것) 위에 아래쪽 텍스트로 `최대 박스면적 = ...px²`
-  (임계값 이상이면 초록, 미만이면 주황)와 임계값 상수명+값을 보여준다. 카메라 프레임이
-  아직 없으면(해당 단계가 아직 한 번도 활성인 적 없음/검출기 초기화 실패) 안내 문구만 표시.
-- `_debug_viz_b1_cone_area()`/`_debug_viz_b2_cone_area()`(둘 다 `yolo_cone_detector` 재사용,
-  각자 `YOLO_CONE_MIN_BOX_AREA_PX_B1`/`_B2`로 표시)/`_debug_viz_b3_vehicle_area()`
-  (`yolo_vehicle_cut_detector`, `YOLO_VEHICLE_MIN_BOX_AREA_PX_B3`) 세 메서드가 각각 위
-  헬퍼를 호출. §5.15 이전 버전(§5.17 첫 시도, 이후 삭제됨)과 달리 `Phase` 기준
-  "활성/대기" 구분이 없다 — 플래그가 켜져 있으면 무조건 그린다. 다만 카메라 프레임/면적값
-  자체는 `_active_yolo_stage()`가 해당 스테이지를 가리킬 때만
-  `perc_yolo_cone()`/`perc_yolo_vehicle_cut()`이 돌아 갱신되므로(`perceive_all()` 참고),
-  그 외 구간에선 마지막 값에 멈춰 있다.
-- `control_loop()`에 `DEBUG_VIZ_B1_CONE_AREA`/`_B2_CONE_AREA`/`_B3_VEHICLE_AREA` 플래그로
-  게이트한 호출 3줄 추가.
-- `config.py` — 위 세 플래그(기본값 **전부 False** — 동시에 켜지 말 것)와 `DEBUG_WIN_POS_
-  B1_CONE_AREA`/`_B2_CONE_AREA`/`_B3_VEHICLE_AREA`(가로로 나란히 `(0,0)`/`(340,0)`/
-  `(680,0)`) 신설.
-
-**사용법:** 지금 튜닝하려는 단계 하나만 `config.py`에서 해당 플래그를 `True`로 켜고(예:
-B1 실측 중이면 `DEBUG_VIZ_B1_CONE_AREA = True`, 나머지 둘은 `False` 유지), 노드를 켠 채로
-그 단계에 실제로 진입시켜(라바콘/고정장애물/방해차량을 실제 거리에 두고) 창에 뜨는 카메라
-화면과 면적 숫자를 보면서 "이 정도 거리에서 이 정도 면적이면 검출로 인정해야겠다" 싶은
-값을 그대로 해당 `YOLO_*_MIN_BOX_AREA_PX_B*` 상수에 넣으면 된다.
-
-**[2026-08-23 밤, 요청 반영] 실측 완료 후 삭제됨:** B1=5000.0/B2=2500.0/B3=4500.0px²로
-실측 확정(§5.16 참고) 후, 이 절에서 추가했던 코드(공용 헬퍼 + 세 메서드 +
-`control_loop()` 호출 3줄, `config.py`의 플래그/좌표 6줄)를 예고대로 전부 삭제했다 —
-지금은 코드에 없음, 이 절은 그 도구가 왜/어떻게 있었는지의 기록으로만 남긴다.
-
-### 5.18 B3 통과 직후 신호등 YOLO 안 켜지던 버그 수정 (2026-08-23 밤)
-
-`_signal_yolo_off`가 `_begin_new_lap()`(한 바퀴 완주 판정) 때까지 안 풀려서 `Phase.DONE`
-진입 후에도 신호등 YOLO가 계속 꺼져있던 버그. `_mark_behavior_passed()`에서 `Phase.DONE`
-진입 시 신호 상태를 즉시 리셋하도록 수정. **실차 미검증.**
-
----
-
-## 6. 실측값 기록 (캘리브레이션)
-
-**실측값**과 (값은 채워져 있지만 측정한 게 아니라 우리가 고른) **설계값**을 구분 표기합니다 — 헷갈리면
-다음 사람이 "이미 실측됐다"고 착각하고 재검증을 건너뛸 수 있어서입니다.
-
-### 6.1 도로/차량 치수 (2026-08-04 실측)
+### 도로/차량 치수 (실측)
 | 상수 | 값 | 근거 |
 |---|---|---|
-| `LANE_WIDTH_M` | 0.4m | 흰선~흰선(도로 전체폭) 80cm 실측, 노란 중앙선이 정중앙 → 차선 1개 폭 = 40cm |
+| `LANE_WIDTH_M` | 0.4m | 흰선~흰선(도로 전체폭) 80cm 실측, 노란 중앙선이 정중앙 → 차선 1개 폭 40cm |
 | `VEHICLE_WIDTH_M` | 0.31m | xycar 본체 실측(세로64×가로31×높이20cm) |
-| `VEHICLE_LENGTH_M` | 0.64m | 위와 동일 실측(세로=전후 길이) |
-| 고정장애물 실측 크기 | 가로20×세로41×높이16cm | `OBSTACLE_VEHICLE_WIDTH_M=0.24` 산출 근거 |
-| 방해차량 실측 크기 | 가로28×세로54×높이19cm | `(0.20+0.28)/2=0.24` |
+| `VEHICLE_LENGTH_M` | 0.64m | 위와 동일 실측 |
+| `OBSTACLE_VEHICLE_WIDTH_M` | 0.24m | 고정장애물(20×41×16cm)/방해차량(28×54×19cm) 실측폭 평균 `(0.20+0.28)/2` |
+| `WHEELBASE_M` | 0.335m | 줄자로 앞바퀴-뒷바퀴 축간거리 실측(옛 이름 `LQR_WHEELBASE_M`). `planner/hybrid_astar.py`의
+wheelbase 기본값과 반드시 같은 값을 유지할 것 |
 
-### 6.2 라이다 장착 각도 보정 (2026-07-22 재실측, 드리프트 의심 미해결)
-`LIDAR_ANGLE_OFFSET_DEG=80.0` — 정면에 사람을 세우고 컴퍼스로 확인한 값.
-**[2026-08-14, 미반영] 재드리프트 의심**: `measure_lidar_camera_offset.py`(§2.30)로 정면에 물체를
-놓고 재보니 실제 최근접점이 인덱스 80이 아니라 88~89에서 찍힘(≈6.5° 차이) — 마운트가 미세하게
-틀어졌을 가능성. 단발성 관찰이라 아직 `config.py`는 안 바꿨음, 정식 재측정 필요(갱신 시 B1/B2/B3
-좌우판정 전부에 영향 크므로 재검증 필수).
+### 라이다
+`LIDAR_ANGLE_OFFSET_DEG=80.0` — 실측값(§10 "알려진 한계"에 드리프트 의심 미해결 사항 있음).
 
-### 6.3 DL 백엔드 BEV 캘리브레이션 (2026-08-05 실측)
-`bev_point_picker.py`로 라이브 카메라에서 직접 클릭 — TL(246,257)/TR(455,257)/BR(635,333)/BL(60,333)
-(원본 640×480 기준), 실측 W=0.8m(좌우 백선 간격)/L=1.0m. `DL_PIXELS_PER_METER=200.0`은 **설계값**(임의
-선택, 실측 아님). 캔버스 크기는 이 4점+스케일로 매 시작 시 자동 역산됨. 카메라 재장착/진동 시
-`bev_point_picker.py`로 재측정 필요.
+### DL 백엔드 BEV 캘리브레이션
+`bev_point_picker.py`로 라이브 카메라에서 직접 클릭한 4점(원본 640×480 기준):
+TL(246,257)/TR(455,257)/BR(635,333)/BL(60,333), 실측 W=0.8m(좌우 백선 간격)/L=1.0m.
+`DL_PIXELS_PER_METER=200.0`은 **설계값**(임의 선택, 실측 아님) — 목적 캔버스를 1m=200px로
+정의. 카메라 재장착/진동 시 `bev_point_picker.py`로 재측정 필요.
 
-### 6.4 DL da/ll 튜닝값 BEV 재계산 (2026-08-05)
-원근→BEV 전환(면적비 ×1.9456) 후 재계산 안 된 픽셀 임계값 4개를 반차로폭/실측 라인두께 기준으로 재산정:
-`DL_DA_MIN_COMPONENT_AREA` 800→**1560**, `DL_SLICE_OUTLIER_MAX` 60→**40**, `DL_STABLE_JUMP_MAX` 30→**20**,
-`DL_LL_CLIP_MARGIN_PX` 15→**8**. 옛값(원근 스케일)은 반차로폭의 75%까지 "이상치 아님"으로 통과시켜 옆
-차선에 걸친 점도 그대로 뒀던 게 문제였음. 여전히 실차 미검증 추정치.
+da/ll 튜닝값(BEV 좌표계 기준, 반차로폭/실측 라인두께로 재산정): `DL_DA_MIN_COMPONENT_AREA=1560`,
+`DL_SLICE_OUTLIER_MAX=40`, `DL_STABLE_JUMP_MAX=20`, `DL_LL_CLIP_MARGIN_PX=8`.
 
-### 6.5 속도 단위 ↔ m/s 환산 (`METERS_PER_SPEED_UNIT`, 2026-08-17~18 재실측으로 갱신)
-**2026-08-06 초판(2점 회귀, 0.1347)은 폐기.** `measure_speed_calibration.py`(줄자+시간차
-실측 도구, track_drive/실제속도측정.md)로 speed 5/10/15를 각 3~4회 반복 재측정한 결과,
-옛 회귀가 실제보다 **약 58% 과대추정**하고 있었던 것으로 확인됨 — 새 회귀(5~15 원점고정)로
-`METERS_PER_SPEED_UNIT≈0.0848 m/s/unit`, 데드존은 옛 추정(speed≈1.4)과 달리 **사실상 0**.
+### 속도 단위 ↔ m/s 환산
+`METERS_PER_SPEED_UNIT=0.0848` — `measure_speed_calibration.py`(줄자+시간차 실측)로
+speed 5/10/15를 각 3~4회 반복 측정한 원점고정 회귀. 데드존은 사실상 0. **`speed≥20`에는
+쓸 수 없음**(§10 참고). VESC(`v_mps`) 실측 대조 결과 항상 실제보다 5~11% 높게 보고됨 —
+`VESC_SPEED_TO_ERPM_GAIN` 재보정 여부는 미결정.
 
-**speed=20은 이 상수를 쓸 수 없음** — 반복측정이 훨씬 불안정했고, VESC(모터축 회전)는
-run마다 거의 고정인데 지상속도만 들쭉날쭉해 견인력 순간손실(슬립)로 진단됨. 이상치를
-걸러낸 재분석 결과 unit≈0.072로 5~15보다 15~16% 낮아, **speed=20 부근부터 이미 비선형
-(견인력 포화) 구간에 들어섰을 가능성**이 있음 — 단일 상수로 표현 불가. speed=25는 실차
-하드웨어 신뢰성 문제(배터리/ESC/모터 의심, 실제속도측정.md §0.1)로 측정 자체가 보류 중.
+`VESC_SPEED_TO_ERPM_GAIN=4614.0` — VESC 드라이버 `vesc.yaml`의 `speed_to_erpm_gain` 값
+그대로(실차 확인).
 
-VESC(`v_mps`) 실측 대조도 이번에 처음 함 — 항상 실제보다 5~11% 높게 보고(방향 일관, 크기
-변동). `VESC_SPEED_TO_ERPM_GAIN` 재보정 여부는 아직 미결정.
-
-`SPEED_CORNER_MIN`(§2.3)/`APPROACH_SPEED`는 이 갱신 이후 데드존 재평가 여지가 있으나
-아직 반영 안 됨 — 다음 확인 대상.
-
-### 6.6 아직 미실측 (플레이스홀더로 남아있는 값)
+### 아직 미실측인 값
 | 상수 | 상태 |
 |---|---|
-| `PIXELS_PER_METER` (전역) | 0.0(미실측) — `DL_USE_BEV`가 검증되면 §6.3의 `DL_PIXELS_PER_METER`로 채울 것 |
-| `PP_MIN_LOOKAHEAD_PX`/`PP_WHEELBASE_PX`/`PP_LOOKAHEAD_BASE_PX` 등 | 전부 실차 미검증 튜닝값(추정/역산치, 실측 아님) |
+| `PIXELS_PER_METER`(전역) | 0.0(미실측) — `DL_USE_BEV` 검증 완료 시 `DL_PIXELS_PER_METER`로 채울 것 |
+| `PP_MIN_LOOKAHEAD_PX`/`PP_WHEELBASE_PX`/`PP_LOOKAHEAD_BASE_PX` 등 | 그리드서치로 재튜닝된 값이지 물리 실측값 아님 |
 
-### 6.7 `WHEELBASE_M` 실측값 (0.26 → 0.335, 2026-08-06, LQR 브랜치에서 이식)
-줄자로 앞바퀴-뒷바퀴 축간거리 실측 — 옛 이름 `LQR_WHEELBASE_M`, `planner/hybrid_astar.py`의 wheelbase
-기본값과 반드시 같은 값을 유지할 것(재실측 시 둘 다 갱신).
-
-### 6.8 `PP_WHEELBASE_PX`를 물리 기반 값으로 계산 (80.0 → 67.0, 2026-08-06)
-"임의 튜닝값"이던 것을 `WHEELBASE_M(0.335) * DL_PIXELS_PER_METER(200) = 67.0`으로 물리 기반 값으로
-대체 — 이후 2026-08-13에 25.0으로 재튜닝됨(§0.5.8 타임라인 참고). 80.0이 다른 근사 오차를 상쇄해온
-경험값이었을 가능성이 있어 실차 재검증 필요.
-
----
-
-## 7. VESC 실측 속도 연동 (ROS1, 2026-08-06 LQR 브랜치에서 이식)
-
-구동모터 실회전속도(VESC 홀센서)를 ROS1 변환 노드(`launch/vesc_speed_bridge.py`, 이 워크스페이스 바깥
-noetic_ws에서 별도 실행)로 표준 메시지(`std_msgs/Float32`, `/vesc_speed_erpm`)화해 `ros1_bridge`로
-받아옴 → `cb_vesc()`가 `VESC_SPEED_TO_ERPM_GAIN=4614.0`(vesc.yaml 실측값)로 나눠 `self.v_mps`로 변환.
-속도 적응형 lookahead(§0.5.4)/pose 추정(`EncoderPoseEstimator`)에 사용. 확인: `DEBUG_VIZ_VESC` →
-`vesc_debug` 창(빨강 NEVER_RECEIVED/주황 STALE/초록 LIVE).
-
-### 7.1 출발/가속 중 순간 정지 — 배터리 전압 강하 의심 (2026-08-07)
-`v_mps`가 `vesc_debug` LIVE 상태에서도 순간 0으로 떨어지는 증상 — 모터 전류 피크 구간(재출발 직후,
-가속 도중)과 일치해 배터리 LVC(저전압보호) 트립으로 추정. 근본 해결(배터리 점검/교체)은 안 하고,
-완화책으로 `SPEED_ACCEL_STEP` 0.85→0.4(가속을 더 완만하게, 0→25 도달시간 1.5s→3.1s)만 적용 — 실차
-미검증, 재발하면 배터리 실측 또는 VESC 자체 LVC 임계값 조정 필요.
-
-### 7.2 완충 상태에서도 재현되는 출발 초반 "틱틱거림/힘딸림" — 정지마찰 구간 체류시간 문제 (2026-08-17)
-§7.1과 증상은 비슷하지만 배터리 완충 후에도 재현된다는 제보 — SOC(잔량)가 아니라 순간 전압강하
-(sag) 문제라는 방증. 원인 분석: 제어루프가 20Hz(0.05초) 고정주기(`create_timer(0.05, ...)`)라 가속
-램프(`SPEED_ACCEL_STEP`)도 정지에서부터 매 틱 계단식으로 오르는데, 모터 데드존(≈1.4, §6.5 회귀
-절편 근거)을 넘는 데만 4틱(0.2초)이 걸린다. 그 구간 내내 바퀴 RPM=0이라 역기전력이 없어 같은 duty
-에서도 락터 전류(가장 큰 전류)가 흐르는데, 계단 램프가 바로 그 구간에서 가장 오래 머무는 구조라
-"가장 전류를 많이 먹는 구간에서 50ms마다 새 duty를 정지마찰에 막혀 못 넘기고 코깅음만 내는" 패턴이
-반복 — 이게 "일정 주기(20Hz)로 힘을 툭툭 준다"는 체감과 일치.
-
-**수정:** `_lane_drive()`의 가속 램프에 `SPEED_KICK_START`(=3.0, `config.py` §2) 도입 — 정지
-(`_prev_speed < SPEED_KICK_START`)에서 새로 출발하는 틱 1회만 `SPEED_ACCEL_STEP` 계단을 건너뛰고
-`SPEED_KICK_START`로 즉시 점프시켜, 정지마찰 구간 체류를 4틱→1틱으로 줄인다. 이후 틱부터는 기존
-`SPEED_ACCEL_STEP` 램프를 그대로 이어감 — §7.1이 완화한 "고속까지 과속 가속" 문제와는 다른 구간
-(정지→데드존 돌파)만 건드리므로 재발 가능성은 낮게 본다.
-
-**알려진 한계 → [2026-08-18 실차 재검증 결과] 효과 없음으로 판명.** 정식 주행 루프에 적용 후
-실차 테스트했으나 틱틱거림 개선 체감이 전혀 없었고, 같은 세션에서 완충 상태인데도 출발 성공률이
-30분에 1회 수준으로 급락(이전엔 5회 중 2회는 성공)하는 등 오히려 상태가 악화됨. 좀비
-`dynamic_bridge` 프로세스 제거([[motor_bridge_zombie_fix]] 참고)로 증상이 나아졌던 것도 이번엔
-우연이었을 가능성이 크다고 재평가됨. **결론: 이 "정지마찰 램프 체류시간" 가설(§7.2)과 §7.1의 LVC
-가설 둘 다 소프트웨어 레버는 이미 적용된 상태에서 실패율이 이 정도라면, 원인은 하드웨어(배터리
-내부저항 열화/ESC 보호임계값 이상/모터·기어박스 기계적 걸림/배터리-ESC 커넥터 접촉불량) 쪽일
-가능성이 높음 — 다음 점검은 정상 배터리팩으로 교체해 출발 성공률을 A/B 비교하는 것부터 시작할 것.
-자세한 내용은 `track_drive/실제속도측정.md` §0.1 참고.**
-
----
-
-## 8. IMU 센서 연동 (SparkFun 9DoF Razor IMU M0, 2026-08-06)
-
-하드웨어가 그동안 고장나 있어 `/imu`가 한 번도 산 적 없었음 — 이번에 수리 + 기존 로봇 워크스페이스에만
-있던 `xycar_imu` 패키지를 이 저장소(`xycar_device/xycar_imu/`)로 편입(버전관리 누락 방지, 실차 배포는
-`~/xycar_ws/src/xycar_device/`에 붙여넣고 `colcon build --packages-select xycar_imu`). launch 파일
-오타(`imu.yaml`→`xycar_imu.yaml`) 2건도 수정.
-
-**아직 안 한 것:** `launch/track_drive.launch.py`의 `imu_include`가 여전히 주석 처리돼 있어, 패키지를
-빌드해도 이 줄을 살리지 않으면 `track_drive` 노드에 `/imu`가 안 들어옴 — 실차에서 펌웨어+빌드 확인 후
-주석 해제 필요. 시리얼 포트(`/dev/ttyIMU`, 57600bps) udev 별칭도 새 보드 기준 재확인 필요.
-
-`cb_imu()`가 `imu_yaw`(바퀴카운트/S3/B3 Hybrid A*용)와 `imu_yaw_rate`+`_imu_t`(§0.5.5 코너감쇠용,
-`IMU_STALE_SEC=0.5`)를 뽑음.
-
-### 8.4 바퀴 카운트가 항상 0에 멈추던 문제 (원인: IMU 하드웨어 고장, 코드 버그 아님)
-`_update_lap()`이 휠 회전이 아니라 IMU yaw 누적만으로 바퀴를 센다 — IMU가 죽어있던 동안 `imu_yaw`가
-초기값에서 안 바뀌어 항상 0으로 찍혔던 것. IMU 수리(위)로 자동 해결될 것으로 예상되나, 전용 생존
-디버그 창은 아직 없어 `[LAP] 누적=` 값이 안 늘어나는 것으로만 간접 확인 가능.
-
----
-
-## 9. 빌드/실행 환경 (개발 PC, 2026-08-13 확인, 전부 해결됨)
-
-- **`colcon build`가 `setup.py` 없다고 실패**: `package.xml`만 있고 `setup.py`/`setup.cfg`/`resource/`
-  마커가 없었음(서브패키지 `__init__.py`도 누락) — 전부 추가. 확인: `colcon build --packages-select
-  track_drive --symlink-install` 성공 + `ros2 pkg executables track_drive`에 노출되는지.
-- **`imu_node`가 `numpy has no attribute 'float'`로 죽음**: apt `python3-transforms3d`(구버전)와 pip
-  numpy(1.24+에서 `np.float` alias 제거) 버전 불일치 — `pip3 install --user --upgrade transforms3d`로
-  해결(sudo 불필요, 사용자 site가 시스템 site보다 먼저 로드됨).
-- **YOLO 콘 가중치 경로가 `xycar_ws/build/`로 잘못 계산됨**: `--symlink-install`이 만드는 심볼릭 링크를
-  `os.path.abspath()`가 안 풀어줘서 발생 — `os.path.realpath()`로 교체(`perception/yolo_cone.py`).
-- **`usb_cam_node_exe`가 카메라 calibration 파일을 못 찾음**: 존재하지 않는 `params.yaml`을 참조하고
-  있어 파라미터 로드 자체가 스킵되던 것(내부 기본값 `default_cam`으로 폴백해 없는 경로를 찾음) — 실존하는
-  `params_1.yaml`로 교체(주행 인지 코드는 `camera_info`를 안 써서 원래 주행엔 영향 없던 로그 노이즈였음).
+### 조향 컨트롤러 물리 기반 계산
+`WHEELBASE_M(0.335) * DL_PIXELS_PER_METER(200) = 67.0`이 물리 기반 `PP_WHEELBASE_PX` 계산값
+이지만, 현재 실사용값은 그리드서치로 재튜닝된 `49.64`다(§7 참고) — 두 값이 다른 것은 의도된
+것이며, 물리 기반 값이 "정답"이라고 착각해 되돌리지 말 것.
